@@ -37,6 +37,9 @@ os.environ.update({
     "WORKER_ENABLED": "false",
     "POOL_ENABLED": "false",
     "CODEX_POOL_ENABLED": "false",
+    # Rollout-enabled paths are exercised explicitly.  Keep unrelated tests
+    # isolated from task-scoped MCP subprocess construction.
+    "CODEX_MAIN_MCP_ENABLED": "false",
     "BACKUP_ENABLED": "false",
     # Unit tests exercise the cleaner with isolated roots explicitly. Importing
     # backend.main must never start a watchdog against the host's real /tmp.

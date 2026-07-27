@@ -58,6 +58,7 @@ export interface RuntimeSettings {
   use_pty_mode: boolean;
   pty_available: boolean;
   codex_app_server_enabled: boolean;
+  codex_main_mcp_enabled: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;

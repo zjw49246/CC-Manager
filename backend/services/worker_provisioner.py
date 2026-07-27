@@ -942,6 +942,7 @@ echo deploy-ok
             "POOL_ENABLED=true",
             "CODEX_POOL_ENABLED=true",
             "DEFAULT_PROVIDER=codex",
+            f"CODEX_MAIN_MCP_ENABLED={'true' if settings.codex_main_mcp_enabled else 'false'}",
             f"USE_PTY_MODE={'true' if settings.use_pty_mode else 'false'}",
         ])
         env_path = remote_dir.rstrip("/") + "/.env"

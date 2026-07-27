@@ -65,6 +65,7 @@ async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
         use_pty_mode=instance_manager.pty_mode_enabled,
         pty_available=_pty_available(),
         codex_app_server_enabled=settings.codex_app_server_enabled,
+        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
         auto_sort_on_access=row.auto_sort_on_access if row.auto_sort_on_access is not None else True,
         context_compact_threshold=_effective_compact_threshold(row),
     )
@@ -104,6 +105,8 @@ async def update_runtime_settings(
     await broadcaster.broadcast("system", {
         "event": "runtime_settings_changed",
         "use_pty_mode": instance_manager.pty_mode_enabled,
+        "codex_app_server_enabled": settings.codex_app_server_enabled,
+        "codex_main_mcp_enabled": settings.codex_main_mcp_enabled,
         "auto_sort_on_access": auto_sort,
         "context_compact_threshold": compact_threshold,
     })
@@ -111,6 +114,7 @@ async def update_runtime_settings(
         use_pty_mode=instance_manager.pty_mode_enabled,
         pty_available=_pty_available(),
         codex_app_server_enabled=settings.codex_app_server_enabled,
+        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
         auto_sort_on_access=auto_sort,
         context_compact_threshold=compact_threshold,
     )

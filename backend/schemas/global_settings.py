@@ -25,6 +25,7 @@ class RuntimeSettingsResponse(BaseModel):
     use_pty_mode: bool
     pty_available: bool
     codex_app_server_enabled: bool
+    codex_main_mcp_enabled: bool
     auto_sort_on_access: bool
     # Effective value (DB override, else env default)
     context_compact_threshold: float

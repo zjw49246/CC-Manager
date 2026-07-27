@@ -206,6 +206,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [modelContextWindows, setModelContextWindows] = useState<Record<string, number>>({});
   const [ptyMode, setPtyMode] = useState(false);
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
+  const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
   const [injecting, setInjecting] = useState(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
@@ -215,11 +216,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const injectTransport = task.provider === 'codex' ? 'Codex turn/steer' : 'Claude PTY';
 
   useEffect(() => {
-    api.getRuntimeSettings().then((s) => {
+    let active = true;
+    setCodexMainMcpEnabled(null);
+    const settingsRequest = task.worker_id == null
+      ? api.getRuntimeSettings()
+      : api.getWorkerRuntimeSettings(task.worker_id);
+    settingsRequest.then((s) => {
+      if (!active) return;
       setPtyMode(s.use_pty_mode);
       setCodexAppServerEnabled(s.codex_app_server_enabled);
+      setCodexMainMcpEnabled(s.codex_main_mcp_enabled);
     }).catch(() => {});
-  }, []);
+    return () => { active = false; };
+  }, [task.worker_id]);
 
   useEffect(() => {
     if (!canInject) setInjectMode(false);
@@ -420,7 +429,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     // System channel: react to PTY mode toggling without a refresh
     if (msg.channel === 'system' && msg.data?.event === 'runtime_settings_changed') {
-      setPtyMode(Boolean(msg.data.use_pty_mode));
+      // Manager broadcasts describe Manager capabilities only. Worker tasks
+      // display the proxied Worker runtime settings loaded above.
+      if (task.worker_id == null) {
+        setPtyMode(Boolean(msg.data.use_pty_mode));
+        if (typeof msg.data.codex_app_server_enabled === 'boolean') {
+          setCodexAppServerEnabled(msg.data.codex_app_server_enabled);
+        }
+        if (typeof msg.data.codex_main_mcp_enabled === 'boolean') {
+          setCodexMainMcpEnabled(msg.data.codex_main_mcp_enabled);
+        }
+      }
       return;
     }
     // Status change: update local override for "thinking" indicator.
@@ -744,7 +763,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       return [...prev, entry];
     });
-  }, [task.id]);
+  }, [task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1120,6 +1139,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
               {providerLabel}
             </span>
+            {task.provider === 'codex' && codexMainMcpEnabled !== null && (
+              <span
+                data-testid="codex-main-mcp-status"
+                className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
+                  codexMainMcpEnabled
+                    ? 'bg-teal-600/25 text-teal-300'
+                    : 'bg-gray-700 text-gray-400'
+                }`}
+                title={
+                  codexMainMcpEnabled
+                    ? 'Codex 主任务 MCP 已启用'
+                    : 'Codex 主任务 MCP 已关闭'
+                }
+              >
+                MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
+              </span>
+            )}
             {projectName && (
               <span className="text-xs bg-emerald-600/30 text-emerald-300 px-1.5 rounded font-medium whitespace-nowrap truncate">{projectName}</span>
             )}

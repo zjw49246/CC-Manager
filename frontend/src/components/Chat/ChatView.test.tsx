@@ -20,6 +20,13 @@ vi.mock('../../api/client', () => ({
       use_pty_mode: false,
       pty_available: false,
       codex_app_server_enabled: true,
+      codex_main_mcp_enabled: true,
+    }),
+    getWorkerRuntimeSettings: vi.fn().mockResolvedValue({
+      use_pty_mode: false,
+      pty_available: false,
+      codex_app_server_enabled: true,
+      codex_main_mcp_enabled: true,
     }),
     config: vi.fn().mockResolvedValue({ model_options: ['claude-opus-4-6'], codex_model_options: [] }),
     injectTaskMessage: vi.fn().mockResolvedValue({ ok: true, injected: true }),
@@ -105,6 +112,109 @@ describe('ChatView', () => {
       use_pty_mode: false,
       pty_available: false,
       codex_app_server_enabled: true,
+      codex_main_mcp_enabled: true,
+    });
+    (api.getWorkerRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      use_pty_mode: false,
+      pty_available: false,
+      codex_app_server_enabled: true,
+      codex_main_mcp_enabled: true,
+    });
+  });
+
+  describe('Codex main MCP capability', () => {
+    it('shows the enabled runtime capability on Codex tasks', async () => {
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex' })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(await screen.findByTitle('Codex 主任务 MCP 已启用')).toHaveTextContent('MCP 已启用');
+    });
+
+    it('shows the emergency opt-out state returned by the backend', async () => {
+      (api.getRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        use_pty_mode: false,
+        pty_available: false,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: false,
+      });
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex' })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(await screen.findByTitle('Codex 主任务 MCP 已关闭')).toHaveTextContent('MCP 已关闭');
+    });
+
+    it('refreshes the capability badge from runtime settings broadcasts', async () => {
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex' })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+      await screen.findByTitle('Codex 主任务 MCP 已启用');
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'system',
+          data: {
+            event: 'runtime_settings_changed',
+            use_pty_mode: false,
+            codex_app_server_enabled: true,
+            codex_main_mcp_enabled: false,
+          },
+        });
+      });
+
+      expect(screen.getByTitle('Codex 主任务 MCP 已关闭')).toHaveTextContent('MCP 已关闭');
+    });
+
+    it('shows the proxied Worker capability for Worker tasks', async () => {
+      (api.getWorkerRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        use_pty_mode: false,
+        pty_available: false,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: false,
+      });
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', worker_id: 7 })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
+      expect(api.getRuntimeSettings).not.toHaveBeenCalled();
+      expect(screen.getByTitle('Codex 主任务 MCP 已关闭')).toHaveTextContent('MCP 已关闭');
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'system',
+          data: {
+            event: 'runtime_settings_changed',
+            use_pty_mode: false,
+            codex_app_server_enabled: true,
+            codex_main_mcp_enabled: true,
+          },
+        });
+      });
+      expect(screen.getByTitle('Codex 主任务 MCP 已关闭')).toBeInTheDocument();
     });
   });
 
@@ -138,7 +248,7 @@ describe('ChatView', () => {
       });
       render(<ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />);
 
-      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+      await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
       expect(screen.queryByTitle(/Codex turn\/steer/)).not.toBeInTheDocument();
     });
   });

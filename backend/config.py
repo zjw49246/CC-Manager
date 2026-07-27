@@ -13,9 +13,10 @@ class Settings(BaseSettings):
     # Startup/protocol failures automatically fall back to `codex exec`.
     codex_app_server_enabled: bool = True
     codex_app_server_request_timeout: float = 30.0
-    # Staged rollout: inject task-scoped required ccm_skills into Codex main
-    # tasks on both app-server and the MCP-equivalent exec fallback.
-    codex_main_mcp_enabled: bool = False
+    # Inject task-scoped required ccm_skills into Codex main tasks on both
+    # app-server and the MCP-equivalent exec fallback.  Keep the environment
+    # override as an emergency rollback switch.
+    codex_main_mcp_enabled: bool = True
     default_provider: str = "codex"
     provider_options: str = "claude,codex"
     default_model: str = "claude-opus-4-6"

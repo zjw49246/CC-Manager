@@ -52,8 +52,13 @@ def _no_pty_no_skills(monkeypatch):
         yield
 
 
-def test_codex_main_mcp_capability_defaults_off():
-    assert Settings.model_fields["codex_main_mcp_enabled"].default is False
+def test_codex_main_mcp_capability_defaults_on():
+    assert Settings.model_fields["codex_main_mcp_enabled"].default is True
+
+
+def test_codex_main_mcp_capability_allows_explicit_env_opt_out(monkeypatch):
+    monkeypatch.setenv("CODEX_MAIN_MCP_ENABLED", "false")
+    assert Settings(_env_file=None).codex_main_mcp_enabled is False
 
 
 def test_parse_codex_agent_message():
@@ -1023,7 +1028,7 @@ async def test_launch_codex_provider_command(db_factory, monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
-    db_factory, monkeypatch, tmp_path,
+    db_factory, monkeypatch, tmp_path, caplog,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -1045,11 +1050,14 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
     mock_proc = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     im.task_message_enqueuer = AsyncMock()
-    with patch(
-        "backend.services.instance_manager.asyncio.create_subprocess_exec",
-        new_callable=AsyncMock,
-        return_value=mock_proc,
-    ) as exec_mock:
+    with (
+        caplog.at_level("INFO", logger="backend.services.instance_manager"),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=mock_proc,
+        ) as exec_mock,
+    ):
         await im.launch(
             instance_id=inst.id,
             prompt="use CCM help",
@@ -1066,6 +1074,8 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args
     assert argv[-1] == "use CCM help"
+    assert "route=direct-exec" in caplog.text
+    assert "required_mcp=True" in caplog.text
     await asyncio.sleep(0.1)
 
 
@@ -1124,7 +1134,7 @@ async def test_invalid_required_exec_mcp_fails_before_subprocess_spawn(
 
 @pytest.mark.asyncio
 async def test_launch_codex_prefers_persistent_app_server(
-    db_factory, monkeypatch, tmp_path,
+    db_factory, monkeypatch, tmp_path, caplog,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     async with db_factory() as db:
@@ -1136,10 +1146,13 @@ async def test_launch_codex_prefers_persistent_app_server(
     im = InstanceManager(db_factory, MagicMock())
     im._launch_codex_app_server = AsyncMock(return_value=4321)
     codex_home = tmp_path / "codex-account"
-    with patch(
-        "backend.services.instance_manager.asyncio.create_subprocess_exec",
-        new_callable=AsyncMock,
-    ) as exec_mock:
+    with (
+        caplog.at_level("INFO", logger="backend.services.instance_manager"),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
         pid = await im.launch(
             instance_id=inst.id, prompt="hi", cwd="/tmp", provider="codex",
             resume_session_id="thread-1", config_dir=str(codex_home),
@@ -1151,7 +1164,53 @@ async def test_launch_codex_prefers_persistent_app_server(
     assert im._launch_codex_app_server.await_args.kwargs["config_dir"] == str(
         codex_home.resolve()
     )
+    assert "route=app-server" in caplog.text
     exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_session_id", [None, "thread-existing"])
+async def test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp(
+    db_factory, monkeypatch, tmp_path, resume_session_id,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name=f"codex-rollout-{resume_session_id or 'fresh'}")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="rollout MCP task",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._launch_codex_app_server = AsyncMock(return_value=4322)
+
+    pid = await im.launch(
+        instance_id=inst.id,
+        prompt="use main MCP",
+        task_id=task.id,
+        cwd="/tmp",
+        provider="codex",
+        resume_session_id=resume_session_id,
+        config_dir=str(tmp_path / "codex-rollout-home"),
+    )
+
+    assert pid == 4322
+    launch_kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert launch_kwargs["resume_session_id"] == resume_session_id
+    specs = launch_kwargs["mcp_specs"]
+    assert len(specs) == 1
+    assert specs[0].required is True
+    assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
+    assert "ccm_command_help" in specs[0].enabled_tools
 
 
 @pytest.mark.asyncio
@@ -1455,7 +1514,7 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
     ["startup", "missing-thread"],
 )
 async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
-    db_factory, monkeypatch, tmp_path, failure_mode,
+    db_factory, monkeypatch, tmp_path, failure_mode, caplog,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -1486,6 +1545,7 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     )
     thread_response = {"thread": {}} if failure_mode == "missing-thread" else None
     with (
+        caplog.at_level("INFO", logger="backend.services.instance_manager"),
         patch(
             "backend.services.codex_app_server.CodexAppServer.ensure_started",
             new_callable=AsyncMock,
@@ -1525,12 +1585,14 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     flag_index = argv.index("-c")
     assert argv[flag_index : flag_index + 2] == expected_mcp_args
     assert argv[-1] == "must keep required MCP"
+    assert "route=safe-fallback" in caplog.text
+    assert "reason=required-mcp-pre-turn" in caplog.text
     await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
 async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
-    db_factory, monkeypatch, tmp_path,
+    db_factory, monkeypatch, tmp_path, caplog,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -1554,10 +1616,13 @@ async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
     im._launch_codex_app_server = AsyncMock(
         side_effect=RuntimeError("unexpected adapter failure")
     )
-    with patch(
-        "backend.services.instance_manager.asyncio.create_subprocess_exec",
-        new_callable=AsyncMock,
-    ) as exec_mock:
+    with (
+        caplog.at_level("ERROR", logger="backend.services.instance_manager"),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
         with pytest.raises(
             CodexRequiredMcpError,
             match="required ccm_skills could be guaranteed",
@@ -1576,6 +1641,8 @@ async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
     assert len(specs) == 1
     assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
     assert "ccm_command_help" in specs[0].enabled_tools
+    assert "Codex transport fail-closed" in caplog.text
+    assert "reason=required-mcp-not-guaranteed" in caplog.text
 
 
 @pytest.mark.asyncio

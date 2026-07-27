@@ -829,6 +829,7 @@ class InstanceManager:
             codex_main_mcp_required or codex_sub_agent_mcp_required
         )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
+        codex_exec_route = "direct-exec"
         if codex_main_mcp_required:
             from backend.services.mcp_config import build_mcp_server_specs
 
@@ -848,6 +849,14 @@ class InstanceManager:
             and codex_sub_agent_mcp_required
             and not settings.codex_app_server_enabled
         ):
+            logger.error(
+                "Codex transport fail-closed route=direct-exec "
+                "reason=sub-agent-requires-app-server task_id=%s "
+                "instance_id=%s home=%s",
+                task_id,
+                instance_id,
+                config_dir,
+            )
             raise CodexRequiredMcpError(
                 "Codex Sub-Agent MCP requires the app-server transport; "
                 "exec fallback does not provide live thread control"
@@ -856,7 +865,7 @@ class InstanceManager:
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
-                    return await self._launch_codex_app_server(
+                    pid = await self._launch_codex_app_server(
                         instance_id=instance_id,
                         prompt=prompt,
                         task_id=task_id,
@@ -876,16 +885,39 @@ class InstanceManager:
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
                     )
+                    logger.info(
+                        "Codex transport selected route=app-server task_id=%s "
+                        "instance_id=%s home=%s required_mcp=%s",
+                        task_id,
+                        instance_id,
+                        config_dir,
+                        codex_mcp_required,
+                    )
+                    return pid
                 except CodexRequiredMcpPreTurnError:
                     if (
                         codex_main_mcp_required
                         and not codex_sub_agent_mcp_required
                     ):
+                        codex_exec_route = "safe-fallback"
                         logger.warning(
-                            "Codex app-server rejected required MCP before "
-                            "turn/start; retrying once through MCP-equivalent exec"
+                            "Codex transport fallback route=safe-fallback "
+                            "reason=required-mcp-pre-turn task_id=%s "
+                            "instance_id=%s home=%s; retrying once through "
+                            "MCP-equivalent exec",
+                            task_id,
+                            instance_id,
+                            config_dir,
                         )
                     else:
+                        logger.exception(
+                            "Codex transport fail-closed route=app-server "
+                            "reason=non-fallback-required-mcp task_id=%s "
+                            "instance_id=%s home=%s",
+                            task_id,
+                            instance_id,
+                            config_dir,
+                        )
                         raise
                 except (
                     asyncio.TimeoutError,
@@ -901,7 +933,11 @@ class InstanceManager:
                     # owner-mismatch means the requested account route is invalid.
                     # Falling back would duplicate work or mix auth/thread state.
                     logger.exception(
-                        "Codex app-server launch cannot safely fall back to exec"
+                        "Codex transport fail-closed route=app-server "
+                        "reason=unsafe-replay task_id=%s instance_id=%s home=%s",
+                        task_id,
+                        instance_id,
+                        config_dir,
                     )
                     raise
                 except Exception as exc:
@@ -910,8 +946,12 @@ class InstanceManager:
                         # app-server failure must fail closed instead of
                         # silently replaying without tools.
                         logger.exception(
-                            "Codex app-server launch failed while required "
-                            "ccm_skills was enabled; refusing MCP-less exec fallback"
+                            "Codex transport fail-closed route=app-server "
+                            "reason=required-mcp-not-guaranteed task_id=%s "
+                            "instance_id=%s home=%s",
+                            task_id,
+                            instance_id,
+                            config_dir,
                         )
                         raise CodexRequiredMcpError(
                             "Codex app-server failed before required "
@@ -920,8 +960,14 @@ class InstanceManager:
                     # App-server is an experimental Codex surface.  A CLI upgrade
                     # must not take all Codex tasks down; retain the proven exec
                     # path as an automatic compatibility fallback.
+                    codex_exec_route = "safe-fallback"
                     logger.exception(
-                        "Codex app-server launch failed; falling back to codex exec"
+                        "Codex transport fallback route=safe-fallback "
+                        "reason=app-server-compatibility task_id=%s "
+                        "instance_id=%s home=%s; falling back to codex exec",
+                        task_id,
+                        instance_id,
+                        config_dir,
                     )
 
         if provider == "claude" and self.pty_mode_enabled:
@@ -966,6 +1012,16 @@ class InstanceManager:
                 codex_mcp_specs if codex_main_mcp_required else ()
             ),
         )
+        if provider == "codex":
+            logger.info(
+                "Codex transport selected route=%s task_id=%s instance_id=%s "
+                "home=%s required_mcp=%s",
+                codex_exec_route,
+                task_id,
+                instance_id,
+                config_dir,
+                codex_main_mcp_required,
+            )
 
         # Must unset CLAUDE_CODE env var to avoid nested session detection
         env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
@@ -2680,6 +2736,11 @@ class InstanceManager:
                     cmd.extend(render_codex_exec_config_args(codex_mcp_specs))
                 except (TypeError, ValueError) as exc:
                     if any(spec.required for spec in codex_mcp_specs):
+                        logger.exception(
+                            "Codex transport fail-closed route=direct-exec "
+                            "reason=invalid-required-mcp-config task_id=%s",
+                            task_id,
+                        )
                         raise CodexRequiredMcpError(
                             "Invalid required Codex exec MCP configuration: "
                             f"{exc}"

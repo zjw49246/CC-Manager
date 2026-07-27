@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import backend.main as main_module
+from backend.config import settings
 from backend.api.workers import (
     _build_add_account_command,
     _persist_worker_account_state,
@@ -742,9 +743,11 @@ async def test_sensitive_ssh_command_is_redacted_from_debug_log(monkeypatch, cap
     assert "sensitive command redacted" in caplog.text
 
 
+@pytest.mark.parametrize("main_mcp_enabled", [True, False])
 async def test_provisioner_ccm_config_uses_private_stdin_atomic_write(
-    db_factory, session_factory,
+    db_factory, session_factory, monkeypatch, main_mcp_enabled,
 ):
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", main_mcp_enabled)
     wid = await _insert_worker(
         session_factory,
         status="creating",
@@ -761,6 +764,10 @@ async def test_provisioner_ccm_config_uses_private_stdin_atomic_write(
     assert "worker-super-secret-token" not in command
     assert "CODEX_POOL_ENABLED=true" in env
     assert "DEFAULT_PROVIDER=codex" in env
+    assert (
+        f"CODEX_MAIN_MCP_ENABLED={'true' if main_mcp_enabled else 'false'}"
+        in env
+    )
     assert "WORKER_ENABLED=false" in env
     assert "AUTH_TOKEN=worker-super-secret-token" in env
     assert "umask 077" in command

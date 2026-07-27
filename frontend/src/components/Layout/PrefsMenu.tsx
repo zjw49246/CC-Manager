@@ -162,6 +162,18 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
               </button>
             </div>
           )}
+          {isAdmin && runtime && (
+            <div
+              data-testid="codex-main-mcp-status"
+              className="flex items-center justify-between gap-3"
+              title="只读运行时 capability；可用 CODEX_MAIN_MCP_ENABLED=false 紧急关闭"
+            >
+              <span className="text-xs text-gray-400">Codex 主任务 MCP</span>
+              <span className={`text-xs font-medium ${runtime.codex_main_mcp_enabled ? 'text-green-400' : 'text-gray-500'}`}>
+                {runtime.codex_main_mcp_enabled ? '已启用' : '已关闭'}
+              </span>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs text-gray-400 flex items-center gap-1.5"><Globe size={13} /> 时区</span>
             <select

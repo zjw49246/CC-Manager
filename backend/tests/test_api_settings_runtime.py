@@ -10,6 +10,28 @@ async def test_get_runtime_settings(client):
     assert "use_pty_mode" in data
     assert "pty_available" in data
     assert "codex_app_server_enabled" in data
+    assert "codex_main_mcp_enabled" in data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
+    client, monkeypatch, enabled,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", enabled)
+
+    get_resp = await client.get("/api/settings/runtime")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["codex_main_mcp_enabled"] is enabled
+
+    put_resp = await client.put(
+        "/api/settings/runtime",
+        json={"auto_sort_on_access": True},
+    )
+    assert put_resp.status_code == 200
+    assert put_resp.json()["codex_main_mcp_enabled"] is enabled
 
 
 @pytest.mark.asyncio
