@@ -415,15 +415,26 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_codex_exec_does_not_spawn_while_app_server_home_is_busy` | 同 home app-server 有活跃 turn 时 exec 不得创建进程 |
 | `test_codex_sub_agent_rejects_home_owned_by_exec_generation` | 普通 exec generation 占用同 home 时，Codex 子 Agent 不得绕过 app-server admission gate |
 | `test_codex_sub_agent_rejects_active_ephemeral_exec` | 临时 exec 占用同 home 时，Codex 子 Agent 同样不得启动 app-server |
-| `test_codex_main_mcp_capability_defaults_off` | `CODEX_MAIN_MCP_ENABLED` 服务端 capability 默认关闭 |
+| `test_codex_main_mcp_capability_defaults_on` | Codex 主任务 MCP 服务端 capability 默认开启 |
+| `test_codex_main_mcp_capability_allows_explicit_env_opt_out` | `CODEX_MAIN_MCP_ENABLED=false` 可显式恢复旧行为 |
+| `test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp` | 默认 rollout 的 fresh/resume 均注入当前 task-scoped required MCP |
+| `test_runtime_settings_reports_effective_codex_main_mcp_capability` | Runtime Settings GET/PUT 均返回实际 capability |
+| `test_provisioner_ccm_config_uses_private_stdin_atomic_write` | Worker `.env` 继承 Manager 的主 MCP capability 值 |
 | `test_launch_codex_app_server_uses_passed_task_scoped_specs` | app-server adapter 使用 launch 层一次性构建的完整 task-scoped spec |
 | `test_codex_app_server_uses_passed_sub_agent_controller_specs` | app-server adapter 使用 launch 层构建的窄化 Sub-Agent controller spec |
 | `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
 | `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
 
+前端 capability 展示回归：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `ChatView > Codex main MCP capability` | Manager 默认开启、紧急关闭、runtime broadcast，以及 Worker 代理 runtime capability 均显示准确 |
+| `PrefsMenu > shows the read-only Codex main MCP runtime capability for admins` | 管理员设置菜单展示只读的实际主任务 MCP capability |
+
 人工 app-server/exec smoke（仅测试环境）：
 
-1. 设置 `CODEX_APP_SERVER_ENABLED=true`、`CODEX_MAIN_MCP_ENABLED=true` 并重启后端。
+1. 保持默认 `CODEX_APP_SERVER_ENABLED=true`，确认未设置 `CODEX_MAIN_MCP_ENABLED=false`，重启后端并检查 `/api/settings/runtime` 返回 `codex_main_mcp_enabled=true`。
 2. 创建本地 Codex task，要求它“必须调用 `ccm_command_help` 查询一个 CCM 命令后原样报告工具结果”。
 3. 确认日志出现 `mcp_tool_call`，server/tool 为 `ccm_skills/ccm_command_help`，且工具参数中的 task 上下文对应当前任务。
 4. 在同一 task 发送第二条消息并确认 resume 仍可调用；再并发运行另一个 task，确认两边查询结果和 `task_id` 不串线。
@@ -431,7 +442,7 @@ Codex 版本兼容基线（2026-07-24）：
 6. 恢复 app-server，并模拟 transport 启动失败或 no-thread-id：只允许出现一次带 MCP 的 exec 回退；模拟 `turn/start` timeout/错误时则不得出现 exec 重放。
 7. 同一账号有活跃 app-server turn 时尝试启动 exec，应返回 busy；turn 结束后 exec 可关闭空闲 app-server 再启动。反向在 exec generation 未收尾时启动 app-server 也应返回 busy；此时在 Codex 账号池强制刷新额度应显示该账号暂不可实时读取，且日志中不得出现同 home 的新 app-server 启动。
 8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
-9. 测试完恢复 `CODEX_MAIN_MCP_ENABLED=false` 和原来的 `CODEX_APP_SERVER_ENABLED` 设置。
+9. 设置 `CODEX_MAIN_MCP_ENABLED=false` 重启并确认普通 Codex exec 无 `ccm_skills`；测试完移除该覆盖并恢复原来的 `CODEX_APP_SERVER_ENABLED` 设置。
 
 真实验收记录（2026-07-24）：
 

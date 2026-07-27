@@ -131,6 +131,19 @@
 
 ---
 
+### PR5：Codex 主任务 MCP 默认 rollout（2026-07-27，commit efa9286）
+
+- [x] `CODEX_MAIN_MCP_ENABLED` 产品默认值改为 `true`，保留显式 `false` 紧急回退；测试进程仍显式关闭后按用例逐项开启，避免无关用例隐式依赖 rollout。
+- [x] app-server 与 `codex exec` 共用 task-scoped required `ccm_skills`；fresh/resume 均覆盖，且日志明确区分 `app-server`、`direct-exec`、`safe-fallback` 与 `fail-closed`。
+- [x] Runtime Settings GET/PUT 与 system broadcast 返回实际 `codex_main_mcp_enabled`；Chat header 和管理员偏好菜单展示只读状态。Worker task 从对应 Worker 的代理 runtime API 读取，忽略 Manager broadcast，避免展示错误 capability。
+- [x] Worker provisioning 将 Manager 的实际主 MCP 开关写入远端 `.env`，默认行为和紧急关闭保持一致；Codex Sub-Agent 的窄化 controller MCP 与 Claude 路径保持原有语义。
+- [x] `.env.example`、README、CLAUDE/AGENTS pointer、TEST 同步更新。
+- [x] 验证：变基最新 `upstream/main` 后 Linux 后端全量 `2456 passed, 2 skipped`；Linux/UTC 前端全量 `399 passed`；PR5 前端定向 `81 passed`；Windows 生产构建、`python -m compileall -q backend`、`git diff --check` 通过。
+- **测试环境记录**：Windows 直接收集后端会被 POSIX `fcntl` 阻断，故使用带 init/tmpfs、LF 原生副本和完整系统依赖的只读 Linux 容器。Windows 本机前端全量另暴露 3 个既有平台差异（路径分隔符 1 项、非 UTC 时区 2 项），同一源码在 Linux/UTC 全量通过，未把无关修复混入 PR5。
+- **Commit**: efa9286
+
+---
+
 ### 阶段 N：PTY 常驻会话模式（2026-06-10，commit 1b6d45b）
 - [x] `use_pty_mode` flag（默认 false，-p 行为零变化），claude 任务分流到 claude_pty CCMBackend
 - [x] 输入走 channel 注入（MCP notification），输出走会话 JSONL，事件结构与 StreamParser 对齐，下游无感知
