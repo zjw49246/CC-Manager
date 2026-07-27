@@ -225,7 +225,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (!active) return;
       setPtyMode(s.use_pty_mode);
       setCodexAppServerEnabled(s.codex_app_server_enabled);
-      setCodexMainMcpEnabled(s.codex_main_mcp_enabled);
+      setCodexMainMcpEnabled(
+        typeof s.codex_main_mcp_enabled === 'boolean'
+          ? s.codex_main_mcp_enabled
+          : null,
+      );
     }).catch(() => {});
     return () => { active = false; };
   }, [task.worker_id]);

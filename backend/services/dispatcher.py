@@ -8052,13 +8052,6 @@ class GlobalDispatcher:
                 raise QueuedMessagePrelaunchError(
                     "Task migrated while queued launch waited for admission"
                 )
-            if task.status == "cancelled":
-                logger.info(
-                    "Discarding queued message for explicitly cancelled task %s",
-                    task_id,
-                )
-                return
-
             # Atomically bridge DB idle selection to the launch window.  This
             # also filters distributed Worker string keys before constructing
             # the integer Instance predicate (PostgreSQL is strict here).

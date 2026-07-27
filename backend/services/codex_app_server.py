@@ -39,6 +39,10 @@ _GOALS_FEATURE_DISABLED_RE = re.compile(
     r"\bgoals feature is disabled\b",
     re.IGNORECASE,
 )
+_NO_ACTIVE_GOAL_RE = re.compile(
+    r"\b(?:no active goal|goal is not active|goal not found)\b",
+    re.IGNORECASE,
+)
 
 
 class CodexAppServerError(RuntimeError):
@@ -116,6 +120,7 @@ class CodexTurnProcess:
         self.thread_id = thread_id
         self.unsubscribe_on_terminal = False
         self.returncode: int | None = None
+        self.termination_kind: str | None = None
         self.stdout = asyncio.StreamReader(limit=10 * 1024 * 1024)
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
         self._interrupt = interrupt
@@ -127,10 +132,17 @@ class CodexTurnProcess:
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.stdout.feed_data(line.encode("utf-8") + b"\n")
 
-    def finish(self, returncode: int, stderr: str = "") -> None:
+    def finish(
+        self,
+        returncode: int,
+        stderr: str = "",
+        *,
+        termination_kind: str | None = None,
+    ) -> None:
         if self.returncode is not None:
             return
         self.returncode = returncode
+        self.termination_kind = termination_kind
         if stderr:
             self.stderr.feed_data(stderr.encode("utf-8", errors="replace"))
         self.stdout.feed_eof()
@@ -283,6 +295,35 @@ class CodexAppServer:
         self._contexts_by_turn[turn_id] = context
         return True
 
+    def _alias_turn_context(
+        self,
+        context: _TurnContext,
+        turn_id: str,
+    ) -> bool:
+        """Route a protocol alias without replacing the authoritative turn id.
+
+        Codex can steer one ``turn/start`` submission into an already-active
+        native goal turn. Notifications then legitimately alternate between
+        the submission id and the active turn id. Both ids must reach the same
+        adapter generation; treating the submission id as an unrelated turn
+        drops assistant output and the terminal event, leaving the worker
+        permanently ``running``.
+        """
+
+        if not turn_id:
+            return False
+        existing = self._contexts_by_turn.get(turn_id)
+        if existing is not None and existing is not context:
+            logger.error(
+                "Refusing to alias Codex turn %s for task %s over task %s",
+                turn_id,
+                context.task_id,
+                existing.task_id,
+            )
+            return False
+        self._contexts_by_turn[turn_id] = context
+        return True
+
     def _interrupt_context_is_current(self, context: _TurnContext) -> bool:
         """Return whether an exact turn context still owns live work."""
 
@@ -309,33 +350,30 @@ class CodexAppServer:
         return str(turn_id) if turn_id else None
 
     async def _pause_active_goal(self, thread_id: str) -> None:
-        """Prevent an interrupted native goal turn from immediately continuing."""
+        """Pause an adopted native goal with one bounded protocol round trip."""
 
         try:
-            response = await self._request(
-                "thread/goal/get",
-                {"threadId": thread_id},
+            await self._request(
+                "thread/goal/set",
+                {"threadId": thread_id, "status": "paused"},
             )
         except CodexAppServerError as exc:
             # Submission ids can be adopted by any steerable active turn, not
             # only a native goal turn. A build with Goals explicitly disabled
-            # reports this exact protocol error; there is then no goal to pause,
-            # so continue to interrupt the authoritative active turn. Other
-            # failures remain fail-closed.
-            if _GOALS_FEATURE_DISABLED_RE.search(str(exc)):
+            # or a regular thread with no goal reports one of these errors.
+            # There is then nothing to pause, so continue to interrupt the
+            # authoritative active turn. Other failures remain fail-closed.
+            if (
+                _GOALS_FEATURE_DISABLED_RE.search(str(exc))
+                or _NO_ACTIVE_GOAL_RE.search(str(exc))
+            ):
                 logger.debug(
-                    "Codex Goals feature disabled for thread %s; "
+                    "Codex thread %s has no pausable native goal; "
                     "continuing direct turn interrupt",
                     thread_id,
                 )
                 return
             raise
-        goal = response.get("goal") if isinstance(response, dict) else None
-        if isinstance(goal, dict) and goal.get("status") == "active":
-            await self._request(
-                "thread/goal/set",
-                {"threadId": thread_id, "status": "paused"},
-            )
 
     async def _interrupt_turn_context(self, context: _TurnContext) -> None:
         """Interrupt the actual active turn, reconciling steer-style admission ids."""
@@ -672,12 +710,15 @@ class CodexAppServer:
         # An already-running steerable turn can emit notifications before this
         # response arrives. In that case its notification turn id is the real
         # active generation and must not be overwritten by this submission id.
+        # The submission id remains a valid notification alias, however.
         if context.observed_turn_id is None:
             self._bind_turn_context(
                 context,
                 str(turn_id),
                 observed=False,
             )
+        elif context.process.returncode is None:
+            self._alias_turn_context(context, str(turn_id))
         if turn_cancelled:
             cleanup = asyncio.create_task(self.abandon_turn(
                 turn_process,
@@ -865,7 +906,11 @@ class CodexAppServer:
         finally:
             if context is not None:
                 self._detach_turn_context(context)
-            process.finish(130, reason)
+            process.finish(
+                130,
+                reason,
+                termination_kind="internal_abort",
+            )
         return interrupt_confirmed
 
     async def steer_turn(self, thread_id: str, content: str) -> bool:
@@ -1258,7 +1303,15 @@ class CodexAppServer:
                 (time.perf_counter() - context.launch_started) * 1000,
                 status,
             )
-            context.process.finish(exit_code, stderr)
+            context.process.finish(
+                exit_code,
+                stderr,
+                termination_kind=(
+                    "user_interrupt"
+                    if status == "interrupted"
+                    else None
+                ),
+            )
             self._detach_turn_context(context)
 
     @staticmethod
@@ -1927,7 +1980,11 @@ class CodexAppServerRegistry:
                 # a second, newly admitted turn.
                 self._draining.add(home)
         if server is None:
-            process.finish(130, reason)
+            process.finish(
+                130,
+                reason,
+                termination_kind="internal_abort",
+            )
             return
 
         abandon = getattr(server, "abandon_turn", None)
@@ -1937,7 +1994,11 @@ class CodexAppServerRegistry:
                 interrupt_confirmed = await abandon(process, reason)
             else:
                 process.terminate()
-                process.finish(130, reason)
+                process.finish(
+                    130,
+                    reason,
+                    termination_kind="internal_abort",
+                )
         except BaseException:
             logger.exception(
                 "Failed to interrupt unclaimed Codex turn before transport shutdown: %s",

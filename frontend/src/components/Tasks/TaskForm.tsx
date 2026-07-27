@@ -377,7 +377,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             .map(([k]) => Number(k)),
         } : {}),
         ...(starOnCreate ? { starred: true } : {}),
-        ...(cloneFromTaskId ? { clone_from_task_id: cloneFromTaskId as number } : {}),
+        ...(provider === 'claude' && cloneFromTaskId
+          ? { clone_from_task_id: cloneFromTaskId as number }
+          : {}),
       });
       setDescription('');
       fileUpload.clear();
@@ -493,7 +495,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           </div>
         )}
       </div>
-      {contextTasks.length > 0 && (
+      {provider === 'claude' && contextTasks.length > 0 && (
         <div className="flex items-center gap-2 min-w-0">
           <label className="text-sm text-gray-400 whitespace-nowrap shrink-0">Copy context from:</label>
           <select

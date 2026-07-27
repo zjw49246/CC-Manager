@@ -567,6 +567,10 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_service_instance_manager.py::test_process_event_codex_window_backfill` | codex usage 无窗口时回填 272K（落库 + 广播都验证） |
 | `test_service_instance_manager.py::test_parse_codex_file_change_started_is_tool_use` | file_change 的 item.started → tool_use（真实事件流实证 started 存在，源码注释不实） |
 | `test_codex_app_server.py::test_notifications_stream_delta_and_finish_process` | app-server `thread/tokenUsage/updated` 保留真实 `modelContextWindow`、latest total/reasoning token，而非累计 thread total |
+| `test_codex_app_server.py::test_existing_goal_turn_notification_rebinds_submission_id` | adopted goal 同时保留 active/submission 两个通知 ID，任一 ID 的 assistant/terminal 事件都不能丢 |
+| `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
+| `test_service_instance_manager.py::test_internal_codex_abort_is_not_a_successful_chat_terminal` | transport/admission 内部 abort 不得伪装成用户 Interrupt 的 completed |
+| `test_service_dispatcher.py::test_cancelled_task_followup_reclaims_session_instead_of_dropping` | Cancel 仅终止当前 generation，后续 chat 可安全领取原生 session 并恢复 executing |
 | `test_codex_app_server.py::test_context_window_error_keeps_structured_codex_error_info` | `turn/completed` 失败不得丢弃 `codexErrorInfo=contextWindowExceeded` 与 additionalDetails |
 | `test_context_compaction.py` | provider 共享的上下文超限分类、Codex current-context token 计算及旧 usage fallback |
 | `test_service_instance_manager.py::test_codex_context_window_failure_compacts_and_requeues` | chat Codex 结构化超限事件触发摘要、清 session、携原消息 `compact_retry` 自动续跑 |

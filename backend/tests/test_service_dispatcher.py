@@ -5,6 +5,7 @@ import signal
 import sys
 import pytest
 from contextlib import contextmanager
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -4444,6 +4445,36 @@ async def _setup_queued_msg_two_idle(db_factory, monkeypatch):
         prompt="hi", source="user",
     )
     return d, id1, id2, task_id, msg
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_followup_reclaims_session_instead_of_dropping(
+    db_factory,
+    monkeypatch,
+):
+    """Cancel stops one generation; a later chat may resume its native session."""
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "cancelled"
+        task.completed_at = datetime.utcnow()
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_awaited_once()
+    assert (
+        d.instance_manager.launch.await_args.kwargs["resume_session_id"]
+        == "sess-1"
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "executing"
+        assert task.completed_at is None
 
 
 @pytest.mark.asyncio

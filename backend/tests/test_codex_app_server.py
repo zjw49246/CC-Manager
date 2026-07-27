@@ -453,8 +453,17 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
     assert context.admitted_turn_id == "turn-submission"
     assert context.observed_turn_id == "turn-active-goal"
     assert context.turn_id == "turn-active-goal"
-    assert "turn-submission" not in server._contexts_by_turn
+    assert server._contexts_by_turn["turn-submission"] is context
     assert server._contexts_by_turn["turn-active-goal"] is context
+
+    # Codex 0.144.6 can use the submission id again for item notifications
+    # even though the native goal's active id was observed first.
+    server._handle_notification("item/agentMessage/delta", {
+        "threadId": "thread-goal",
+        "turnId": "turn-submission",
+        "itemId": "msg-submission",
+        "delta": "submission-routed output",
+    })
 
     # Once an actual turn is confirmed, an unrelated late notification must
     # not be routed into this process by thread-id fallback.
@@ -477,7 +486,7 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
     while line := await process.stdout.readline():
         rows.append(json.loads(line))
     deltas = [row.get("delta") for row in rows if "delta" in row]
-    assert deltas == ["still working"]
+    assert deltas == ["still working", "submission-routed output"]
     assert await process.wait() == 0
     assert server._contexts_by_thread == {}
     assert server._contexts_by_turn == {}
@@ -557,8 +566,6 @@ async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
                 },
             )
             return {}
-        if method == "thread/goal/get":
-            return {"goal": {"status": "active"}}
         if method == "thread/goal/set":
             goal_statuses.append(params["status"])
             return {"goal": {"status": params["status"]}}
@@ -618,9 +625,9 @@ async def test_interrupt_continues_when_goals_feature_is_disabled():
                 },
             )
             return {}
-        if method == "thread/goal/get":
+        if method == "thread/goal/set":
             raise CodexAppServerError(
-                "thread/goal/get failed: goals feature is disabled"
+                "thread/goal/set failed: goals feature is disabled"
             )
         raise AssertionError(f"unexpected request: {method}")
 

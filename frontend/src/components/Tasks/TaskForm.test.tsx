@@ -307,6 +307,48 @@ describe('TaskForm copy-context-from select overflow fix', () => {
     expect(screen.queryByText('Copy context from:')).not.toBeInTheDocument();
   });
 
+  it('does not show any copy-from control for Codex', async () => {
+    vi.mocked(api.listTasks).mockResolvedValue([
+      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
+    ] as any);
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    expect(await screen.findByText('Copy context from:')).toBeInTheDocument();
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Claude'), 'codex');
+
+    expect(screen.queryByText('Copy context from:')).not.toBeInTheDocument();
+    expect(screen.queryByText('Copy content from:')).not.toBeInTheDocument();
+  });
+
+  it('does not submit a previously selected Claude context for Codex', async () => {
+    vi.mocked(api.listTasks).mockResolvedValue([
+      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
+    ] as any);
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await userEvent.selectOptions(
+      await screen.findByDisplayValue('None (start fresh)'),
+      '10',
+    );
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Claude'), 'codex');
+    await userEvent.type(
+      screen.getByPlaceholderText('Prompt / Description (this will be sent to Codex)'),
+      'test task',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls.at(-1)?.[0]).not.toHaveProperty(
+      'clone_from_task_id',
+    );
+  });
+
   it('form uses overflow-visible so dropdown panels are not clipped', async () => {
     // 5c3e2c7 起 form 改为 overflow-visible（Config/Tools 下拉需要溢出渲染）；
     // 横向溢出问题由 copy-context select 自身的宽度约束解决

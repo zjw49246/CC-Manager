@@ -216,6 +216,26 @@ describe('ChatView', () => {
       });
       expect(screen.getByTitle('Codex 主任务 MCP 已关闭')).toBeInTheDocument();
     });
+
+    it('does not report an old Worker capability as disabled when it is absent', async () => {
+      (api.getWorkerRuntimeSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        use_pty_mode: false,
+        pty_available: false,
+        codex_app_server_enabled: true,
+      });
+
+      render(
+        <ChatView
+          task={makeTask({ provider: 'codex', worker_id: 7 })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await waitFor(() => expect(api.getWorkerRuntimeSettings).toHaveBeenCalledWith(7));
+      expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    });
   });
 
   describe('Live turn injection', () => {

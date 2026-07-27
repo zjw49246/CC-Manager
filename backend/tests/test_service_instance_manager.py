@@ -6014,6 +6014,16 @@ async def test_consume_output_chat_initiated_interrupt_marks_completed(db_factor
     assert task.status == "completed"
 
 
+def test_internal_codex_abort_is_not_a_successful_chat_terminal():
+    """Admission/transport cleanup must not masquerade as user Interrupt."""
+
+    process = MagicMock(termination_kind="internal_abort")
+    assert not InstanceManager._chat_terminal_succeeded(process, 130)
+    process.termination_kind = "user_interrupt"
+    assert InstanceManager._chat_terminal_succeeded(process, 130)
+    assert InstanceManager._chat_terminal_succeeded(process, 0)
+
+
 async def _run_crashed_chat_consumer(
     manager,
     instance_id,

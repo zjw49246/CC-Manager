@@ -3600,8 +3600,11 @@ class InstanceManager:
         # order. Cancellation/retry/delete use the same order; taking the
         # Instance write first here can deadlock those paths on PostgreSQL or
         # MySQL.
-        interrupted = exit_code in (-2, 130)
-        new_status = "idle" if (exit_code == 0 or interrupted) else "error"
+        successful_terminal = self._chat_terminal_succeeded(
+            process,
+            exit_code,
+        )
+        new_status = "idle" if successful_terminal else "error"
         final_status = None
         task_publication_generation: dict | None = None
         failure_notice_data = None
@@ -3654,7 +3657,7 @@ class InstanceManager:
                 if current_task_generation.status in chat_active_statuses:
                     final_status = (
                         "completed"
-                        if exit_code == 0 or interrupted
+                        if successful_terminal
                         else "failed"
                     )
                     task_values: dict = {"status": final_status}
@@ -7353,6 +7356,19 @@ class InstanceManager:
             return effective[1]
         returncode = getattr(process, "returncode", None)
         return returncode if isinstance(returncode, int) else -1
+
+    @staticmethod
+    def _chat_terminal_succeeded(process, exit_code: int) -> bool:
+        """Separate an acknowledged user interrupt from internal abort cleanup."""
+
+        if exit_code == 0:
+            return True
+        if exit_code not in (-2, 130):
+            return False
+        return (
+            getattr(process, "termination_kind", None)
+            != "internal_abort"
+        )
 
     def get_config_dir(self, instance_id: int) -> str | None:
         return self._config_dirs.get(instance_id)
