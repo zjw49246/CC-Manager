@@ -45,6 +45,17 @@ function uploadPayload(results: UploadResult[]) {
   } : {};
 }
 
+function reviewerFeedbackRevisionRequest(version: PlanVersion, additionalRequest: string) {
+  const sections = [
+    `Continue iterating Plan v${version.version_number}. Resolve every item in the Reviewer's latest feedback. Preserve sound existing decisions unless a change is required by that feedback.`,
+    `## Reviewer's latest feedback\n${version.review_feedback!.trim()}`,
+  ];
+  if (additionalRequest.trim()) {
+    sections.push(`## Additional user revision instructions\n${additionalRequest.trim()}`);
+  }
+  return sections.join('\n\n');
+}
+
 function confirmableStaleness(error: unknown): PlanStaleness | null {
   if (!isApiRequestError(error) || error.status !== 409 || !error.detail || typeof error.detail !== 'object') return null;
   const detail = error.detail as Record<string, unknown>;
@@ -219,6 +230,27 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     });
   };
 
+  const reviseWithLatestReviewerFeedback = async () => {
+    const feedback = shown?.review_feedback?.trim();
+    if (
+      !shown
+      || shown.id !== plan.current_version_id
+      || plan.active_run_id != null
+      || !(shown.review_exhausted || shown.review_verdict === 'exhausted')
+      || !feedback
+    ) return;
+    await mutate('Starting revision with Reviewer feedback', async () => {
+      await api.createPlanRun(plan.id, {
+        run_type: 'user_revision',
+        request: reviewerFeedbackRevisionRequest(shown, revision),
+        base_version_id: shown.id,
+        expected_current_version_id: plan.current_version_id || undefined,
+        ...uploadPayload(uploads.uploadedResults),
+      });
+      setRevision(''); uploads.clear();
+    });
+  };
+
   const resolveDelivery = async (
     receiptKey: string,
     action: 'confirm_launched' | 'release_for_retry',
@@ -256,6 +288,15 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const staleMessages = planStalenessMessages(staleness);
   const hardConflictMessages = planHardConflictMessages(staleness);
   const showStaleness = Boolean(shown && !shown.applied);
+  const canReviseWithLatestReviewerFeedback = Boolean(
+    shown
+    && current
+    && !plan.active_run_id
+    && !plan.archived_at
+    && shown.human_decision === 'pending'
+    && (shown.review_exhausted || shown.review_verdict === 'exhausted')
+    && shown.review_feedback?.trim(),
+  );
   return <div className="flex h-full min-h-0 min-w-0 flex-col overflow-x-hidden">
     <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
       <div className="min-w-0 flex-1">
@@ -371,7 +412,9 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           <input ref={fileInput} type="file" multiple className="hidden" onChange={(event) => { uploads.addFiles(Array.from(event.target.files || []), setError); event.target.value = ''; }} />
           <button type="button" disabled={busy} onClick={() => fileInput.current?.click()} className="flex items-center gap-1 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 transition-colors hover:border-gray-600 hover:bg-gray-800 disabled:pointer-events-none disabled:opacity-40"><Paperclip size={12} /> Revision files</button>
           <button type="button" disabled={busy || !revision.trim() || uploads.isUploading || uploads.hasFailed} onClick={() => void revise()} className="rounded-lg border border-indigo-500/40 px-3 py-2 text-xs text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/10 disabled:pointer-events-none disabled:opacity-40">Revise from v{shown.version_number}</button>
+          {canReviseWithLatestReviewerFeedback && <button type="button" disabled={busy || uploads.isUploading || uploads.hasFailed} onClick={() => void reviseWithLatestReviewerFeedback()} className="flex items-center gap-1 rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-200 transition-colors hover:border-amber-400/70 hover:bg-amber-500/15 disabled:pointer-events-none disabled:opacity-40"><RefreshCw size={12} /> Revise with Reviewer's latest feedback</button>}
         </div>
+        {canReviseWithLatestReviewerFeedback && <p className="text-[11px] text-amber-200/70">The exhausted review feedback is included automatically. Text and files above are optional additional context for this action.</p>}
       </div>}
 
       <div className="mt-4 flex flex-wrap gap-2">

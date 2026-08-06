@@ -193,6 +193,68 @@ describe('PlanDetail', () => {
     expect(screen.getByText(/Historical Version/)).toBeInTheDocument();
   });
 
+  it("offers a one-click revision only for the current exhausted review and carries its feedback", async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({
+      review_verdict: 'exhausted',
+      review_feedback: 'Clarify rollback boundaries and add an exact concurrency test.',
+      review_exhausted: true,
+    });
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.createPlanRun).mockResolvedValue({} as PlanRun);
+
+    render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} />);
+
+    const button = await screen.findByRole('button', {
+      name: "Revise with Reviewer's latest feedback",
+    });
+    expect(button).toBeEnabled();
+    expect(screen.getByText(/feedback is included automatically/)).toBeInTheDocument();
+
+    await userEvent.click(button);
+
+    await waitFor(() => expect(api.createPlanRun).toHaveBeenCalledWith(4, {
+      run_type: 'user_revision',
+      request: [
+        "Continue iterating Plan v2. Resolve every item in the Reviewer's latest feedback. Preserve sound existing decisions unless a change is required by that feedback.",
+        "## Reviewer's latest feedback\nClarify rollback boundaries and add an exact concurrency test.",
+      ].join('\n\n'),
+      base_version_id: 12,
+      expected_current_version_id: 12,
+    }));
+  });
+
+  it("does not offer the latest-feedback revision for a Reviewer-approved Version", async () => {
+    const prior = version({
+      id: 11,
+      version_number: 1,
+      review_verdict: 'exhausted',
+      review_feedback: 'Older unresolved feedback.',
+      review_exhausted: true,
+      superseded_by_version_id: 12,
+      display_state: 'superseded',
+    });
+    const current = version({
+      review_verdict: 'approve',
+      review_feedback: 'Ready to implement.',
+      review_exhausted: false,
+    });
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+
+    render(<PlanDetail plan={plan(current, prior)} onRefresh={vi.fn()} />);
+
+    await screen.findByText('Ready to implement.');
+    expect(screen.queryByRole('button', {
+      name: "Revise with Reviewer's latest feedback",
+    })).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Plan Version' }), '11');
+    expect(await screen.findByText('Older unresolved feedback.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', {
+      name: "Revise with Reviewer's latest feedback",
+    })).not.toBeInTheDocument();
+  });
+
   it('labels an undecided historical Version as superseded and disables a missing execution Task link', async () => {
     const prior = version({
       id: 11,
