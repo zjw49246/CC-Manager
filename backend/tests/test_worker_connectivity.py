@@ -21,23 +21,31 @@ from backend.services.worker_provisioner import (
     WorkerProvisioner,
 )
 from backend.services.ssh_executor import (
+    SSHHostKeyMismatchError,
     SSHExecutor,
     SSHKeyPreflightError,
     derive_openssh_public_key,
+    openssh_public_key_fingerprint,
     preflight_private_key,
+    probe_ssh_host_key,
     validate_openssh_public_key,
     worker_known_hosts_path,
 )
 
 
-def _private_key_file(tmp_path: Path, *, mode: int = 0o600) -> Path:
+def _private_key_file(
+    tmp_path: Path,
+    *,
+    mode: int = 0o600,
+    name: str = "worker-key",
+) -> Path:
     private_key = ed25519.Ed25519PrivateKey.generate()
     data = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.OpenSSH,
         encryption_algorithm=serialization.NoEncryption(),
     )
-    path = tmp_path / "worker-key"
+    path = tmp_path / name
     path.write_bytes(data)
     path.chmod(mode)
     return path
@@ -237,9 +245,170 @@ def test_ssh_uses_only_selected_key_and_drains_both_streams(tmp_path, monkeypatc
     assert channel.write_shutdown is True
     assert client.loaded_system_keys is False
     assert client.loaded_host_keys == str(known_hosts)
-    assert client.connect_kwargs["key_filename"] == str(key_path)
+    assert client.connect_kwargs["port"] == 22
+    assert "key_filename" not in client.connect_kwargs
+    assert client.connect_kwargs["pkey"].get_name() == "ssh-ed25519"
     assert client.connect_kwargs["allow_agent"] is False
     assert client.connect_kwargs["look_for_keys"] is False
+
+
+def test_managed_ssh_uses_non_default_port_and_exact_pinned_host_key(
+    tmp_path,
+    monkeypatch,
+):
+    key_path = _private_key_file(tmp_path)
+    pinned = derive_openssh_public_key(key_path)
+    key_kind, key_body = pinned.split(" ", 1)
+    channel = _FakeChannel(b"ok", b"")
+    client = _FakeSSHClient(channel)
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    executor = SSHExecutor(
+        "ssh.example.internal",
+        "deploy",
+        str(key_path),
+        port=2222,
+        host_key_policy="pinned",
+        pinned_host_key=pinned,
+    )
+
+    result = executor._execute_result_sync("true", 5, None, 1024)
+
+    assert result.exit_code == 7
+    assert result.stdout == "ok"
+    assert result.stderr == ""
+    assert result.truncated is False
+    assert client.connect_kwargs["port"] == 2222
+    assert client.loaded_system_keys is False
+    assert client.loaded_host_keys is None
+    presented = SimpleNamespace(
+        get_name=lambda: key_kind,
+        get_base64=lambda: key_body,
+    )
+    client.policy.missing_host_key(client, "ssh.example.internal", presented)
+
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    other_key = derive_openssh_public_key(_private_key_file(other_dir))
+    other_kind, other_body = other_key.split(" ", 1)
+    with pytest.raises(SSHHostKeyMismatchError):
+        client.policy.missing_host_key(
+            client,
+            "ssh.example.internal",
+            SimpleNamespace(
+                get_name=lambda: other_kind,
+                get_base64=lambda: other_body,
+            ),
+        )
+
+
+def test_managed_ssh_rejects_private_key_replaced_after_authorization(tmp_path):
+    key_path = _private_key_file(tmp_path)
+    authorized_fingerprint = openssh_public_key_fingerprint(
+        derive_openssh_public_key(key_path)
+    )
+    replacement = _private_key_file(tmp_path, name="replacement-key")
+    executor = SSHExecutor(
+        "ssh.example.internal",
+        "deploy",
+        str(key_path),
+        expected_public_key_fingerprint=authorized_fingerprint,
+    )
+    key_path.write_bytes(replacement.read_bytes())
+    key_path.chmod(0o600)
+
+    with pytest.raises(SSHKeyPreflightError) as exc_info:
+        executor.connect()
+
+    assert exc_info.value.code == "key_changed"
+
+
+def test_pinned_ssh_refuses_to_downgrade_host_checking_for_rsync(tmp_path):
+    key_path = _private_key_file(tmp_path)
+    pinned = derive_openssh_public_key(key_path)
+    executor = SSHExecutor(
+        "ssh.example.internal",
+        "deploy",
+        str(key_path),
+        host_key_policy="pinned",
+        pinned_host_key=pinned,
+    )
+
+    with pytest.raises(ValueError, match="do not support the rsync transport"):
+        executor._rsync_ssh_command()
+
+
+def test_managed_ssh_result_bounds_combined_output(tmp_path, monkeypatch):
+    key_path = _private_key_file(tmp_path)
+    channel = _FakeChannel(b"stdout", b"stderr")
+    client = _FakeSSHClient(channel)
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    executor = SSHExecutor("worker.internal", "ubuntu", str(key_path))
+
+    result = executor._execute_result_sync("noisy", 5, None, 8)
+
+    assert result.exit_code == 7
+    assert result.stdout == "stdout"
+    assert result.stderr == "st"
+    assert result.truncated is True
+    assert result.duration_ms >= 0
+
+
+def test_openssh_public_key_fingerprint_is_stable(tmp_path):
+    public_key = derive_openssh_public_key(_private_key_file(tmp_path))
+
+    first = openssh_public_key_fingerprint(public_key)
+    second = openssh_public_key_fingerprint(public_key)
+
+    assert first == second
+    assert first.startswith("SHA256:")
+
+
+def test_probe_ssh_host_key_uses_requested_endpoint(tmp_path, monkeypatch):
+    public_key = derive_openssh_public_key(_private_key_file(tmp_path))
+    key_kind, key_body = public_key.split(" ", 1)
+    key = SimpleNamespace(
+        get_name=lambda: key_kind,
+        get_base64=lambda: key_body,
+    )
+    sock = SimpleNamespace(close=lambda: None)
+    seen = {}
+
+    def fake_create_connection(endpoint, timeout):
+        seen.update(endpoint=endpoint, socket_timeout=timeout)
+        return sock
+
+    class FakeTransport:
+        def __init__(self, received_sock):
+            assert received_sock is sock
+
+        def start_client(self, timeout):
+            seen["handshake_timeout"] = timeout
+
+        def get_remote_server_key(self):
+            return key
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(
+        "backend.services.ssh_executor.socket.create_connection",
+        fake_create_connection,
+    )
+    monkeypatch.setattr(paramiko, "Transport", FakeTransport)
+
+    result = probe_ssh_host_key(
+        "ssh.example.internal", port=2222, timeout=4,
+    )
+
+    assert seen == {
+        "endpoint": ("ssh.example.internal", 2222),
+        "socket_timeout": 4.0,
+        "handshake_timeout": 4.0,
+        "closed": True,
+    }
+    assert result.key_type == key_kind
+    assert result.openssh_public_key == public_key
+    assert result.sha256_fingerprint.startswith("SHA256:")
 
 
 async def test_run_with_input_keeps_payload_out_of_logs(tmp_path, monkeypatch, caplog):

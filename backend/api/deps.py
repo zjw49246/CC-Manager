@@ -29,16 +29,29 @@ def require_admin(request: Request):
 
 
 def require_internal_service(request: Request) -> None:
-    """Allow callbacks from CCM's own service token, not ordinary user JWTs.
+    """Allow scoped CCM callbacks (and the legacy deployment credential).
 
     Auth-disabled deployments intentionally retain their historical open
-    semantics.  When auth is enabled, MCP callback endpoints carry the legacy
-    deployment token and middleware labels it ``auth_type=token``.
+    semantics. New child processes receive an exact-route credential labelled
+    ``internal_service``; ``token`` remains for deployment/Worker compatibility.
     """
     from backend.config import settings
 
-    if settings.auth_token and getattr(request.state, "auth_type", None) != "token":
+    if settings.auth_token and getattr(request.state, "auth_type", None) not in {
+        "token",
+        "internal_service",
+    }:
         raise HTTPException(403, "Internal service authentication required")
+
+
+def _internal_task_access_allowed(request: Request, task_id: int) -> bool:
+    if getattr(request.state, "auth_type", None) != "internal_service":
+        return False
+    from backend.services.internal_service_auth import internal_task_id
+
+    return internal_task_id(
+        getattr(request.state, "internal_service_claims", None)
+    ) == task_id
 
 
 def _member_group_ids(user_id: int):
@@ -149,6 +162,8 @@ async def _task_access_allowed(
     *,
     allow_chat_share: bool,
 ) -> bool:
+    if _internal_task_access_allowed(request, task.id):
+        return True
     if is_admin(request):
         return True
     user_id = get_current_user_id(request)

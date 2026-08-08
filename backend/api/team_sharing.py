@@ -84,6 +84,28 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
     await _require_share_target(body.target_type, body.target_id, db)
+    locked_project = (
+        await db.execute(
+            select(Project).where(Project.id == project_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_project is None:
+        raise HTTPException(404, "Project not found")
+    # Lock current Tasks in a stable order. Grant replacement takes the same
+    # Task lock, closing the share-vs-grant race on databases with row locks.
+    await db.execute(
+        select(Task.id)
+        .where(Task.project_id == project_id)
+        .order_by(Task.id)
+        .with_for_update()
+    )
+    from backend.services.task_ssh_access import project_has_task_ssh_grants
+
+    if await project_has_task_ssh_grants(db, project_id):
+        raise HTTPException(
+            409,
+            "Remove SSH grants from this Project's Tasks before sharing it",
+        )
     existing = await db.execute(
         select(TeamProjectShare).where(
             TeamProjectShare.project_id == project_id,
@@ -182,6 +204,20 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to share this task")
     await _require_share_target(body.target_type, body.target_id, db)
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    from backend.services.task_ssh_access import task_has_any_ssh_grants
+
+    if await task_has_any_ssh_grants(db, task_id):
+        raise HTTPException(
+            409,
+            "Remove this Task's SSH grants before sharing it",
+        )
     # Verify target has Project access
     if task.project_id:
         proj_share = await db.execute(

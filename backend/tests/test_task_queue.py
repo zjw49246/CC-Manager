@@ -384,8 +384,12 @@ async def test_delete_conflict_task(queue):
     """Should be able to delete tasks in conflict state."""
     task = await queue.create(title="t", description="d", target_repo="/tmp")
     await queue.mark_status(task.id, "conflict")
-    result = await queue.delete(task.id)
+    with patch(
+        "backend.services.internal_service_auth.revoke_internal_service_owner"
+    ) as revoke:
+        result = await queue.delete(task.id)
     assert result is True
+    revoke.assert_called_once_with("task-turn", task.id)
 
 
 @pytest.mark.asyncio

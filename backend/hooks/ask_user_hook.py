@@ -18,6 +18,7 @@
 """
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -67,8 +68,9 @@ def main() -> None:
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    if args.auth_token:
-        req.add_header("Authorization", f"Bearer {args.auth_token}")
+    auth_token = os.environ.get("CCM_ASK_USER_TOKEN", "") or args.auth_token
+    if auth_token:
+        req.add_header("Authorization", f"Bearer {auth_token}")
 
     try:
         with urllib.request.urlopen(req, timeout=args.timeout) as resp:

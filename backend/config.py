@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     effort_options: str = "low,medium,high,xhigh,max"  # comma-separated
     host: str = "0.0.0.0"
     port: int = 8000
+    # Optional fixed Manager-local origin for MCP servers/hooks. When empty,
+    # the live ASGI listening address is learned from incoming requests.
+    internal_api_base_url: str = ""
     # Public base URL of this deployment (e.g. https://ccm.example.com),
     # used to display the GitHub webhook URL on the PR Monitor page.
     public_base_url: str = ""
@@ -76,6 +79,18 @@ class Settings(BaseSettings):
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
+    # Browser-uploaded SSH Profile keys. Files are private host credentials;
+    # only opaque one-time upload tokens are returned to the frontend.
+    ssh_key_storage_dir: str = "~/.ccm/ssh-keys"
+    ssh_sftp_max_concurrency: int = 8
+    ssh_sftp_queue_timeout_seconds: float = 5.0
+    ssh_sftp_operation_timeout_seconds: float = 30.0
+    ssh_sftp_download_timeout_seconds: float = 120.0
+    ssh_sftp_channel_timeout_seconds: float = 15.0
+    # Task-scoped MCP credentials and Claude security settings live outside
+    # world-readable/shared temporary directories. Agent sandboxes deny this
+    # complete root after the trusted CLI has loaded its own files.
+    task_runtime_secret_dir: str = "~/.ccm/task-runtime-secrets"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
     worker_enabled: bool = True

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -27,6 +27,8 @@ from backend.api.uploads import router as uploads_router
 from backend.api.secrets import router as secrets_router
 from backend.api.tags import router as tags_router
 from backend.api.files import router as files_router
+from backend.api.ssh_profiles import router as ssh_profiles_router
+from backend.api.task_ssh import router as task_ssh_router
 from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
@@ -802,6 +804,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Claude Code Manager", version="0.1.0", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def remember_internal_api_endpoint(request: Request, call_next):
+    # Use scope["server"], never the untrusted Host header. This captures
+    # Uvicorn CLI-only --host/--port overrides before a request can create and
+    # dispatch a Task whose MCP subprocess needs to call back into Manager.
+    from backend.services.internal_api_endpoint import observe_asgi_server
+
+    observe_asgi_server(request.scope.get("server"))
+    return await call_next(request)
+
+
 app.add_middleware(TokenAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -832,6 +846,8 @@ app.include_router(uploads_router)
 app.include_router(secrets_router)
 app.include_router(tags_router)
 app.include_router(files_router)
+app.include_router(ssh_profiles_router)
+app.include_router(task_ssh_router)
 app.include_router(task_artifacts_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)

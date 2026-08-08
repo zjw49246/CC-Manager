@@ -38,6 +38,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
 - **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
 - **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件
+- **SSH 工作台与 Task 授权** — Files 页面可管理固定主机指纹的 SSH Profile、浏览/下载远程文件；管理员可在新建 Task 或 Chat 中按 `exec/read/write` 最小权限授权，Claude/Codex 通过 task-scoped `ccm_ssh` MCP 使用，私钥始终留在 Manager。使用和安全边界见 [SSH access](docs/ssh-access.md)
 - **数学公式渲染** — 聊天和 Discussion 中的 Markdown 支持 KaTeX；兼容 Codex 常用的 `\\(...\\)` / 整段 `\\[...\\]` 以及 `$$...$$`，单美元符号内容按普通文本显示，链接、HTML、代码和货币内容保持不变
 - **交互式提问（ask_user）** — 模型调用内置 `AskUserQuestion` 时，聊天里弹出可选卡片（单选/多选/自定义文本），用户选完即把答案喂回模型继续。超时默认 1800s，支持跨页面全局通知（右下角弹窗 + 未读标记），可用 `ASK_USER_ENABLED=false` 关闭
 - **权限透传（PTY 模式）** — CC 请求工具权限时聊天里出现卡片（工具名/描述/输入预览），点允许/拒绝实时回包；120s 超时默认拒绝

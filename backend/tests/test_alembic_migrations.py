@@ -31,6 +31,8 @@ import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.ssh_profile  # noqa: F401
+import backend.models.task_ssh_grant  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -41,7 +43,11 @@ PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
 FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
-CURRENT_HEAD_REVISION = "e5b8d1c4a7f2"
+PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
+SSH_PROFILES_REVISION = "73c4a9e1b2d0"
+TASK_SSH_GRANTS_REVISION = "84d5b0f2c3e1"
+TASK_SSH_POLICY_REVISION = "91e6a4c8d2f0"
+CURRENT_HEAD_REVISION = "a6d9f2c4e8b1"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -432,7 +438,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "ssh_profiles", "task_ssh_grants", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -1641,7 +1647,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_plan_main_merge(self, tmp_path):
+    def test_migration_graph_has_one_head_after_ssh_allowed_roots(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -1649,6 +1655,22 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == TASK_SSH_POLICY_REVISION
+        )
+        assert (
+            script.get_revision(TASK_SSH_POLICY_REVISION).down_revision
+            == TASK_SSH_GRANTS_REVISION
+        )
+        assert (
+            script.get_revision(TASK_SSH_GRANTS_REVISION).down_revision
+            == SSH_PROFILES_REVISION
+        )
+        assert (
+            script.get_revision(SSH_PROFILES_REVISION).down_revision
+            == PLAN_MAIN_MERGE_REVISION
+        )
+        assert (
+            script.get_revision(PLAN_MAIN_MERGE_REVISION).down_revision
             == (FIRST_CLASS_PLAN_HEAD_REVISION, ATTENTION_TAG_REVISION)
         )
         assert (
@@ -1680,6 +1702,40 @@ class TestPublishedMigrationHistory:
             assert conn.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_existing_managed_profiles_keep_task_access_on_upgrade(self, tmp_path):
+        db_path = str(tmp_path / "ssh-policy.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_SSH_GRANTS_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO ssh_profiles (
+                    name, host, port, username, key_path,
+                    public_key_fingerprint, host_key_type, host_key_value,
+                    host_key_fingerprint, revision, enabled,
+                    created_at, updated_at
+                ) VALUES (
+                    'existing', 'ssh.example.internal', 22, 'deploy', '/tmp/key',
+                    'SHA256:client', 'ssh-ed25519', 'ssh-ed25519 AAAA',
+                    'SHA256:host', 1, 1,
+                    '2026-08-07 00:00:00', '2026-08-07 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, "head")
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT task_access_enabled, task_capabilities, allowed_roots
+                FROM ssh_profiles WHERE name = 'existing'
+            """)).one()
+        assert bool(row[0]) is True
+        assert json.loads(row[1]) == ["exec", "read", "write"]
+        assert json.loads(row[2]) == ["/"]
         engine.dispose()
 
     @pytest.mark.parametrize(

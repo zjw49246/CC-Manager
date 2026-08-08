@@ -133,7 +133,16 @@ async function formRequest<T>(path: string, formData: FormData): Promise<T> {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(typeof err.detail === 'string' ? err.detail : res.statusText);
+    const detail = err.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && typeof detail.message === 'string'
+        ? detail.message
+        : res.statusText;
+    const requestError = new Error(message) as ApiRequestError;
+    requestError.status = res.status;
+    requestError.detail = detail;
+    throw requestError;
   }
   const refreshedToken = res.headers.get('X-Refreshed-Token');
   if (refreshedToken) setToken(refreshedToken);
@@ -185,6 +194,91 @@ export interface Project {
   badge_color: string | null;
   created_at: string;
   location?: string;  // "local" or worker name
+}
+
+export interface SSHProfile {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_path_hint: string;
+  public_key_fingerprint: string;
+  host_key_type: string;
+  host_key_fingerprint: string;
+  revision: number;
+  enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
+  created_by: number | null;
+  last_tested_at: string | null;
+  last_test_ok: boolean | null;
+  last_error_code: string | null;
+  last_error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SSHProfileInput {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_path?: string;
+  key_upload_token?: string;
+  host_key_value: string;
+  enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
+}
+
+export interface SSHPrivateKeyUpload {
+  upload_token: string;
+  filename: string;
+  public_key_fingerprint: string;
+}
+
+export interface SSHHostKeyProbe {
+  key_type: string;
+  host_key_value: string;
+  fingerprint: string;
+}
+
+export interface SSHProfileTestResult {
+  ok: boolean;
+  error_code: string | null;
+  detail: string | null;
+}
+
+export type TaskSSHCapability = 'exec' | 'read' | 'write';
+
+export interface TaskSSHGrantInput {
+  profile_id: number;
+  capabilities: TaskSSHCapability[];
+}
+
+export interface TaskSSHGrant {
+  id: number;
+  task_id: number;
+  profile_id: number;
+  profile_name: string;
+  host: string;
+  port: number;
+  username: string;
+  host_key_fingerprint: string;
+  profile_revision: number;
+  current_profile_revision: number;
+  capabilities: TaskSSHCapability[];
+  profile_task_access_enabled: boolean;
+  profile_task_capabilities: TaskSSHCapability[];
+  profile_allowed_roots: string[];
+  valid: boolean;
+  invalid_reason: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export type ProjectTodoStatus = 'open' | 'done' | 'archived';
@@ -1658,7 +1752,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -1989,6 +2083,62 @@ export const api = {
   },
 
   // Files (SSH)
+  listSSHProfiles: (taskEligibleOnly = false) =>
+    request<SSHProfile[]>(
+      `/api/ssh-profiles${taskEligibleOnly ? '?task_eligible_only=true' : ''}`,
+    ),
+  createSSHProfile: (data: SSHProfileInput) =>
+    request<SSHProfile>('/api/ssh-profiles', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  uploadSSHPrivateKey: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return formRequest<SSHPrivateKeyUpload>('/api/ssh-profiles/upload-key', formData);
+  },
+  cancelSSHPrivateKeyUpload: (uploadToken: string) =>
+    request<{ ok: boolean }>(`/api/ssh-profiles/upload-key/${encodeURIComponent(uploadToken)}`, {
+      method: 'DELETE',
+    }),
+  listTaskSSHGrants: (taskId: number) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`),
+  updateTaskSSHGrants: (taskId: number, grants: TaskSSHGrantInput[]) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`, {
+      method: 'PUT',
+      body: JSON.stringify({ grants }),
+    }),
+  updateSSHProfile: (id: number, data: Partial<SSHProfileInput>) =>
+    request<SSHProfile>(`/api/ssh-profiles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteSSHProfile: (id: number) =>
+    request<{ ok: boolean }>(`/api/ssh-profiles/${id}`, { method: 'DELETE' }),
+  probeSSHHostKey: (data: { host: string; port: number; timeout_seconds?: number }) =>
+    request<SSHHostKeyProbe>('/api/ssh-profiles/probe-host-key', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  testSSHProfile: (id: number) =>
+    request<SSHProfileTestResult>(`/api/ssh-profiles/${id}/test`, { method: 'POST' }),
+  managedSSHListDir: (profileId: number, path: string) =>
+    request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[]; truncated: boolean }>(`/api/files/ssh/${profileId}/list`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHReadFile: (profileId: number, path: string) =>
+    request<{ path: string; content: string; size: number }>(`/api/files/ssh/${profileId}/read`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHDownloadFile: async (profileId: number, path: string) => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/files/ssh/${profileId}/download`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ path }),
+    });
+    await validateAuthenticatedDownloadResponse(res);
+    return res;
+  },
   sshListDir: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>
     request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[] }>('/api/files/ssh/list', { method: 'POST', body: JSON.stringify({ ...creds, path }) }),
   sshReadFile: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>

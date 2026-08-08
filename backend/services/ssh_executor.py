@@ -10,17 +10,22 @@ import asyncio
 import base64
 import binascii
 import errno
+import hashlib
+import hmac
+import io
 import logging
 import os
 import re
 import select
+import secrets
 import shlex
 import socket
 import stat
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from cryptography.exceptions import UnsupportedAlgorithm
 
@@ -28,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_PRIVATE_KEY_BYTES = 1024 * 1024
+DEFAULT_SSH_OUTPUT_LIMIT_BYTES = 1024 * 1024
 _OPENSSH_PUBLIC_KEY_RE = re.compile(
     r"^(?P<kind>ssh-(?:rsa|ed25519)|ecdsa-sha2-nistp(?:256|384|521)) "
     r"(?P<body>[A-Za-z0-9+/]+={0,3})$"
@@ -50,6 +56,7 @@ class SSHKeyMaterial:
 
     private_key_path: str
     openssh_public_key: str
+    private_key_bytes: bytes = field(default=b"", repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -59,6 +66,124 @@ class SSHProbeResult:
     ok: bool
     error_code: str | None = None
     detail: str | None = None
+
+
+@dataclass(frozen=True)
+class SSHCommandResult:
+    """One bounded remote-command result for user/task-facing SSH calls."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    truncated: bool
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class SSHHostKeyInfo:
+    """Public server identity returned by the unauthenticated SSH handshake."""
+
+    key_type: str
+    openssh_public_key: str
+    sha256_fingerprint: str
+
+
+class SSHHostKeyMismatchError(ValueError):
+    """The remote server identity did not match the explicitly pinned key."""
+
+
+class _PinnedHostKeyPolicy:
+    """Paramiko missing-host policy that accepts one exact public host key."""
+
+    def __init__(self, expected_key: str):
+        self.expected_key = validate_openssh_public_key(expected_key)
+
+    def missing_host_key(self, _client, _hostname, key) -> None:
+        actual = validate_openssh_public_key(
+            f"{key.get_name()} {key.get_base64()}"
+        )
+        if not _constant_time_text_equal(actual, self.expected_key):
+            raise SSHHostKeyMismatchError(
+                "SSH host key does not match the pinned server identity"
+            )
+
+
+def _constant_time_text_equal(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def openssh_public_key_fingerprint(public_key: str) -> str:
+    """Return the familiar ``SHA256:...`` fingerprint for an OpenSSH key."""
+
+    normalized = validate_openssh_public_key(public_key)
+    body = normalized.split(" ", 1)[1]
+    digest = hashlib.sha256(base64.b64decode(body)).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def probe_ssh_host_key(
+    host: str,
+    *,
+    port: int = 22,
+    timeout: float = 10.0,
+) -> SSHHostKeyInfo:
+    """Perform only the SSH handshake and return the server's public key."""
+
+    import paramiko
+
+    normalized_host = _validate_ssh_host(host)
+    normalized_port = _validate_ssh_port(port)
+    if isinstance(timeout, bool) or timeout <= 0 or timeout > 60:
+        raise ValueError("SSH host-key probe timeout must be between 0 and 60 seconds")
+    sock = socket.create_connection(
+        (normalized_host, normalized_port), timeout=float(timeout),
+    )
+    transport = paramiko.Transport(sock)
+    try:
+        transport.start_client(timeout=float(timeout))
+        key = transport.get_remote_server_key()
+        openssh_key = validate_openssh_public_key(
+            f"{key.get_name()} {key.get_base64()}"
+        )
+        return SSHHostKeyInfo(
+            key_type=key.get_name(),
+            openssh_public_key=openssh_key,
+            sha256_fingerprint=openssh_public_key_fingerprint(openssh_key),
+        )
+    finally:
+        transport.close()
+        sock.close()
+
+
+def _validate_ssh_host(host: str) -> str:
+    if not isinstance(host, str):
+        raise ValueError("SSH host must be a string")
+    normalized = host.strip()
+    if (
+        not normalized
+        or len(normalized) > 253
+        or any(character.isspace() or character == "\x00" for character in normalized)
+    ):
+        raise ValueError("SSH host is invalid")
+    return normalized
+
+
+def _validate_ssh_port(port: int) -> int:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("SSH port must be between 1 and 65535")
+    return port
+
+
+def _validate_output_limit(max_output_bytes: int | None) -> int | None:
+    if max_output_bytes is None:
+        return None
+    if (
+        isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or max_output_bytes <= 0
+    ):
+        raise ValueError("SSH output limit must be a positive byte count")
+    return max_output_bytes
 
 
 def _canonical_private_key_path(key_path: str | os.PathLike[str]) -> Path:
@@ -167,6 +292,7 @@ def preflight_private_key(key_path: str | os.PathLike[str]) -> SSHKeyMaterial:
     return SSHKeyMaterial(
         private_key_path=str(path),
         openssh_public_key=_public_key_from_private_bytes(data),
+        private_key_bytes=data,
     )
 
 
@@ -240,6 +366,12 @@ def _prepare_known_hosts_file(raw_path: str) -> str:
 def _classify_probe_exception(exc: BaseException) -> SSHProbeResult:
     if isinstance(exc, SSHKeyPreflightError):
         return SSHProbeResult(False, exc.code, exc.detail)
+    if isinstance(exc, SSHHostKeyMismatchError):
+        return SSHProbeResult(
+            False,
+            "host_key_mismatch",
+            "SSH host key does not match the pinned server identity",
+        )
 
     import paramiko
 
@@ -250,7 +382,7 @@ def _classify_probe_exception(exc: BaseException) -> SSHProbeResult:
     if isinstance(exc, paramiko.NoValidConnectionsError):
         nested = tuple(exc.errors.values())
         if nested and all(isinstance(item, ConnectionRefusedError) for item in nested):
-            return SSHProbeResult(False, "connection_refused", "TCP port 22 refused the SSH connection")
+            return SSHProbeResult(False, "connection_refused", "The SSH port refused the connection")
         if any(isinstance(item, (TimeoutError, socket.timeout)) for item in nested):
             return SSHProbeResult(False, "connection_timeout", "TCP connection to SSH timed out")
         if any(
@@ -281,44 +413,158 @@ class SSHExecutor:
         user: str,
         key_path: str,
         *,
+        port: int = 22,
         known_hosts_path: str | None = None,
+        host_key_policy: Literal["tofu", "pinned"] = "tofu",
+        pinned_host_key: str | None = None,
+        expected_public_key_fingerprint: str | None = None,
     ):
-        self.host = host
-        self.user = user
+        self.host = _validate_ssh_host(host)
+        if not isinstance(user, str) or not user.strip() or len(user.strip()) > 255:
+            raise ValueError("SSH user is invalid")
+        self.user = user.strip()
+        self.port = _validate_ssh_port(port)
         self.key_path = os.path.expandvars(os.path.expanduser(key_path))
         self.known_hosts_path = known_hosts_path
+        if host_key_policy not in {"tofu", "pinned"}:
+            raise ValueError("Unsupported SSH host-key policy")
+        if host_key_policy == "pinned" and not pinned_host_key:
+            raise ValueError("Pinned SSH host-key policy requires a public host key")
+        if host_key_policy == "tofu" and pinned_host_key:
+            raise ValueError("Pinned SSH host key requires the pinned policy")
+        self.host_key_policy = host_key_policy
+        self.pinned_host_key = (
+            validate_openssh_public_key(pinned_host_key)
+            if pinned_host_key
+            else None
+        )
+        if expected_public_key_fingerprint is not None and (
+            not isinstance(expected_public_key_fingerprint, str)
+            or not expected_public_key_fingerprint.startswith("SHA256:")
+        ):
+            raise ValueError("Expected SSH client key fingerprint is invalid")
+        self.expected_public_key_fingerprint = expected_public_key_fingerprint
         self.last_probe_result: SSHProbeResult | None = None
 
-    def _execute_sync(
-        self,
-        command: str,
-        timeout: int,
-        input_data: bytes | None,
-    ) -> tuple[int, str]:
+    def _preflight_key(self) -> SSHKeyMaterial:
+        key = preflight_private_key(self.key_path)
+        if self.expected_public_key_fingerprint is not None:
+            actual = openssh_public_key_fingerprint(key.openssh_public_key)
+            if not secrets.compare_digest(
+                actual,
+                self.expected_public_key_fingerprint,
+            ):
+                raise SSHKeyPreflightError(
+                    "key_changed",
+                    "SSH private key no longer matches the authorized profile",
+                )
+        return key
+
+    @staticmethod
+    def _paramiko_private_key(private_key_bytes: bytes):
         import paramiko
 
-        if isinstance(timeout, bool) or timeout <= 0:
-            raise ValueError("SSH timeout must be positive")
-        deadline = time.monotonic() + float(timeout)
-        key = preflight_private_key(self.key_path)
-        client = paramiko.SSHClient()
-        if self.known_hosts_path:
-            client.load_host_keys(_prepare_known_hosts_file(self.known_hosts_path))
-        else:
-            client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            connect_timeout = max(1.0, min(float(timeout), 15.0))
+            text = private_key_bytes.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise SSHKeyPreflightError(
+                "key_invalid", "SSH private key format is invalid or unsupported"
+            ) from exc
+        for key_type in (
+            paramiko.Ed25519Key,
+            paramiko.ECDSAKey,
+            paramiko.RSAKey,
+        ):
+            try:
+                return key_type.from_private_key(io.StringIO(text))
+            except (paramiko.SSHException, ValueError):
+                continue
+        raise SSHKeyPreflightError(
+            "key_invalid", "SSH private key format is invalid or unsupported"
+        )
+
+    def _new_client(self, key: SSHKeyMaterial, timeout: int):
+        import paramiko
+
+        private_key = self._paramiko_private_key(key.private_key_bytes)
+        client = paramiko.SSHClient()
+        if self.host_key_policy == "pinned":
+            client.set_missing_host_key_policy(
+                _PinnedHostKeyPolicy(self.pinned_host_key or "")
+            )
+        else:
+            if self.known_hosts_path:
+                client.load_host_keys(
+                    _prepare_known_hosts_file(self.known_hosts_path)
+                )
+            else:
+                client.load_system_host_keys()
+            # Existing Worker connections retain their per-instance TOFU
+            # semantics. Managed user/task profiles opt into ``pinned``.
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_timeout = max(1.0, min(float(timeout), 15.0))
+        try:
             client.connect(
                 self.host,
+                port=self.port,
                 username=self.user,
-                key_filename=key.private_key_path,
+                pkey=private_key,
                 timeout=connect_timeout,
                 banner_timeout=connect_timeout,
                 auth_timeout=connect_timeout,
                 allow_agent=False,
                 look_for_keys=False,
             )
+        except BaseException:
+            client.close()
+            raise
+        return client
+
+    def connect(self, timeout: int = 10):
+        """Open one verified SSH connection for a bounded synchronous caller.
+
+        The returned Paramiko client must be closed by the caller.  This is
+        intentionally synchronous so SFTP users can keep the client and SFTP
+        handle inside one ``asyncio.to_thread`` call.
+        """
+
+        if isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("SSH timeout must be positive")
+        key = self._preflight_key()
+        return self._new_client(key, timeout)
+
+    @staticmethod
+    def _append_bounded(
+        chunks: list[bytes],
+        payload: bytes,
+        *,
+        captured: int,
+        max_output_bytes: int | None,
+    ) -> tuple[int, bool]:
+        if max_output_bytes is None:
+            chunks.append(payload)
+            return captured + len(payload), False
+        remaining = max_output_bytes - captured
+        if remaining > 0:
+            chunks.append(payload[:remaining])
+        accepted = min(max(remaining, 0), len(payload))
+        return captured + accepted, accepted < len(payload)
+
+    def _execute_result_sync(
+        self,
+        command: str,
+        timeout: int,
+        input_data: bytes | None,
+        max_output_bytes: int | None,
+    ) -> SSHCommandResult:
+        if isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("SSH timeout must be positive")
+        output_limit = _validate_output_limit(max_output_bytes)
+        started = time.monotonic()
+        deadline = started + float(timeout)
+        key = self._preflight_key()
+        client = self._new_client(key, timeout)
+        try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"SSH connection timed out after {timeout}s")
@@ -332,13 +578,29 @@ class SSHExecutor:
 
             out_chunks: list[bytes] = []
             err_chunks: list[bytes] = []
+            captured = 0
+            truncated = False
             while True:
                 made_progress = False
                 while channel.recv_ready():
-                    out_chunks.append(channel.recv(65536))
+                    payload = channel.recv(65536)
+                    captured, overflowed = self._append_bounded(
+                        out_chunks,
+                        payload,
+                        captured=captured,
+                        max_output_bytes=output_limit,
+                    )
+                    truncated = truncated or overflowed
                     made_progress = True
                 while channel.recv_stderr_ready():
-                    err_chunks.append(channel.recv_stderr(65536))
+                    payload = channel.recv_stderr(65536)
+                    captured, overflowed = self._append_bounded(
+                        err_chunks,
+                        payload,
+                        captured=captured,
+                        max_output_bytes=output_limit,
+                    )
+                    truncated = truncated or overflowed
                     made_progress = True
                 if (
                     channel.exit_status_ready()
@@ -353,12 +615,27 @@ class SSHExecutor:
                 if not made_progress:
                     select.select([channel], [], [], min(0.1, remaining))
 
-            exit_code = channel.recv_exit_status()
-            out = b"".join(out_chunks).decode(errors="replace")
-            err = b"".join(err_chunks).decode(errors="replace")
-            return exit_code, out + (("\n" + err) if err.strip() else "")
+            return SSHCommandResult(
+                exit_code=channel.recv_exit_status(),
+                stdout=b"".join(out_chunks).decode(errors="replace"),
+                stderr=b"".join(err_chunks).decode(errors="replace"),
+                truncated=truncated,
+                duration_ms=max(0, round((time.monotonic() - started) * 1000)),
+            )
         finally:
             client.close()
+
+    def _execute_sync(
+        self,
+        command: str,
+        timeout: int,
+        input_data: bytes | None,
+    ) -> tuple[int, str]:
+        result = self._execute_result_sync(command, timeout, input_data, None)
+        output = result.stdout
+        if result.stderr.strip():
+            output += "\n" + result.stderr
+        return result.exit_code, output
 
     def _run_sync(self, command: str, timeout: int) -> tuple[int, str]:
         return self._execute_sync(command, timeout, None)
@@ -377,6 +654,30 @@ class SSHExecutor:
             "[sensitive command redacted]" if sensitive else command[:200],
         )
         return await asyncio.to_thread(self._run_sync, command, timeout)
+
+    async def run_result(
+        self,
+        command: str,
+        timeout: int = 60,
+        *,
+        max_output_bytes: int = DEFAULT_SSH_OUTPUT_LIMIT_BYTES,
+        sensitive: bool = False,
+    ) -> SSHCommandResult:
+        """Execute a bounded, non-interactive command for user/task callers."""
+
+        logger.debug(
+            "ssh %s:%s: %s",
+            self.host,
+            self.port,
+            "[sensitive command redacted]" if sensitive else command[:200],
+        )
+        return await asyncio.to_thread(
+            self._execute_result_sync,
+            command,
+            timeout,
+            None,
+            max_output_bytes,
+        )
 
     async def run_with_input(
         self,
@@ -423,13 +724,18 @@ class SSHExecutor:
         return (await self.probe(timeout=timeout)).ok
 
     def _rsync_ssh_command(self) -> str:
-        key = preflight_private_key(self.key_path)
+        if self.host_key_policy == "pinned":
+            raise ValueError(
+                "Pinned SSH profiles do not support the rsync transport"
+            )
+        key = self._preflight_key()
         host_key_options = "-o StrictHostKeyChecking=accept-new"
         if self.known_hosts_path:
             known_hosts = _prepare_known_hosts_file(self.known_hosts_path)
             host_key_options += f" -o UserKnownHostsFile={shlex.quote(known_hosts)}"
         return (
             f"ssh -i {shlex.quote(key.private_key_path)} "
+            f"-p {self.port} "
             "-o IdentitiesOnly=yes -o BatchMode=yes "
             f"{host_key_options} -o ConnectTimeout=15"
         )

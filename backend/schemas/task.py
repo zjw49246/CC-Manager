@@ -12,6 +12,7 @@ from pydantic import (
 
 from backend.config import settings
 from backend.schemas.plan import PlanPipelineConfig
+from backend.schemas.task_ssh_grant import TaskSSHGrantInput
 
 
 class UserSkillSnapshotPayload(BaseModel):
@@ -87,6 +88,7 @@ class TaskCreate(BaseModel):
     file_paths: list[str] | None = None
     attachments: list[dict] | None = None  # [{url, name, is_image}, ...]
     secret_ids: list[int] | None = None
+    ssh_grants: list[TaskSSHGrantInput] | None = Field(default=None, max_length=50)
     clone_from_task_id: int | None = None
     # Internal/Plan endpoints use these fields to preserve independent Plan
     # relationships across Manager→Worker copies. Public creation validates the
@@ -265,6 +267,14 @@ class TaskUpdate(BaseModel):
     @classmethod
     def normalize_attention_tag(cls, value: object) -> object:
         return _normalize_attention_tag(value)
+
+
+class InternalTaskSkillsUpdate(BaseModel):
+    """Narrow payload accepted from the Task-scoped skills MCP server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled_skills: dict
 
 
 class TaskResponse(BaseModel):

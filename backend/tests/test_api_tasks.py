@@ -114,6 +114,32 @@ async def test_explicit_skill_save_clears_temporary_generation_marker(
 
 
 @pytest.mark.asyncio
+async def test_internal_skill_update_endpoint_accepts_only_enabled_skills(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Scoped skill update",
+        "description": "d",
+        "provider": "claude",
+    })
+    task_id = created.json()["id"]
+
+    updated = await client.put(
+        f"/api/tasks/{task_id}/internal/enabled-skills",
+        json={"enabled_skills": {"monitor": True}},
+    )
+    rejected = await client.put(
+        f"/api/tasks/{task_id}/internal/enabled-skills",
+        json={
+            "enabled_skills": {},
+            "title": "must not be writable through the MCP credential",
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["enabled_skills"] == {"monitor": True}
+    assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_local_codex_accepts_monitor_when_main_mcp_is_enabled(
     client,
     monkeypatch,

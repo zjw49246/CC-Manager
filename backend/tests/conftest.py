@@ -12,7 +12,9 @@ from pathlib import Path
 # bootstrap, an incompletely mocked test can write Instance/Task lifecycle
 # state into the developer's real ``claude_manager.db``.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-"))
+_GLOBAL_TEST_DB_DIR = Path(
+    tempfile.mkdtemp(prefix="ccm-pytest-global-")
+).resolve()
 atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
 _GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
 _GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)
@@ -32,6 +34,10 @@ os.environ.update({
     ),
     "CLOUDROUTER_ACCOUNTS_DIR": str(
         _GLOBAL_TEST_DB_DIR / "cloudrouter-accounts"
+    ),
+    "SSH_KEY_STORAGE_DIR": str(_GLOBAL_TEST_DB_DIR / "ssh-key-store"),
+    "TASK_RUNTIME_SECRET_DIR": str(
+        _GLOBAL_TEST_DB_DIR / "task-runtime-secrets"
     ),
     "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
     "WORKER_ENABLED": "false",
@@ -78,6 +84,10 @@ import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.ssh_profile  # noqa: F401
+import backend.models.task_ssh_grant  # noqa: F401
+import backend.models.task_share  # noqa: F401
+import backend.models.team_share  # noqa: F401
 
 @pytest.fixture(scope="session")
 def event_loop():

@@ -53,11 +53,12 @@ async def ask_user_wait(body: AskUserWaitRequest, request: Request):
     from backend.config import settings
     from backend.main import broadcaster
 
-    # This endpoint is called by CCM's local hook, which authenticates with the
-    # deployment service token. A user JWT must never be able to impersonate a
+    # This endpoint is called by CCM's local hook, which normally authenticates
+    # with a Task-bound scoped token. A user JWT must never impersonate a
     # model tool call, create a fake prompt card, or receive another user's
     # answer. No-auth deployments intentionally preserve their open semantics.
-    if settings.auth_token and getattr(request.state, "auth_type", None) != "token":
+    auth_type = getattr(request.state, "auth_type", None)
+    if settings.auth_token and auth_type not in {"token", "internal_service"}:
         raise HTTPException(403, "Internal hook authentication required")
 
     if not body.questions:
@@ -77,6 +78,14 @@ async def ask_user_wait(body: AskUserWaitRequest, request: Request):
             return {"answered": False, "no_session": True}
         task_id = task.id
         instance_id = task.instance_id or 1
+
+    if auth_type == "internal_service":
+        from backend.services.internal_service_auth import internal_task_id
+
+        if internal_task_id(
+            getattr(request.state, "internal_service_claims", None)
+        ) != task_id:
+            raise HTTPException(403, "Internal hook Task identity mismatch")
 
     pending = ask_user_registry.create(
         task_id=task_id,

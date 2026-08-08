@@ -1,6 +1,5 @@
 """Tests for MCP config generation and cleanup."""
 import json
-import tempfile
 import tomllib
 from pathlib import Path
 
@@ -11,8 +10,11 @@ from backend.mcp import (
     ccm_monitor_agent_server,
     ccm_skills_server,
     ccm_sub_agent_server,
+    ccm_ssh_server,
 )
 from backend.services import mcp_config
+from backend.services import internal_api_endpoint
+from backend.services import internal_service_auth
 from backend.services.mcp_config import (
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
@@ -23,6 +25,7 @@ from backend.services.mcp_config import (
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
+    build_task_ssh_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
     cleanup_sub_agent_mcp_config,
@@ -111,7 +114,11 @@ def test_generate_mcp_config_monitor_enabled():
 
 def test_generate_mcp_config_file_path():
     path = generate_mcp_config(42, {"monitor": True}, api_base="http://localhost:8000")
-    expected = Path(tempfile.gettempdir()) / "ccm_mcp_42.json"
+    expected = (
+        Path(settings.task_runtime_secret_dir)
+        / "task-42"
+        / "mcp.json"
+    )
     assert path == expected
     path.unlink(missing_ok=True)
 
@@ -135,6 +142,11 @@ def _set_spec_snapshot_runtime(monkeypatch):
         "/srv/ccm/.venv/bin/python3",
     )
     monkeypatch.setattr(settings, "auth_token", "secret-token")
+    monkeypatch.setattr(
+        internal_service_auth,
+        "issue_internal_service_token",
+        lambda **_kwargs: "scoped-token",
+    )
 
 
 def test_main_mcp_server_spec_snapshot(monkeypatch):
@@ -149,16 +161,19 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_skills",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
                 "42",
                 "--api-base",
                 "http://manager:8321",
-                "--auth-token",
-                "secret-token",
             ),
             cwd="/srv/ccm",
+            env={
+                "PYTHONPATH": "/srv/ccm",
+                "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+            },
             required=True,
             enabled_tools=EXPECTED_MAIN_TOOLS,
             default_tools_approval_mode="approve",
@@ -181,6 +196,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_monitor_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -189,10 +205,12 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
                 "42",
                 "--api-base",
                 "http://manager:8321",
-                "--auth-token",
-                "secret-token",
             ),
             cwd="/srv/ccm",
+            env={
+                "PYTHONPATH": "/srv/ccm",
+                "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+            },
             required=True,
             enabled_tools=EXPECTED_MONITOR_TOOLS,
             default_tools_approval_mode="approve",
@@ -213,7 +231,7 @@ def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
         turn_generation=9,
     )[0]
 
-    assert spec.args[2:8] == (
+    assert spec.args[3:9] == (
         "--monitor-session-id",
         "7",
         "--task-id",
@@ -235,6 +253,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_sub_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -243,10 +262,12 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
                 "42",
                 "--api-base",
                 "http://manager:8321",
-                "--auth-token",
-                "secret-token",
             ),
             cwd="/srv/ccm",
+            env={
+                "PYTHONPATH": "/srv/ccm",
+                "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+            },
             required=True,
             enabled_tools=EXPECTED_SUB_AGENT_TOOLS,
             default_tools_approval_mode="approve",
@@ -301,6 +322,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_mcp_config(42),
             "ccm_skills",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -313,6 +335,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_monitor_agent_mcp_config(7),
             "ccm_monitor_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -327,6 +350,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_sub_agent_mcp_config(9),
             "ccm_sub_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -350,20 +374,19 @@ def test_claude_json_output_remains_compatible(
 
     path = generator(*generator_args, api_base=api_base)
     try:
-        assert json.loads(path.read_text()) == {
-            "mcpServers": {
-                expected_name: {
-                    "command": "/srv/ccm/.venv/bin/python3",
-                    "args": [
-                        *expected_args,
-                        "--api-base",
-                        api_base,
-                        "--auth-token",
-                        "secret-token",
-                    ],
-                    "cwd": "/srv/ccm",
-                }
-            }
+        servers = json.loads(path.read_text())["mcpServers"]
+        assert servers[expected_name] == {
+            "command": "/srv/ccm/.venv/bin/python3",
+            "args": [
+                *expected_args,
+                "--api-base",
+                api_base,
+            ],
+            "cwd": "/srv/ccm",
+            "env": {
+                "PYTHONPATH": "/srv/ccm",
+                "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+            },
         }
     finally:
         cleanup()
@@ -378,6 +401,98 @@ def test_default_api_base_and_empty_auth_token(monkeypatch):
 
     assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8321")
     assert "--auth-token" not in spec.args
+    assert "CCM_INTERNAL_SERVICE_TOKEN" not in spec.env
+
+
+def test_observed_asgi_port_overrides_cli_stale_settings(monkeypatch):
+    monkeypatch.setattr(internal_api_endpoint, "_observed_api_base", None)
+    monkeypatch.setattr(settings, "host", "0.0.0.0")
+    monkeypatch.setattr(settings, "port", 8000)
+    monkeypatch.setattr(settings, "internal_api_base_url", "")
+
+    internal_api_endpoint.observe_asgi_server(("127.0.0.1", 8803))
+    spec = build_mcp_server_specs(42)[0]
+
+    assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8803")
+
+
+def test_internal_api_base_rejects_non_origin_values():
+    with pytest.raises(ValueError, match=r"HTTP\(S\) origin"):
+        internal_api_endpoint.resolve_internal_api_base(
+            "https://manager.example/internal"
+        )
+
+
+def test_task_ssh_spec_exposes_only_tools_for_granted_capabilities(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+    (spec,) = build_task_ssh_mcp_server_specs(
+        42,
+        capabilities=("read",),
+    )
+
+    assert spec.name == "ccm_ssh"
+    assert spec.required is True
+    assert spec.enabled_tools == (
+        "list_connections",
+        "list_directory",
+        "read_file",
+    )
+    assert spec.args[spec.args.index("--task-id") + 1] == "42"
+    assert spec.args[spec.args.index("--capability") + 1] == "read"
+    assert spec.args[spec.args.index("-m") + 1] == (
+        "backend.mcp.ccm_ssh_server"
+    )
+    assert dict(spec.env) == {
+        "PYTHONPATH": mcp_config._CCM_ROOT,
+        "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+    }
+    assert "secret-token" not in spec.args
+
+
+def test_claude_task_ssh_config_is_added_without_replacing_skills_server(
+    monkeypatch,
+):
+    _set_spec_snapshot_runtime(monkeypatch)
+    path = generate_mcp_config(
+        42,
+        {},
+        api_base="http://localhost:8000",
+        task_ssh_capabilities=("exec", "write"),
+    )
+    try:
+        config = json.loads(path.read_text())
+        assert set(config["mcpServers"]) == {
+            "ccm_skills",
+            "ccm_ssh",
+        }
+        assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
+        assert config["mcpServers"]["ccm_ssh"]["env"] == {
+            "PYTHONPATH": mcp_config._CCM_ROOT,
+            "CCM_INTERNAL_SERVICE_TOKEN": "scoped-token",
+        }
+        assert "secret-token" not in json.dumps(config)
+    finally:
+        cleanup_mcp_config(42)
+
+
+def test_ccm_ssh_module_registers_expected_tools():
+    registered = set(ccm_ssh_server.mcp._tool_manager._tools)
+    assert {
+        "list_connections",
+        "run_command",
+        "list_directory",
+        "read_file",
+        "write_file",
+    } <= registered
+
+
+def test_ccm_ssh_server_hides_tools_outside_granted_capabilities(monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr(ccm_ssh_server.mcp, "remove_tool", removed.append)
+
+    ccm_ssh_server._restrict_tools_for_capabilities({"read"})
+
+    assert set(removed) == {"run_command", "write_file"}
 
 
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():

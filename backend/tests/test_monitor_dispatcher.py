@@ -78,6 +78,7 @@ def dispatcher(db_factory, mock_broadcaster):
 async def test_api_account_aux_home_survives_cancelled_unreaped_spawn(
     dispatcher, tmp_path, kind,
 ):
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     home = str(tmp_path / "api-account" / "claude")
     dispatcher.pool = MagicMock()
     dispatcher._pool_select = AsyncMock(return_value=home)
@@ -90,23 +91,30 @@ async def test_api_account_aux_home_survives_cancelled_unreaped_spawn(
         raise asyncio.CancelledError()
 
     dispatcher._launch_registered_aux_process = cancelled_spawn
-    with pytest.raises(asyncio.CancelledError):
-        if kind == "monitor":
-            await dispatcher._launch_monitor_agent(
-                prompt="monitor",
-                cwd=str(tmp_path),
-                model="claude-opus-4-8",
-                monitor_session_id=session_id,
-                mcp_config_path=tmp_path / "monitor.json",
-            )
-        else:
-            await dispatcher._launch_sub_agent(
-                prompt="child",
-                cwd=str(tmp_path),
-                model="claude-opus-4-8",
-                session_id=session_id,
-                mcp_config_path=tmp_path / "child.json",
-            )
+    with patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            if kind == "monitor":
+                await dispatcher._launch_monitor_agent(
+                    prompt="monitor",
+                    cwd=str(tmp_path),
+                    model="claude-opus-4-8",
+                    task_id=task_id,
+                    monitor_session_id=session_id,
+                    turn_generation=1,
+                    mcp_config_path=tmp_path / "monitor.json",
+                )
+            else:
+                await dispatcher._launch_sub_agent(
+                    prompt="child",
+                    cwd=str(tmp_path),
+                    model="claude-opus-4-8",
+                    task_id=task_id,
+                    session_id=session_id,
+                    mcp_config_path=tmp_path / "child.json",
+                )
 
     home_map = (
         dispatcher._monitor_config_dirs
@@ -339,6 +347,9 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     assert kwargs["mcp_specs"] == specs
     assert kwargs["mcp_specs"][0].required is True
     assert kwargs["disable_project_config"] is False
+    assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["task_ssh_protected_paths"]
     assert set(kwargs["mcp_specs"][0].enabled_tools) == {
         "get_context",
         "report_progress",
@@ -832,16 +843,22 @@ def test_build_monitor_agent_prompt_interval_guidance(dispatcher):
 async def test_launch_monitor_agent_raises_bash_max_timeout(dispatcher, tmp_path):
     """A one-check turn no longer scales shell timeout with interval."""
     dispatcher.pool = None
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     captured = {}
 
     async def fake_exec(*cmd, **kwargs):
         captured["env"] = kwargs["env"]
         return _fake_proc()
 
-    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec), patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
         await dispatcher._launch_monitor_agent(
             prompt="p", cwd="/tmp", model=None,
+            task_id=task_id,
             monitor_session_id=990001,
+            turn_generation=1,
             mcp_config_path=tmp_path / "mcp.json",
             interval_seconds=3600,
         )
@@ -856,6 +873,7 @@ async def test_launch_monitor_agent_keeps_larger_env_timeout(
 ):
     """环境里已有更大的 BASH_MAX_TIMEOUT_MS 时只抬不降。"""
     dispatcher.pool = None
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", "99999000")
     captured = {}
 
@@ -863,10 +881,15 @@ async def test_launch_monitor_agent_keeps_larger_env_timeout(
         captured["env"] = kwargs["env"]
         return _fake_proc()
 
-    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec), patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
         await dispatcher._launch_monitor_agent(
             prompt="p", cwd="/tmp", model=None,
+            task_id=task_id,
             monitor_session_id=990002,
+            turn_generation=1,
             mcp_config_path=tmp_path / "mcp.json",
             interval_seconds=300,
         )
@@ -1651,6 +1674,7 @@ async def test_codex_monitor_reuses_thread_with_read_only_generation_specs(
         assert kwargs["sandbox_mode"] == "read-only"
         assert kwargs["disable_autonomous_features"] is True
         assert kwargs["disable_project_config"] is True
+        assert kwargs["task_ssh_protected_paths"]
         # Monitor must never inherit the parent Task's ccm_skills server or
         # skill context. Its only model-visible capability is the exact
         # generation-fenced callback server.

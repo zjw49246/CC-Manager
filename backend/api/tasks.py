@@ -20,6 +20,7 @@ from backend.schemas.task import (
     TaskActionRequest,
     PlanApprovalRequest,
     TaskCreate,
+    InternalTaskSkillsUpdate,
     TaskMigrationImport,
     TaskResponse,
     TaskRoutingExpectation,
@@ -656,6 +657,8 @@ async def create_task(
         )
     if body.secret_ids:
         require_admin(request)
+    if body.ssh_grants:
+        require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
     supersedes: Task | None = None
@@ -720,6 +723,7 @@ async def create_task(
     file_paths = data.pop("file_paths", None)
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
+    ssh_grants = data.pop("ssh_grants", None) or []
     clone_from_task_id = data.pop("clone_from_task_id", None)
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
@@ -912,14 +916,46 @@ async def create_task(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
+    from backend.services.task_ssh_access import (
+        TaskSSHAccessError,
+        prepare_task_ssh_grants,
+        task_ssh_grant_rows,
+    )
+
+    try:
+        prepared_ssh_grants = await prepare_task_ssh_grants(
+            db,
+            ssh_grants,
+            worker_id=data.get("worker_id"),
+            shared_from_id=data.get("shared_from_id"),
+            metadata=data.get("metadata_"),
+            project_id=data.get("project_id"),
+        )
+    except TaskSSHAccessError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
     if supersedes is None:
-        task = await queue.create(**data)
+        task = await stage_task_record(db, **data)
+        if prepared_ssh_grants:
+            db.add_all(task_ssh_grant_rows(
+                task.id,
+                prepared_ssh_grants,
+                created_by=user_id,
+            ))
+        await db.commit()
+        await db.refresh(task)
     else:
         superseded_id = supersedes.id
         metadata = dict(data.get("metadata_") or {})
         metadata["revised_from_plan_task_id"] = superseded_id
         data["metadata_"] = metadata
         task = await stage_task_record(db, **data)
+        if prepared_ssh_grants:
+            db.add_all(task_ssh_grant_rows(
+                task.id,
+                prepared_ssh_grants,
+                created_by=user_id,
+            ))
         from backend.services.plan_tasks import mark_plan_superseded
 
         if not await mark_plan_superseded(
@@ -984,6 +1020,12 @@ async def import_migrated_task(
     data = body.model_dump()
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    ssh_grants = data.pop("ssh_grants", None)
+    if ssh_grants:
+        raise HTTPException(
+            400,
+            "Managed SSH grants cannot be imported to a Worker",
+        )
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -2379,6 +2421,27 @@ async def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@router.put(
+    "/{task_id}/internal/enabled-skills",
+    response_model=TaskResponse,
+)
+async def update_task_enabled_skills_internal(
+    task_id: int,
+    body: InternalTaskSkillsUpdate,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Apply only the skill toggle exposed to the scoped skills MCP."""
+
+    require_internal_service(request)
+    return await update_task(
+        task_id,
+        TaskUpdate(enabled_skills=body.enabled_skills),
+        request,
+        queue,
+    )
 
 
 async def _settle_task_launch_barrier(

@@ -9875,7 +9875,7 @@ class GlobalDispatcher:
                 *,
                 thread_id: str | None,
                 home: str | None,
-            ) -> None:
+            ) -> tuple[tuple[str, ...], bool]:
                 """Lock Task -> Monitor for one exact launch generation."""
 
                 task_guard = await db.execute(
@@ -9940,13 +9940,35 @@ class GlobalDispatcher:
                         "routing synchronization is pending"
                     )
 
-            async with self.db_factory() as db:
-                await guard_current_generation(
+                from backend.services.task_ssh_access import (
+                    task_ssh_protected_paths,
+                    valid_task_ssh_capabilities,
+                )
+
+                protected_paths = await task_ssh_protected_paths(
                     db,
-                    thread_id=(
-                        None if persisted_thread is None else str(persisted_thread)
-                    ),
-                    home=(None if persisted_home is None else str(persisted_home)),
+                    extra_paths=(admitted_home,),
+                )
+                direct_network_disabled = bool(
+                    await valid_task_ssh_capabilities(db, current_task)
+                )
+                return protected_paths, direct_network_disabled
+
+            async with self.db_factory() as db:
+                protected_paths, direct_network_disabled = (
+                    await guard_current_generation(
+                        db,
+                        thread_id=(
+                            None
+                            if persisted_thread is None
+                            else str(persisted_thread)
+                        ),
+                        home=(
+                            None
+                            if persisted_home is None
+                            else str(persisted_home)
+                        ),
+                    )
                 )
 
                 async def bind_started_thread(thread_id: str) -> None:
@@ -10070,6 +10092,8 @@ class GlobalDispatcher:
                     disable_project_config=True,
                     sandbox_mode="read-only",
                     disable_autonomous_features=True,
+                    task_ssh_protected_paths=protected_paths,
+                    task_ssh_disable_network=direct_network_disabled,
                     on_thread_started=bind_started_thread,
                     on_turn_prepared=publish_prepared_turn,
                 )
@@ -10254,7 +10278,9 @@ class GlobalDispatcher:
             prompt=prompt,
             cwd=str(snapshot["cwd"]),
             model=(None if snapshot["model"] is None else str(snapshot["model"])),
+            task_id=task_id,
             monitor_session_id=monitor_session_id,
+            turn_generation=generation,
             mcp_config_path=mcp_config_path,
             interval_seconds=int(snapshot["interval"]),
         )
@@ -10563,7 +10589,9 @@ class GlobalDispatcher:
         prompt: str,
         cwd: str,
         model: str | None,
+        task_id: int,
         monitor_session_id: int,
+        turn_generation: int,
         mcp_config_path: Path,
         interval_seconds: int = 300,
     ) -> asyncio.subprocess.Process:
@@ -10580,7 +10608,8 @@ class GlobalDispatcher:
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "acceptEdits",
             "--disallowedTools",
             "Edit,Write,NotebookEdit,Workflow,Agent,Monitor",
             "--mcp-config",
@@ -10594,7 +10623,17 @@ class GlobalDispatcher:
         env = {
             k: v
             for k, v in os.environ.items()
-            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+            if k.upper()
+            not in {
+                "AUTH_TOKEN",
+                "CCM_INTERNAL_SERVICE_TOKEN",
+                "CCM_ASK_USER_TOKEN",
+                "CLAUDECODE",
+                "CLAUDE_CODE",
+                "SSH_AUTH_SOCK",
+                "SSH_ASKPASS",
+                "SSH_AGENT_PID",
+            }
         }
         config_dir: str | None = None
 
@@ -10614,6 +10653,51 @@ class GlobalDispatcher:
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
+
+        from backend.services.task_agent_isolation import (
+            CLAUDE_MONITOR_BUILTIN_TOOLS,
+            generate_claude_aux_isolation_settings,
+            validate_claude_task_isolation_settings,
+        )
+        from backend.services.task_ssh_access import (
+            task_ssh_protected_paths,
+            valid_task_ssh_capabilities,
+        )
+
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if task is None:
+                raise RuntimeError("Monitor parent Task no longer exists")
+            direct_network_disabled = bool(
+                await valid_task_ssh_capabilities(db, task)
+            )
+            protected_paths = await task_ssh_protected_paths(
+                db,
+                extra_paths=(() if not config_dir else (config_dir,)),
+            )
+        isolation_path = generate_claude_aux_isolation_settings(
+            namespace="monitor",
+            identifier=monitor_session_id,
+            protected_paths=protected_paths,
+            turn_generation=turn_generation,
+            disable_direct_network=direct_network_disabled,
+        )
+        await asyncio.to_thread(
+            validate_claude_task_isolation_settings,
+            isolation_path,
+            claude_binary=settings.claude_binary,
+        )
+        cmd.extend([
+            "--settings",
+            str(isolation_path),
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--tools",
+            ",".join(CLAUDE_MONITOR_BUILTIN_TOOLS),
+        ])
 
         log_path = Path(f"/tmp/ccm_monitor_{monitor_session_id}.log")
         async with self.instance_manager._cloudrouter_runtime_admission(
@@ -10781,6 +10865,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     prompt=prompt,
                     cwd=task_cwd,
                     model=model,
+                    task_id=task_id,
                     session_id=session_id,
                     mcp_config_path=mcp_config_path,
                 )
@@ -10887,6 +10972,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         prompt: str,
         cwd: str,
         model: str | None,
+        task_id: int,
         session_id: int,
         mcp_config_path: Path,
     ) -> asyncio.subprocess.Process:
@@ -10898,7 +10984,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             "--output-format",
             "stream-json",
             "--verbose",
-            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "acceptEdits",
             "--disallowedTools",
             "Agent,Task,Monitor",
             "--mcp-config",
@@ -10912,7 +10999,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         env = {
             k: v
             for k, v in os.environ.items()
-            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
+            if k.upper()
+            not in {
+                "AUTH_TOKEN",
+                "CCM_INTERNAL_SERVICE_TOKEN",
+                "CCM_ASK_USER_TOKEN",
+                "CLAUDECODE",
+                "CLAUDE_CODE",
+                "SSH_AUTH_SOCK",
+                "SSH_ASKPASS",
+                "SSH_AGENT_PID",
+            }
         }
         config_dir: str | None = None
 
@@ -10921,6 +11018,50 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if config_dir:
                 env["CLAUDE_CONFIG_DIR"] = config_dir
                 self._sanitize_cloudrouter_claude_env(env, config_dir)
+
+        from backend.services.task_agent_isolation import (
+            CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
+            generate_claude_aux_isolation_settings,
+            validate_claude_task_isolation_settings,
+        )
+        from backend.services.task_ssh_access import (
+            task_ssh_protected_paths,
+            valid_task_ssh_capabilities,
+        )
+
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if task is None:
+                raise RuntimeError("Sub-Agent parent Task no longer exists")
+            direct_network_disabled = bool(
+                await valid_task_ssh_capabilities(db, task)
+            )
+            protected_paths = await task_ssh_protected_paths(
+                db,
+                extra_paths=(() if not config_dir else (config_dir,)),
+            )
+        isolation_path = generate_claude_aux_isolation_settings(
+            namespace="sub-agent",
+            identifier=session_id,
+            protected_paths=protected_paths,
+            disable_direct_network=direct_network_disabled,
+        )
+        await asyncio.to_thread(
+            validate_claude_task_isolation_settings,
+            isolation_path,
+            claude_binary=settings.claude_binary,
+        )
+        cmd.extend([
+            "--settings",
+            str(isolation_path),
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--tools",
+            ",".join(CLAUDE_SUB_AGENT_BUILTIN_TOOLS),
+        ])
 
         log_path = Path(f"/tmp/ccm_sub_agent_{session_id}.log")
         async with self.instance_manager._cloudrouter_runtime_admission(
@@ -11062,6 +11203,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 "Task routing synchronization is pending"
                             )
 
+                        from backend.services.task_ssh_access import (
+                            task_ssh_protected_paths,
+                            valid_task_ssh_capabilities,
+                        )
+
+                        protected_paths = await task_ssh_protected_paths(
+                            db,
+                            extra_paths=(admitted_home,),
+                        )
+                        direct_network_disabled = bool(
+                            await valid_task_ssh_capabilities(db, current_task)
+                        )
+
                         # Keep the Task→SubAgent DB barrier until start_turn has
                         # registered the native turn.  A concurrent Worker stage
                         # therefore either wins first and blocks us, or observes
@@ -11081,6 +11235,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             task_id=task_id,
                             mcp_specs=mcp_specs,
                             disable_project_config=disable_project_config,
+                            sandbox_mode="workspace-write",
+                            task_ssh_protected_paths=protected_paths,
+                            task_ssh_disable_network=direct_network_disabled,
+                            disable_autonomous_features=True,
                         )
                         # Registration is synchronous and deliberately occurs
                         # before the next await.  If DB commit is cancelled or

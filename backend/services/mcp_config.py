@@ -7,10 +7,8 @@ without changing either provider's runtime task-launch path.
 
 import json
 import math
-import os
 import re
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -60,6 +58,18 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
     "check_sub_agents",
     "stop_sub_agent",
 )
+CCM_SSH_TOOLS = (
+    "list_connections",
+    "run_command",
+    "list_directory",
+    "read_file",
+    "write_file",
+)
+CCM_SSH_CAPABILITY_TOOLS = {
+    "exec": ("run_command",),
+    "read": ("list_directory", "read_file"),
+    "write": ("write_file",),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +93,10 @@ class McpServerSpec:
         object.__setattr__(self, "enabled_tools", tuple(self.enabled_tools))
 
 
-def _api_base_and_auth_token(api_base: str | None) -> tuple[str, str]:
-    from backend.config import settings
+def _api_base(api_base: str | None) -> str:
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    if api_base is None:
-        host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-        api_base = f"http://{host}:{settings.port}"
-    return api_base, getattr(settings, "auth_token", "") or ""
+    return resolve_internal_api_base(api_base)
 
 
 def _ccm_server_spec(
@@ -99,23 +106,47 @@ def _ccm_server_spec(
     context_args: Sequence[str],
     enabled_tools: tuple[str, ...],
     api_base: str | None,
+    task_id: int | None = None,
+    monitor_session_id: int | None = None,
+    sub_agent_session_id: int | None = None,
+    credential_owner_kind: str,
+    credential_owner_id: str | int,
 ) -> McpServerSpec:
-    resolved_api_base, auth_token = _api_base_and_auth_token(api_base)
+    from backend.services.internal_service_auth import (
+        INTERNAL_TOKEN_ENV,
+        issue_internal_service_token,
+    )
+
+    resolved_api_base = _api_base(api_base)
     args = [
+        # Claude Code does not consistently honor ``cwd`` for stdio MCP
+        # entries. Safe-path mode plus an explicit PYTHONPATH pins imports to
+        # the running Manager checkout instead of the Task repository.
+        "-P",
         "-m",
         module,
         *context_args,
         "--api-base",
         resolved_api_base,
     ]
-    if auth_token:
-        args.extend(["--auth-token", auth_token])
+    scoped_token = issue_internal_service_token(
+        audience=name,
+        task_id=task_id,
+        monitor_session_id=monitor_session_id,
+        sub_agent_session_id=sub_agent_session_id,
+        owner_kind=credential_owner_kind,
+        owner_id=credential_owner_id,
+    )
+    server_env = {"PYTHONPATH": _CCM_ROOT}
+    if scoped_token:
+        server_env[INTERNAL_TOKEN_ENV] = scoped_token
 
     return McpServerSpec(
         name=name,
         command=_VENV_PYTHON,
         args=tuple(args),
         cwd=_CCM_ROOT,
+        env=server_env,
         required=True,
         enabled_tools=enabled_tools,
         # These are CCM-owned, task-scoped tools whose handlers enforce the
@@ -164,6 +195,39 @@ def build_mcp_server_specs(
             context_args=("--task-id", str(task_id)),
             enabled_tools=enabled_tools,
             api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
+        ),
+    )
+
+
+def build_task_ssh_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    capabilities: Sequence[str] = ("exec", "read", "write"),
+) -> tuple[McpServerSpec, ...]:
+    """Build the required, Task-scoped SSH capability server."""
+
+    enabled_tools = ["list_connections"]
+    selected = set(capabilities) & set(CCM_SSH_CAPABILITY_TOOLS)
+    for capability in ("exec", "read", "write"):
+        if capability in selected:
+            enabled_tools.extend(CCM_SSH_CAPABILITY_TOOLS[capability])
+    context_args = ["--task-id", str(task_id)]
+    for capability in sorted(selected):
+        context_args.extend(("--capability", capability))
+    return (
+        _ccm_server_spec(
+            name="ccm_ssh",
+            module="backend.mcp.ccm_ssh_server",
+            context_args=tuple(context_args),
+            enabled_tools=tuple(enabled_tools),
+            api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
         ),
     )
 
@@ -193,6 +257,14 @@ def build_monitor_agent_mcp_server_specs(
             context_args=tuple(context_args),
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            monitor_session_id=monitor_session_id,
+            credential_owner_kind="monitor-turn",
+            credential_owner_id=(
+                f"{monitor_session_id}:{turn_generation}"
+                if turn_generation is not None
+                else f"{monitor_session_id}:legacy"
+            ),
         ),
     )
 
@@ -210,6 +282,9 @@ def build_sub_agent_controller_mcp_server_specs(
             context_args=("--task-id", str(task_id)),
             enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
         ),
     )
 
@@ -233,6 +308,10 @@ def build_sub_agent_mcp_server_specs(
             ),
             enabled_tools=CCM_SUB_AGENT_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            sub_agent_session_id=session_id,
+            credential_owner_kind="sub-agent",
+            credential_owner_id=session_id,
         ),
     )
 
@@ -382,34 +461,57 @@ def render_codex_exec_config_args(specs: Sequence[McpServerSpec]) -> list[str]:
 
 def _write_claude_mcp_config(
     specs: Sequence[McpServerSpec],
-    config_path: Path,
+    *,
+    namespace: str,
+    identifier: int,
+    name: str,
 ) -> Path:
+    from backend.services.task_runtime_secrets import write_private_json
+
     config = render_claude_mcp_config(specs)
-    fd = os.open(str(config_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(config, f, indent=2)
-    return config_path
+    return write_private_json(
+        namespace,
+        identifier,
+        name,
+        cast(Mapping[str, object], config),
+    )
 
 
 def generate_mcp_config(
     task_id: int,
     enabled_skills: dict | None = None,
     api_base: str | None = None,
+    *,
+    task_ssh_capabilities: Sequence[str] = (),
 ) -> Path:
     """为指定 task 生成 MCP config JSON 文件。
 
     ccm_skills server 始终包含（提供 $help 等默认命令）。
     Returns: 临时文件路径，进程结束后由调用方清理。
     """
-    config_path = Path(tempfile.gettempdir()) / f"ccm_mcp_{task_id}.json"
     specs = build_mcp_server_specs(task_id, enabled_skills, api_base)
-    return _write_claude_mcp_config(specs, config_path)
+    if task_ssh_capabilities:
+        specs += build_task_ssh_mcp_server_specs(
+            task_id,
+            api_base,
+            capabilities=task_ssh_capabilities,
+        )
+    return _write_claude_mcp_config(
+        specs,
+        namespace="task",
+        identifier=task_id,
+        name="mcp.json",
+    )
 
 
 def cleanup_mcp_config(task_id: int):
     """清理临时 MCP config 文件。"""
-    config_path = Path(tempfile.gettempdir()) / f"ccm_mcp_{task_id}.json"
-    config_path.unlink(missing_ok=True)
+    from backend.services.task_runtime_secrets import remove_private_scope
+
+    remove_private_scope("task", task_id)
+    # Claude PTY and its MCP children persist across follow-up turns. Keep the
+    # cached, route/task-scoped credentials alive until bounded expiry or an
+    # explicit owner revocation; every endpoint still rechecks live state.
 
 
 def generate_monitor_agent_mcp_config(
@@ -423,12 +525,8 @@ def generate_monitor_agent_mcp_config(
     Returns:
         配置文件路径，调用方负责清理。
     """
-    generation_suffix = (
-        f"_{turn_generation}" if turn_generation is not None else ""
-    )
-    config_path = (
-        Path(tempfile.gettempdir())
-        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    generation_name = (
+        str(turn_generation) if turn_generation is not None else "legacy"
     )
     specs = build_monitor_agent_mcp_server_specs(
         monitor_session_id,
@@ -436,7 +534,12 @@ def generate_monitor_agent_mcp_config(
         api_base,
         turn_generation,
     )
-    return _write_claude_mcp_config(specs, config_path)
+    return _write_claude_mcp_config(
+        specs,
+        namespace="monitor",
+        identifier=monitor_session_id,
+        name=f"mcp-{generation_name}.json",
+    )
 
 
 def cleanup_monitor_agent_mcp_config(
@@ -444,14 +547,36 @@ def cleanup_monitor_agent_mcp_config(
     turn_generation: int | None = None,
 ):
     """清理 monitor 子 agent 的 MCP config 文件。"""
-    generation_suffix = (
-        f"_{turn_generation}" if turn_generation is not None else ""
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+        revoke_internal_service_owner_prefix,
     )
-    config_path = (
-        Path(tempfile.gettempdir())
-        / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
+    from backend.services.task_runtime_secrets import (
+        remove_private_file,
+        remove_private_scope,
     )
-    config_path.unlink(missing_ok=True)
+
+    if turn_generation is None:
+        remove_private_scope("monitor", monitor_session_id)
+        revoke_internal_service_owner_prefix(
+            "monitor-turn",
+            f"{monitor_session_id}:",
+        )
+    else:
+        remove_private_file(
+            "monitor",
+            monitor_session_id,
+            f"mcp-{turn_generation}.json",
+        )
+        remove_private_file(
+            "monitor",
+            monitor_session_id,
+            f"claude-security-{turn_generation}.json",
+        )
+        revoke_internal_service_owner(
+            "monitor-turn",
+            f"{monitor_session_id}:{turn_generation}",
+        )
 
 
 def generate_sub_agent_mcp_config(
@@ -462,12 +587,21 @@ def generate_sub_agent_mcp_config(
     Returns:
         配置文件路径，调用方负责清理。
     """
-    config_path = Path(tempfile.gettempdir()) / f"ccm_sub_agent_{session_id}.json"
     specs = build_sub_agent_mcp_server_specs(session_id, task_id, api_base)
-    return _write_claude_mcp_config(specs, config_path)
+    return _write_claude_mcp_config(
+        specs,
+        namespace="sub-agent",
+        identifier=session_id,
+        name="mcp.json",
+    )
 
 
 def cleanup_sub_agent_mcp_config(session_id: int):
     """清理 sub-agent 的 MCP config 文件。"""
-    config_path = Path(tempfile.gettempdir()) / f"ccm_sub_agent_{session_id}.json"
-    config_path.unlink(missing_ok=True)
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+    )
+    from backend.services.task_runtime_secrets import remove_private_scope
+
+    remove_private_scope("sub-agent", session_id)
+    revoke_internal_service_owner("sub-agent", session_id)

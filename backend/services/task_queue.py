@@ -10,6 +10,7 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.services.task_creation import stage_task_record
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
@@ -688,6 +689,13 @@ class TaskQueue:
                     PlanAgentRun.id.in_(plan_run_ids)
                 )
             )
+        # SQLite does not enable foreign-key cascades consistently across all
+        # supported deployment/test connection paths.  Keep SSH grants inside
+        # the same generation-fenced transaction so a deleted Task can never
+        # leave reusable authorization behind (or collide if its id is reused).
+        await self.db.execute(
+            sa_delete(TaskSSHGrant).where(TaskSSHGrant.task_id == task_id)
+        )
         if monitor_ids:
             await self.db.execute(
                 sa_delete(MonitorCheck).where(
@@ -711,6 +719,11 @@ class TaskQueue:
             await self.db.rollback()
             return False
         await self.db.commit()
+        from backend.services.internal_service_auth import (
+            revoke_internal_service_owner,
+        )
+
+        revoke_internal_service_owner("task-turn", task_id)
         return True
 
     async def dequeue(

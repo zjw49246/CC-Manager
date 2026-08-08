@@ -38,9 +38,19 @@ async def share_task(
     targets: list of {"open_id": str, "name": str, "ccm_url": str}
     Returns list of created share records (as dicts).
     """
-    task = await db.get(Task, task_id)
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if not task:
         raise ValueError(f"Task {task_id} not found")
+    from backend.services.task_ssh_access import task_has_any_ssh_grants
+
+    if await task_has_any_ssh_grants(db, task_id):
+        raise ValueError(
+            "Remove this Task's SSH grants before sharing it"
+        )
 
     identity = await _get_my_identity(db)
     if not identity:
@@ -183,9 +193,25 @@ async def share_project(
     targets: list[dict],
 ) -> list[dict]:
     """Share a project (and all its current tasks) with members."""
-    project = await db.get(Project, project_id)
+    project = (
+        await db.execute(
+            select(Project).where(Project.id == project_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if not project:
         raise ValueError(f"Project {project_id} not found")
+    await db.execute(
+        select(Task.id)
+        .where(Task.project_id == project_id)
+        .order_by(Task.id)
+        .with_for_update()
+    )
+    from backend.services.task_ssh_access import project_has_task_ssh_grants
+
+    if await project_has_task_ssh_grants(db, project_id):
+        raise ValueError(
+            "Remove SSH grants from this Project's Tasks before sharing it"
+        )
 
     created = []
     for target in targets:
