@@ -30,9 +30,9 @@ _MARKER = "ask_user_hook.py"  # 识别"我们的"hook 项
 
 def _hook_command() -> str:
     from backend.config import settings
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-    api_base = f"http://{host}:{settings.port}"
+    api_base = resolve_internal_api_base()
     python = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else "python3"
     timeout = int(getattr(settings, "ask_user_timeout", 1800)) + 60
 

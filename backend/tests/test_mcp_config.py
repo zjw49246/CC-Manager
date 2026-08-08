@@ -11,18 +11,26 @@ from backend.mcp import (
     ccm_monitor_agent_server,
     ccm_skills_server,
     ccm_sub_agent_server,
+    ccm_workspace_review_server,
 )
 from backend.services import mcp_config
+from backend.services import internal_api_endpoint
 from backend.services.mcp_config import (
+    CCM_BROWSER_REVIEW_TOOLS,
+    CCM_FRONTEND_REVIEW_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
     CCM_SUB_AGENT_CONTROLLER_TOOLS,
     CCM_SUB_AGENT_TOOLS,
+    CCM_WORKSPACE_REVIEW_TOOLS,
     McpServerSpec,
     build_mcp_server_specs,
+    build_browser_review_mcp_server_specs,
+    build_frontend_review_mcp_server_specs,
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
+    build_workspace_review_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
     cleanup_sub_agent_mcp_config,
@@ -96,11 +104,74 @@ def test_generate_mcp_config_empty_skills_still_includes_ccm_skills():
 
 
 def test_generate_mcp_config_skills_do_not_add_extra_servers():
-    """启用任意 skill 不再产生独立的 per-skill server，只有 ccm_skills 一个入口。"""
+    """普通 skill 不增加服务；固定的 Task 工具服务保持存在。"""
     path = generate_mcp_config(1, {"worker": True, "monitor": True}, api_base="http://localhost:8000")
     config = json.loads(path.read_text())
-    assert set(config["mcpServers"].keys()) == {"ccm_skills"}
+    assert set(config["mcpServers"].keys()) == {
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    }
     path.unlink(missing_ok=True)
+
+
+def test_browser_review_adds_required_task_scoped_server():
+    specs = build_mcp_server_specs(
+        73,
+        {"browser-review": "job-abc"},
+        api_base="http://127.0.0.1:8795",
+        provider="codex",
+    )
+
+    assert [spec.name for spec in specs] == ["ccm_browser_review"]
+    browser_spec = specs[0]
+    assert browser_spec == build_browser_review_mcp_server_specs(
+        "job-abc",
+        api_base="http://127.0.0.1:8795",
+    )[0]
+    assert browser_spec.required is True
+    assert browser_spec.enabled_tools == CCM_BROWSER_REVIEW_TOOLS
+    assert "backend.mcp.ccm_browser_review_server" in browser_spec.args
+    assert "--job-id" in browser_spec.args
+    assert "job-abc" in browser_spec.args
+
+
+def test_ordinary_task_adds_repeatable_frontend_review_server():
+    specs = build_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+        provider="codex",
+    )
+
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
+    frontend_spec = specs[1]
+    assert frontend_spec == build_frontend_review_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+    )[0]
+    assert frontend_spec.enabled_tools == CCM_FRONTEND_REVIEW_TOOLS
+    assert frontend_spec.enabled_tools == ("start_review", "check_review", "stop_review")
+    assert "browser_open" not in frontend_spec.enabled_tools
+    assert "--task-id" in frontend_spec.args
+    assert "73" in frontend_spec.args
+    workspace_spec = specs[2]
+    assert workspace_spec == build_workspace_review_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+    )[0]
+    assert workspace_spec.enabled_tools == CCM_WORKSPACE_REVIEW_TOOLS
+    assert workspace_spec.enabled_tools == (
+        "workspace_review_capabilities",
+        "test_current_changes",
+        "check_current_changes_review",
+        "stop_current_changes_review",
+        "test_git_target",
+        "compare_test_runs",
+    )
 
 
 def test_generate_mcp_config_monitor_enabled():
@@ -140,15 +211,17 @@ def _set_spec_snapshot_runtime(monkeypatch):
 def test_main_mcp_server_spec_snapshot(monkeypatch):
     _set_spec_snapshot_runtime(monkeypatch)
 
-    assert build_mcp_server_specs(
+    specs = build_mcp_server_specs(
         42,
         {"monitor": True},
         api_base="http://manager:8321",
-    ) == (
+    )
+    assert specs[0] == (
         McpServerSpec(
             name="ccm_skills",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -159,13 +232,18 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_MAIN_TOOLS,
             default_tools_approval_mode="approve",
             startup_timeout_sec=10.0,
             tool_timeout_sec=60.0,
-        ),
+        )
     )
+    assert specs[1] == build_frontend_review_mcp_server_specs(
+        42,
+        api_base="http://manager:8321",
+    )[0]
     assert CCM_SKILLS_TOOLS == EXPECTED_MAIN_TOOLS
 
 
@@ -181,6 +259,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_monitor_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -193,6 +272,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_MONITOR_TOOLS,
             default_tools_approval_mode="approve",
@@ -213,7 +293,7 @@ def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
         turn_generation=9,
     )[0]
 
-    assert spec.args[2:8] == (
+    assert spec.args[3:9] == (
         "--monitor-session-id",
         "7",
         "--task-id",
@@ -235,6 +315,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_sub_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -247,6 +328,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
                 "secret-token",
             ),
             cwd="/srv/ccm",
+            env={"PYTHONPATH": "/srv/ccm"},
             required=True,
             enabled_tools=EXPECTED_SUB_AGENT_TOOLS,
             default_tools_approval_mode="approve",
@@ -283,6 +365,7 @@ def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
         (ccm_skills_server, CCM_SKILLS_TOOLS),
         (ccm_monitor_agent_server, CCM_MONITOR_AGENT_TOOLS),
         (ccm_sub_agent_server, CCM_SUB_AGENT_TOOLS),
+        (ccm_workspace_review_server, CCM_WORKSPACE_REVIEW_TOOLS),
     ],
 )
 def test_spec_enabled_tools_match_registered_server_tools(
@@ -301,6 +384,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_mcp_config(42),
             "ccm_skills",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -313,6 +397,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_monitor_agent_mcp_config(7),
             "ccm_monitor_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -327,6 +412,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_sub_agent_mcp_config(9),
             "ccm_sub_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -350,44 +436,63 @@ def test_claude_json_output_remains_compatible(
 
     path = generator(*generator_args, api_base=api_base)
     try:
-        assert json.loads(path.read_text()) == {
-            "mcpServers": {
-                expected_name: {
-                    "command": "/srv/ccm/.venv/bin/python3",
-                    "args": [
-                        *expected_args,
-                        "--api-base",
-                        api_base,
-                        "--auth-token",
-                        "secret-token",
-                    ],
-                    "cwd": "/srv/ccm",
-                }
-            }
+        servers = json.loads(path.read_text())["mcpServers"]
+        assert servers[expected_name] == {
+            "command": "/srv/ccm/.venv/bin/python3",
+            "args": [
+                *expected_args,
+                "--api-base",
+                api_base,
+                "--auth-token",
+                "secret-token",
+            ],
+            "cwd": "/srv/ccm",
+            "env": {"PYTHONPATH": "/srv/ccm"},
         }
+        expected_names = {expected_name}
+        if expected_name == "ccm_skills":
+            expected_names.add("ccm_frontend_review")
+            expected_names.add("ccm_workspace_review")
+            assert "--task-id" in servers["ccm_frontend_review"]["args"]
+            assert "--task-id" in servers["ccm_workspace_review"]["args"]
+        assert set(servers) == expected_names
     finally:
         cleanup()
 
 
 def test_default_api_base_and_empty_auth_token(monkeypatch):
+    monkeypatch.setattr(internal_api_endpoint, "_observed_api_base", None)
     monkeypatch.setattr(settings, "host", "0.0.0.0")
     monkeypatch.setattr(settings, "port", 8321)
+    monkeypatch.setattr(settings, "internal_api_base_url", "")
     monkeypatch.setattr(settings, "auth_token", "")
 
-    (spec,) = build_mcp_server_specs(42)
+    spec = build_mcp_server_specs(42)[0]
 
     assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8321")
     assert "--auth-token" not in spec.args
 
 
+def test_observed_asgi_port_overrides_cli_stale_settings(monkeypatch):
+    monkeypatch.setattr(internal_api_endpoint, "_observed_api_base", None)
+    monkeypatch.setattr(settings, "host", "0.0.0.0")
+    monkeypatch.setattr(settings, "port", 8000)
+    monkeypatch.setattr(settings, "internal_api_base_url", "")
+
+    internal_api_endpoint.observe_asgi_server(("127.0.0.1", 8803))
+    spec = build_mcp_server_specs(42)[0]
+
+    assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8803")
+
+
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
-    (claude_spec,) = build_mcp_server_specs(42, provider="claude")
-    (closed_codex_spec,) = build_mcp_server_specs(42, provider="codex")
-    (local_codex_spec,) = build_mcp_server_specs(
+    claude_spec = build_mcp_server_specs(42, provider="claude")[0]
+    closed_codex_spec = build_mcp_server_specs(42, provider="codex")[0]
+    local_codex_spec = build_mcp_server_specs(
         42,
         provider="codex",
         codex_monitor_enabled=True,
-    )
+    )[0]
 
     monitor_tools = {"create_monitor", "check_monitors", "stop_monitor"}
     assert monitor_tools.issubset(claude_spec.enabled_tools)
@@ -412,16 +517,21 @@ def test_platform_paths_are_preserved(monkeypatch, root, python):
     monkeypatch.setattr(mcp_config, "_VENV_PYTHON", python)
     monkeypatch.setattr(settings, "auth_token", "")
 
-    (spec,) = build_mcp_server_specs(
+    spec = build_mcp_server_specs(
         42,
         api_base="http://127.0.0.1:8000",
-    )
+    )[0]
     rendered = render_claude_mcp_config((spec,))
 
     assert spec.command == python
     assert spec.cwd == root
+    assert spec.args[:3] == ("-P", "-m", "backend.mcp.ccm_skills_server")
+    assert dict(spec.env) == {"PYTHONPATH": root}
     assert rendered["mcpServers"]["ccm_skills"]["command"] == python
     assert rendered["mcpServers"]["ccm_skills"]["cwd"] == root
+    assert rendered["mcpServers"]["ccm_skills"]["env"] == {
+        "PYTHONPATH": root,
+    }
 
 
 def test_claude_renderer_includes_env_but_not_provider_metadata():
@@ -590,7 +700,11 @@ def test_codex_renderers_share_each_role_spec(
 
     app_server_config = render_codex_mcp_config(specs)
 
-    assert set(app_server_config["mcp_servers"]) == {expected_name}
+    expected_names = {expected_name}
+    if expected_name == "ccm_skills":
+        expected_names.add("ccm_frontend_review")
+        expected_names.add("ccm_workspace_review")
+    assert set(app_server_config["mcp_servers"]) == expected_names
     assert (
         app_server_config["mcp_servers"][expected_name][
             "default_tools_approval_mode"

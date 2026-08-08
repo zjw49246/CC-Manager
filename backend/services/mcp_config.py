@@ -60,6 +60,33 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
     "check_sub_agents",
     "stop_sub_agent",
 )
+CCM_BROWSER_REVIEW_TOOLS = (
+    "browser_open",
+    "browser_observe",
+    "browser_inspect",
+    "browser_scroll",
+    "browser_wait",
+    "browser_move",
+    "browser_click",
+    "browser_double_click",
+    "browser_type_text",
+    "browser_keypress",
+    "browser_drag",
+    "finish_review",
+)
+CCM_FRONTEND_REVIEW_TOOLS = (
+    "start_review",
+    "check_review",
+    "stop_review",
+)
+CCM_WORKSPACE_REVIEW_TOOLS = (
+    "workspace_review_capabilities",
+    "test_current_changes",
+    "check_current_changes_review",
+    "stop_current_changes_review",
+    "test_git_target",
+    "compare_test_runs",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +112,12 @@ class McpServerSpec:
 
 def _api_base_and_auth_token(api_base: str | None) -> tuple[str, str]:
     from backend.config import settings
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    if api_base is None:
-        host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-        api_base = f"http://{host}:{settings.port}"
-    return api_base, getattr(settings, "auth_token", "") or ""
+    return (
+        resolve_internal_api_base(api_base),
+        getattr(settings, "auth_token", "") or "",
+    )
 
 
 def _ccm_server_spec(
@@ -102,6 +130,12 @@ def _ccm_server_spec(
 ) -> McpServerSpec:
     resolved_api_base, auth_token = _api_base_and_auth_token(api_base)
     args = [
+        # Claude Code currently ignores the non-standard ``cwd`` field in an
+        # --mcp-config stdio entry.  Without safe-path mode, ``python -m``
+        # therefore imports ``backend`` from the Task checkout when that
+        # checkout is another CCM clone.  Pin module resolution to the running
+        # Manager checkout instead of whichever repository the agent reviews.
+        "-P",
         "-m",
         module,
         *context_args,
@@ -116,6 +150,7 @@ def _ccm_server_spec(
         command=_VENV_PYTHON,
         args=tuple(args),
         cwd=_CCM_ROOT,
+        env={"PYTHONPATH": _CCM_ROOT},
         required=True,
         enabled_tools=enabled_tools,
         # These are CCM-owned, task-scoped tools whose handlers enforce the
@@ -157,12 +192,87 @@ def build_mcp_server_specs(
             if tool not in CODEX_UNSUPPORTED_MAIN_TOOLS
         )
 
-    return (
+    browser_review_job_id = (enabled_skills or {}).get("browser-review")
+    if isinstance(browser_review_job_id, str) and browser_review_job_id.strip():
+        # A fixed Browser Review Task is a deliberately context-minimized
+        # black-box agent. It receives only the bound browser evidence tools,
+        # never the ordinary Task controller/context toolset.
+        return build_browser_review_mcp_server_specs(
+            browser_review_job_id.strip(),
+            api_base=api_base,
+        )
+
+    specs = [
         _ccm_server_spec(
             name="ccm_skills",
             module="backend.mcp.ccm_skills_server",
             context_args=("--task-id", str(task_id)),
             enabled_tools=enabled_tools,
+            api_base=api_base,
+        ),
+    ]
+    specs.extend(
+        build_frontend_review_mcp_server_specs(task_id, api_base=api_base)
+    )
+    specs.extend(
+        build_workspace_review_mcp_server_specs(task_id, api_base=api_base)
+    )
+    return tuple(specs)
+
+
+def build_frontend_review_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Expose repeatable browser review tools inside an ordinary Task."""
+
+    if task_id <= 0:
+        raise ValueError("task id must be positive")
+    return (
+        _ccm_server_spec(
+            name="ccm_frontend_review",
+            module="backend.mcp.ccm_browser_review_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=CCM_FRONTEND_REVIEW_TOOLS,
+            api_base=api_base,
+        ),
+    )
+
+
+def build_browser_review_mcp_server_specs(
+    job_id: str,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Build the isolated, task-scoped browser tools for one review job."""
+
+    normalized_job_id = job_id.strip()
+    if not normalized_job_id:
+        raise ValueError("browser review job id cannot be empty")
+    return (
+        _ccm_server_spec(
+            name="ccm_browser_review",
+            module="backend.mcp.ccm_browser_review_server",
+            context_args=("--job-id", normalized_job_id),
+            enabled_tools=CCM_BROWSER_REVIEW_TOOLS,
+            api_base=api_base,
+        ),
+    )
+
+
+def build_workspace_review_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Expose current-branch Preview + isolated Browser Agent orchestration."""
+
+    if task_id <= 0:
+        raise ValueError("task id must be positive")
+    return (
+        _ccm_server_spec(
+            name="ccm_workspace_review",
+            module="backend.mcp.ccm_workspace_review_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=CCM_WORKSPACE_REVIEW_TOOLS,
             api_base=api_base,
         ),
     )

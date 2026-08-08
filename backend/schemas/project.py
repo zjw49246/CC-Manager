@@ -57,6 +57,7 @@ class ProjectResponse(BaseModel):
     sort_order: int
     tags: list[str]
     env_files: list[str]
+    preview_config: dict | None = None
     git_author_name: str | None
     git_author_email: str | None
     git_credential_type: str | None

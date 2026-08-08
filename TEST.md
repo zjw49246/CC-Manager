@@ -1260,6 +1260,11 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/mcp/ccm_skills_server.py` | `backend/tests/test_mcp_server.py` |
 | `backend/models/monitor_session.py` | `backend/tests/test_monitor_models.py` |
 | `backend/services/mcp_config.py` | `backend/tests/test_mcp_config.py` |
+| `backend/services/browser_review.py` | `backend/tests/test_browser_review.py` |
+| `backend/services/browser_review_jobs.py` | `backend/tests/test_browser_review_jobs.py` |
+| `backend/services/test_harness.py` + `test_harness_contracts.py` + `test_harness_targets.py` + `backend/api/test_harness.py` | `backend/tests/test_test_harness.py` + `test_test_harness_contracts.py` + `test_test_harness_targets.py` + `test_api_test_harness.py` + migration tests |
+| `backend/api/browser_reviews.py` + `backend/mcp/ccm_browser_review_server.py` | `backend/tests/test_api_browser_reviews.py` + `backend/tests/test_mcp_config.py` + 真实浏览器冒烟 |
+| `backend/services/workspace_review.py` + `backend/services/workspace_review_intent.py` + `backend/api/workspace_reviews.py` + `backend/mcp/ccm_workspace_review_server.py` | `backend/tests/test_workspace_review.py` + `backend/tests/test_workspace_review_intent.py` + `backend/tests/test_api_workspace_reviews.py` + `frontend/src/components/Chat/{ChatView,BrowserReviewPanel}.test.tsx` |
 | `backend/api/monitor.py` | `backend/tests/test_api_monitor.py` |
 | `backend/api/settings.py` (runtime) | `backend/tests/test_api_settings_runtime.py`（含 context_compact_threshold 默认/更新/越界拒绝） |
 | `backend/services/dispatcher.py` (monitor) | `backend/tests/test_monitor_dispatcher.py` |
@@ -1269,6 +1274,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/api/pr_monitor.py` | curl 测试 CRUD + webhook |
 | `backend/services/pr_review_service.py` | 集成测试（webhook → task 创建） |
 | `frontend/src/pages/PRMonitorPage.tsx` | TypeScript 类型检查 + 手动 UI 测试 |
+| `frontend/src/pages/BrowserReviewPage.tsx` | `frontend/src/pages/BrowserReviewPage.test.tsx` + TypeScript build + 手动 UI 测试 |
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
 | `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
 

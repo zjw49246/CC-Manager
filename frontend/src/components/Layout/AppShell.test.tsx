@@ -125,6 +125,7 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Browser Review' })).not.toBeInTheDocument();
   });
 
   it('marks Plans navigation when a Plan requires user action', async () => {

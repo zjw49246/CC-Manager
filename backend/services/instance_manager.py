@@ -891,6 +891,7 @@ class InstanceManager:
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
+        browser_review_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -921,6 +922,27 @@ class InstanceManager:
                 )
 
                 pr_review_task = is_pr_sandbox_task(task)
+                task_browser_job_id = (
+                    task.enabled_skills.get("browser-review")
+                    if isinstance(task.enabled_skills, dict)
+                    else None
+                )
+                supplied_browser_job_id = (
+                    enabled_skills.get("browser-review")
+                    if isinstance(enabled_skills, dict)
+                    else None
+                )
+                browser_review_task = bool(
+                    isinstance(task_browser_job_id, str)
+                    and task_browser_job_id.strip()
+                )
+                if (
+                    browser_review_task
+                    and supplied_browser_job_id != task_browser_job_id
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent launch lost its exact bound MCP job"
+                    )
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -947,7 +969,7 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
-                if pr_review_task:
+                if pr_review_task or browser_review_task:
                     # PR input is already snapshotted into the fixed prompt.
                     # No ambient skills or monitor capability may reintroduce
                     # filesystem/network tools.
@@ -1070,6 +1092,27 @@ class InstanceManager:
             and settings.codex_main_mcp_enabled
             and not pr_review_task
         )
+        browser_review_job_id = (
+            enabled_skills.get("browser-review")
+            if isinstance(enabled_skills, dict)
+            else None
+        )
+        codex_browser_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and isinstance(browser_review_job_id, str)
+            and browser_review_job_id.strip()
+        )
+        if browser_review_task and not codex_browser_mcp_required and provider == "codex":
+            raise CodexRequiredMcpError(
+                "Codex Browser Agent lost its required bound Browser MCP"
+            )
+        codex_frontend_review_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and not pr_review_task
+            and not codex_browser_mcp_required
+        )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
             and task_id is not None
@@ -1078,7 +1121,10 @@ class InstanceManager:
             and not pr_review_task
         )
         codex_mcp_required = (
-            codex_main_mcp_required or codex_sub_agent_mcp_required
+            codex_main_mcp_required
+            or codex_browser_mcp_required
+            or codex_frontend_review_mcp_required
+            or codex_sub_agent_mcp_required
         )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
@@ -1091,12 +1137,37 @@ class InstanceManager:
                 provider=provider,
                 codex_monitor_enabled=codex_monitor_enabled,
             )
-        elif codex_sub_agent_mcp_required:
-            from backend.services.mcp_config import (
-                build_sub_agent_controller_mcp_server_specs,
-            )
+        else:
+            direct_specs: list["McpServerSpec"] = []
+            if codex_browser_mcp_required:
+                from backend.services.mcp_config import (
+                    build_browser_review_mcp_server_specs,
+                )
 
-            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+                direct_specs.extend(
+                    build_browser_review_mcp_server_specs(browser_review_job_id)
+                )
+            elif codex_frontend_review_mcp_required:
+                from backend.services.mcp_config import (
+                    build_frontend_review_mcp_server_specs,
+                    build_workspace_review_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_frontend_review_mcp_server_specs(task_id)
+                )
+                direct_specs.extend(
+                    build_workspace_review_mcp_server_specs(task_id)
+                )
+            if codex_sub_agent_mcp_required:
+                from backend.services.mcp_config import (
+                    build_sub_agent_controller_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_sub_agent_controller_mcp_server_specs(task_id)
+                )
+            codex_mcp_specs = tuple(direct_specs)
 
         if (
             provider == "codex"
@@ -1128,11 +1199,11 @@ class InstanceManager:
 
         if (
             provider == "codex"
-            and pr_review_task
+            and (pr_review_task or browser_review_task)
             and not settings.codex_app_server_enabled
         ):
             raise CodexRequiredMcpError(
-                "Codex PR review isolation requires the app-server read-only "
+                "Codex isolated review requires the app-server read-only "
                 "sandbox; exec fallback is disabled"
             )
 
@@ -1162,15 +1233,19 @@ class InstanceManager:
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
+                            or browser_review_task
                         ),
                         codex_service_tier=codex_service_tier,
                         sandbox_mode=(
                             "read-only"
-                            if pr_review_task
+                            if pr_review_task or browser_review_task
                             else "danger-full-access"
                         ),
-                        disable_autonomous_features=pr_review_task,
+                        disable_autonomous_features=(
+                            pr_review_task or browser_review_task
+                        ),
                         tools_disabled=pr_review_task,
+                        mcp_only=browser_review_task,
                     )
                     logger.info(
                         "Codex transport selected route=app-server task_id=%s "
@@ -1182,9 +1257,9 @@ class InstanceManager:
                     )
                     return pid
                 except CodexRequiredMcpPreTurnError as exc:
-                    if pr_review_task:
+                    if pr_review_task or browser_review_task:
                         raise CodexRequiredMcpError(
-                            "Codex PR review read-only sandbox could not be "
+                            "Codex isolated review sandbox could not be "
                             "confirmed before turn/start"
                         ) from exc
                     if codex_service_tier == "priority":
@@ -1193,7 +1268,11 @@ class InstanceManager:
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
                     if (
-                        codex_main_mcp_required
+                        (
+                            codex_main_mcp_required
+                            or codex_browser_mcp_required
+                            or codex_frontend_review_mcp_required
+                        )
                         and not codex_sub_agent_mcp_required
                     ):
                         codex_exec_route = "safe-fallback"
@@ -1240,14 +1319,14 @@ class InstanceManager:
                     )
                     raise
                 except Exception as exc:
-                    if pr_review_task:
+                    if pr_review_task or browser_review_task:
                         logger.exception(
-                            "Codex PR review app-server failed; refusing "
+                            "Codex isolated review app-server failed; refusing "
                             "unsandboxed exec fallback task_id=%s",
                             task_id,
                         )
                         raise CodexRequiredMcpError(
-                            "Codex PR review isolation could not be guaranteed"
+                            "Codex isolated review boundary could not be guaranteed"
                         ) from exc
                     if codex_service_tier == "priority":
                         # exec --json does not expose an accepted/effective
@@ -1292,6 +1371,7 @@ class InstanceManager:
             provider == "claude"
             and self.pty_mode_enabled
             and not pr_review_task
+            and not browser_review_task
         ):
             return await self._launch_pty(
                 instance_id=instance_id,
@@ -1319,7 +1399,7 @@ class InstanceManager:
                 queue_timestamp=queue_timestamp,
             )
 
-        if provider == "codex" and pr_review_task:
+        if provider == "codex" and (pr_review_task or browser_review_task):
             raise CodexRequiredMcpError(
                 "Codex PR review isolation forbids exec fallback"
             )
@@ -1338,11 +1418,13 @@ class InstanceManager:
             task_id=task_id,
             skill_context=task_skill_context,
             codex_mcp_specs=(
-                codex_mcp_specs if codex_main_mcp_required else ()
+                codex_mcp_specs if codex_mcp_required else ()
             ),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
-            tools_disabled=pr_review_task,
+            tools_disabled=(
+                pr_review_task or (provider == "claude" and browser_review_task)
+            ),
         )
         if provider == "codex":
             logger.info(
@@ -1352,7 +1434,7 @@ class InstanceManager:
                 task_id,
                 instance_id,
                 config_dir,
-                codex_main_mcp_required,
+                codex_mcp_required,
             )
 
         # Must unset CLAUDE_CODE env var to avoid nested session detection
@@ -2052,6 +2134,7 @@ class InstanceManager:
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
+        mcp_only: bool = False,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -2074,6 +2157,7 @@ class InstanceManager:
             sandbox_mode=sandbox_mode,
             disable_autonomous_features=disable_autonomous_features,
             tools_disabled=tools_disabled,
+            mcp_only=mcp_only,
         )
         # Keep thread-scoped cleanup ownership on the exact native turn. Fresh
         # dispatcher launches do not populate ``_launch_params`` (that cache is
@@ -5241,6 +5325,8 @@ class InstanceManager:
                     "--disable-slash-commands",
                     "--exclude-dynamic-system-prompt-sections",
                 ])
+                if mcp_config_path and Path(mcp_config_path).exists():
+                    cmd.extend(["--mcp-config", mcp_config_path])
                 return cmd
             from backend.services.skill_loader import (
                 discover_skills,
@@ -10089,6 +10175,29 @@ class InstanceManager:
                         instance_id,
                     )
             await self._pty_backend.stop(instance_id)
+            # claude-pty normally completes its asyncio-compatible proxy from
+            # the consumer's on_exit callback. A forced Interrupt may cancel
+            # that consumer after the native Session has already reaped the
+            # Claude process, leaving proxy.wait() blocked forever even though
+            # there is no live child left. Bridge only from exact native death
+            # evidence; a still-live or unknown Session remains fail-closed.
+            if process.returncode is None:
+                native_session = getattr(process, "session", None)
+                native_dead = (
+                    native_session is not None
+                    and getattr(native_session, "is_alive", None) is False
+                )
+                complete_proxy = getattr(process, "complete", None)
+                if native_dead and callable(complete_proxy):
+                    native_process = getattr(native_session, "_process", None)
+                    native_exit_code = getattr(
+                        native_process, "exit_code", None
+                    )
+                    complete_proxy(
+                        native_exit_code
+                        if isinstance(native_exit_code, int)
+                        else 130
+                    )
             try:
                 await self._wait_process_tree(instance_id, process, 10.0)
             except asyncio.TimeoutError:

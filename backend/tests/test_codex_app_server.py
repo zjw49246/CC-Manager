@@ -138,6 +138,52 @@ async def _start_tool_free_test_turn(
     )
 
 
+async def _start_mcp_only_test_turn(
+    server: CodexAppServer,
+) -> tuple[CodexTurnProcess, str]:
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "config": {
+                "mcp_servers": {"ambient": {"command": "/bin/false"}},
+            },
+            "origins": {},
+        },
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
+        _tool_free_thread_response("thread-mcp-only"),
+        {"turn": {"id": "turn-mcp-only"}},
+    ])
+    browser_spec = McpServerSpec(
+        name="ccm_browser_review",
+        command="python",
+        args=("-m", "backend.mcp.ccm_browser_review_server"),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("browser_open", "browser_inspect"),
+    )
+    return await server.start_turn(
+        prompt="use only the bound browser MCP",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=991,
+        mcp_specs=(browser_spec,),
+        disable_project_config=True,
+        sandbox_mode="read-only",
+        disable_autonomous_features=True,
+        mcp_only=True,
+    )
+
+
 def _write_schema_filtering_app_server(path: Path) -> None:
     """Write a stdio peer that models Codex 0.144.6's serde boundary."""
 
@@ -1160,6 +1206,72 @@ async def test_tool_free_profile_allows_only_audited_passive_items():
             "id": "turn-tool-free-test",
             "status": "completed",
         },
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_only_profile_keeps_bound_mcp_and_denies_ambient_capabilities():
+    server = CodexAppServer("codex")
+    process, thread_id = await _start_mcp_only_test_turn(server)
+
+    thread_params = server._request.await_args_list[2].args[1]
+    config = thread_params["config"]
+    assert config["mcp_servers"]["ambient"] == {"enabled": False}
+    assert config["mcp_servers"]["ccm_browser_review"]["required"] is True
+    assert config["orchestrator"]["mcp"] == {"enabled": True}
+    assert thread_params["environments"] == []
+    assert thread_params["runtimeWorkspaceRoots"] == []
+    assert thread_params["dynamicTools"] == []
+
+    context = server._contexts_by_thread[thread_id]
+    assert context.mcp_only is True
+    server._schedule_tool_free_violation = MagicMock()
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-1",
+            "type": "mcpToolCall",
+            "server": "ccm_browser_review",
+            "tool": "browser_open",
+        },
+    })
+    server._handle_notification("item/mcpToolCall/progress", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "itemId": "mcp-1",
+    })
+    server._schedule_tool_free_violation.assert_not_called()
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {"id": "cmd-1", "type": "commandExecution"},
+    })
+    server._schedule_tool_free_violation.assert_called_once_with(
+        context,
+        "item/started item type 'commandExecution'",
+    )
+
+    server._schedule_tool_free_violation.reset_mock()
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-rogue",
+            "type": "mcpToolCall",
+            "server": "ambient",
+            "tool": "read_file",
+        },
+    })
+    server._schedule_tool_free_violation.assert_called_once_with(
+        context,
+        "item/started unbound MCP tool ('ambient', 'read_file')",
+    )
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-mcp-only", "status": "completed"},
     })
     assert await process.wait() == 0
 

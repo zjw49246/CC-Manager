@@ -8,16 +8,20 @@ import type {
   ChatMessage,
   CodexForkAnchor,
   FileAttachment,
+  FrontendReviewGoalCapabilities,
   InjectTaskAttachments,
   MonitorSession,
   PlanResource,
   Project,
   Task,
+  TestHarnessRun,
   UploadResult,
+  WorkspaceReviewCapabilities,
 } from '../../api/client';
+import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -40,6 +44,12 @@ import {
 import { SubAgentIndicator } from './SubAgentIndicator';
 import { MonitorPanel } from './MonitorPanel';
 import {
+  BrowserReviewPanel,
+  type BrowserReviewDisplayMode,
+  type BrowserReviewGoalProgress,
+  type BrowserReviewGoalStart,
+} from './BrowserReviewPanel';
+import {
   isLegacyCodexCollabCompleted,
   mergeChatHistory,
 } from './messageMerge';
@@ -61,6 +71,22 @@ interface QueuedMessage {
   uploadResults?: UploadResult[];
   planTaskIds?: number[];
   planVersionIds?: number[];
+}
+
+const WORKSPACE_REVIEW_START_TOOLS = new Set([
+  'ccm_workspace_review.test_current_changes',
+  'ccm_workspace_review.test_git_target',
+]);
+
+function workspaceReviewGoalFromToolInput(rawInput: unknown): string | null {
+  if (typeof rawInput !== 'string' || !rawInput.trim()) return null;
+  try {
+    const parsed = JSON.parse(rawInput) as Record<string, unknown>;
+    const goal = parsed.goal ?? parsed.objective;
+    return typeof goal === 'string' && goal.trim() ? goal.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 interface LiveStreamCacheEntry {
@@ -520,6 +546,126 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [forkSeedUploads, forkSeedUploadsConsumedKey, forkSeedUploadsKey]);
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
+  const [browserReviewAvailable, setBrowserReviewAvailable] = useState(false);
+  const [showBrowserReviewPanel, setShowBrowserReviewPanel] = useState(false);
+  const [frontendReviewComposerMode, setFrontendReviewComposerMode] = useState(false);
+  const [workspaceReviewComposerMode, setWorkspaceReviewComposerMode] = useState(false);
+  const [frontendReviewGoalCapability, setFrontendReviewGoalCapability] = useState<FrontendReviewGoalCapabilities | null>(null);
+  const [workspaceReviewCapability, setWorkspaceReviewCapability] = useState<WorkspaceReviewCapabilities | null>(null);
+  const [startedWorkspaceReview, setStartedWorkspaceReview] = useState<TestHarnessRun | null>(null);
+  const [expectedWorkspaceReviewBaseline, setExpectedWorkspaceReviewBaseline] = useState<string | null | undefined>(undefined);
+  const [frontendReviewGoalStart, setFrontendReviewGoalStart] = useState<BrowserReviewGoalStart | null>(null);
+  const [frontendReviewGoalLocallyActive, setFrontendReviewGoalLocallyActive] = useState(
+    task.metadata_?.frontend_review?.mode === 'goal'
+      && ['pending', 'in_progress', 'executing'].includes(task.status),
+  );
+  const frontendReviewGoalRequestSequence = useRef(0);
+  const signalledWorkspaceReviewItemsRef = useRef(new Set<string>());
+  const frontendReviewGoalActiveRef = useRef(
+    task.metadata_?.frontend_review?.mode === 'goal'
+      && ['pending', 'in_progress', 'executing'].includes(task.status),
+  );
+  const [frontendReviewGoalCapabilityLoading, setFrontendReviewGoalCapabilityLoading] = useState(false);
+  const [browserReviewDisplayMode, setBrowserReviewDisplayMode] = useState<BrowserReviewDisplayMode>(() => (
+    localStorage.getItem('ccm-browser-review-display-mode') === 'floating' ? 'floating' : 'docked'
+  ));
+  const previousBrowserReviewAvailable = useRef(false);
+  const handleBrowserReviewAvailable = useCallback((available: boolean) => {
+    setBrowserReviewAvailable(available);
+    if (available && !previousBrowserReviewAvailable.current) {
+      setShowBrowserReviewPanel(true);
+    }
+    previousBrowserReviewAvailable.current = available;
+  }, []);
+  const handleBrowserReviewDisplayModeChange = useCallback((mode: BrowserReviewDisplayMode) => {
+    setBrowserReviewDisplayMode(mode);
+    setShowBrowserReviewPanel(true);
+    try { localStorage.setItem('ccm-browser-review-display-mode', mode); } catch { /* storage may be unavailable */ }
+  }, []);
+  const handleNewBrowserReview = useCallback(() => {
+    setShowBrowserReviewPanel(true);
+  }, []);
+  const handleExpectedWorkspaceReviewFound = useCallback(() => {
+    setExpectedWorkspaceReviewBaseline(undefined);
+  }, []);
+  const handleFrontendReviewGoalFound = useCallback(() => {
+    setFrontendReviewGoalStart(null);
+  }, []);
+
+  useEffect(() => {
+    previousBrowserReviewAvailable.current = false;
+    setBrowserReviewAvailable(false);
+    setShowBrowserReviewPanel(false);
+    setFrontendReviewComposerMode(false);
+    setWorkspaceReviewComposerMode(false);
+    setStartedWorkspaceReview(null);
+    setExpectedWorkspaceReviewBaseline(undefined);
+    setFrontendReviewGoalStart(null);
+    setFrontendReviewGoalLocallyActive(false);
+    signalledWorkspaceReviewItemsRef.current.clear();
+    frontendReviewGoalActiveRef.current = false;
+  }, [task.id]);
+
+  useEffect(() => {
+    let active = true;
+    setFrontendReviewGoalCapability(null);
+    setWorkspaceReviewCapability(null);
+    if (task.worker_id != null || task.shared_from_id != null || !task.session_id) {
+      setFrontendReviewGoalCapabilityLoading(false);
+      return () => { active = false; };
+    }
+    setFrontendReviewGoalCapabilityLoading(true);
+    Promise.all([
+      api.getFrontendReviewGoalCapabilities(task.id),
+      api.getWorkspaceReviewCapabilities(task.id),
+    ])
+      .then(([goalCapability, reviewCapability]) => {
+        if (active) {
+          setFrontendReviewGoalCapability(goalCapability);
+          setWorkspaceReviewCapability(reviewCapability);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setFrontendReviewGoalCapability({
+            available: false,
+            reason: '无法确认本地 Git 仓库，请刷新后重试',
+            repo_path: null,
+          });
+          setWorkspaceReviewCapability({
+            available: false,
+            reason: '无法确认本地 Git 仓库，请刷新后重试',
+            repo_path: null,
+            configured: false,
+            config: null,
+            suggested_config: null,
+          });
+        }
+      })
+      .finally(() => {
+        if (active) setFrontendReviewGoalCapabilityLoading(false);
+      });
+    return () => { active = false; };
+  }, [
+    task.id,
+    task.project_id,
+    task.session_id,
+    task.shared_from_id,
+    task.status,
+    task.target_repo,
+    task.worker_id,
+  ]);
+
+  useEffect(() => {
+    if (
+      frontendReviewGoalCapability?.available === false
+      || (workspaceReviewCapability !== null
+        && !workspaceReviewCapability.available
+        && workspaceReviewCapability.suggested_config === null)
+    ) {
+      setFrontendReviewComposerMode(false);
+    }
+  }, [frontendReviewGoalCapability?.available, workspaceReviewCapability]);
 
   // Canonical first-class Plans associated with this Task. Legacy carrier
   // Task ids remain queue-readable only so drafts from an older release can
@@ -582,6 +728,84 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const workspaceReviewCanBeConfigured = (
+    workspaceReviewCapability?.available === true
+    || workspaceReviewCapability?.suggested_config != null
+  );
+  const canStartWorkspaceReview = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && Boolean(task.session_id)
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+    && workspaceReviewCanBeConfigured
+  );
+  const canStartConfiguredBrowserReview = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+  );
+  const canStartFrontendReviewGoal = (
+    task.worker_id == null
+    && task.shared_from_id == null
+    && Boolean(task.session_id)
+    && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
+    && !isProcessing
+    && frontendReviewGoalCapability?.available === true
+    && workspaceReviewCanBeConfigured
+  );
+  const workspaceReviewUnavailableReason = !task.session_id
+    ? 'Task 完成并建立 session 后才能审查当前分支'
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+      ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
+      : frontendReviewGoalCapabilityLoading
+        ? '正在确认本地 Git 仓库与 Preview 配置…'
+        : workspaceReviewCapability?.reason || '当前 Task 没有可运行的本地 Preview';
+  const frontendReviewGoalUnavailableReason = !task.session_id
+    ? 'Task 完成并建立 session 后才能启动循环审查'
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+      ? 'Task 正在执行，请等待完成后再启动循环审查'
+      : frontendReviewGoalCapabilityLoading
+        ? '正在确认可修改的本地 Git 仓库…'
+        : workspaceReviewCapability?.reason || frontendReviewGoalCapability?.reason || '尚未确认存在可修改的本地 Git 仓库';
+  const configuredBrowserReviewUnavailableReason = task.worker_id != null
+    ? 'Worker Task 暂不支持从 Manager 界面直接启动网站测试'
+    : task.shared_from_id != null
+      ? '共享 Task 只能查看已有测试记录'
+      : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+        ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
+        : null;
+  const isFrontendReviewGoal = task.metadata_?.frontend_review?.mode === 'goal';
+  const frontendReviewGoalTaskActive = ['pending', 'in_progress', 'executing'].includes(effectiveStatus);
+  const showFrontendReviewGoal = frontendReviewGoalStart !== null
+    || ((isFrontendReviewGoal || frontendReviewGoalLocallyActive) && frontendReviewGoalTaskActive);
+  useEffect(() => {
+    if (frontendReviewGoalStart !== null || (isFrontendReviewGoal && frontendReviewGoalTaskActive)) {
+      frontendReviewGoalActiveRef.current = true;
+      setFrontendReviewGoalLocallyActive(true);
+    } else if (!frontendReviewGoalTaskActive) {
+      frontendReviewGoalActiveRef.current = false;
+      setFrontendReviewGoalLocallyActive(false);
+    }
+  }, [frontendReviewGoalStart, frontendReviewGoalTaskActive, isFrontendReviewGoal]);
+  const [frontendReviewGoalProgress, setFrontendReviewGoalProgress] = useState<BrowserReviewGoalProgress>({
+    turn: task.goal_turns_used || 0,
+    maxTurns: task.goal_max_turns || 5,
+    lastReason: task.goal_last_reason,
+    active: isProcessing,
+  });
+  useEffect(() => {
+    setFrontendReviewGoalProgress({
+      turn: task.goal_turns_used || 0,
+      maxTurns: task.goal_max_turns || 5,
+      lastReason: task.goal_last_reason,
+      active: ['pending', 'in_progress', 'executing'].includes(task.status),
+    });
+  }, [task.id, task.goal_turns_used, task.goal_max_turns, task.goal_last_reason, task.status]);
+  useEffect(() => {
+    setFrontendReviewGoalProgress((current) => ({ ...current, active: isProcessing }));
+  }, [isProcessing]);
   useEffect(() => {
     if (!stillRunning) return;
     const timer = window.setTimeout(() => {
@@ -931,6 +1155,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       if (newStatus) {
         lastWsStatusAt.current = Date.now();
         setLocalStatus(newStatus);
+        if (['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)) {
+          frontendReviewGoalActiveRef.current = false;
+          setFrontendReviewGoalLocallyActive(false);
+          setFrontendReviewGoalStart(null);
+        }
       }
       if (
         ['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)
@@ -969,6 +1198,39 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
+    if (eventType === 'goal_evaluation') {
+      setFrontendReviewGoalProgress({
+        turn: Number(msg.data.turn) || 0,
+        maxTurns: Number(msg.data.max_turns) || task.goal_max_turns || 5,
+        lastReason: typeof msg.data.reason === 'string' ? msg.data.reason : null,
+        active: !msg.data.achieved,
+      });
+      return;
+    }
+    const workspaceReviewToolName = typeof msg.data.tool_name === 'string'
+      ? msg.data.tool_name
+      : '';
+    if (
+      eventType === 'tool_use'
+      && frontendReviewGoalActiveRef.current
+      && WORKSPACE_REVIEW_START_TOOLS.has(workspaceReviewToolName)
+    ) {
+      const itemKey = typeof msg.data.item_id === 'string'
+        ? msg.data.item_id
+        : `${workspaceReviewToolName}:${String(msg.data.timestamp || '')}`;
+      if (!signalledWorkspaceReviewItemsRef.current.has(itemKey)) {
+        signalledWorkspaceReviewItemsRef.current.add(itemKey);
+        setFrontendReviewGoalStart((current) => ({
+          requestId: ++frontendReviewGoalRequestSequence.current,
+          prompt: workspaceReviewGoalFromToolInput(msg.data!.tool_input)
+            || current?.prompt
+            || '按当前 Goal 对最新代码创建新的浏览器审查',
+          maxTurns: current?.maxTurns || task.goal_max_turns || 5,
+          phase: 'starting_review',
+        }));
+        setShowBrowserReviewPanel(true);
+      }
+    }
     if (eventType === 'monitor_session_created' || eventType === 'monitor_session_status'
         || eventType === 'sub_agent_session_created' || eventType === 'sub_agent_session_status') {
       api.listMonitorSessions(task.id).then(setMonitorSessions).catch(() => {});
@@ -1160,7 +1422,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
         setSending(false);
         setStillRunning(false);
-        setLocalStatus(null);  // Reset — status_change WS may have been missed
+        // Keep an already observed terminal status sticky. A late process_exit
+        // must not revive stale `task.status=executing` props and bring the
+        // Goal/thinking indicator back after completion.
+        setLocalStatus((current) => (
+          ['completed', 'failed', 'cancelled', 'conflict'].includes(current || '')
+            ? current
+            : null
+        ));
         setAutoDequeueFlag(f => f + 1);
         // Replace live-only bubbles with their persisted LogEntry ids so every
         // completed Codex turn immediately becomes a valid fork anchor.
@@ -1367,7 +1636,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(task.id, next);
       return next;
     });
-  }, [markAskUserResolved, refreshVersionedPlans, task.id, task.worker_id]);
+  }, [markAskUserResolved, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1551,7 +1820,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   useEffect(() => {
     if (
       !backgroundActive
-      && ['completed', 'failed', 'cancelled', 'pending'].includes(effectiveStatus)
+      && ['completed', 'failed', 'cancelled', 'conflict', 'pending'].includes(effectiveStatus)
     ) {
       clearLiveStreamCache(task.id);
       setSending(false);
@@ -1752,6 +2021,31 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
+  const ensureWorkspacePreviewConfigured = async (): Promise<boolean> => {
+    if (workspaceReviewCapability?.available) return true;
+    const suggestion = workspaceReviewCapability?.suggested_config;
+    if (!suggestion) {
+      setError(workspaceReviewCapability?.reason || '当前 Project 没有可用的 Preview 配置。');
+      return false;
+    }
+    const commands = [
+      ...suggestion.setup.map((item) => `${item.cwd}: ${item.command.join(' ')}`),
+      ...suggestion.processes.map((item) => `${item.cwd}: ${item.command.join(' ')}`),
+    ].join('\n');
+    const approved = window.confirm(
+      `首次运行需要保存并信任 Project Preview 配置。\n\n${suggestion.name}\n${commands}\n\n这些命令会以 CCM 当前系统用户执行该工作区代码；服务仅监听本机回环地址，模型/云凭证环境变量会被清除。只应确认你信任的本地分支。是否继续？`,
+    );
+    if (!approved) return false;
+    try {
+      const capability = await api.approveWorkspacePreviewConfig(task.id, suggestion);
+      setWorkspaceReviewCapability(capability);
+      return capability.available;
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : '保存 Preview 配置失败');
+      return false;
+    }
+  };
+
   const handleSend = async (
     overrideText?: string,
     fromQueue?: boolean,
@@ -1799,6 +2093,49 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
 
+    if (frontendReviewComposerMode && !fromQueue && !canStartFrontendReviewGoal) {
+      setError(frontendReviewGoalUnavailableReason);
+      return;
+    }
+    if (workspaceReviewComposerMode && !fromQueue && !canStartWorkspaceReview) {
+      setError(workspaceReviewUnavailableReason);
+      return;
+    }
+    if (workspaceReviewComposerMode && !fromQueue) {
+      if (sendableAttachmentCount > 0) {
+        setError('单次黑盒审查暂不接收附件；请在目标分支中保存改动后再启动。');
+        return;
+      }
+      setSending(true);
+      setError(null);
+      try {
+        if (!await ensureWorkspacePreviewConfigured()) return;
+        const startedReview = await api.startTestRun(task.id, {
+          target_kind: 'current_workspace',
+          target: {},
+          goal: text,
+          profile: 'standard',
+          allow_actions: true,
+          browser_channel: DEFAULT_BROWSER_CHANNEL,
+          viewport_width: 1440,
+          viewport_height: 900,
+        });
+        setStartedWorkspaceReview(startedReview);
+        setInput('');
+        setWorkspaceReviewComposerMode(false);
+        setShowBrowserReviewPanel(true);
+        onTaskUpdated?.();
+      } catch (nextError) {
+        setError(nextError instanceof Error ? nextError.message : '启动当前分支审查失败');
+      } finally {
+        setSending(false);
+      }
+      return;
+    }
+    if (frontendReviewComposerMode && !fromQueue) {
+      if (!await ensureWorkspacePreviewConfigured()) return;
+    }
+
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
     if (isProcessing && !fromQueue) {
       if (text || sendableAttachmentCount > 0) {
@@ -1822,6 +2159,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setError(null);
 
     let optimisticMessageId: number | null = null;
+    let frontendReviewGoalRequestId: number | null = null;
     try {
       let uploadedPaths: string[] | undefined;
       const uploadedResults = uploadedResultsForTurn;
@@ -1868,108 +2206,160 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         setSending(true);
       }
 
-      const routing = {
-        provider: task.provider,
-        model: modelOverride || task.model,
-        codex_service_tier: task.codex_service_tier,
-      };
-      const confirmedStalePlanIds: number[] = [];
-      for (;;) {
-        try {
-          if (planVersionIdsForTurn.length > 0) {
-            await api.sendTaskChat(
-              task.id,
-              text || '(files attached)',
-              uploadedPaths,
-              selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-              modelOverride,
-              routing,
-              undefined,
-              undefined,
-              planVersionIdsForTurn,
-              confirmedStalePlanIds,
-            );
-          } else if (planIdsForTurn.length > 0) {
-            await api.sendTaskChat(
-              task.id,
-              text || '(files attached)',
-              uploadedPaths,
-              selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-              modelOverride,
-              routing,
-              planIdsForTurn,
-              confirmedStalePlanIds,
-            );
-          } else {
-            // Keep the legacy six-argument call for ordinary messages.
-            await api.sendTaskChat(
-              task.id,
-              text || '(files attached)',
-              uploadedPaths,
-              selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
-              modelOverride,
-              routing,
-            );
+      if (frontendReviewComposerMode && !fromQueue) {
+        frontendReviewGoalRequestId = ++frontendReviewGoalRequestSequence.current;
+        frontendReviewGoalActiveRef.current = true;
+        setFrontendReviewGoalLocallyActive(true);
+        setFrontendReviewGoalStart({
+          requestId: frontendReviewGoalRequestId,
+          prompt: text,
+          maxTurns: 5,
+          phase: 'starting_goal',
+        });
+        setFrontendReviewGoalProgress({
+          turn: 0,
+          maxTurns: 5,
+          lastReason: null,
+          active: true,
+        });
+        setShowBrowserReviewPanel(true);
+        const activatedTask = await api.startFrontendReviewGoal(task.id, {
+          message: text,
+          file_paths: uploadedPaths,
+          secret_ids: selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+          profile: 'standard',
+          max_iterations: 5,
+          expected_routing: {
+            provider: task.provider,
+            model: task.model,
+            codex_service_tier: task.codex_service_tier,
+          },
+        });
+        setFrontendReviewComposerMode(false);
+        setLocalStatus(activatedTask.status || 'pending');
+        setFrontendReviewGoalProgress({
+          turn: 0,
+          maxTurns: activatedTask.goal_max_turns || 5,
+          lastReason: null,
+          active: true,
+        });
+        setFrontendReviewGoalStart((current) => (
+          current?.requestId === frontendReviewGoalRequestId
+            ? { ...current, maxTurns: activatedTask.goal_max_turns || 5 }
+            : current
+        ));
+        onTaskUpdated?.();
+      } else {
+        const routing = {
+          provider: task.provider,
+          model: modelOverride || task.model,
+          codex_service_tier: task.codex_service_tier,
+        };
+        const confirmedStalePlanIds: number[] = [];
+        let chatResponse: Awaited<ReturnType<typeof api.sendTaskChat>> | null = null;
+        for (;;) {
+          try {
+            if (planVersionIdsForTurn.length > 0) {
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+                undefined,
+                undefined,
+                planVersionIdsForTurn,
+                confirmedStalePlanIds,
+              );
+            } else if (planIdsForTurn.length > 0) {
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+                planIdsForTurn,
+                confirmedStalePlanIds,
+              );
+            } else {
+              // Keep the legacy six-argument call for ordinary messages.
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+                selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
+                modelOverride,
+                routing,
+              );
+            }
+            break;
+          } catch (sendError) {
+            const detail = isApiRequestError(sendError)
+              ? sendError.detail
+              : null;
+            const stalePlanId = (
+              detail
+              && typeof detail === 'object'
+              && (
+                ('plan_version_id' in detail && typeof detail.plan_version_id === 'number')
+                || ('plan_task_id' in detail && typeof detail.plan_task_id === 'number')
+              )
+            ) ? (
+              'plan_version_id' in detail && typeof detail.plan_version_id === 'number'
+                ? detail.plan_version_id
+                : ('plan_task_id' in detail && typeof detail.plan_task_id === 'number' ? detail.plan_task_id : null)
+            ) : null;
+            const selectedIdsForStale = planVersionIdsForTurn.length > 0
+              ? planVersionIdsForTurn
+              : planIdsForTurn;
+            const staleState = (
+              detail
+              && typeof detail === 'object'
+              && 'staleness' in detail
+              && detail.staleness
+              && typeof detail.staleness === 'object'
+            ) ? detail.staleness as Record<string, unknown> : null;
+            if (
+              stalePlanId == null
+              || !selectedIdsForStale.includes(stalePlanId)
+              || confirmedStalePlanIds.includes(stalePlanId)
+              || staleState?.stale !== true
+              || staleState.hard_conflict === true
+              || staleState.can_confirm === false
+              || !window.confirm(planStalenessConfirmationMessage(staleState, 'apply'))
+            ) {
+              throw sendError;
+            }
+            confirmedStalePlanIds.push(stalePlanId);
           }
-          break;
-        } catch (sendError) {
-          const detail = isApiRequestError(sendError)
-            ? sendError.detail
-            : null;
-          const stalePlanId = (
-            detail
-            && typeof detail === 'object'
-            && (
-              ('plan_version_id' in detail && typeof detail.plan_version_id === 'number')
-              || ('plan_task_id' in detail && typeof detail.plan_task_id === 'number')
-            )
-          ) ? (
-            'plan_version_id' in detail && typeof detail.plan_version_id === 'number'
-              ? detail.plan_version_id
-              : ('plan_task_id' in detail && typeof detail.plan_task_id === 'number' ? detail.plan_task_id : null)
-          ) : null;
-          const selectedIdsForStale = planVersionIdsForTurn.length > 0
-            ? planVersionIdsForTurn
-            : planIdsForTurn;
-          const staleState = (
-            detail
-            && typeof detail === 'object'
-            && 'staleness' in detail
-            && detail.staleness
-            && typeof detail.staleness === 'object'
-          ) ? detail.staleness as Record<string, unknown> : null;
-          if (
-            stalePlanId == null
-            || !selectedIdsForStale.includes(stalePlanId)
-            || confirmedStalePlanIds.includes(stalePlanId)
-            || staleState?.stale !== true
-            || staleState.hard_conflict === true
-            || staleState.can_confirm === false
-            || !window.confirm(planStalenessConfirmationMessage(staleState, 'apply'))
-          ) {
-            throw sendError;
-          }
-          confirmedStalePlanIds.push(stalePlanId);
         }
-      }
-      if (planIdsForTurn.length > 0) {
-        setSelectedPlanIds((current) =>
-          current.filter((id) => !planIdsForTurn.includes(id))
-        );
-        // Replace the optimistic bubble with the durable user-message row,
-        // including the exact approved Plan snapshots used by the backend.
-        fetchHistory();
-      }
-      if (planVersionIdsForTurn.length > 0) {
-        setSelectedPlanVersionIds((current) =>
-          current.filter((id) => !planVersionIdsForTurn.includes(id))
-        );
-        setVersionedPlans((current) => current.map((plan) => (
-          plan.current_version && planVersionIdsForTurn.includes(plan.current_version.id)
-            ? { ...plan, display_state: 'applied', current_version: { ...plan.current_version, applied: true } }
-            : plan
-        )));
-        fetchHistory();
+        if (chatResponse?.workspace_review_expected) {
+          setExpectedWorkspaceReviewBaseline(
+            chatResponse.workspace_review_baseline_run_id,
+          );
+          setShowBrowserReviewPanel(true);
+        }
+        if (planIdsForTurn.length > 0) {
+          setSelectedPlanIds((current) =>
+            current.filter((id) => !planIdsForTurn.includes(id))
+          );
+          // Replace the optimistic bubble with the durable user-message row,
+          // including the exact approved Plan snapshots used by the backend.
+          fetchHistory();
+        }
+        if (planVersionIdsForTurn.length > 0) {
+          setSelectedPlanVersionIds((current) =>
+            current.filter((id) => !planVersionIdsForTurn.includes(id))
+          );
+          setVersionedPlans((current) => current.map((plan) => (
+            plan.current_version && planVersionIdsForTurn.includes(plan.current_version.id)
+              ? { ...plan, display_state: 'applied', current_version: { ...plan.current_version, applied: true } }
+              : plan
+          )));
+          fetchHistory();
+        }
       }
       if (!fromQueue) {
         consumeForkSeedUploads();
@@ -1977,6 +2367,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       setModelOverride(null);
     } catch (e) {
       setSending(false);
+      if (frontendReviewGoalRequestId !== null) {
+        setFrontendReviewGoalStart((current) => (
+          current?.requestId === frontendReviewGoalRequestId ? null : current
+        ));
+        setFrontendReviewGoalLocallyActive(false);
+        frontendReviewGoalActiveRef.current = false;
+      }
       if (optimisticMessageId !== null) {
         setMessages((current) =>
           current.filter((message) => message.id !== optimisticMessageId)
@@ -2056,6 +2453,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 后台运行中
               </span>
             )}
+            {showFrontendReviewGoal && (
+              <span
+                className="whitespace-nowrap rounded bg-indigo-500/20 px-1.5 text-xs font-medium text-indigo-300"
+                title={frontendReviewGoalProgress.lastReason || '模型将自动判断是否继续下一轮'}
+              >
+                Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
+              </span>
+            )}
             {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
               <span
                 data-testid="codex-main-mcp-status"
@@ -2084,6 +2489,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
+            <button
+              type="button"
+              onClick={() => setShowBrowserReviewPanel((value) => !value)}
+              className={`relative rounded p-1.5 transition-colors ${
+                showBrowserReviewPanel
+                  ? 'bg-indigo-500/15 text-indigo-300'
+                  : 'text-gray-600 hover:text-indigo-400'
+              }`}
+              title={browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
+              aria-label="Toggle Frontend Review panel"
+            >
+              <Eye size={18} />
+              <span
+                className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
+                aria-hidden="true"
+              />
+            </button>
             {task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
@@ -2135,15 +2557,34 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     const resp = await api.stopTaskSession(task.id);
                     setSending(false);
                     setStillRunning(false);
+                    const stoppedStatus = resp.task_status
+                      || (resp.stopped !== false ? 'completed' : null)
+                      || (resp.note?.includes('marked as completed') ? 'completed' : null);
+                    if (stoppedStatus) {
+                      lastWsStatusAt.current = Date.now();
+                      setLocalStatus(stoppedStatus);
+                    }
+                    if (typeof resp.background_active === 'boolean') {
+                      lastWsBackgroundAt.current = Date.now();
+                      setLocalBackgroundActive(resp.background_active);
+                    } else if (stoppedStatus) {
+                      lastWsBackgroundAt.current = Date.now();
+                      setLocalBackgroundActive(false);
+                    }
                     if (resp.stopped === false) {
                       const cleared = resp.cleared_messages ?? 0;
-                      setError(
-                        `Interrupt: no running process found${cleared > 0 ? `, cleared ${cleared} queued message(s)` : ''}. ` +
-                        'If output keeps arriving, the session may still be finishing.'
-                      );
+                      if (stoppedStatus === 'completed') {
+                        setError(null);
+                      } else {
+                        setError(
+                          `Interrupt: no running process found${cleared > 0 ? `, cleared ${cleared} queued message(s)` : ''}. ` +
+                          'The latest Task status is being refreshed.'
+                        );
+                      }
                     } else {
                       setError(null);
                     }
+                    onTaskUpdated?.();
                   } catch (interruptError) {
                     setSending(false);
                     const noRunningSession = isApiRequestError(interruptError)
@@ -2158,6 +2599,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                           ? interruptError.message
                           : String(interruptError)}`,
                     );
+                    onTaskUpdated?.();
                   }
                   finally { setInterrupting(false); }
                 }}
@@ -2516,6 +2958,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {/* Load older messages banner — fixed above scroll area */}
       {messages.length > 0 && hasMoreHistory && (
         <div className="flex justify-center py-1.5 border-b border-gray-800 bg-gray-950/80 shrink-0">
@@ -2602,9 +3046,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           )
         )}
         {isProcessing && (
-          <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
+          <div className="flex gap-2 items-start text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
-            <span>{providerLabel} is thinking...</span>
+            {showFrontendReviewGoal ? (
+              <div>
+                <div>Goal Agent 第 {Math.max(1, frontendReviewGoalProgress.turn + 1)} 轮正在执行…</div>
+                <div className="mt-0.5 text-[11px] text-gray-500">
+                  审查报告不会结束本轮；Agent 会继续处理必要修改、构建测试和修改后复查。
+                </div>
+              </div>
+            ) : (
+              <span>{providerLabel} is thinking...</span>
+            )}
           </div>
         )}
         <div ref={bottomRef} className="h-4" />
@@ -2834,13 +3287,65 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <Paperclip size={18} />
             </button>
             <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
-            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || (!task.session_id && !task.shared_from_id)} />
+            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)} />
+            {task.worker_id == null && task.shared_from_id == null && (
+              <button
+                type="button"
+                onClick={() => {
+                  setWorkspaceReviewComposerMode((value) => !value);
+                  setFrontendReviewComposerMode(false);
+                  setInjectMode(false);
+                  setModelOverride(null);
+                }}
+                disabled={injecting || !canStartWorkspaceReview}
+                aria-label="单次审查当前分支"
+                aria-pressed={workspaceReviewComposerMode}
+                className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  workspaceReviewComposerMode
+                    ? 'bg-cyan-500/15 text-cyan-300 ring-1 ring-inset ring-cyan-400/40'
+                    : 'text-gray-500 hover:bg-cyan-500/10 hover:text-cyan-300'
+                }`}
+                title={canStartWorkspaceReview
+                  ? workspaceReviewComposerMode
+                    ? '单次审查已选择：启动隔离 Preview，并由独立浏览器 Agent 黑盒测试'
+                    : '单次审查当前开发分支（不修改代码）'
+                  : workspaceReviewUnavailableReason}
+              >
+                <Eye size={16} />
+              </button>
+            )}
+            {task.worker_id == null && task.shared_from_id == null && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFrontendReviewComposerMode((value) => !value);
+                  setWorkspaceReviewComposerMode(false);
+                  setInjectMode(false);
+                  setModelOverride(null);
+                }}
+                disabled={injecting || !canStartFrontendReviewGoal}
+                aria-label="循环审查"
+                aria-pressed={frontendReviewComposerMode}
+                className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 disabled:cursor-not-allowed disabled:opacity-40 ${
+                  frontendReviewComposerMode
+                    ? 'bg-indigo-500/15 text-indigo-400 ring-1 ring-inset ring-indigo-400/40'
+                    : 'text-gray-500 hover:bg-indigo-500/10 hover:text-indigo-400'
+                }`}
+                title={canStartFrontendReviewGoal
+                  ? frontendReviewComposerMode
+                    ? '循环审查已选择：发送后在当前 Task/session 中自动审查、修改并复查'
+                    : '启动循环审查（当前 Task/session，最多 5 轮）'
+                  : frontendReviewGoalUnavailableReason}
+              >
+                <RefreshCw size={16} />
+              </button>
+            )}
             {/* Temp model override (one-shot) */}
             <div className="relative" data-temp-model>
               <button
                 type="button"
                 onClick={() => setShowModelMenu((v) => !v)}
-                disabled={injecting || (!task.session_id && !task.shared_from_id)}
+                disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   modelOverride ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -2934,6 +3439,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
             </div>
           )}
+          {frontendReviewComposerMode && (
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] leading-relaxed text-indigo-400">
+              <RefreshCw size={11} className="shrink-0" />
+              <span className="truncate">当前 Task/session：浏览器审查 → 必要修改 → 测试 → 重新审查（最多 5 轮）</span>
+            </div>
+          )}
+          {workspaceReviewComposerMode && (
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] leading-relaxed text-cyan-300">
+              <Eye size={11} className="shrink-0" />
+              <span className="truncate">单次黑盒审查当前分支：隔离 Preview → 浏览器验证 → 截图与报告（不修改代码）</span>
+            </div>
+          )}
           <div className="flex gap-2 items-end">
             <textarea
               ref={textareaRef}
@@ -2945,6 +3462,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   ? 'Run the task first to start a session...'
                   : injectMode && canInject
                     ? '注入模式：消息将直接注入运行中的 turn...'
+                    : frontendReviewComposerMode
+                      ? '描述这次要循环审查的页面、URL、流程或前端改动...'
+                    : workspaceReviewComposerMode
+                      ? '描述要验证的功能、页面和关键流程；无需提供 URL...'
                     : isProcessing
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
@@ -2956,22 +3477,50 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!task.session_id && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : injectMode && canInject
                 ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
+                : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
+                : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
                 : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 injectMode && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
+                : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
+                : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {injectMode && canInject ? <Syringe size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {injectMode && canInject ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>
         </div>
+      </div>
+        </div>
+        <BrowserReviewPanel
+          taskId={task.id}
+          taskActive={isProcessing}
+          taskProvider={task.provider}
+          taskModel={task.model}
+          taskEffort={task.effort_level}
+          taskServiceTier={task.codex_service_tier}
+          canStartConfiguredReview={canStartConfiguredBrowserReview}
+          configuredReviewUnavailableReason={configuredBrowserReviewUnavailableReason || undefined}
+          open={showBrowserReviewPanel}
+          displayMode={browserReviewDisplayMode}
+          onAvailableChange={handleBrowserReviewAvailable}
+          onClose={() => setShowBrowserReviewPanel(false)}
+          onDisplayModeChange={handleBrowserReviewDisplayModeChange}
+          onNewReview={handleNewBrowserReview}
+          startedWorkspaceRun={startedWorkspaceReview}
+          expectedWorkspaceReviewBaseline={expectedWorkspaceReviewBaseline}
+          onExpectedWorkspaceReviewFound={handleExpectedWorkspaceReviewFound}
+          goalStart={frontendReviewGoalStart}
+          onGoalReviewFound={handleFrontendReviewGoalFound}
+          goalProgress={showFrontendReviewGoal ? frontendReviewGoalProgress : undefined}
+        />
       </div>
     </div>
   );

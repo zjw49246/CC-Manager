@@ -30,6 +30,8 @@ import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
+import backend.models.workspace_review  # noqa: F401
+import backend.models.test_harness  # noqa: F401
 import backend.models.plan  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -40,8 +42,16 @@ PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
+WORKSPACE_REVIEW_REVISION = "5a7d2c9e1b40"
+TEST_HARNESS_REVISION = "7d2f4b9a6c10"
 FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
-CURRENT_HEAD_REVISION = "e5b8d1c4a7f2"
+PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
+BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
+SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
+RESOLVED_TARGET_REVISION = "d9a2b4c6e8f1"
+CHILD_BINDING_REVISION = "e0b3c5d7f9a1"
+ARCHIVE_STATE_REVISION = "f1c4e6a8b0d2"
+CURRENT_HEAD_REVISION = ARCHIVE_STATE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -432,7 +442,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings", "test_harness_sandbox_leases", "test_harness_child_bindings"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -445,6 +455,28 @@ class TestFreshMigration:
         assert "plan_context_snapshot" in task_cols
         assert "plan_applied_log_id" in task_cols
         assert "attention_tag" in task_cols
+
+        child_binding_cols = _get_table_columns(
+            engine, "test_harness_child_bindings"
+        )
+        assert {
+            "harness_run_id",
+            "workspace_review_run_id",
+            "owner_task_id",
+            "child_task_id",
+            "browser_review_job_id",
+            "state",
+        }.issubset(child_binding_cols)
+
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert {
+            "artifact_staging_root",
+            "artifact_archive_prefix",
+            "archive_state",
+            "archive_manifest",
+            "archive_error",
+            "archived_at",
+        }.issubset(attempt_cols)
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -645,6 +677,86 @@ class TestFreshMigration:
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
         assert revision == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_archive_state_migration_preserves_legacy_pointer_and_roundtrips(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "archive-state-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CHILD_BINDING_REVISION)
+
+        run_id = "a" * 32
+        attempt_id = "b" * 32
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_runs ("
+                    "id, target_kind, target_spec, test_plan, runtime_config, "
+                    "request_fingerprint, root_run_id, attempt_number, status, "
+                    "stage, stale, cleanup_status, event_sequence, created_at"
+                    ") VALUES ("
+                    ":id, 'fixed_url', '{}', '{}', '{}', :fingerprint, :id, "
+                    "1, 'completed', 'completed', 0, 'completed', 0, :created_at"
+                    ")"
+                ),
+                {
+                    "id": run_id,
+                    "fingerprint": "c" * 64,
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_attempts ("
+                    "id, run_id, ordinal, status, stage, provider, model, "
+                    "reasoning_effort, codex_service_tier, artifact_root, "
+                    "result_data, created_at"
+                    ") VALUES ("
+                    ":id, :run_id, 1, 'completed', 'completed', 'codex', "
+                    "'gpt-5.6-sol', 'medium', 'default', :artifact_root, '{}', "
+                    ":created_at"
+                    ")"
+                ),
+                {
+                    "id": attempt_id,
+                    "run_id": run_id,
+                    "artifact_root": "/private/tmp/legacy-browser-job",
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, ARCHIVE_STATE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT artifact_staging_root, artifact_archive_prefix, "
+                    "archive_state, archive_manifest, archive_error, archived_at "
+                    "FROM test_harness_attempts WHERE id = :id"
+                ),
+                {"id": attempt_id},
+            ).one()
+        assert row.artifact_staging_root == "/private/tmp/legacy-browser-job"
+        assert row.artifact_archive_prefix is None
+        assert row.archive_state == "staging"
+        manifest = row.archive_manifest
+        if isinstance(manifest, str):
+            manifest = json.loads(manifest)
+        assert manifest == {}
+        assert row.archive_error is None
+        assert row.archived_at is None
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CHILD_BINDING_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert "artifact_root" in attempt_cols
+        assert "archive_state" not in attempt_cols
+        assert "artifact_staging_root" not in attempt_cols
         engine.dispose()
 
 
@@ -1641,14 +1753,42 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_plan_main_merge(self, tmp_path):
+    def test_migration_graph_has_one_head_after_sandbox_lease(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
-            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            script.get_revision(ARCHIVE_STATE_REVISION).down_revision
+            == CHILD_BINDING_REVISION
+        )
+        assert (
+            script.get_revision(CHILD_BINDING_REVISION).down_revision
+            == RESOLVED_TARGET_REVISION
+        )
+        assert (
+            script.get_revision(RESOLVED_TARGET_REVISION).down_revision
+            == SANDBOX_LEASE_REVISION
+        )
+        assert (
+            script.get_revision(SANDBOX_LEASE_REVISION).down_revision
+            == BROWSER_PLAN_MERGE_REVISION
+        )
+        assert (
+            script.get_revision(BROWSER_PLAN_MERGE_REVISION).down_revision
+            == (TEST_HARNESS_REVISION, PLAN_MAIN_MERGE_REVISION)
+        )
+        assert (
+            script.get_revision(TEST_HARNESS_REVISION).down_revision
+            == WORKSPACE_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(WORKSPACE_REVIEW_REVISION).down_revision
+            == ATTENTION_TAG_REVISION
+        )
+        assert (
+            script.get_revision(PLAN_MAIN_MERGE_REVISION).down_revision
             == (FIRST_CLASS_PLAN_HEAD_REVISION, ATTENTION_TAG_REVISION)
         )
         assert (
@@ -1676,6 +1816,43 @@ class TestPublishedMigrationHistory:
         task_columns = _get_table_columns(engine, "tasks")
         assert "attention_tag" in task_columns
         assert "plan_target_task_id" in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_deployed_browser_harness_head_upgrades_to_combined_plan_head(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "browser-to-combined.db")
+        cfg = _alembic_cfg(db_path)
+
+        # This is the exact state deployed by the browser feature branch before
+        # it was rebased onto the first-class Plan migration history.
+        _run_alembic(cfg, command.upgrade, TEST_HARNESS_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        tables = _get_all_tables(engine)
+        assert "workspace_review_runs" in tables
+        assert "test_harness_runs" in tables
+        assert "plans" not in tables
+        assert "plan_pipeline_config" not in _get_table_columns(
+            engine,
+            "global_settings",
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        tables = _get_all_tables(engine)
+        assert "workspace_review_runs" in tables
+        assert "test_harness_runs" in tables
+        assert "plans" in tables
+        assert "plan_pipeline_config" in _get_table_columns(
+            engine,
+            "global_settings",
+        )
         with engine.connect() as conn:
             assert conn.execute(
                 text("SELECT version_num FROM alembic_version")

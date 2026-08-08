@@ -44,7 +44,7 @@ class Task(Base):
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
-    mode: Mapped[str] = mapped_column(String(20), default="auto")  # "auto", "plan", or "loop"
+    mode: Mapped[str] = mapped_column(String(20), default="auto")  # "auto", "plan", "loop", or "goal"
     todo_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # loop only: path relative to target_repo
     loop_progress: Mapped[str | None] = mapped_column(String(200), nullable=True)  # loop only: e.g. "3/5", written by Claude
     max_iterations: Mapped[int] = mapped_column(Integer, default=50)  # loop only: max iterations before auto-abort

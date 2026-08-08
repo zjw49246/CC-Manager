@@ -37,17 +37,36 @@ def _is_api_account(account) -> bool:
     return is_api_auth_kind(getattr(account, "auth_kind", ""))
 
 
-def _get_pool():
+def _get_optional_pool():
     from backend.main import dispatcher
-    if not dispatcher.pool:
-        raise HTTPException(status_code=404, detail="Pool is not enabled. Set POOL_ENABLED=true in .env")
+
     return dispatcher.pool
+
+
+def _get_pool():
+    pool = _get_optional_pool()
+    if not pool:
+        raise HTTPException(status_code=404, detail="Pool is not enabled. Set POOL_ENABLED=true in .env")
+    return pool
+
+
+def _disabled_pool_status() -> dict:
+    return {
+        "enabled": False,
+        "total": 0,
+        "available": 0,
+        "cooldown": 0,
+        "disabled": 0,
+        "preferred": None,
+        "last_selected": None,
+        "accounts": [],
+    }
 
 
 @router.get("/status")
 async def pool_status():
-    pool = _get_pool()
-    return pool.status()
+    pool = _get_optional_pool()
+    return pool.status() if pool else _disabled_pool_status()
 
 
 @router.get("/usage")

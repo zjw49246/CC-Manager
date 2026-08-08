@@ -10,7 +10,13 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessChildBinding
 from backend.services.task_creation import stage_task_record
+from backend.services.test_harness_children import (
+    CHILD_COMPLETED,
+    CHILD_READY,
+    CHILD_RUNNING,
+)
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -768,6 +774,21 @@ class TaskQueue:
                 # them; final launch barriers independently fail closed.
                 blocked_ids.add(candidate_id)
                 continue
+            isolated_browser_child = bool(
+                (candidate.metadata_ or {}).get("isolated_browser_agent") is True
+            )
+            if isolated_browser_child:
+                binding_state = await self.db.scalar(
+                    select(TestHarnessChildBinding.state).where(
+                        TestHarnessChildBinding.child_task_id == candidate_id
+                    )
+                )
+                if binding_state != CHILD_READY:
+                    # Missing, reserved, stopping and recovered bindings all
+                    # fail closed. Startup recovery will terminalize legacy
+                    # rows; a live attach path alone may publish ``ready``.
+                    blocked_ids.add(candidate_id)
+                    continue
 
             values = {
                 "status": "in_progress",
@@ -788,6 +809,24 @@ class TaskQueue:
                 )
                 .values(**values)
             )
+            if claimed.rowcount and isolated_browser_child:
+                binding_claimed = await self.db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.child_task_id == candidate_id,
+                        TestHarnessChildBinding.state == CHILD_READY,
+                    )
+                    .values(
+                        state=CHILD_RUNNING,
+                        claimed_retry_count=candidate.retry_count,
+                        claimed_instance_id=instance_id,
+                        error=None,
+                    )
+                )
+                if not binding_claimed.rowcount:
+                    await self.db.rollback()
+                    self.db.expire_all()
+                    continue
             await self.db.commit()
             if not claimed.rowcount:
                 # Another dispatcher won after our candidate SELECT.  Expire a
@@ -836,6 +875,19 @@ class TaskQueue:
             .where(*predicates)
             .values(status="completed", completed_at=datetime.utcnow(), error_message=None)
         )
+        if result.rowcount:
+            await self.db.execute(
+                update(TestHarnessChildBinding)
+                .where(
+                    TestHarnessChildBinding.child_task_id == task_id,
+                    TestHarnessChildBinding.state.in_((CHILD_READY, CHILD_RUNNING)),
+                )
+                .values(
+                    state=CHILD_COMPLETED,
+                    completed_at=datetime.utcnow(),
+                    error=None,
+                )
+            )
         await self.db.commit()
         return bool(result.rowcount)
 
@@ -863,6 +915,19 @@ class TaskQueue:
             .where(*predicates)
             .values(status="failed", error_message=error, completed_at=datetime.utcnow())
         )
+        if result.rowcount:
+            await self.db.execute(
+                update(TestHarnessChildBinding)
+                .where(
+                    TestHarnessChildBinding.child_task_id == task_id,
+                    TestHarnessChildBinding.state.in_((CHILD_READY, CHILD_RUNNING)),
+                )
+                .values(
+                    state=CHILD_COMPLETED,
+                    completed_at=datetime.utcnow(),
+                    error=error,
+                )
+            )
         await self.db.commit()
         return bool(result.rowcount)
 
@@ -892,6 +957,12 @@ class TaskQueue:
         if instance_id is not None:
             predicate.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicate, generation_fence)
+        metadata = await self.db.scalar(
+            select(Task.metadata_).where(Task.id == task_id)
+        )
+        isolated_browser_child = bool(
+            (metadata or {}).get("isolated_browser_agent") is True
+        )
         result = await self.db.execute(
             update(Task)
             .where(*predicate)
@@ -903,6 +974,23 @@ class TaskQueue:
                 completed_at=None,
             )
         )
+        if result.rowcount and isolated_browser_child:
+            released = await self.db.execute(
+                update(TestHarnessChildBinding)
+                .where(
+                    TestHarnessChildBinding.child_task_id == task_id,
+                    TestHarnessChildBinding.state == CHILD_RUNNING,
+                )
+                .values(
+                    state=CHILD_READY,
+                    claimed_retry_count=None,
+                    claimed_instance_id=None,
+                    error=reason,
+                )
+            )
+            if not released.rowcount:
+                await self.db.rollback()
+                return False
         await self.db.commit()
         return bool(result.rowcount)
 
@@ -920,6 +1008,8 @@ class TaskQueue:
         instance_id: int | None = None,
         generation_fence: TaskGenerationFence | None = None,
         rollback_on_miss: bool = False,
+        task_updates: dict | None = None,
+        commit: bool = True,
     ) -> Task | None:
         """CAS a retryable task back to pending and release old ownership.
 
@@ -939,18 +1029,21 @@ class TaskQueue:
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
+        values = {
+            "status": "pending",
+            "retry_count": Task.retry_count + 1,
+            "instance_id": None,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "pty_background_generation": None,
+        }
+        if task_updates:
+            values.update(task_updates)
         result = await self.db.execute(
             update(Task)
             .where(*predicates)
-            .values(
-                status="pending",
-                retry_count=Task.retry_count + 1,
-                instance_id=None,
-                error_message=None,
-                started_at=None,
-                completed_at=None,
-                pty_background_generation=None,
-            )
+            .values(**values)
         )
         if not result.rowcount:
             if rollback_on_miss:
@@ -961,7 +1054,10 @@ class TaskQueue:
                 # in the same transaction opt into rollback_on_miss.
                 await self.db.commit()
             return None
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         self.db.expire_all()
         task = await self.get(task_id)
         if task is not None:
@@ -973,7 +1069,15 @@ class TaskQueue:
             update(Task)
             .where(
                 Task.id == task_id,
-                Task.status.in_(("pending", "in_progress", "executing", "merging")),
+                Task.status.in_(
+                    (
+                        "pending_activation",
+                        "pending",
+                        "in_progress",
+                        "executing",
+                        "merging",
+                    )
+                ),
             )
             .values(status="cancelled", completed_at=datetime.utcnow())
         )

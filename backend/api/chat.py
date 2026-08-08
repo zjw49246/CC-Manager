@@ -33,7 +33,7 @@ from backend.api.uploads import (
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_creation import stage_task_record
 from backend.services.chat_event_identity import persisted_chat_event
-from backend.services.task_queue import task_is_pr_review_superseded
+from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
@@ -129,6 +129,33 @@ class ChatMessage(BaseModel):
         if self.plan_task_ids and self.plan_version_ids:
             raise ValueError("Use plan_version_ids or legacy plan_task_ids, not both")
         return self
+
+
+class FrontendReviewGoalMessage(BaseModel):
+    """Start a repeatable frontend review from an existing Task chat."""
+
+    message: str = Field(min_length=1)
+    image_paths: list[str] | None = None
+    file_paths: list[str] | None = None
+    secret_ids: list[int] | None = None
+    profile: Literal["standard", "exhaustive"] = "standard"
+    max_iterations: int = Field(default=5, ge=1, le=10)
+    expected_routing: TaskRoutingExpectation | None = None
+
+    @model_validator(mode="after")
+    def normalize_message(self):
+        self.message = self.message.strip()
+        if not self.message:
+            raise ValueError("message is required")
+        return self
+
+
+class FrontendReviewGoalCapabilities(BaseModel):
+    """Whether an existing Task can safely edit a local Git worktree."""
+
+    available: bool
+    reason: str | None = None
+    repo_path: str | None = None
 
 
 class ForkAnchor(BaseModel):
@@ -578,6 +605,7 @@ async def send_chat_message(
                 "Task routing changed while chat admission was in progress",
             )
         from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
             _require_pr_review_chat_allowed,
@@ -591,6 +619,17 @@ async def send_chat_message(
                 request
             ),
         )
+        if task.status in _MANUAL_RETRYABLE_STATUSES:
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            restore_updates = frontend_review_goal_terminal_updates(task)
+            if restore_updates:
+                for field, value in restore_updates.items():
+                    setattr(task, field, value)
+                await db.commit()
+                await db.refresh(task)
         admitted_routing = _require_expected_task_routing(
             task,
             body.expected_routing,
@@ -739,6 +778,17 @@ async def send_chat_message(
     # enabled skills are advertised by the launch-time skill directory; merely
     # enabling one must not be represented as a fresh user invocation.
     prompt_parts = [model_message]
+    review_routing_prompt: str | None = None
+    if not command:
+        from backend.services.workspace_review_intent import (
+            workspace_browser_review_routing_prompt,
+        )
+
+        review_routing_prompt = workspace_browser_review_routing_prompt(
+            model_message,
+        )
+        if review_routing_prompt:
+            prompt_parts.append(review_routing_prompt)
     if command:
         # $command detected: inject command prompt and set temporary skills
         prompt_parts.append(command.prompt_template)
@@ -756,6 +806,20 @@ async def send_chat_message(
         file_list = "\n".join(f"- {p}" for p in all_paths)
         prompt_parts.append(f"请用 Read 工具查看以下文件：\n{file_list}")
     prompt = "\n\n".join(prompt_parts)
+    workspace_review_baseline_run_id: str | None = None
+    if review_routing_prompt is not None:
+        from backend.models.test_harness import TestHarnessRun
+
+        baseline = await db.execute(
+            select(TestHarnessRun.id)
+            .where(TestHarnessRun.task_id == task_id)
+            .order_by(
+                TestHarnessRun.created_at.desc(),
+                TestHarnessRun.id.desc(),
+            )
+            .limit(1)
+        )
+        workspace_review_baseline_run_id = baseline.scalar_one_or_none()
     if approved_plans:
         from backend.services.plan_tasks import build_approved_plan_prompt
 
@@ -1053,7 +1117,281 @@ async def send_chat_message(
                 version_id=version.id,
                 user_log_id=user_log.id,
             )
+    response["workspace_review_expected"] = review_routing_prompt is not None
+    response["workspace_review_baseline_run_id"] = (
+        workspace_review_baseline_run_id
+    )
     return response
+
+
+@router.get(
+    "/{task_id}/frontend-review-goal/capabilities",
+    response_model=FrontendReviewGoalCapabilities,
+)
+async def get_frontend_review_goal_capabilities(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Inspect the Task's real resume cwd without mutating the repository."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+
+    from backend.services.frontend_review_goal import (
+        inspect_frontend_review_local_repository,
+    )
+
+    return await inspect_frontend_review_local_repository(task, db)
+
+
+@router.post(
+    "/{task_id}/frontend-review-goal",
+    response_model=TaskResponse,
+)
+async def start_frontend_review_goal(
+    task_id: int,
+    body: FrontendReviewGoalMessage,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn an idle existing Task into a repeatable Browser Review Goal."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    if body.secret_ids:
+        from backend.api.deps import require_admin
+
+        require_admin(request)
+
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+
+        from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
+            _require_expected_task_routing,
+            _require_no_pending_worker_routing,
+            _retry_local_task_safely,
+        )
+        from backend.services.task_creation import (
+            validate_task_service_tier_configuration,
+        )
+
+        _require_expected_task_routing(
+            current,
+            body.expected_routing,
+            effective_model=current.model,
+        )
+        if task_is_pr_review_superseded(current):
+            raise HTTPException(
+                409,
+                "This PR review task was superseded by a newer push",
+            )
+        if current.worker_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal currently requires a Manager-local Task",
+            )
+        if current.shared_from_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal cannot start from a shared Task",
+            )
+        _require_no_pending_worker_routing(current)
+        if not current.session_id:
+            raise HTTPException(
+                400,
+                "Run the task once before starting a Frontend Review Goal",
+            )
+        if current.status not in _MANUAL_RETRYABLE_STATUSES:
+            raise HTTPException(
+                409,
+                f"Task status {current.status} is not idle; wait for it to finish",
+            )
+        if current.pty_background_generation is not None:
+            raise HTTPException(
+                409,
+                "Task still has active Claude PTY background output",
+            )
+        if int(current.active_sub_agents or 0) > 0:
+            raise HTTPException(
+                409,
+                "Task still has active Monitor or Sub-Agent sessions",
+            )
+        from backend.services.frontend_review_goal import (
+            inspect_frontend_review_local_repository,
+        )
+
+        repository_capability = await inspect_frontend_review_local_repository(
+            current,
+            db,
+        )
+        if not repository_capability["available"]:
+            raise HTTPException(
+                409,
+                repository_capability["reason"]
+                or "无法确认可修改的本地 Git 仓库",
+            )
+        from backend.models.project import Project
+
+        project = await db.get(Project, current.project_id) if current.project_id else None
+        from backend.services.workspace_review import workspace_review_capability
+
+        review_capability = workspace_review_capability(current, project)
+        if not review_capability["available"]:
+            raise HTTPException(
+                409,
+                review_capability["reason"]
+                or "Project 尚未确认可信 Preview 配置",
+            )
+        try:
+            validate_task_service_tier_configuration(
+                provider=current.provider,
+                model=current.model,
+                codex_service_tier=current.codex_service_tier,
+                mode="goal",
+                goal_evaluator_model=current.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_ACTIVATION_METADATA_KEY,
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+            frontend_review_goal_restore_snapshot,
+        )
+
+        review_config = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: {
+                "mode": "goal",
+                "profile": body.profile,
+                "max_iterations": body.max_iterations,
+            },
+        })
+        if review_config is None:  # Pydantic already validates; fail closed.
+            raise HTTPException(422, "Invalid Frontend Review Goal configuration")
+        all_paths = body.file_paths or body.image_paths or []
+        metadata = deepcopy(current.metadata_ or {})
+        metadata[FRONTEND_REVIEW_METADATA_KEY] = review_config
+        metadata[FRONTEND_REVIEW_ACTIVATION_METADATA_KEY] = {
+            "message": body.message,
+            "file_paths": list(all_paths),
+            "secret_ids": list(body.secret_ids or []),
+            "restore": frontend_review_goal_restore_snapshot(current),
+        }
+        task_updates = {
+            "mode": "goal",
+            "goal_condition": build_frontend_review_goal_condition(body.message),
+            "goal_max_turns": review_config["max_iterations"],
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+            "retry_count": 0,
+            "metadata_": metadata,
+        }
+
+        display_content = body.message
+        sender_display_name = await _sender_display_name(request, db)
+        if sender_display_name:
+            display_content = f"[{sender_display_name}] {body.message}"
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        attachments = [{
+            "url": f"/api/uploads/{os.path.basename(path)}",
+            "name": os.path.basename(path),
+            "is_image": os.path.splitext(path)[1].lower() in image_exts,
+        } for path in all_paths]
+
+        from backend.main import dispatcher
+        from backend.services.dispatcher import (
+            TaskStartConflictError,
+            TaskStartPausedError,
+        )
+
+        if dispatcher is None:
+            raise HTTPException(503, "Dispatcher is unavailable")
+        try:
+            async with dispatcher.task_start_guard(
+                require_idle_task_id=task_id,
+            ):
+                queue = TaskQueue(db)
+                activated = await _retry_local_task_safely(
+                    task_id,
+                    queue,
+                    db,
+                    task_updates=task_updates,
+                    commit=False,
+                )
+                if activated is None:
+                    raise HTTPException(409, "Task disappeared during Goal activation")
+                log_metadata: dict[str, Any] = {
+                    "source": "frontend-review-goal",
+                    "raw_content": body.message,
+                }
+                if attachments:
+                    log_metadata.update({
+                        "attachments": attachments,
+                        "file_paths": list(all_paths),
+                    })
+                if sender_display_name:
+                    log_metadata["sender_name"] = sender_display_name
+                user_log = LogEntry(
+                    instance_id=None,
+                    task_id=task_id,
+                    event_type="user_message",
+                    role="user",
+                    content=display_content,
+                    raw_json=json.dumps(log_metadata, ensure_ascii=False),
+                    is_error=False,
+                )
+                db.add(user_log)
+                await db.commit()
+                await db.refresh(user_log)
+                await db.refresh(activated)
+        except TaskStartPausedError as exc:
+            raise HTTPException(
+                409,
+                "服务即将重启，暂时不能启动循环审查，请稍后重试",
+            ) from exc
+        except TaskStartConflictError as exc:
+            raise HTTPException(
+                409,
+                "Task 已有一条消息等待执行，请等待完成后再启动循环审查",
+            ) from exc
+
+    from backend.main import broadcaster
+
+    image_urls = [
+        attachment["url"]
+        for attachment in attachments
+        if attachment["is_image"]
+    ]
+    event = persisted_chat_event(user_log, {
+        "event_type": "user_message",
+        "role": "user",
+        "content": display_content,
+        "source": "frontend-review-goal",
+        "raw_content": body.message,
+        "image_urls": image_urls,
+        "attachments": attachments,
+    })
+    if sender_display_name:
+        event["sender_name"] = sender_display_name
+    await broadcaster.broadcast(f"task:{task_id}", event)
+    from backend.services.task_events import broadcast_status_change
+
+    await broadcast_status_change(task_id, "pending")
+    dispatcher.wake()
+    return activated
 
 
 @router.get("/{task_id}/fork-anchors")

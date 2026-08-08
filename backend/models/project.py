@@ -22,6 +22,9 @@ class Project(Base):
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0", index=True)
     tags: Mapped[list] = mapped_column(JSON, default=list, nullable=False, server_default="[]")
     env_files: Mapped[list] = mapped_column(JSON, default=list, nullable=False, server_default="[]")
+    # Trusted, manager-owned commands used to launch an isolated preview of a
+    # Task worktree.  Repository files are never executed as preview config.
+    preview_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Git identity (commit author)
     git_author_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     git_author_email: Mapped[str | None] = mapped_column(String(200), nullable=True)

@@ -119,6 +119,8 @@ claude-manager/
 │   │   ├── monitor.py           # Monitor Session CRUD + 子 agent endpoints
 │   │   ├── pool.py              # Claude 账号池 status/usage/reload/clear-cooldown
 │   │   ├── pr_monitor.py        # PR Monitor CRUD + GitHub webhook
+│   │   ├── browser_reviews.py   # 浏览器审查任务/进度/产物 API
+│   │   ├── test_harness.py      # Task 统一测试 Run/重试/比较/证据 API
 │   │   ├── workers.py           # 分布式 Worker CRUD + stop/start/destroy/retry
 │   │   ├── sub_agents.py        # 子 Agent summary API
 │   │   ├── ask_user.py          # ask_user 拦截 + 答案回流
@@ -144,6 +146,8 @@ claude-manager/
 │   ├── schemas/                 # Pydantic 请求/响应模型
 │   ├── mcp/                     # MCP Servers
 │   │   ├── ccm_skills_server.py         # 主 Agent MCP: create_monitor / check_monitors / stop_monitor
+│   │   ├── ccm_browser_review_server.py # Task-scoped 隔离浏览器审查工具
+│   │   ├── ccm_workspace_review_server.py # 当前工作区/PR/ref 测试工具
 │   │   └── ccm_monitor_agent_server.py  # 子 Agent MCP: report_status / mark_complete / get_context
 │   └── services/                # 核心业务逻辑
 │       ├── dispatcher.py        # 全局调度器 (9 步任务生命周期 + goal + monitor)
@@ -166,6 +170,17 @@ claude-manager/
 │       ├── task_queue.py        # 优先级任务队列
 │       ├── worktree_manager.py  # Git worktree 管理 + rebase + push
 │       ├── pr_review_service.py # PR 审核 prompt 构建 + 状态回查
+│       ├── browser_review.py    # 隔离 Playwright 浏览器、安全动作与 CLI harness
+│       ├── browser_review_jobs.py # CCM Task-backed browser review job/证据管理
+│       ├── test_harness.py      # provider-neutral 测试门面与持久化生命周期
+│       ├── test_harness_artifacts.py # 私有证据、哈希归档与保留策略
+│       ├── test_harness_runtime.py # 每 Task 独立 Browser Agent 模型/强度配置
+│       ├── test_harness_children.py # Browser Agent 子 Task 持久所有权/停止恢复
+│       ├── test_harness_git_targets.py # 公共 GitHub 元数据与 exact SHA 冻结
+│       ├── test_harness_sandbox.py # PR/ref Docker Sandbox 与持久 Lease
+│       ├── test_harness_egress_proxy.py # Sandbox 依赖出口白名单代理
+│       ├── test_harness_preview_relay.py # 只读 loopback Preview relay
+│       ├── test_harness_targets.py # PR/ref 隔离目标编排门禁
 │       ├── ask_user.py          # ask_user 注册表 + Future 管理
 │       ├── ask_user_settings.py # ask_user hook 注入/移除
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
@@ -193,6 +208,7 @@ claude-manager/
 │       └── hooks/useWebSocket.ts
 ├── scripts/
 │   ├── dev.sh                   # 一键启动开发环境
+│   ├── browser_review_demo.py   # Playwright + OpenAI Computer Use 前端审查 demo
 │   ├── setup.sh                 # Worker SSH Key + 环境初始化
 │   ├── refresh_pty.sh           # 刷新 claude-pty 依赖
 │   ├── start_all.sh             # 生产环境启动脚本
@@ -235,7 +251,7 @@ cd frontend && npm install && cd ..
 cp .env.example .env
 # 编辑 .env，设置：
 #   AUTH_TOKEN=你的访问密码
-#   OPENAI_API_KEY=sk-...（语音功能需要）
+#   OPENAI_API_KEY=sk-...（仅 Whisper 语音和独立 Browser Review CLI 需要）
 #   WORKSPACE_DIR=~/Projects（项目工作区根目录）
 ```
 
@@ -253,6 +269,60 @@ cd frontend && npx vite --host &
 访问 http://localhost:5173，输入 `AUTH_TOKEN` 登录。
 
 启动后 Dispatcher 会自动创建 worker 实例并开始调度。
+
+### 浏览器前端审查 Demo
+
+CCM 的 Web 浏览器测试现在统一由持久化 Test Harness 管理。普通对话、Task 输入区的
+一次性测试、Goal 复查、固定 URL、PR 号和 Git ref 都会创建同一种 Run，冻结测试
+目标、TestPlan、provider/model 和预算，并持续记录 Attempt、阶段事件、截图/报告、
+结构化 Finding 与最终 Verdict。右侧栏或浮窗会自动切到同一 Task 的最新 Run；终态
+Run 可以直接“重新测试”，也可以比较两轮 finding fingerprint。服务重启后历史记录
+仍在；截图/报告只有复制到私有内容寻址存储并重新通过 SHA-256 校验后才进入
+`complete`，缺失或中断会保留 staging 供恢复并让 Run fail closed，不会伪装成通过。
+
+Browser Agent 的 provider、模型、推理强度和 Codex Fast/Standard 可在右侧测试栏单独
+配置，默认才跟随父 Task。该选择按 Task 保存，并统一用于普通对话触发、一次性测试、
+Goal 复查、固定 URL 以及 PR/ref 审查；每个 Run 启动后会冻结实际路由，因此父 Task 与
+黑盒审查 Agent 可以使用不同模型，也不会在运行中因设置变化而漂移。
+
+当前工作区测试会先使用 Project 中管理员确认过的 Preview 配置启动 loopback 隔离
+预览；PR/ref 测试会解析精确 Git SHA，把源码 fetch、依赖安装、构建和 Preview 全部
+放进临时 Docker Sandbox，绝不在 Manager 宿主机执行不可信提交或切换当前开发工作树。
+独立 Browser Agent 只收到 URL、冻结后的测试计划和浏览器工具，
+不继承父 Task 的会话或仓库上下文，因此更接近黑盒验收。浏览器会收集截图、console、
+页面异常、失败请求和 HTTP 4xx/5xx，并阻止跨源导航、弹窗、下载、凭证输入和破坏性
+动作。Claude 与 Codex 复用同一套 Harness/MCP；这项能力不绑定某一个模型厂商。
+
+固定 URL 测试也从 Task 右侧测试栏配置和启动。轨迹只展示可公开的进度/决策摘要、
+Harness 生命周期和浏览器工具调用，不暴露隐藏推理。Web 页面不需要单独的
+`OPENAI_API_KEY`；远程 Worker 暂不执行本机浏览器测试。
+
+默认是只读模式，并限制跨域顶层导航、弹窗、下载和 Service Worker。网页文本、DOM
+和遥测始终作为不可信证据，不能改变 Agent 任务。独立 CLI 仍保留，可用于脱离 CCM
+Task 的浏览器链路诊断；其中完整模型审查才需要 `OPENAI_API_KEY`：
+
+```bash
+# 默认使用 Playwright 自带的 Chromium（也可用 --browser-channel chrome 复用系统 Chrome）
+uv run playwright install chromium
+
+# 先只验证浏览器、截图和遥测，不调用模型
+uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173 --capture-only
+
+# 完整模型审查；默认只允许截图、滚动、等待和移动鼠标
+OPENAI_API_KEY=sk-... uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173
+
+# 在无敏感数据的隔离预览环境中允许点击、输入、按键和拖拽
+OPENAI_API_KEY=sk-... uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173 --allow-actions
+```
+
+结果默认写入系统临时目录，包括 `report.md`、`final.png`、
+`telemetry.json`，模型发生操作时还会保存逐步截图和脱敏后的
+`actions.jsonl`。可用
+`--output-dir` 指定目录，`--headed` 显示浏览器窗口。顶层页面导航默认限制在
+目标同源，弹窗、下载和 Service Worker 均被禁用。
 
 ### Android App 打包
 
@@ -515,7 +585,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `AUTH_TOKEN` | (必填) | API 认证 Token |
 | `PORT` | `8000` | 主服务监听端口 |
 | `PUBLIC_BASE_URL` | （空） | 部署的公网地址（如 `https://ccm.example.com`） |
-| `OPENAI_API_KEY` | (可选) | 语音功能所需 |
+| `OPENAI_API_KEY` | (可选) | Whisper 语音及独立 Browser Review CLI 的 Responses 模式所需；Web Browser Review 复用 CCM 账号池，不读取该 Key |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./claude_manager.db` | 数据库连接（支持 SQLite/PostgreSQL/MySQL） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | （空） | 飞书 OAuth 应用凭据 |
 | `FEISHU_OAUTH_STATE_SECRET` | （空） | 可选独立 OAuth state 签名密钥；留空时安全复用 `FEISHU_APP_SECRET` |

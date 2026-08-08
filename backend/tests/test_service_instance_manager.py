@@ -41,6 +41,7 @@ from backend.services.codex_app_server import (
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
 from backend.services.mcp_config import (
     McpServerSpec,
+    build_browser_review_mcp_server_specs,
     build_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     render_codex_exec_config_args,
@@ -1968,6 +1969,151 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
 
 
 @pytest.mark.asyncio
+async def test_codex_browser_review_requires_mcp_only_app_server(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-browser-review-exec")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="browser review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            enabled_skills={"browser-review": "job-abc"},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="app-server read-only sandbox",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="review the browser",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                enabled_skills=task.enabled_skills,
+                config_dir=str(tmp_path / "codex-browser-review-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_browser_review_uses_proven_mcp_only_profile(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-browser-review-app-server")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="isolated browser review",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+            enabled_skills={"browser-review": "job-bound"},
+            metadata_={"isolated_browser_agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch.object(
+        im,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+        return_value=4321,
+    ) as launch_app_server:
+        pid = await im.launch(
+            instance_id=inst.id,
+            prompt="use only the bound browser tools",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="codex",
+            enabled_skills=task.enabled_skills,
+            config_dir=str(tmp_path / "codex-browser-mcp-only-home"),
+        )
+
+    assert pid == 4321
+    kwargs = launch_app_server.await_args.kwargs
+    assert kwargs["mcp_only"] is True
+    assert kwargs["tools_disabled"] is False
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["skill_context"] == ""
+    assert [spec.name for spec in kwargs["mcp_specs"]] == ["ccm_browser_review"]
+
+
+@pytest.mark.asyncio
+async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    async with db_factory() as db:
+        inst = Instance(name="claude-browser-review-tools")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="isolated Claude browser review",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            enabled_skills={"browser-review": "job-claude"},
+            metadata_={"isolated_browser_agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=process,
+    ) as spawn:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="use only browser evidence tools",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="claude",
+            enabled_skills=task.enabled_skills,
+        )
+
+    argv = list(spawn.await_args.args)
+    tools_index = argv.index("--tools")
+    assert argv[tools_index + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" in argv
+    assert "--setting-sources" in argv
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
 async def test_invalid_required_exec_mcp_fails_before_subprocess_spawn(
     db_factory, monkeypatch, tmp_path,
 ):
@@ -2159,10 +2305,19 @@ async def test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp(
     launch_kwargs = im._launch_codex_app_server.await_args.kwargs
     assert launch_kwargs["resume_session_id"] == resume_session_id
     specs = launch_kwargs["mcp_specs"]
-    assert len(specs) == 1
-    assert specs[0].required is True
-    assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
+    assert all(spec.required is True for spec in specs)
+    assert all(
+        spec.args[spec.args.index("--task-id") + 1] == str(task.id)
+        for spec in specs
+    )
     assert "ccm_command_help" in specs[0].enabled_tools
+    assert "test_git_target" in specs[2].enabled_tools
+    assert "compare_test_runs" in specs[2].enabled_tools
 
 
 @pytest.mark.asyncio
@@ -2894,7 +3049,11 @@ async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
 
     exec_mock.assert_not_awaited()
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
-    assert len(specs) == 1
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
     assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
     assert "ccm_command_help" in specs[0].enabled_tools
     assert "Codex transport fail-closed" in caplog.text
@@ -3003,12 +3162,16 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         assert "ccm_command_help" in specs[0].enabled_tools
         assert "create_sub_agent" in specs[0].enabled_tools
     else:
-        assert set(specs[0].enabled_tools) == {
+        controller_spec = next(
+            spec for spec in specs if "create_sub_agent" in spec.enabled_tools
+        )
+        assert set(controller_spec.enabled_tools) == {
             "ccm_read_skill",
             "create_sub_agent",
             "check_sub_agents",
             "stop_sub_agent",
         }
+        assert any(spec.name == "ccm_frontend_review" for spec in specs)
 
 
 @pytest.mark.asyncio
@@ -3291,7 +3454,11 @@ async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
 
     assert pid == 7655
     specs = registry.start_turn.await_args.kwargs["mcp_specs"]
-    assert len(specs) == 1
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
     spec = specs[0]
     assert spec.name == "ccm_skills"
     assert spec.required is True
@@ -9827,6 +9994,41 @@ async def test_stop_uses_pty_backend_for_managed_instance():
     ok = await im.stop(5)
     assert ok is True
     assert stopped == [5]
+    assert 5 not in im.processes
+
+
+@pytest.mark.asyncio
+async def test_stop_completes_pty_proxy_from_confirmed_dead_native_session():
+    """A lost on_exit callback must not strand a proxy after native reap."""
+
+    from claude_pty.adapters.ccm import _PTYProcessProxy
+
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    im.broadcaster.broadcast = AsyncMock()
+    proxy = _PTYProcessProxy()
+    native_process = types.SimpleNamespace(exit_code=-signal.SIGTERM)
+    native_session = types.SimpleNamespace(
+        is_alive=False,
+        _process=native_process,
+    )
+    proxy.session = native_session
+    proxy.pid = 51_337
+    im.processes[5] = proxy
+
+    class FakeBackend:
+        _sessions = {5: native_session}
+
+        async def stop(self, instance_id):
+            assert instance_id == 5
+            # Native process is already reaped, but the dependency's cancelled
+            # consumer never reached proxy.complete().
+
+    im._pty_backend = FakeBackend()
+    ok = await im.stop(5)
+
+    assert ok is True
+    assert proxy.returncode == -signal.SIGTERM
+    assert await proxy.wait() == -signal.SIGTERM
     assert 5 not in im.processes
 
 

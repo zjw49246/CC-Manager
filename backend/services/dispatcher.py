@@ -153,6 +153,12 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
+_TASK_ARTIFACT_LINK_NOTE = (
+    "如果在任务工作区创建或修改了供用户查看、下载的产物文件，最终回复必须把每个产物写成 "
+    "Markdown 链接，不要只输出裸文件路径。链接目标优先使用相对当前工作目录的路径；"
+    "路径包含空格时用尖括号包裹，例如 `[下载报告](<reports/final report.pdf>)`。"
+)
+
 _MATH_FORMAT_HINT = (
     "数学排版提示：公式请使用有效 LaTeX（行内 `\\(...\\)`，独立 "
     "`\\[...\\]`），不要放进代码块或写成 `sum_i`、`sqrt(...)` 等 ASCII 伪公式。"
@@ -385,6 +391,10 @@ class ClaudeAccountRoutingError(QueuedMessagePrelaunchError):
 
 class TaskStartPausedError(RuntimeError):
     """A new task turn reached the admission gate during maintenance."""
+
+
+class TaskStartConflictError(RuntimeError):
+    """A different queued turn already owns this Task's start admission."""
 
 
 @dataclass(order=True)
@@ -1135,7 +1145,11 @@ class GlobalDispatcher:
             pass
 
     @asynccontextmanager
-    async def task_start_guard(self):
+    async def task_start_guard(
+        self,
+        *,
+        require_idle_task_id: int | None = None,
+    ):
         """Admit one new Task start and serialize it with maintenance.
 
         The caller must commit the Task's active status before leaving the
@@ -1145,6 +1159,13 @@ class GlobalDispatcher:
         async with self._dispatch_claim_lock:
             if self._dispatch_paused or self._shutting_down:
                 raise TaskStartPausedError("task starts are paused for maintenance")
+            if (
+                require_idle_task_id is not None
+                and require_idle_task_id in self._pending_task_starts
+            ):
+                raise TaskStartConflictError(
+                    f"task {require_idle_task_id} already has a queued turn"
+                )
             fence = self.deployment_task_start_fence
             if fence is None:
                 yield
@@ -5588,17 +5609,23 @@ class GlobalDispatcher:
                 )
                 status = "pending"
             else:
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_terminal_updates,
+                )
+
+                terminal_values = {
+                    "status": "failed",
+                    "error_message": reason,
+                    "completed_at": datetime.utcnow(),
+                    **frontend_review_goal_terminal_updates(task),
+                }
                 changed = await db.execute(
                     update(Task)
                     .where(
                         *self._task_status_generation_predicates(observed_generation),
                         task_retry_not_superseded_predicate(),
                     )
-                    .values(
-                        status="failed",
-                        error_message=reason,
-                        completed_at=datetime.utcnow(),
-                    )
+                    .values(**terminal_values)
                 )
                 status = "failed"
 
@@ -5657,17 +5684,23 @@ class GlobalDispatcher:
                 return False, False
             background_active = task.pty_background_generation is not None
             observed_generation = self._task_status_generation(task)
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            terminal_values = {
+                "status": "completed",
+                "completed_at": datetime.utcnow(),
+                "error_message": None,
+                **frontend_review_goal_terminal_updates(task),
+            }
             changed = await db.execute(
                 update(Task)
                 .where(
                     *self._task_status_generation_predicates(observed_generation),
                     task_retry_not_superseded_predicate(),
                 )
-                .values(
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                    error_message=None,
-                )
+                .values(**terminal_values)
             )
             if not changed.rowcount:
                 await db.rollback()
@@ -5725,17 +5758,23 @@ class GlobalDispatcher:
             if task is None:
                 return False
             observed_generation = self._task_status_generation(task)
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            terminal_values = {
+                "status": "failed",
+                "error_message": reason,
+                "completed_at": datetime.utcnow(),
+                **frontend_review_goal_terminal_updates(task),
+            }
             changed = await db.execute(
                 update(Task)
                 .where(
                     *self._task_status_generation_predicates(observed_generation),
                     task_retry_not_superseded_predicate(),
                 )
-                .values(
-                    status="failed",
-                    error_message=reason,
-                    completed_at=datetime.utcnow(),
-                )
+                .values(**terminal_values)
             )
             if not changed.rowcount:
                 await db.rollback()
@@ -7807,13 +7846,33 @@ class GlobalDispatcher:
                     codex_service_tier=task.codex_service_tier,
                 )
             else:
-                resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
-                turn_prompt = self._build_goal_followup_prompt(
-                    task,
-                    resume_reason,
-                    turn,
-                    max_turns,
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_activation,
                 )
+
+                activation = (
+                    frontend_review_goal_activation(task.metadata_)
+                    if turn == 0
+                    else None
+                )
+                resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
+                if activation is not None:
+                    secrets_block = await _build_secrets_block(
+                        self.db_factory,
+                        activation["secret_ids"],
+                    )
+                    turn_prompt = self._build_frontend_review_goal_activation_prompt(
+                        task,
+                        activation,
+                        secrets_block=secrets_block,
+                    )
+                else:
+                    turn_prompt = self._build_goal_followup_prompt(
+                        task,
+                        resume_reason,
+                        turn,
+                        max_turns,
+                    )
                 turn_resume_session = session_id
                 # Resume on the session's resident account (no config_dir drift →
                 # PTY hot session preserved); migrate / fall back if cooled down.
@@ -7866,6 +7925,20 @@ class GlobalDispatcher:
 
             # Collect conversation summary for evaluator
             conversation_summary = await self._collect_goal_conversation(task.id, turn)
+            frontend_review_evidence_ready = True
+            frontend_review_evidence_reason = ""
+            from backend.services.frontend_review_goal import (
+                collect_frontend_review_goal_evidence,
+                frontend_review_goal_config,
+            )
+
+            if frontend_review_goal_config(task.metadata_) is not None:
+                (
+                    frontend_review_evidence,
+                    frontend_review_evidence_ready,
+                    frontend_review_evidence_reason,
+                ) = await collect_frontend_review_goal_evidence(task.id)
+                conversation_summary += frontend_review_evidence
 
             # Evaluate goal condition. Operational failures are distinct from
             # an actual "not achieved" verdict, so they never consume a goal
@@ -7888,7 +7961,12 @@ class GlobalDispatcher:
                 return
 
             turn += 1
-            last_reason = eval_result.reason
+            achieved = eval_result.achieved
+            evaluation_reason = eval_result.reason
+            if achieved and not frontend_review_evidence_ready:
+                achieved = False
+                evaluation_reason = frontend_review_evidence_reason
+            last_reason = evaluation_reason
 
             # Update progress in DB
             async with self.db_factory() as db:
@@ -7897,7 +7975,7 @@ class GlobalDispatcher:
                     .where(*self._task_lifecycle_generation_predicates(generation))
                     .values(
                         goal_turns_used=turn,
-                        goal_last_reason=eval_result.reason,
+                        goal_last_reason=evaluation_reason,
                     )
                 )
                 await db.commit()
@@ -7910,27 +7988,21 @@ class GlobalDispatcher:
                 return
 
             # Broadcast evaluation result
-            await self.broadcaster.broadcast(
-                f"task:{task.id}",
-                {
-                    "event_type": "goal_evaluation",
-                    "turn": turn,
-                    "max_turns": max_turns,
-                    "achieved": eval_result.achieved,
-                    "reason": eval_result.reason,
-                },
-            )
-            await self.broadcaster.broadcast(
-                "tasks",
-                {
-                    "event": "goal_evaluation",
-                    "task_id": task.id,
-                    "turn": turn,
-                    "achieved": eval_result.achieved,
-                },
-            )
+            await self.broadcaster.broadcast(f"task:{task.id}", {
+                "event_type": "goal_evaluation",
+                "turn": turn,
+                "max_turns": max_turns,
+                "achieved": achieved,
+                "reason": evaluation_reason,
+            })
+            await self.broadcaster.broadcast("tasks", {
+                "event": "goal_evaluation",
+                "task_id": task.id,
+                "turn": turn,
+                "achieved": achieved,
+            })
 
-            if eval_result.achieved:
+            if achieved:
                 await self._complete_owned_task(
                     generation,
                     count_completion=True,
@@ -7954,6 +8026,15 @@ class GlobalDispatcher:
             parts.append(
                 f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
             )
+
+        from backend.services.frontend_review_goal import (
+            build_frontend_review_goal_protocol,
+            frontend_review_goal_config,
+        )
+
+        frontend_review = frontend_review_goal_config(metadata)
+        if frontend_review is not None:
+            parts.append(build_frontend_review_goal_protocol(frontend_review))
 
         math_hint = _conditional_math_format_hint(
             f"{task.description}\n{task.goal_condition or ''}"
@@ -7986,6 +8067,45 @@ class GlobalDispatcher:
             f"本轮结束时请简要说明完成了什么、当前状态如何。"
         )
         return _prepend_task_artifact_policy(task, prompt)
+
+    def _build_frontend_review_goal_activation_prompt(
+        self,
+        task: Task,
+        activation: dict,
+        *,
+        secrets_block: str = "",
+    ) -> str:
+        """Build turn zero when Goal review starts from an existing chat."""
+
+        from backend.services.frontend_review_goal import (
+            build_frontend_review_goal_protocol,
+            frontend_review_goal_config,
+        )
+
+        config = frontend_review_goal_config(task.metadata_)
+        if config is None:
+            raise RuntimeError("Frontend Review Goal activation is missing config")
+        parts = [
+            _agent_doc_preamble(task),
+            build_frontend_review_goal_protocol(config),
+        ]
+        if secrets_block:
+            parts.append(secrets_block)
+        file_paths = activation.get("file_paths") or []
+        if file_paths:
+            file_list = "\n".join(f"- {path}" for path in file_paths)
+            parts.append(f"请先用 Read 工具查看用户随本次审查提供的文件：\n{file_list}")
+        parts.append(
+            "用户在当前 Task 中启动了新的循环前端审查。"
+            "以下内容是本轮的新目标，请在保留当前 session 上下文的同时以它为准：\n\n"
+            f"{activation['message']}"
+        )
+        parts.append(
+            f"目标完成条件：\n{task.goal_condition}\n\n"
+            f"请持续执行审查、必要的修改和复查，最多 {task.goal_max_turns or 5} 轮。"
+            "每轮结束时请给出可审计摘要；是否继续由独立评估器判断。"
+        )
+        return "\n\n".join(parts)
 
     async def _collect_goal_conversation(self, task_id: int, current_turn: int) -> str:
         """Collect recent conversation log entries for the evaluator.

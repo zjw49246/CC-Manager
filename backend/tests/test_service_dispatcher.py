@@ -3439,6 +3439,66 @@ async def test_goal_achieved_after_multiple_turns(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_frontend_review_goal_evidence_gate_forces_another_turn(db_factory):
+    """A positive model verdict cannot bypass missing browser proof."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        inst = Instance(name="frontend-goal-evidence-worker")
+        db.add(inst)
+        task = _make_goal_task(db, goal_max_turns=3)
+        task.metadata_ = {
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 3,
+            },
+        }
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_obj = task
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.wait = AsyncMock(return_value=0)
+    d.instance_manager.processes = {inst_id: mock_proc}
+
+    from backend.services.goal_evaluator import GoalEvalResult
+    evidence = AsyncMock(side_effect=[
+        ("\nno proof", False, "需要真实浏览器截图"),
+        ("\nproof exists", True, "证据门禁已满足"),
+    ])
+    with (
+        patch(
+            "backend.services.goal_evaluator.GoalEvaluator.evaluate",
+            return_value=GoalEvalResult(achieved=True, reason="模型认为完成"),
+        ),
+        patch(
+            "backend.services.frontend_review_goal.collect_frontend_review_goal_evidence",
+            evidence,
+        ),
+    ):
+        await _claim_mode_lifecycle(db_factory, inst_id, task_obj)
+        await d._run_goal_lifecycle(
+            inst_id,
+            task_obj,
+            d._task_lifecycle_generation(task_obj),
+            "/repo",
+        )
+
+    assert evidence.await_count == 2
+    assert d.instance_manager.launch.await_count == 2
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_obj.id)
+        assert persisted.status == "completed"
+        assert persisted.goal_turns_used == 2
+        assert persisted.goal_last_reason == "模型认为完成"
+
+
+@pytest.mark.asyncio
 async def test_goal_max_turns_exceeded(db_factory):
     """Goal task fails when max turns exhausted."""
     d = _make_dispatcher(db_factory)
@@ -3827,6 +3887,66 @@ async def test_goal_initial_prompt_with_images(db_factory):
     prompt = d._build_goal_initial_prompt(task)
     assert "/uploads/a.png" in prompt
     assert "Read" in prompt
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_goal_initial_prompt_contains_browser_protocol(db_factory):
+    d = _make_dispatcher(db_factory)
+    task = Task(
+        title="frontend goal",
+        description="审查本地页面并修复",
+        mode="goal",
+        goal_condition="Browser Review evidence exists",
+        goal_max_turns=5,
+        provider="codex",
+        metadata_={
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+        },
+    )
+
+    prompt = d._build_goal_initial_prompt(task)
+
+    assert "<frontend_review_goal_protocol>" in prompt
+    assert "ccm_workspace_review.test_current_changes" in prompt
+
+
+def test_frontend_review_goal_activation_prompt_keeps_same_session_request():
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    task = Task(
+        id=91,
+        description="原始任务",
+        provider="codex",
+        goal_condition="必须有最新浏览器截图和报告",
+        goal_max_turns=5,
+        metadata_={
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+        },
+    )
+
+    prompt = dispatcher._build_frontend_review_goal_activation_prompt(
+        task,
+        {
+            "message": "审查设置页窄屏并修复溢出",
+            "file_paths": ["/tmp/reference.png"],
+        },
+        secrets_block="<resolved-secret-reference>",
+    )
+
+    assert "当前 Task 中启动了新的循环前端审查" in prompt
+    assert "审查设置页窄屏并修复溢出" in prompt
+    assert "/tmp/reference.png" in prompt
+    assert "<resolved-secret-reference>" in prompt
+    assert "ccm_workspace_review.test_current_changes" in prompt
+    assert "check_current_changes_review" in prompt
+    assert "修改前端代码后必须再次调用" in prompt
 
 
 @pytest.mark.asyncio
@@ -6278,6 +6398,76 @@ async def test_completion_publication_fence_rejects_late_background_arm(
         current = await db.get(Task, task_id)
         assert current.status == "completed"
         assert current.pty_background_generation == "late-background-epoch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "fail", "retry_exhausted"])
+async def test_temporary_frontend_review_goal_terminal_paths_restore_chat_mode(
+    db_factory,
+    operation,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name=f"frontend-review-terminal-{operation}")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="temporary frontend review goal",
+            status="executing",
+            instance_id=instance.id,
+            mode="goal",
+            goal_condition="temporary review condition",
+            goal_max_turns=5,
+            goal_turns_used=2,
+            goal_last_reason="browser passed",
+            retry_count=0,
+            max_retries=0,
+            metadata_={
+                "keep": "account-binding",
+                "frontend_review": {
+                    "mode": "goal",
+                    "profile": "standard",
+                    "max_iterations": 5,
+                },
+                "frontend_review_activation": {
+                    "message": "review and fix the frontend",
+                    "file_paths": [],
+                    "secret_ids": [],
+                    "restore": {
+                        "mode": "auto",
+                        "goal_condition": None,
+                        "goal_max_turns": 30,
+                        "goal_turns_used": 0,
+                        "goal_last_reason": None,
+                    },
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    if operation == "complete":
+        assert await d._complete_owned_task(generation)
+        expected_status = "completed"
+    elif operation == "fail":
+        assert await d._fail_owned_task(generation, "failed")
+        expected_status = "failed"
+    else:
+        assert await d._retry_or_fail_mode_task(generation, "exhausted") == "failed"
+        expected_status = "failed"
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == expected_status
+        assert current.mode == "auto"
+        assert current.goal_condition is None
+        assert current.goal_max_turns == 30
+        assert current.goal_turns_used == 0
+        assert current.goal_last_reason is None
+        assert current.metadata_ == {"keep": "account-binding"}
 
 
 @pytest.mark.asyncio

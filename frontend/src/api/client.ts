@@ -15,6 +15,356 @@ export interface PRFindingDiffDownload extends TaskArtifactDownload {
   confirmationToken: string;
 }
 
+export type BrowserReviewStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface BrowserReviewTelemetry {
+  console?: Record<string, unknown>[];
+  page_errors?: Record<string, unknown>[];
+  request_failures?: Record<string, unknown>[];
+  http_errors?: Record<string, unknown>[];
+  blocked_navigations?: Record<string, unknown>[];
+}
+
+export interface BrowserReviewTraceEvent {
+  id: number;
+  kind: 'decision' | 'tool';
+  title: string;
+  detail: string | null;
+  tool_name?: string;
+  timestamp: string | null;
+}
+
+export interface BrowserReviewJob {
+  id: string;
+  task_id: number | null;
+  owner_task_id?: number | null;
+  harness_run_id?: string | null;
+  inline_tool: boolean;
+  status: BrowserReviewStatus;
+  stage: string;
+  url: string;
+  network_policy: 'external_public' | 'managed_preview';
+  goal: string;
+  provider: 'claude' | 'codex' | 'capture' | 'openai-responses';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  allow_actions: boolean;
+  capture_only: boolean;
+  browser_channel: 'chrome' | 'chromium';
+  viewport_width: number;
+  viewport_height: number;
+  max_steps: number;
+  max_actions: number;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  response_id: string | null;
+  steps: number;
+  actions: number;
+  latest_screenshot: string | null;
+  telemetry: BrowserReviewTelemetry;
+  action_batches: { step: number; actions: Record<string, unknown>[] }[];
+  trace: BrowserReviewTraceEvent[];
+  verdict: 'passed' | 'failed' | 'inconclusive' | null;
+  findings: TestHarnessFinding[];
+  coverage: Record<string, unknown>;
+  artifacts: string[];
+  report: string | null;
+}
+
+export interface WorkspacePreviewCommand {
+  command: string[];
+  cwd: string;
+  env?: Record<string, string>;
+  timeout_seconds?: number;
+  name?: string;
+}
+
+export interface WorkspacePreviewConfig {
+  version: 1;
+  name: string;
+  setup: WorkspacePreviewCommand[];
+  processes: WorkspacePreviewCommand[];
+  url: string;
+  health_url: string;
+  startup_timeout_seconds: number;
+  sandbox?: {
+    setup: WorkspacePreviewCommand[];
+    processes: WorkspacePreviewCommand[];
+    allowed_hosts: string[];
+  } | null;
+}
+
+export interface WorkspaceReviewCapabilities {
+  available: boolean;
+  reason: string | null;
+  repo_path: string | null;
+  configured: boolean;
+  config: WorkspacePreviewConfig | null;
+  suggested_config: WorkspacePreviewConfig | null;
+}
+
+export type WorkspaceReviewStatus = 'queued' | 'preparing' | 'ready' | 'reviewing' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+export interface WorkspaceReviewRun {
+  id: string;
+  task_id: number;
+  project_id: number | null;
+  agent_task_id: number | null;
+  browser_review_job_id: string | null;
+  mode: 'review_only' | 'fix_loop';
+  profile: 'quick' | 'standard' | 'exhaustive';
+  goal: string;
+  status: WorkspaceReviewStatus;
+  stage: string;
+  workspace_path: string;
+  git_head: string;
+  workspace_fingerprint: string;
+  preview_config: WorkspacePreviewConfig;
+  preview_url: string | null;
+  stale: boolean;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string;
+  cleanup_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export type TestHarnessTargetKind = 'current_workspace' | 'fixed_url' | 'pull_request' | 'git_ref';
+export type TestHarnessStatus = 'queued' | 'resolving_target' | 'preparing_environment' | 'preview_ready' | 'running' | 'collecting_evidence' | 'evaluating' | 'cleaning' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'stale';
+
+export interface TestHarnessEvent {
+  id: number;
+  sequence: number;
+  event_type: string;
+  stage: string | null;
+  title: string;
+  detail: string | null;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TestHarnessFinding {
+  id?: string;
+  fingerprint?: string;
+  scenario_id: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  category: string;
+  title: string;
+  route: string | null;
+  locator: string | null;
+  expected: string | null;
+  actual: string | null;
+  reproduction: string[];
+  evidence: string[];
+  confidence: number | null;
+}
+
+export interface TestHarnessEvidence {
+  id: string;
+  kind: string;
+  name: string;
+  content_type: string;
+  sha256: string;
+  byte_size: number;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TestHarnessAttempt {
+  id: string;
+  ordinal: number;
+  status: string;
+  stage: string;
+  provider: string;
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  agent_task_id: number | null;
+  browser_review_job_id: string | null;
+  archive_state: 'staging' | 'archiving' | 'complete' | 'retryable_error' | 'incomplete';
+  archive_error: string | null;
+  archive_manifest: {
+    version: number;
+    expected: string[];
+    archived: string[];
+    terminal_status: string | null;
+  };
+  archived_at: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface TestHarnessRun {
+  id: string;
+  task_id: number | null;
+  project_id: number | null;
+  workspace_review_run_id: string | null;
+  browser_review_job_id: string | null;
+  agent_task_id: number | null;
+  target_kind: TestHarnessTargetKind;
+  target: Record<string, unknown>;
+  resolved_target: Record<string, unknown> | null;
+  test_plan: Record<string, unknown> & { objective?: string; profile?: string };
+  runtime: Record<string, unknown>;
+  request_fingerprint: string;
+  parent_run_id: string | null;
+  root_run_id: string;
+  attempt_number: number;
+  status: TestHarnessStatus;
+  stage: string;
+  verdict: 'passed' | 'failed' | 'inconclusive' | 'error' | 'cancelled' | 'stale' | null;
+  source_git_head: string | null;
+  source_fingerprint: string | null;
+  stale: boolean;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string;
+  cleanup_error: string | null;
+  evidence_archive_state: TestHarnessAttempt['archive_state'] | null;
+  evidence_archive_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  attempts: TestHarnessAttempt[];
+  events: TestHarnessEvent[];
+  evidence: TestHarnessEvidence[];
+  findings: TestHarnessFinding[];
+  workspace_review: WorkspaceReviewRun | null;
+  browser_review: BrowserReviewJob | null;
+}
+
+export interface TestHarnessRunStart {
+  target_kind?: TestHarnessTargetKind;
+  target?: Record<string, unknown>;
+  goal: string;
+  profile?: 'quick' | 'standard' | 'exhaustive';
+  allow_actions?: boolean;
+  browser_channel?: 'chrome' | 'chromium';
+  viewport_width?: number;
+  viewport_height?: number;
+  max_steps?: number;
+  max_actions?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+  test_plan?: Record<string, unknown>;
+  parent_run_id?: string;
+  idempotency_key?: string;
+}
+
+export interface TestHarnessRuntimeSelection {
+  provider: 'claude' | 'codex';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+}
+
+export interface TestHarnessRuntimeConfig extends TestHarnessRuntimeSelection {
+  inherit_task: boolean;
+  source: 'task' | 'browser_review_config' | 'run_override';
+  task_runtime: TestHarnessRuntimeSelection;
+  default_provider: 'claude' | 'codex';
+  providers: ('claude' | 'codex')[];
+  default_models: Record<'claude' | 'codex', string>;
+  models_by_provider: Record<'claude' | 'codex', string[]>;
+  default_effort: string;
+  effort_options: Record<'claude' | 'codex', string[]>;
+  model_efforts: Record<'claude' | 'codex', Record<string, string[]>>;
+  codex_service_tiers: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+}
+
+export interface TestHarnessRuntimeConfigUpdate {
+  inherit_task: boolean;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+}
+
+export interface TestHarnessCapabilities {
+  contract_version: number;
+  available: boolean;
+  reason: string | null;
+  provider: string;
+  task_provider: string;
+  provider_browser_capability: boolean;
+  runtime_configurable: boolean;
+  runtime: TestHarnessRuntimeConfig;
+  context_policy: string;
+  targets: Record<TestHarnessTargetKind, boolean>;
+  target_reasons: Partial<Record<TestHarnessTargetKind, string | null>>;
+  sandbox: {
+    available: boolean;
+    backend: string | null;
+    reason: string | null;
+    image: string | null;
+    image_id: string | null;
+  };
+  preview: WorkspaceReviewCapabilities;
+  supports_repeat: boolean;
+  supports_compare: boolean;
+}
+
+export interface WorkspaceReviewStart {
+  goal: string;
+  mode?: 'review_only' | 'fix_loop';
+  profile?: 'quick' | 'standard' | 'exhaustive';
+  allow_actions?: boolean;
+  browser_channel?: 'chrome' | 'chromium';
+  viewport_width?: number;
+  viewport_height?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+}
+
+export interface BrowserReviewConfig {
+  default_goal: string;
+  default_provider: 'claude' | 'codex';
+  providers: ('claude' | 'codex')[];
+  default_models: Record<'claude' | 'codex', string>;
+  models_by_provider: Record<'claude' | 'codex', string[]>;
+  default_effort: string;
+  effort_options: Record<'claude' | 'codex', string[]>;
+  model_efforts: Record<'claude' | 'codex', Record<string, string[]>>;
+  codex_service_tiers: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+  browser_channels: ('chrome' | 'chromium')[];
+  max_concurrent_jobs: number;
+  execution: 'ccm_task_account_pool';
+}
+
+export interface BrowserReviewCreate {
+  url: string;
+  goal: string;
+  provider: 'claude' | 'codex';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  allow_actions: boolean;
+  browser_channel: 'chrome' | 'chromium';
+  viewport_width: number;
+  viewport_height: number;
+  max_steps: number;
+  max_actions: number;
+}
+
+export interface FrontendReviewGoalCapabilities {
+  available: boolean;
+  reason: string | null;
+  repo_path: string | null;
+}
+
 export function isApiRequestError(error: unknown): error is ApiRequestError {
   return error instanceof Error
     && typeof (error as { status?: unknown }).status === 'number';
@@ -119,6 +469,27 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+async function blobRequest(path: string): Promise<Blob> {
+  const token = getToken();
+  const res = await fetch(`${getBase()}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(
+      typeof error.detail === 'string' ? error.detail : res.statusText,
+    );
+  }
+  const refreshedToken = res.headers.get('X-Refreshed-Token');
+  if (refreshedToken) setToken(refreshedToken);
+  return res.blob();
+}
+
 async function formRequest<T>(path: string, formData: FormData): Promise<T> {
   const token = getToken();
   const res = await fetch(`${getBase()}${path}`, {
@@ -176,6 +547,7 @@ export interface Project {
   sort_order: number;
   tags: string[];
   env_files: string[];
+  preview_config?: WorkspacePreviewConfig | null;
   git_author_name: string | null;
   git_author_email: string | null;
   git_credential_type: string | null;  // "ssh" | "https" | null
@@ -202,6 +574,12 @@ export interface ProjectTodo {
 }
 
 export type CodexServiceTier = 'default' | 'priority';
+
+export interface FrontendReviewConfig {
+  mode: 'goal';
+  profile: 'standard' | 'exhaustive';
+  max_iterations: number;
+}
 
 export interface PlanModelRoute {
   provider: 'claude' | 'codex';
@@ -343,6 +721,12 @@ export interface Task {
     plan_superseded_by_task_id?: number;
     ccm_worker_managed_task?: boolean;
     ccm_user_skill_snapshots?: unknown[];
+    frontend_review?: FrontendReviewConfig;
+    frontend_review_activation?: {
+      message: string;
+      file_paths?: string[];
+      secret_ids?: number[];
+    };
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -1642,7 +2026,14 @@ export const api = {
   markTaskUnread: (id: number) =>
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
-    request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
+    request<{
+      ok: boolean;
+      stopped?: boolean;
+      cleared_messages?: number;
+      note?: string;
+      task_status?: string;
+      background_active?: boolean;
+    }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
   listForkAnchors: (id: number) =>
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
   forkTask: (
@@ -1658,7 +2049,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -1881,6 +2272,8 @@ export const api = {
       applied_plan_task_ids?: number[];
       applied_plan_version_ids?: number[];
       plan_application_receipt_key?: string;
+      workspace_review_expected: boolean;
+      workspace_review_baseline_run_id: string | null;
     }>(`/api/tasks/${taskId}/chat`, {
       method: 'POST',
       body: JSON.stringify({
@@ -1899,6 +2292,22 @@ export const api = {
           : {}),
       }),
     }),
+  startFrontendReviewGoal: (
+    taskId: number,
+    data: {
+      message: string;
+      file_paths?: string[];
+      secret_ids?: number[];
+      profile?: 'standard' | 'exhaustive';
+      max_iterations?: number;
+      expected_routing?: TaskRoutingExpectation;
+    },
+  ) => request<Task>(`/api/tasks/${taskId}/frontend-review-goal`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getFrontendReviewGoalCapabilities: (taskId: number) =>
+    request<FrontendReviewGoalCapabilities>(`/api/tasks/${taskId}/frontend-review-goal/capabilities`),
   getInjectCapabilities: (taskId: number) =>
     request<InjectTaskCapabilities>(`/api/tasks/${taskId}/inject-capabilities`),
   injectTaskMessage: (
@@ -2084,6 +2493,89 @@ export const api = {
     ),
   getSubAgentSummary: (taskId: number) =>
     request<SubAgentSummary>(`/api/tasks/${taskId}/sub-agents/summary`),
+
+  // Browser Review demo
+  getBrowserReviewConfig: () =>
+    request<BrowserReviewConfig>('/api/browser-reviews/config'),
+  listBrowserReviews: () =>
+    request<BrowserReviewJob[]>('/api/browser-reviews'),
+  createBrowserReview: (data: BrowserReviewCreate) =>
+    request<BrowserReviewJob>('/api/browser-reviews', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getBrowserReview: (id: string) =>
+    request<BrowserReviewJob>(`/api/browser-reviews/${encodeURIComponent(id)}`),
+  cancelBrowserReview: (id: string) =>
+    request<BrowserReviewJob>(`/api/browser-reviews/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    }),
+  getBrowserReviewArtifact: (id: string, name: string) =>
+    blobRequest(
+      `/api/browser-reviews/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`,
+    ),
+  listTaskBrowserReviews: (taskId: number) =>
+    request<BrowserReviewJob[]>(`/api/tasks/${taskId}/browser-reviews`),
+  getTaskBrowserReviewArtifact: (taskId: number, id: string, name: string) =>
+    blobRequest(
+      `/api/tasks/${taskId}/browser-reviews/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`,
+    ),
+
+  // Durable, provider-neutral frontend Test Harness
+  getTestHarnessCapabilities: (taskId: number) =>
+    request<TestHarnessCapabilities>(`/api/tasks/${taskId}/test-runs/capabilities`),
+  getTestHarnessRuntimeConfig: (taskId: number) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`),
+  updateTestHarnessRuntimeConfig: (taskId: number, data: TestHarnessRuntimeConfigUpdate) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  startTestRun: (taskId: number, data: TestHarnessRunStart) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listTestRuns: (taskId: number) =>
+    request<TestHarnessRun[]>(`/api/tasks/${taskId}/test-runs`),
+  getTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}`),
+  cancelTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
+  repeatTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/repeat`, {
+      method: 'POST',
+    }),
+  compareTestRuns: (taskId: number, baseRunId: string, candidateRunId: string) =>
+    request<Record<string, unknown>>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(baseRunId)}/compare/${encodeURIComponent(candidateRunId)}`),
+  getTestRunEvidence: (taskId: number, runId: string, name: string) =>
+    blobRequest(
+      `/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/evidence/${encodeURIComponent(name)}`,
+    ),
+
+  // Current Task workspace browser verification
+  getWorkspaceReviewCapabilities: (taskId: number) =>
+    request<WorkspaceReviewCapabilities>(`/api/tasks/${taskId}/workspace-reviews/capabilities`),
+  approveWorkspacePreviewConfig: (taskId: number, config: WorkspacePreviewConfig) =>
+    request<WorkspaceReviewCapabilities>(`/api/tasks/${taskId}/workspace-reviews/preview-config`, {
+      method: 'PUT',
+      body: JSON.stringify({ config }),
+    }),
+  startWorkspaceReview: (taskId: number, data: WorkspaceReviewStart) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listWorkspaceReviews: (taskId: number) =>
+    request<WorkspaceReviewRun[]>(`/api/tasks/${taskId}/workspace-reviews`),
+  getWorkspaceReview: (taskId: number, runId: string) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews/${encodeURIComponent(runId)}`),
+  cancelWorkspaceReview: (taskId: number, runId: string) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
 
   // PR Monitor
   getMonitoredRepos: () =>

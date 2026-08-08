@@ -12,7 +12,7 @@ from pathlib import Path
 # bootstrap, an incompletely mocked test can write Instance/Task lifecycle
 # state into the developer's real ``claude_manager.db``.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-"))
+_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-")).resolve()
 atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
 _GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
 _GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)
@@ -44,6 +44,9 @@ os.environ.update({
     # Unit tests exercise the cleaner with isolated roots explicitly. Importing
     # backend.main must never start a watchdog against the host's real /tmp.
     "TMP_CLEANUP_ENABLED": "false",
+    "TEST_HARNESS_ARTIFACT_ROOT": str(
+        _GLOBAL_TEST_DB_DIR / "test-harness-artifacts"
+    ),
     "AUTO_START_DISPATCHER": "false",
     "AUTO_PUSH_TO_ORIGIN": "false",
     # Preserve the product default for constructor/wiring tests. Dispatcher is
@@ -76,6 +79,8 @@ import backend.models.discussion  # noqa: F401
 import backend.models.monitor_session  # noqa: F401
 import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
+import backend.models.workspace_review  # noqa: F401
+import backend.models.test_harness  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
 
@@ -124,6 +129,9 @@ async def app(db_engine):
 
     from backend.main import app as real_app
     from backend.database import get_db
+    from backend.services.test_harness import test_harness_service
+    from backend.services import workspace_review as workspace_review_module
+    from backend.services.workspace_review import workspace_review_manager
 
     async def override_get_db():
         async with session_factory() as session:
@@ -133,12 +141,24 @@ async def app(db_engine):
 
     from backend.config import settings
     original_token = settings.auth_token
+    original_harness_db_factory = test_harness_service.db_factory
+    original_harness_child_db_factory = test_harness_service.child_service.db_factory
+    original_workspace_child_db_factory = workspace_review_manager.child_service.db_factory
+    original_workspace_db_factory = workspace_review_module.async_session
     settings.auth_token = ""
+    test_harness_service.db_factory = session_factory
+    test_harness_service.child_service.db_factory = session_factory
+    workspace_review_manager.child_service.db_factory = session_factory
+    workspace_review_module.async_session = session_factory
 
     yield real_app, session_factory
 
     real_app.dependency_overrides.clear()
     settings.auth_token = original_token
+    test_harness_service.db_factory = original_harness_db_factory
+    test_harness_service.child_service.db_factory = original_harness_child_db_factory
+    workspace_review_manager.child_service.db_factory = original_workspace_child_db_factory
+    workspace_review_module.async_session = original_workspace_db_factory
 
 
 @pytest_asyncio.fixture

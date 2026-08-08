@@ -1435,11 +1435,30 @@ def _read_saved_mailbox_credential(
     )
 
 
-def _get_pool():
+def _get_optional_pool():
     from backend.main import codex_pool
-    if not codex_pool:
-        raise HTTPException(status_code=404, detail="Codex pool not enabled. Set CODEX_POOL_ENABLED=true in .env")
+
     return codex_pool
+
+
+def _get_pool():
+    pool = _get_optional_pool()
+    if not pool:
+        raise HTTPException(status_code=404, detail="Codex pool not enabled. Set CODEX_POOL_ENABLED=true in .env")
+    return pool
+
+
+def _disabled_pool_status() -> dict:
+    return {
+        "enabled": False,
+        "total": 0,
+        "available": 0,
+        "cooldown": 0,
+        "disabled": 0,
+        "preferred": None,
+        "last_selected": None,
+        "accounts": [],
+    }
 
 
 def _get_instance_manager():
@@ -1458,8 +1477,8 @@ def _get_dispatcher():
 
 @router.get("/status")
 async def codex_pool_status():
-    pool = _get_pool()
-    return pool.status()
+    pool = _get_optional_pool()
+    return pool.status() if pool else _disabled_pool_status()
 
 
 @router.get("/usage")

@@ -10,6 +10,7 @@ fi
 
 PORT=${PORT:-8000}
 TOKEN_MANAGER_PORT=${TOKEN_MANAGER_PORT:-8001}
+export PORT
 
 echo "Starting Claude Code Manager..."
 echo "Backend:  http://localhost:${PORT}"

@@ -698,6 +698,86 @@ async def test_cancel_task(client):
 
 
 @pytest.mark.asyncio
+async def test_cancel_owner_cascades_to_durable_browser_child(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import (
+        TestHarnessChildBinding,
+        TestHarnessRun,
+    )
+
+    create_resp = await client.post(
+        "/api/tasks",
+        json={"title": "Owner with browser run", "description": "d"},
+    )
+    task_id = create_resp.json()["id"]
+    run_id = "a" * 32
+    async with session_factory() as db:
+        child = Task(
+            title="Isolated Browser Agent",
+            description="black-box review",
+            status="pending_activation",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+            archived=True,
+            metadata_={
+                "isolated_browser_agent": True,
+                "test_harness_run_id": run_id,
+                "test_harness_parent_task_id": task_id,
+                "browser_review_job_id": "browser-cascade-job",
+            },
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=task_id,
+                agent_task_id=child.id,
+                browser_review_job_id="browser-cascade-job",
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="b" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="waiting_for_agent",
+            )
+        )
+        db.add(
+            TestHarnessChildBinding(
+                id="c" * 32,
+                harness_run_id=run_id,
+                owner_task_id=task_id,
+                child_task_id=child.id,
+                browser_review_job_id="browser-cascade-job",
+                state="reserved",
+            )
+        )
+        await db.commit()
+        child_id = child.id
+
+    response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        child = await db.get(Task, child_id)
+        run = await db.get(TestHarnessRun, run_id)
+        binding = await db.get(TestHarnessChildBinding, "c" * 32)
+        assert owner.status == "cancelled"
+        assert child.status == "cancelled"
+        assert run.status == "cancelled"
+        assert binding.state == "stopped"
+
+
+@pytest.mark.asyncio
 async def test_retry_task(client):
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
@@ -2135,6 +2215,47 @@ async def test_create_goal_task(client):
     assert data["goal_max_turns"] == 30
     assert data["goal_turns_used"] == 0
     assert data["goal_last_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_frontend_review_goal_builds_internal_condition(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Frontend Review Goal",
+        "description": "审查 http://127.0.0.1:5173，修复后重新验证",
+        "target_repo": "/tmp",
+        "frontend_review": {
+            "mode": "goal",
+            "profile": "standard",
+            "max_iterations": 5,
+        },
+    })
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["mode"] == "goal"
+    assert data["goal_max_turns"] == 5
+    assert "Browser Review" in data["goal_condition"]
+    assert data["metadata_"]["frontend_review"] == {
+        "mode": "goal",
+        "profile": "standard",
+        "max_iterations": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_frontend_review_goal_rejects_excessive_iterations(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Unbounded Frontend Review Goal",
+        "description": "review it",
+        "target_repo": "/tmp",
+        "frontend_review": {
+            "mode": "goal",
+            "profile": "standard",
+            "max_iterations": 11,
+        },
+    })
+
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -4085,6 +4206,37 @@ async def test_stop_session_no_process_reports_not_stopped(client, session_facto
     assert body["stopped"] is False
     assert "note" in body
     mock_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_session_is_idempotent_for_terminal_task(client, session_factory):
+    """A stale active UI can stop an already-terminal Task without a 400."""
+    from backend.models.task import Task
+    from sqlalchemy import update
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Already done", "description": "d", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="completed")
+        )
+        await db.commit()
+
+    resp = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "stopped": False,
+        "cleared_messages": 0,
+        "note": "Task is already completed; no running process found",
+        "task_status": "completed",
+        "background_active": False,
+    }
 
 
 @pytest.mark.asyncio

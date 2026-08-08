@@ -2,6 +2,7 @@
 import asyncio
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 import pytest_asyncio
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.task import Task
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.project import Project
 from backend.models.task_share import TaskShare
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
@@ -1007,6 +1009,200 @@ def _mock_dispatcher():
 
 
 @pytest.mark.asyncio
+async def test_chat_can_start_frontend_review_goal_on_same_task(
+    client,
+    session_factory,
+    tmp_path: Path,
+):
+    repo = tmp_path / "frontend-review-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="completed",
+        provider="codex",
+        model="gpt-5.6-sol",
+        retry_count=2,
+        target_repo=str(repo),
+        last_cwd=str(repo),
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"frontend-review-{task_id}",
+            local_path=str(repo),
+            status="ready",
+            preview_config={
+                "version": 1,
+                "name": "Test preview",
+                "setup": [],
+                "processes": [{
+                    "name": "web",
+                    "command": [
+                        "python",
+                        "-m",
+                        "http.server",
+                        "{preview_port}",
+                    ],
+                    "cwd": ".",
+                }],
+                "url": "http://127.0.0.1:{preview_port}/",
+                "health_url": "http://127.0.0.1:{preview_port}/",
+                "startup_timeout_seconds": 30,
+            },
+        )
+        db.add(project)
+        await db.flush()
+        task = await db.get(Task, task_id)
+        assert task is not None
+        task.project_id = project.id
+        await db.commit()
+
+    capability_response = await client.get(
+        f"/api/tasks/{task_id}/frontend-review-goal/capabilities",
+    )
+    assert capability_response.status_code == 200
+    assert capability_response.json() == {
+        "available": True,
+        "reason": None,
+        "repo_path": str(repo),
+    }
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/frontend-review-goal",
+        json={
+            "message": "审查登录页桌面和移动端，修复后重新验证",
+            "file_paths": ["/tmp/login-reference.png"],
+            "profile": "standard",
+            "max_iterations": 5,
+            "expected_routing": {
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "codex_service_tier": "default",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["id"] == task_id
+    assert data["status"] == "pending"
+    assert data["mode"] == "goal"
+    assert data["session_id"] == "test-session-123"
+    assert data["retry_count"] == 0
+    assert data["goal_turns_used"] == 0
+    assert data["goal_max_turns"] == 5
+    assert "审查登录页桌面和移动端" in data["goal_condition"]
+    assert data["metadata_"]["frontend_review"] == {
+        "mode": "goal",
+        "profile": "standard",
+        "max_iterations": 5,
+    }
+    assert data["metadata_"]["frontend_review_activation"] == {
+        "message": "审查登录页桌面和移动端，修复后重新验证",
+        "file_paths": ["/tmp/login-reference.png"],
+        "secret_ids": [],
+        "restore": {
+            "mode": "auto",
+            "goal_condition": None,
+            "goal_max_turns": 30,
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+        },
+    }
+
+    async with session_factory() as db:
+        rows = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].content == "审查登录页桌面和移动端，修复后重新验证"
+    assert json.loads(rows[0].raw_json)["source"] == "frontend-review-goal"
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_goal_rejects_non_git_resume_directory(
+    client,
+    session_factory,
+    tmp_path: Path,
+):
+    ordinary_directory = tmp_path / "not-a-repository"
+    ordinary_directory.mkdir()
+    repo = tmp_path / "configured-repository"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="completed",
+        target_repo=str(repo),
+        last_cwd=str(ordinary_directory),
+    )
+
+    capability_response = await client.get(
+        f"/api/tasks/{task_id}/frontend-review-goal/capabilities",
+    )
+    assert capability_response.status_code == 200
+    capability = capability_response.json()
+    assert capability["available"] is False
+    assert "Git" in capability["reason"]
+    assert capability["repo_path"] is None
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/frontend-review-goal",
+        json={"message": "现在开始循环审查"},
+    )
+
+    assert response.status_code == 409
+    assert "Git" in response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        rows = list((await db.execute(
+            select(LogEntry).where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )).scalars().all())
+    assert task is not None
+    assert task.status == "completed"
+    assert task.mode == "auto"
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_goal_requires_idle_local_session(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="executing",
+    )
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/frontend-review-goal",
+        json={"message": "现在开始循环审查"},
+    )
+
+    assert response.status_code == 409
+    assert "not idle" in response.text
+
+
+@pytest.mark.asyncio
 async def test_chat_send_enqueues_message(client, session_factory):
     """Chat send returns 200 queued=True and enqueues via the dispatcher."""
     from backend.services.dispatcher import PRIORITY_USER
@@ -1031,6 +1227,8 @@ async def test_chat_send_enqueues_message(client, session_factory):
     assert data["ok"] is True
     assert data["queued"] is True
     assert data["session_id"] == "test-session-123"
+    assert data["workspace_review_expected"] is False
+    assert data["workspace_review_baseline_run_id"] is None
 
     mock_d.enqueue_message.assert_awaited_once()
     kwargs = mock_d.enqueue_message.call_args.kwargs
@@ -1047,6 +1245,98 @@ async def test_chat_send_enqueues_message(client, session_factory):
     ]
     assert len(task_broadcasts) == 1
     assert task_broadcasts[0][0][1]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_chat_closes_legacy_terminal_frontend_review_goal_before_enqueue(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="completed",
+        mode="goal",
+        goal_condition="temporary browser review",
+        goal_max_turns=5,
+        goal_turns_used=2,
+        goal_last_reason="review passed",
+        metadata_={
+            "keep": "account-binding",
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+            # Legacy activations did not contain a restore snapshot.
+            "frontend_review_activation": {
+                "message": "审查并修复前端",
+                "file_paths": [],
+                "secret_ids": [],
+            },
+        },
+    )
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+
+    with patch("backend.main.dispatcher", mock_d), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "这是 Goal 结束后的普通后续问题"},
+        )
+
+    assert response.status_code == 200, response.text
+    mock_d.enqueue_message.assert_awaited_once()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert task.mode == "auto"
+        assert task.goal_condition is None
+        assert task.goal_max_turns == 30
+        assert task.goal_turns_used == 0
+        assert task.goal_last_reason is None
+        assert task.metadata_ == {"keep": "account-binding"}
+
+
+@pytest.mark.asyncio
+async def test_chat_frontend_pr_acceptance_injects_browser_review_protocol(
+    client,
+    session_factory,
+):
+    """Natural-language PR UI acceptance cannot silently become code-only QA."""
+
+    task_id = await _create_task_with_session(client, session_factory)
+    mock_d = _mock_dispatcher()
+    mock_broadcaster = MagicMock()
+    mock_broadcaster.broadcast = AsyncMock()
+    message = "审查一下pr99分支的前端内容是否实现"
+
+    with patch("backend.main.dispatcher", mock_d), \
+         patch("backend.main.broadcaster", mock_broadcaster):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": message},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_review_expected"] is True
+    assert response.json()["workspace_review_baseline_run_id"] is None
+    prompt = mock_d.enqueue_message.await_args.kwargs["prompt"]
+    assert prompt.startswith(message)
+    assert "ccm_workspace_browser_review_request" in prompt
+    assert "test_git_target" in prompt
+    assert "PR #99" in prompt
+    assert "精确 SHA" in prompt
+    assert "Sandbox cleanup" in prompt
+    assert "不得改测当前工作区" in prompt
+
+    history = await client.get(f"/api/tasks/{task_id}/chat/history")
+    user_rows = [row for row in history.json() if row["role"] == "user"]
+    assert user_rows[-1]["content"] == message
 
 
 @pytest.mark.asyncio
