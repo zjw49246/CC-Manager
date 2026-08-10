@@ -3732,12 +3732,15 @@ async def _store_injected_message(
     *,
     db: AsyncSession,
     broadcaster,
-    task: Task,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
     raw_content: str,
     display_content: str,
     sender_display_name: str | None,
     uploads: list[ValidatedUploadAttachment],
     instance_id: int | None,
+    generation_audit_matched: bool,
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -3747,6 +3750,11 @@ async def _store_injected_message(
     raw_metadata: dict[str, Any] = {
         "source": "inject",
         "raw_content": raw_content,
+        "generation_audit": (
+            "matched"
+            if generation_audit_matched
+            else "changed_after_transport"
+        ),
     }
     if attachments:
         raw_metadata.update({
@@ -3758,9 +3766,9 @@ async def _store_injected_message(
         raw_metadata["sender_name"] = sender_display_name
     entry = LogEntry(
         instance_id=instance_id,
-        task_id=task.id,
-        task_retry_count=task.retry_count,
-        task_turn_generation=task.turn_generation,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
         turn_scope="foreground",
         event_type="user_message",
         role="user",
@@ -3786,7 +3794,98 @@ async def _store_injected_message(
     })
     if sender_display_name:
         event["sender_name"] = sender_display_name
-    await broadcaster.broadcast(f"task:{task.id}", event)
+    await broadcaster.broadcast(f"task:{task_id}", event)
+
+
+async def _audit_and_store_injected_message(
+    *,
+    db: AsyncSession,
+    broadcaster,
+    request: Request,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_session_id: str,
+    task_instance_id: int | None,
+    task_provider_db_value: str | None,
+    raw_content: str,
+    uploads: list[ValidatedUploadAttachment],
+) -> None:
+    """Durably audit a transport side effect against its admitted generation.
+
+    The transport acknowledgement happens without a database transaction held.
+    Reacquire the Task row only after that acknowledgement and persist the user
+    message in the same short transaction.  A generation that changed in the
+    transport window is audit evidence, not a reason to erase an already
+    delivered message or return a retryable response.
+    """
+
+    generation_audit = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            Task.retry_count == task_retry_count,
+            Task.turn_generation == task_turn_generation,
+            (
+                Task.instance_id.is_(None)
+                if task_instance_id is None
+                else Task.instance_id == task_instance_id
+            ),
+            Task.session_id == task_session_id,
+            (
+                Task.provider.is_(None)
+                if task_provider_db_value is None
+                else Task.provider == task_provider_db_value
+            ),
+        )
+        .values(status=Task.status)
+    )
+    generation_audit_matched = generation_audit.rowcount == 1
+    if not generation_audit_matched:
+        logger.warning(
+            "Task %s generation changed after its live injection transport "
+            "acknowledged retry=%s turn=%s session=%s; preserving the "
+            "delivered-message audit under the admitted generation",
+            task_id,
+            task_retry_count,
+            task_turn_generation,
+            task_session_id,
+        )
+
+    display_content, sender_display_name = await _inject_display_content(
+        request,
+        db,
+        raw_content,
+    )
+    await _store_injected_message(
+        db=db,
+        broadcaster=broadcaster,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        raw_content=raw_content,
+        display_content=display_content,
+        sender_display_name=sender_display_name,
+        uploads=uploads,
+        instance_id=task_instance_id,
+        generation_audit_matched=generation_audit_matched,
+    )
+
+
+async def _settle_injected_message_audit(operation) -> None:
+    """Finish the audit after transport success even if HTTP is cancelled."""
+
+    audit_task = asyncio.create_task(operation)
+    delayed_cancel: asyncio.CancelledError | None = None
+    while not audit_task.done():
+        try:
+            await asyncio.shield(audit_task)
+        except asyncio.CancelledError as exc:
+            if delayed_cancel is None:
+                delayed_cancel = exc
+    audit_task.result()
+    if delayed_cancel is not None:
+        raise delayed_cancel
 
 
 @router.get("/{task_id}/inject-capabilities")
@@ -3902,27 +4001,42 @@ async def inject_message(
 
         uploads = _validated_inject_attachments(body)
 
-        # Hold the Task write lock through the transport steer and injected
-        # LogEntry commit.  A concurrent termination admission either wins
-        # before this exact SQL gate (and injection is refused) or waits until
-        # the already-admitted injection is durably recorded.
+        # Capture the immutable admission generation before ending this DB
+        # transaction.  The in-process operation lock stays held across the
+        # transport and audit, while these scalar values keep both operations
+        # tied to the exact foreground generation admitted here.
+        admitted_task_id = task.id
+        admitted_status = task.status
+        admitted_retry_count = task.retry_count
+        admitted_turn_generation = task.turn_generation
+        admitted_instance_id = task.instance_id
+        admitted_session_id = task.session_id
+        admitted_provider_db_value = task.provider
+        admitted_provider = (task.provider or "claude").lower()
+
+        # Take a short exact-generation admission gate, then COMMIT it before
+        # awaiting the provider.  The PTY consumer may need to persist an
+        # assistant/tool event before it can read the later queue-operation
+        # acknowledgement; retaining this row lock across the await would make
+        # the API wait for the consumer while the consumer waits for this API.
         injection_gate = await db.execute(
             sa_update(Task)
             .where(
-                Task.id == task_id,
+                Task.id == admitted_task_id,
                 Task.status.in_(("in_progress", "executing")),
-                Task.status == task.status,
-                Task.retry_count == task.retry_count,
-                Task.turn_generation == task.turn_generation,
+                Task.status == admitted_status,
+                Task.retry_count == admitted_retry_count,
+                Task.turn_generation == admitted_turn_generation,
                 (
                     Task.instance_id.is_(None)
-                    if task.instance_id is None
-                    else Task.instance_id == task.instance_id
+                    if admitted_instance_id is None
+                    else Task.instance_id == admitted_instance_id
                 ),
+                Task.session_id == admitted_session_id,
                 (
-                    Task.session_id.is_(None)
-                    if task.session_id is None
-                    else Task.session_id == task.session_id
+                    Task.provider.is_(None)
+                    if admitted_provider_db_value is None
+                    else Task.provider == admitted_provider_db_value
                 ),
                 Task.worker_id.is_(None),
                 Task.shared_from_id.is_(None),
@@ -3937,15 +4051,18 @@ async def inject_message(
                 "Task state changed or it has an active Worker termination "
                 "receipt",
             )
+        # This is the critical lock-release boundary.  Never move it below a
+        # provider transport await: enqueue -> assistant -> remove is a normal
+        # Claude JSONL sequence, and the assistant event uses the same Task row.
+        await db.commit()
 
         from backend.main import instance_manager, broadcaster
 
-        provider = (task.provider or "claude").lower()
         transport_content = _inject_transport_content(
             body.message,
             uploads,
         )
-        if provider == "codex":
+        if admitted_provider == "codex":
             from backend.config import settings
 
             if not settings.codex_app_server_enabled:
@@ -3955,7 +4072,7 @@ async def inject_message(
                 )
             if uploads:
                 ok = await instance_manager.inject_codex_message(
-                    task.session_id,
+                    admitted_session_id,
                     transport_content,
                     input_items=_codex_inject_input_items(
                         transport_content,
@@ -3964,7 +4081,7 @@ async def inject_message(
                 )
             else:
                 ok = await instance_manager.inject_codex_message(
-                    task.session_id,
+                    admitted_session_id,
                     transport_content,
                 )
             unavailable_detail = (
@@ -3972,8 +4089,8 @@ async def inject_message(
                 "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
                 "模式直接发普通消息"
             )
-        elif provider == "claude":
-            if not instance_manager.has_pty_session(task.session_id):
+        elif admitted_provider == "claude":
+            if not instance_manager.has_pty_session(admitted_session_id):
                 raise HTTPException(
                     400,
                     (
@@ -3986,14 +4103,22 @@ async def inject_message(
             try:
                 if uploads:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
                         require_host_file_access=True,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
                     )
                 else:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
                     )
             except Exception as exc:
                 from backend.services.instance_manager import (
@@ -4017,26 +4142,30 @@ async def inject_message(
         else:
             raise HTTPException(
                 400,
-                f"Provider {provider} 不支持执行中注入",
+                f"Provider {admitted_provider} 不支持执行中注入",
             )
 
         if not ok:
             raise HTTPException(409, unavailable_detail)
 
-        display_content, sender_display_name = await _inject_display_content(
-            request,
-            db,
-            body.message,
-        )
-        await _store_injected_message(
-            db=db,
-            broadcaster=broadcaster,
-            task=task,
-            raw_content=body.message,
-            display_content=display_content,
-            sender_display_name=sender_display_name,
-            uploads=uploads,
-            instance_id=task.instance_id,
+        # The model has accepted the input.  From this point on, cancellation
+        # must not leave an invisible side effect that a client will retry.
+        # Re-audit the exact generation and persist its user-message record in
+        # one short transaction, even when that generation changed meanwhile.
+        await _settle_injected_message_audit(
+            _audit_and_store_injected_message(
+                db=db,
+                broadcaster=broadcaster,
+                request=request,
+                task_id=admitted_task_id,
+                task_retry_count=admitted_retry_count,
+                task_turn_generation=admitted_turn_generation,
+                task_session_id=admitted_session_id,
+                task_instance_id=admitted_instance_id,
+                task_provider_db_value=admitted_provider_db_value,
+                raw_content=body.message,
+                uploads=uploads,
+            )
         )
         return {
             "ok": True,

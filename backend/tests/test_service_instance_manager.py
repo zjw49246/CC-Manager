@@ -624,31 +624,266 @@ async def test_inject_codex_message_forwards_native_attachment_inputs():
 
 @pytest.mark.asyncio
 async def test_inject_pty_attachment_rejects_container_before_inject():
+    native_process = object()
     session = types.SimpleNamespace(
         session_id="claude-session-1",
         is_alive=True,
-        inject=AsyncMock(return_value=True),
+        active_turn_process=native_process,
+        steer_active_turn=AsyncMock(return_value=True),
     )
-    consumer = MagicMock()
-    consumer.done.return_value = False
     manager = InstanceManager(MagicMock(), MagicMock())
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    proxy = types.SimpleNamespace(session=session, returncode=None)
     manager._pty_backend = types.SimpleNamespace(
         _sessions={7: session},
         _consumers={7: consumer},
+        _proxies={7: proxy},
+    )
+    manager.processes[7] = proxy
+    manager._tasks[7] = consumer
+    manager._consumer_records[7] = _OutputConsumerRecord(
+        process=proxy,
+        task=consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=99,
+        task_retry_count=2,
+        task_turn_generation=3,
     )
     manager._container_tasks[7] = 99
 
-    with pytest.raises(
-        LiveAttachmentInjectionUnsupportedError,
-        match="cannot access uploaded files",
-    ):
-        await manager.inject_pty_message(
-            "claude-session-1",
-            "Read /tmp/upload.txt",
-            require_host_file_access=True,
-        )
+    try:
+        with pytest.raises(
+            LiveAttachmentInjectionUnsupportedError,
+            match="cannot access uploaded files",
+        ):
+            await manager.inject_pty_message(
+                "claude-session-1",
+                "Read /tmp/upload.txt",
+                task_id=99,
+                task_retry_count=2,
+                task_turn_generation=3,
+                expected_instance_id=7,
+                require_host_file_access=True,
+            )
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
+    session.steer_active_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_steers_exact_foreground_turn_without_channel():
+    native_process = object()
+    session = types.SimpleNamespace(
+        session_id="claude-session-1",
+        is_alive=True,
+        active_turn_process=native_process,
+        steer_active_turn=AsyncMock(return_value=True),
+        inject=AsyncMock(return_value=False),
+    )
+    manager = InstanceManager(MagicMock(), MagicMock())
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    proxy = types.SimpleNamespace(session=session, returncode=None)
+    record = _OutputConsumerRecord(
+        process=proxy,
+        task=consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=99,
+        task_retry_count=2,
+        task_turn_generation=3,
+    )
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={7: session},
+        _consumers={7: consumer},
+        _proxies={7: proxy},
+    )
+    manager.processes[7] = proxy
+    manager._tasks[7] = consumer
+    manager._consumer_records[7] = record
+
+    try:
+        assert await manager.inject_pty_message(
+            "claude-session-1",
+            "change direction",
+            task_id=99,
+            task_retry_count=2,
+            task_turn_generation=3,
+            expected_instance_id=7,
+        ) is True
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    session.steer_active_turn.assert_awaited_once_with(
+        "change direction",
+        expected_process=native_process,
+    )
     session.inject.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_uses_pinned_session_active_turn_api(tmp_path):
+    """Exercise the CCM-to-claude-pty boundary without a Session mock."""
+    from claude_pty import JsonlReader, PTYConfig, Session
+
+    jsonl_path = tmp_path / "session.jsonl"
+    jsonl_path.write_text("", encoding="utf-8")
+
+    class NativeProcess:
+        session_id = "claude-session-pinned"
+        is_alive = True
+        exit_code = None
+        rate_limited = False
+
+        def __init__(self):
+            self.jsonl_path = str(jsonl_path)
+            self.sent: list[str] = []
+
+        def send_prompt(self, text: str) -> None:
+            self.sent.append(text)
+
+        def stop(self) -> None:
+            self.is_alive = False
+
+    native_process = NativeProcess()
+    session = Session(
+        cwd=str(tmp_path),
+        config=PTYConfig(
+            jsonl_poll_interval=0.01,
+            post_response_wait=0.0,
+            response_timeout=2.0,
+            inject_confirm_timeout=0.5,
+        ),
+    )
+    session._session_id = native_process.session_id
+    session._process = native_process
+    session._reader = JsonlReader(str(jsonl_path), tracker=session._tracker)
+    session._tracker.set_jsonl_path(str(jsonl_path))
+    session._started = True
+
+    def append_jsonl(*records: dict) -> None:
+        with jsonl_path.open("a", encoding="utf-8") as stream:
+            for record in records:
+                stream.write(json.dumps(record) + "\n")
+
+    async def wait_until(predicate, timeout: float = 1.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("condition was not reached")
+            await asyncio.sleep(0.005)
+
+    async def collect_turn() -> list:
+        return [event async for event in session.send_prompt("initial task")]
+
+    consumer = asyncio.create_task(collect_turn())
+    await wait_until(lambda: native_process.sent == ["initial task"])
+    append_jsonl({
+        "type": "user",
+        "message": {"role": "user", "content": "initial task"},
+    })
+    await wait_until(lambda: session.active_turn_process is native_process)
+
+    manager = InstanceManager(MagicMock(), MagicMock())
+    proxy = types.SimpleNamespace(session=session, returncode=None)
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={7: session},
+        _consumers={7: consumer},
+        _proxies={7: proxy},
+    )
+    manager.processes[7] = proxy
+    manager._tasks[7] = consumer
+    manager._consumer_records[7] = _OutputConsumerRecord(
+        process=proxy,
+        task=consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=99,
+        task_retry_count=2,
+        task_turn_generation=3,
+    )
+
+    injection = asyncio.create_task(manager.inject_pty_message(
+        native_process.session_id,
+        "change direction",
+        task_id=99,
+        task_retry_count=2,
+        task_turn_generation=3,
+        expected_instance_id=7,
+    ))
+    await wait_until(
+        lambda: native_process.sent == ["initial task", "change direction"]
+    )
+    append_jsonl(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "change direction",
+        },
+        {"type": "queue-operation", "operation": "remove"},
+    )
+    assert await injection is True
+
+    append_jsonl(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        },
+        {"type": "system", "subtype": "turn_duration", "durationMs": 1},
+    )
+    await consumer
+    assert session.active_turn_process is None
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_rejects_replaced_task_generation_before_stdin():
+    native_process = object()
+    session = types.SimpleNamespace(
+        session_id="claude-session-1",
+        is_alive=True,
+        active_turn_process=native_process,
+        steer_active_turn=AsyncMock(return_value=True),
+    )
+    manager = InstanceManager(MagicMock(), MagicMock())
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    proxy = types.SimpleNamespace(session=session, returncode=None)
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={7: session},
+        _consumers={7: consumer},
+        _proxies={7: proxy},
+    )
+    manager.processes[7] = proxy
+    manager._tasks[7] = consumer
+    manager._consumer_records[7] = _OutputConsumerRecord(
+        process=proxy,
+        task=consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=99,
+        task_retry_count=2,
+        task_turn_generation=4,
+    )
+
+    try:
+        assert await manager.inject_pty_message(
+            "claude-session-1",
+            "stale update",
+            task_id=99,
+            task_retry_count=2,
+            task_turn_generation=3,
+            expected_instance_id=7,
+        ) is False
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    session.steer_active_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

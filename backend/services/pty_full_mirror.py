@@ -346,11 +346,10 @@ class FullMirrorCCMBackend(CCMBackend):
                     or event_dict.get("orphan")
                     or event_dict.get("autonomous")
                 ):
-                    # Pinned claude-pty marks every structured quota event as
-                    # terminal before yielding it. on_event is awaited before
-                    # Session checks that latch, so clear soft events and hard
-                    # events proven to belong to stale/autonomous turns. Only
-                    # a hard signal from this foreground turn may abort it.
+                    # Keep the compatibility clear for older claude-pty
+                    # sessions that latched every structured quota event, and
+                    # for hard events proven stale/autonomous. Only a hard
+                    # signal from this foreground turn may abort it.
                     process = getattr(record, "process", None)
                     session = getattr(process, "session", None)
                     if (

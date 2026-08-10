@@ -1012,49 +1012,140 @@ class InstanceManager:
         session_id: str,
         content: str,
         *,
+        task_id: int | None = None,
+        task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
+        expected_instance_id: int | None = None,
         require_host_file_access: bool = False,
     ) -> bool:
-        """Inject text into a live PTY session (PTY-only).
+        """Steer one exact live Claude PTY foreground turn via stdin.
 
-        Looked up by Claude session_id — the chat path picks a different
-        instance per message, so task.instance_id is NOT a reliable key.
-        Delivered as a channel notification; CC consumes it at the next
-        tool-call boundary (mid-turn) or at the start of the next turn.
-        Returns False when PTY mode is off, no live session exists, or
-        injection fails.
+        Experimental Claude Channels are not a delivery acknowledgement: the
+        channel server may be absent (CloudRouter/API sessions) or return 200
+        before Claude consumes the notification.  The pinned ``claude-pty``
+        API instead owns the active-turn boundary and serializes the complete
+        bracketed-paste write with process stop/interrupt.
+
+        ``Task.instance_id`` can be absent for chat-launched turns, so the
+        native session id resolves the candidate slot.  The immutable
+        Task/consumer/process identity is then revalidated under that slot's
+        lifecycle lock before any input is written.  Returns False for an
+        idle, terminal, replaced, ambiguous, or otherwise stale generation.
         """
         if self._pty_backend is None or not content or not session_id:
             return False
-        session = None
-        key = None
-        for k, sess in self._pty_backend._sessions.items():
-            if sess.session_id == session_id and sess.is_alive:
-                session, key = sess, k
-                break
-        if session is None:
-            return False
-        # 仅允许注入到【正在运行的 turn】：turn 结束后 consumer 退出，
-        # 此时注入的 channel 消息会唤醒一个无人采集的"孤儿 turn"——
-        # 回复只进 JSONL，CCM 永远看不到（生产 task 51 实录）。
-        consumer = self._pty_backend._consumers.get(key)
-        if consumer is None or consumer.done():
-            logger.info(
-                "PTY inject rejected for session %s: no running turn", session_id
+
+        sessions = getattr(self._pty_backend, "_sessions", {})
+        if expected_instance_id is not None:
+            candidate = sessions.get(expected_instance_id)
+            candidates = (
+                [(expected_instance_id, candidate)]
+                if candidate is not None
+                and getattr(candidate, "session_id", None) == session_id
+                else []
             )
+        else:
+            candidates = [
+                (key, candidate)
+                for key, candidate in sessions.items()
+                if getattr(candidate, "session_id", None) == session_id
+            ]
+        # A duplicated native session registration is an ABA ambiguity, not a
+        # reason to pick whichever dict entry happens to appear first.
+        if len(candidates) != 1:
             return False
-        if require_host_file_access and key in self._container_tasks:
-            # Shared-project PTY sessions run inside a container whose mount
-            # set does not include Manager's upload directory.  Sending only a
-            # host path would look successful while silently dropping every
-            # attachment from the model's reachable filesystem.
-            raise LiveAttachmentInjectionUnsupportedError(
-                "The active Claude PTY container cannot access uploaded files"
+        key, candidate = candidates[0]
+        lifecycle_lock = self._instance_lifecycle_lock(key)
+        async with lifecycle_lock:
+            session = getattr(self._pty_backend, "_sessions", {}).get(key)
+            if (
+                session is not candidate
+                or getattr(session, "session_id", None) != session_id
+                or not getattr(session, "is_alive", False)
+                or key in self._stopping
+                or key in self._launch_reservations
+            ):
+                return False
+
+            if require_host_file_access and key in self._container_tasks:
+                # Shared-project PTY sessions run inside a container whose
+                # mount set does not include Manager's upload directory.
+                raise LiveAttachmentInjectionUnsupportedError(
+                    "The active Claude PTY container cannot access uploaded files"
+                )
+
+            consumer = getattr(self._pty_backend, "_consumers", {}).get(key)
+            record = self._consumer_records.get(key)
+            process = self.processes.get(key)
+            proxy = getattr(self._pty_backend, "_proxies", {}).get(key)
+            cancelling = getattr(consumer, "cancelling", None)
+            exact_turn = bool(
+                consumer is not None
+                and not consumer.done()
+                and (not callable(cancelling) or cancelling() == 0)
+                and record is not None
+                and record.task is consumer
+                and record.process is process
+                and record.provider == "claude"
+                and record.pty_terminal_owner is None
+                and self._tasks.get(key) is consumer
+                and proxy is process
+                and getattr(proxy, "session", None) is session
+                and getattr(process, "returncode", None) is None
+                and not any(
+                    pending_key[0] == key
+                    and pending_key[1] is process
+                    for pending_key in self._consumer_recovery_pending
+                )
             )
-        try:
-            return await session.inject(content)
-        except Exception:
-            logger.exception("PTY inject failed for session %s", session_id)
-            return False
+            if task_id is not None:
+                exact_turn = bool(
+                    exact_turn
+                    and record.task_id == task_id
+                    and record.task_retry_count == task_retry_count
+                    and record.task_turn_generation == task_turn_generation
+                )
+            if not exact_turn:
+                logger.info(
+                    "PTY steer rejected for session %s: stale foreground turn",
+                    session_id,
+                )
+                return False
+
+            native_process = getattr(session, "active_turn_process", None)
+            steer = getattr(session, "steer_active_turn", None)
+            if native_process is None or not callable(steer):
+                logger.info(
+                    "PTY steer rejected for session %s: turn is not steerable",
+                    session_id,
+                )
+                return False
+            try:
+                # Once the exact provider side effect is admitted, finish its
+                # acknowledgement even if the HTTP caller disconnects.  Do
+                # not let cancellation release the lifecycle lock while a PTY
+                # thread can still write, or skip the API's audit LogEntry
+                # after Claude already accepted the update.
+                steering = asyncio.create_task(
+                    steer(content, expected_process=native_process)
+                )
+                caller_cancelled = False
+                while not steering.done():
+                    try:
+                        await asyncio.shield(steering)
+                    except asyncio.CancelledError:
+                        caller_cancelled = True
+                result = bool(steering.result())
+                if caller_cancelled:
+                    logger.info(
+                        "Finished PTY steer acknowledgement for session %s "
+                        "after caller cancellation",
+                        session_id,
+                    )
+                return result
+            except Exception:
+                logger.exception("PTY steer failed for session %s", session_id)
+                return False
 
     async def inject_codex_message(
         self,

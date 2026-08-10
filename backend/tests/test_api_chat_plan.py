@@ -3167,7 +3167,12 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     assert resp.status_code == 200
     # 回归：chat 路径不更新 task.instance_id，必须按 session_id 定位 PTY 会话
     mock_im.inject_pty_message.assert_awaited_once_with(
-        "test-session-123", "focus on tests"
+        "test-session-123",
+        "focus on tests",
+        task_id=task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        expected_instance_id=None,
     )
     casts = [c for c in mock_broadcaster.broadcast.call_args_list
              if c[0][1].get("source") == "inject"]
@@ -3192,6 +3197,92 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     assert stored.task_retry_count == 0
     assert stored.task_turn_generation == 0
     assert stored.turn_scope == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_inject_releases_task_transaction_before_transport_and_audits(
+    app,
+    client,
+    session_factory,
+):
+    """Provider ACK must not wait behind the API's Task write transaction."""
+    from backend.database import get_db
+
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        status="executing",
+        retry_count=3,
+        turn_generation=7,
+    )
+
+    real_app, _ = app
+    original_db_override = real_app.dependency_overrides[get_db]
+    request_session: AsyncSession | None = None
+
+    async def capture_request_session():
+        nonlocal request_session
+        async with session_factory() as session:
+            request_session = session
+            yield session
+
+    async def acknowledge_after_foreground_event(*_args, **_kwargs):
+        # This is the lock-inversion edge in production: before Claude can emit
+        # the later queue-operation ACK, its consumer persists an assistant/tool
+        # event against this same Task.  The request transaction must already be
+        # closed while the provider transport is awaiting that event.
+        assert request_session is not None
+        assert request_session.in_transaction() is False
+        async with session_factory() as event_db:
+            await event_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(turn_generation=8)
+            )
+            await event_db.commit()
+        return True
+
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(
+        side_effect=acknowledge_after_foreground_event,
+    )
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    real_app.dependency_overrides[get_db] = capture_request_session
+    try:
+        with patch("backend.main.instance_manager", mock_im), patch(
+            "backend.main.broadcaster",
+            mock_broadcaster,
+        ):
+            response = await client.post(
+                f"/api/tasks/{task_id}/inject",
+                json={"message": "persist even across the terminal edge"},
+            )
+    finally:
+        real_app.dependency_overrides[get_db] = original_db_override
+
+    # The provider accepted the message, so a post-ACK generation change is
+    # audited rather than exposed as a retryable 409 with no user-message log.
+    assert response.status_code == 200
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+        current_task = await db.get(Task, task_id)
+    assert current_task.turn_generation == 8
+    assert stored.task_retry_count == 3
+    assert stored.task_turn_generation == 7
+    assert json.loads(stored.raw_json)["generation_audit"] == (
+        "changed_after_transport"
+    )
 
 
 @pytest.mark.asyncio
@@ -3242,7 +3333,13 @@ async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
     injected = mock_im.inject_pty_message.await_args
     assert injected.args[0] == "test-session-123"
     assert str(upload_path) in injected.args[1]
-    assert injected.kwargs == {"require_host_file_access": True}
+    assert injected.kwargs == {
+        "require_host_file_access": True,
+        "task_id": task_id,
+        "task_retry_count": 0,
+        "task_turn_generation": 0,
+        "expected_instance_id": None,
+    }
 
     events = [
         call.args[1]
@@ -3296,6 +3393,71 @@ async def test_inject_no_live_session_409(client, session_factory):
             f"/api/tasks/{task_id}/inject", json={"message": "x"}
         )
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_inject_rejects_changed_runtime_generation_without_logging(
+    client,
+    session_factory,
+):
+    """A replacement foreground generation must fail before persistence."""
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        status="executing",
+        retry_count=3,
+        turn_generation=7,
+    )
+    runtime_turn_generation = 8
+
+    async def reject_stale_generation(
+        _session_id,
+        _content,
+        *,
+        task_turn_generation,
+        **_kwargs,
+    ):
+        # The exact PTY owner has already advanced from DB generation 7 to 8.
+        return task_turn_generation == runtime_turn_generation
+
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(
+        side_effect=reject_stale_generation,
+    )
+    mock_broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        mock_broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "stale steer"},
+        )
+
+    assert response.status_code == 409
+    mock_im.inject_pty_message.assert_awaited_once_with(
+        "test-session-123",
+        "stale steer",
+        task_id=task_id,
+        task_retry_count=3,
+        task_turn_generation=7,
+        expected_instance_id=None,
+    )
+    mock_broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert count == 0
 
 
 @pytest.mark.asyncio
