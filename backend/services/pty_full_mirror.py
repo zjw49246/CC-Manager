@@ -324,6 +324,23 @@ class FullMirrorCCMBackend(CCMBackend):
             # Therefore the structured backgroundTaskId is an authoritative
             # foreground-exit barrier, not a heuristic transcript scan.
             background_tracker.observe(event_dict)
+        # Persist the semantic terminal outcome on the exact PTY generation
+        # before entering the generic event pipeline.  That pipeline may
+        # legitimately decline or fail a stale DB write, but a foreground
+        # provider timeout/API failure must still control ``on_exit``.  A
+        # persistent Claude process otherwise reports OS exit code 0 and the
+        # failed turn is incorrectly finalized as completed (production task
+        # 322).
+        fatal_provider_error = self._im._fatal_provider_error_for_event(
+            event_dict
+        )
+        if fatal_provider_error and record is not None:
+            if getattr(record, "fatal_provider_error", None) is None:
+                object.__setattr__(
+                    record,
+                    "fatal_provider_error",
+                    fatal_provider_error[:2000],
+                )
         raw = event_dict.get("raw_json")
         if raw:
             try:

@@ -4838,6 +4838,100 @@ class TestFullMirrorBackend:
         im._try_chat_transient_retry.assert_awaited_once()
         im._try_chat_pool_rotation.assert_awaited_once()
 
+    async def test_pty_timeout_event_fails_turn_even_when_event_persistence_fails(
+        self, db_factory
+    ):
+        """A persistent PTY timeout must never become a completed Task.
+
+        Event persistence and terminal classification are deliberately
+        separate.  This reproduces the production task-322 boundary where
+        the timeout log existed but the reusable Claude process still yielded
+        an OS-level zero exit.
+        """
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        timeout_text = "Response timed out after 900.0s"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 0
+            task.instance_id = instance_id
+            task.session_id = "stalled-native-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 779
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 779
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session.session_id = "stalled-native-session"
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            record = im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=0,
+                instance_started_at=started_at,
+            )
+            im._process_event = AsyncMock(
+                side_effect=RuntimeError("simulated persistence failure")
+            )
+            await backend.on_event(
+                instance_id,
+                {
+                    "event_type": "system_event",
+                    "role": None,
+                    "content": timeout_text,
+                    "is_error": True,
+                },
+                task_id=task_id,
+            )
+            assert record.fatal_provider_error == timeout_text
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        await exit_turn()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "failed"
+            assert task.error_message == timeout_text
+            assert task.session_id is None
+            assert inst.status == "error"
+        assert proxy.returncode == 1
+
     async def test_soft_quota_warning_keeps_successful_pty_turn_completed(
         self, db_factory
     ):
