@@ -420,8 +420,9 @@ def _task_isolated_thread_response(
     sandbox_type: str = "workspaceWrite",
     network_access: bool = False,
     instruction_sources: list[str] | None = None,
+    writable_roots: list[str] | None = None,
 ) -> dict:
-    return {
+    response = {
         "thread": {
             "id": thread_id,
             "status": {"type": "idle"},
@@ -435,8 +436,13 @@ def _task_isolated_thread_response(
         "sandbox": {
             "type": sandbox_type,
             "networkAccess": network_access,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
         },
     }
+    if writable_roots is not None:
+        response["sandbox"]["writableRoots"] = writable_roots
+    return response
 
 
 async def _start_tool_free_test_turn(
@@ -1591,7 +1597,7 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox(
             return _task_isolated_thread_response(
                 "thread-read-only-credentials",
                 permission_profile=params["config"]["default_permissions"],
-                sandbox_type="readOnly",
+                writable_roots=[str(boundary.scratch.path)],
             )
         if method == "turn/start":
             return {"turn": {"id": "turn-read-only-credentials"}}

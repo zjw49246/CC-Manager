@@ -1317,6 +1317,7 @@ def _audit_task_ssh_thread_response(
     managed_network_proxy: bool,
     sandbox_mode: str,
     cwd: str,
+    private_tmpdir: str,
 ) -> None:
     """Prove Codex admitted CCM's exact Task-isolation profile."""
 
@@ -1330,19 +1331,38 @@ def _audit_task_ssh_thread_response(
     ):
         raise ValueError("Task isolation profile was not selected")
     sandbox = response.get("sandbox")
-    expected_type = {
-        "workspace-write": "workspaceWrite",
-        "read-only": "readOnly",
-    }.get(sandbox_mode)
     if disable_network == managed_network_proxy:
         raise ValueError("Task response audit lost its network boundary")
     expected_network = managed_network_proxy
     if (
         not isinstance(sandbox, dict)
-        or sandbox.get("type") != expected_type
+        # Every Task profile grants its generation-private TMP leaf write
+        # access. Codex 0.147 therefore reports ``workspaceWrite`` even when
+        # the repository itself was requested as read-only. The selected
+        # request-unique permission profile proves the repository rule; for
+        # read-only turns, also prove TMP is the only extra writable root.
+        or sandbox.get("type") != "workspaceWrite"
         or sandbox.get("networkAccess") is not expected_network
     ):
         raise ValueError("Task isolation resolved an unexpected sandbox policy")
+    if sandbox_mode == "read-only":
+        writable_roots = sandbox.get("writableRoots")
+        if not isinstance(writable_roots, list) or any(
+            not isinstance(path, str) for path in writable_roots
+        ):
+            raise ValueError("read-only Task writable roots are malformed")
+        expected_scratch = _canonical_path(private_tmpdir)
+        if {
+            _canonical_path(path) for path in writable_roots
+        } != {expected_scratch}:
+            raise ValueError("read-only Task admitted an unexpected writable root")
+        if (
+            sandbox.get("excludeTmpdirEnvVar") is not True
+            or sandbox.get("excludeSlashTmp") is not True
+        ):
+            raise ValueError("read-only Task did not isolate ambient temp roots")
+    elif sandbox_mode != "workspace-write":
+        raise ValueError("Task isolation reported an unsupported sandbox mode")
     sources = response.get("instructionSources")
     if not isinstance(sources, list):
         raise ValueError("Task isolation did not report instruction sources")
@@ -5618,6 +5638,7 @@ class CodexAppServer:
                     managed_network_proxy=task_managed_network_proxy,
                     sandbox_mode=sandbox_mode,
                     cwd=cwd,
+                    private_tmpdir=str(task_private_tmpdir.path),
                 )
                 await asyncio.sleep(0)
                 if (
