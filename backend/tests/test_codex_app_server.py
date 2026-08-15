@@ -13,7 +13,7 @@ import threading
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -9816,7 +9816,7 @@ async def test_unconfirmed_unclaimed_abort_does_not_kill_live_peer(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
+async def test_claimed_stop_recycles_target_threads_with_live_peer(
     tmp_path,
 ):
     """An explicit stop stays effective when exact descendant cleanup wedges."""
@@ -9881,7 +9881,16 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
 
     target_context = server._contexts_by_thread["thread-target"]
     peer_context = server._contexts_by_thread["thread-peer"]
+
+    async def confirm_target_interrupt(exact_process, reason):
+        assert exact_process is target
+        target.finish(130, reason, termination_kind="internal_abort")
+        server._detach_turn_context(target_context)
+        return True
+
+    server.abandon_turn = AsyncMock(side_effect=confirm_target_interrupt)
     server.shutdown = AsyncMock()
+    server.recycle_thread_runtime = AsyncMock()
     registry = CodexAppServerRegistry("codex")
     registry._servers[home] = server
     registry._thread_owners.update({
@@ -9889,21 +9898,20 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
         "thread-peer": home,
     })
 
-    with pytest.raises(
-        CodexSharedTransportBusyError,
-        match="another live turn shares",
-    ):
-        await registry.stop_claimed_turn(
-            home,
-            target,
-            reason="user requested stop",
-        )
+    assert await registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ) is False
 
     server.shutdown.assert_not_awaited()
-    assert target.returncode is None
+    assert target.returncode == 130
     assert peer.returncode is None
-    assert server._contexts_by_thread["thread-target"] is target_context
     assert server._contexts_by_thread["thread-peer"] is peer_context
+    assert server.recycle_thread_runtime.await_args_list == [
+        call("thread-child"),
+        call("thread-target"),
+    ]
     assert registry._servers[home] is server
     assert registry._thread_owners == {
         "thread-target": home,
@@ -9913,7 +9921,7 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
 
 
 @pytest.mark.asyncio
-async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
+async def test_claimed_stop_preflight_allows_peer_for_thread_scoped_cleanup(tmp_path):
     home = normalize_codex_home(tmp_path / "preflight-peer")
     server = CodexAppServer("codex", codex_home=home)
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -9938,8 +9946,7 @@ async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
     registry = CodexAppServerRegistry("codex")
     registry._servers[home] = server
 
-    with pytest.raises(CodexSharedTransportBusyError, match="another live turn"):
-        await registry.require_claimed_turn_stop_isolated(home, target)
+    await registry.require_claimed_turn_stop_isolated(home, target)
 
     server.abandon_turn.assert_not_awaited()
     assert target.returncode is None
@@ -9948,6 +9955,45 @@ async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
 
     target.finish(0)
     peer.finish(0)
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_escalates_to_transport_when_target_interrupt_fails(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "peer-hard-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": _TurnContext(
+            "thread-target", target, 0.0, task_id=160,
+        ),
+        "thread-peer": _TurnContext(
+            "thread-peer", peer, 0.0, task_id=161,
+        ),
+    }
+    server.abandon_turn = AsyncMock(return_value=False)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    assert await registry.stop_claimed_turn(
+        home, target, reason="user requested stop",
+    ) is True
+
+    server.shutdown.assert_awaited_once_with(
+        interrupted_process=target,
+        reason="user requested stop",
+    )
+    assert target.returncode == 130
+    assert peer.returncode == 1
+    assert home not in registry._servers
+    assert home not in registry._draining
 
 
 @pytest.mark.asyncio

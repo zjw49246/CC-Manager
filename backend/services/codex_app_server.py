@@ -9417,12 +9417,13 @@ class CodexAppServerRegistry:
         codex_home: str | os.PathLike[str],
         process: CodexTurnProcess,
     ) -> None:
-        """Fail before caller-side stop effects when transport recycle is unsafe.
+        """Fail before stop effects only when the target generation is unsafe.
 
         This is deliberately only a preflight: ``stop_claimed_turn`` repeats
         every check while holding the abort lock before it performs the native
-        interrupt.  Callers use this earlier check to avoid destructive queue
-        or producer cleanup for a stop that is already known to be impossible.
+        interrupt.  A live peer is not a blocker: the normal path unloads the
+        target threads, and an unconfirmed interrupt escalates to a transport
+        hard-stop so explicit user cancellation cannot remain stuck.
         """
 
         home = normalize_codex_home(codex_home)
@@ -9448,22 +9449,21 @@ class CodexAppServerRegistry:
                         "Codex app-server transport generation is no longer "
                         f"registered: {home}"
                     )
-                starting = self._starting.get(home, 0)
-                if starting:
-                    raise CodexSharedTransportBusyError(
-                        "Cannot stop the claimed turn while "
-                        f"{starting} admitted app-server request(s) are in "
-                        f"flight on its shared transport: {home}"
-                    )
                 task_id, task_processes = server.live_task_turn_processes(
                     process
                 )
-                if server.has_live_turn_outside_task(task_id, task_processes):
+                target_thread_ids = {
+                    context.thread_id
+                    for context in server._contexts_by_thread.values()
+                    if context.process in task_processes
+                }
+                if any(
+                    thread_id in self._starting_threads
+                    for thread_id in target_thread_ids
+                ):
                     raise CodexSharedTransportBusyError(
-                        "Cannot stop the claimed Task while another live "
-                        "turn shares its Codex app-server transport from a "
-                        "different Task: "
-                        f"{home}"
+                        "Cannot stop the claimed Task while one of its exact "
+                        "thread operations is still being admitted"
                     )
 
     async def stop_claimed_turn(
@@ -9473,16 +9473,16 @@ class CodexAppServerRegistry:
         *,
         reason: str,
     ) -> bool:
-        """Stop one durably-owned turn and recycle its account transport.
+        """Stop one durably-owned Task without sacrificing a live peer.
 
         Exact thread/turn interruption is always attempted first.  It is not,
         however, sufficient proof that task-scoped native helpers are gone:
         Codex keeps MCP servers and code-mode hosts below the persistent
-        app-server even after a turn reports ``interrupted``.  Once admission
-        is drained, therefore recycle the account transport for every explicit
-        stop.  Non-target adapters fail and use the ordinary task retry path;
-        returning success while target-owned native helpers remain alive is
-        not an acceptable outcome.
+        app-server even after a turn reports ``interrupted``.  When another
+        Task shares the account transport, recycle every exact target thread
+        instead of the transport.  Archiving unloads the thread runtime and
+        unarchiving preserves its resumable identity.  An isolated Task still
+        recycles the whole transport as the strongest cleanup boundary.
 
         Returns whether transport shutdown was required.
         """
@@ -9514,37 +9514,45 @@ class CodexAppServerRegistry:
                             "Codex app-server transport generation is no "
                             f"longer registered: {home}"
                         )
-                    starting = self._starting.get(home, 0)
-                    if starting:
-                        raise CodexSharedTransportBusyError(
-                            "Cannot stop the claimed turn while "
-                            f"{starting} admitted app-server request(s) are "
-                            f"in flight on its shared transport: {home}"
-                        )
                     task_id, task_processes = server.live_task_turn_processes(
                         process
                     )
-                    if server.has_live_turn_outside_task(
+                    peer_present = server.has_live_turn_outside_task(
                         task_id,
                         task_processes,
-                    ):
-                        # Explicit stop currently requires recycling the whole
-                        # account transport to prove task-scoped MCP helpers
-                        # are gone.  Never interrupt first and discover peers
-                        # afterwards: recycling here would turn an unrelated
-                        # peer with emitted output/external effects into an
-                        # unreplayable failure.
-                        raise CodexSharedTransportBusyError(
-                            "Cannot stop the claimed Task while another live "
-                            "turn shares its Codex app-server transport from "
-                            "a different Task: "
-                            f"{home}"
+                    )
+                    target_contexts = tuple(
+                        context
+                        for context in server._contexts_by_thread.values()
+                        if context.process in task_processes
+                    )
+                    target_thread_ids = {
+                        context.thread_id for context in target_contexts
+                    }
+                    for context in target_contexts:
+                        target_thread_ids.update(
+                            context.active_descendant_thread_ids
                         )
-                    # Close admission before the interrupt RPC.  A request
-                    # admitted earlier remains visible in ``_starting`` and
-                    # blocks transport-level escalation below.
-                    self._draining.add(home)
-                    drain_owned = True
+                    if any(
+                        thread_id in self._starting_threads
+                        for thread_id in target_thread_ids
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed Task while one of its "
+                            "exact thread operations is still being admitted"
+                        )
+                    if not peer_present:
+                        # With no peer, close account admission so transport
+                        # recycle remains an exact hard-stop fallback.
+                        starting = self._starting.get(home, 0)
+                        if starting:
+                            raise CodexSharedTransportBusyError(
+                                "Cannot stop the claimed turn while "
+                                f"{starting} admitted app-server request(s) "
+                                f"are in flight on its shared transport: {home}"
+                            )
+                        self._draining.add(home)
+                        drain_owned = True
 
                 interrupt_results: dict[CodexTurnProcess, bool] = {}
                 for task_process in task_processes:
@@ -9579,7 +9587,7 @@ class CodexAppServerRegistry:
                     blockers.append(
                         "an unconfirmed Task turn generation changed"
                     )
-                if starting:
+                if starting and not has_peer_turns:
                     blockers.append(
                         f"{starting} admitted app-server request(s) are in flight"
                     )
@@ -9592,12 +9600,56 @@ class CodexAppServerRegistry:
                         + "; ".join(blockers)
                     )
 
-                if has_peer_turns:
-                    raise CodexSharedTransportBusyError(
-                        "Cannot recycle the claimed turn because another live "
-                        "turn appeared on its Codex app-server transport: "
-                        f"{home}"
+                interrupts_confirmed = all(
+                    interrupt_results.get(task_process, False)
+                    or task_process.returncode is not None
+                    for task_process in task_processes
+                )
+                if has_peer_turns and interrupts_confirmed:
+                    # Archive/unarchive is the app-server's thread-scoped
+                    # runtime unload boundary.  It closes retained MCP/code
+                    # mode helpers without terminating unrelated live turns.
+                    # Descendants are unloaded before their parent roots.
+                    root_thread_ids = {
+                        context.thread_id for context in target_contexts
+                    }
+                    ordered_thread_ids = (
+                        sorted(target_thread_ids - root_thread_ids)
+                        + sorted(root_thread_ids)
                     )
+                    try:
+                        for thread_id in ordered_thread_ids:
+                            await server.recycle_thread_runtime(thread_id)
+                    except BaseException as exc:
+                        raise CodexSharedTransportBusyError(
+                            "Target Task turns were interrupted, but their "
+                            "thread-scoped runtime cleanup could not be "
+                            "confirmed"
+                        ) from exc
+                    for task_process in task_processes:
+                        task_process.finish(
+                            130,
+                            reason,
+                            termination_kind="internal_abort",
+                        )
+                    return False
+
+                if has_peer_turns:
+                    # The user-visible stop contract is stronger than account
+                    # transport availability.  A failed exact interrupt must
+                    # not strand the target merely because a peer exists.
+                    # Fence the account now and fall through to the existing
+                    # transport hard-stop.  Peer adapters are failed (never
+                    # replayed) below, making the collateral effect explicit
+                    # and auditable instead of returning a permanent 409.
+                    async with self._lock:
+                        if self._servers.get(home) is not server:
+                            raise CodexSharedTransportBusyError(
+                                "Cannot escalate Task interruption because the "
+                                "exact app-server generation changed"
+                            )
+                        self._draining.add(home)
+                        drain_owned = True
 
                 # Admission is drained.  Transport recycle is the only
                 # available lifecycle boundary that also closes task-scoped
