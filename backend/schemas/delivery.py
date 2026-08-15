@@ -23,6 +23,8 @@ class DeliveryRunCreate(BaseModel):
     timeout_hours: float | None = Field(default=None, ge=0, le=168)
     max_cycles: int = Field(default=10, ge=1, le=100)
     max_no_progress: int = Field(default=3, ge=1, le=20)
+    # Trusted mode is the default for new Runs; historical Runs remain strict.
+    strict_branch_protection: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
