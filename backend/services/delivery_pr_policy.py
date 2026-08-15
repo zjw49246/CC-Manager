@@ -40,6 +40,7 @@ class FrozenDeliveryPRPolicy:
     terminal: str
     wait_for_ci: bool
     required_checks: list[dict]
+    strict_branch_protection: bool
 
 
 def has_reserved_delivery_marker(review: PRReview | None) -> bool:
@@ -271,6 +272,8 @@ async def frozen_delivery_pr_policy(
         raise DeliveryPRPolicyError("Delivery policy snapshot hash is invalid")
     auto_merge = policy.get("auto_merge")
     terminal = policy.get("terminal")
+    # Runs admitted before trusted mode existed keep the strict contract.
+    strict_branch_protection = policy.get("strict_branch_protection", True)
     monitor_policy = policy.get("pr_monitor")
     wait_for_ci = (
         monitor_policy.get("wait_for_ci")
@@ -290,6 +293,7 @@ async def frozen_delivery_pr_policy(
         or monitor_policy.get("repo_id") != review.repo_id
         or monitor_policy.get("review_mode") != "panel"
         or wait_for_ci is not True
+        or type(strict_branch_protection) is not bool
         or not isinstance(required_checks, list)
         or not required_checks
         or any(not isinstance(item, dict) for item in required_checks)
@@ -304,6 +308,7 @@ async def frozen_delivery_pr_policy(
         terminal=terminal,
         wait_for_ci=wait_for_ci,
         required_checks=required_checks,
+        strict_branch_protection=strict_branch_protection,
     )
 
 

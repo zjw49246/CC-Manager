@@ -166,6 +166,7 @@ class DeliveryCreateSpec:
     timeout_hours: float | None = None
     max_cycles: int = 10
     max_no_progress: int = 3
+    strict_branch_protection: bool = False
 
 
 def _admission_scope(created_by: int | None) -> str:
@@ -218,6 +219,7 @@ def _admission_request(
         "timeout_hours": spec.timeout_hours,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
+        "strict_branch_protection": spec.strict_branch_protection,
     }
 
 
@@ -531,6 +533,10 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "max_no_progress must be between 1 and 20"
         )
+    if type(spec.strict_branch_protection) is not bool:
+        raise DeliveryValidationError(
+            "strict_branch_protection must be a boolean"
+        )
 
     # Admission serializes with Project/PR Monitor identity mutations.  The
     # API mutation paths take the same rows before checking for an active Run,
@@ -637,6 +643,7 @@ async def create_delivery_run(
         "schema_version": 1,
         "terminal": "merged" if auto_merge else "ready_to_merge",
         "auto_merge": auto_merge,
+        "strict_branch_protection": spec.strict_branch_protection,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
         "provider": resolved_provider,

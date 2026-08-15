@@ -1499,6 +1499,36 @@ def _direct_merge_policy_error(detail: str) -> GhError:
     return GhError(f"Direct auto-merge protection policy is unsafe: {detail}")
 
 
+def _validate_direct_merge_permission(
+    permission: object,
+    *,
+    actor: str,
+) -> None:
+    if not isinstance(permission, dict):
+        raise _direct_merge_policy_error(
+            "publisher repository permission response is malformed"
+        )
+    role = permission.get("role_name")
+    user = permission.get("user")
+    permissions = user.get("permissions") if isinstance(user, dict) else None
+    if (
+        role not in _STANDARD_GITHUB_ROLES
+        or permission.get("permission") != _STANDARD_GITHUB_ROLES.get(role)
+        or not isinstance(user, dict)
+        or not isinstance(user.get("login"), str)
+        or user["login"].lower() != actor.lower()
+        or user.get("type") != "User"
+        or user.get("role_name") != role
+        or not isinstance(permissions, dict)
+        or permissions.get("push") is not True
+        or (role == "admin" and permissions.get("admin") is not True)
+        or (role == "maintain" and permissions.get("maintain") is not True)
+    ):
+        raise _direct_merge_policy_error(
+            "publisher must have a standard write, maintain, or admin role"
+        )
+
+
 def _validate_direct_merge_protection(
     protection: object,
     permission: object,
@@ -1509,6 +1539,7 @@ def _validate_direct_merge_protection(
     frozen_required_checks: object = None,
     exact_ci: object = None,
     head_sha: str | None = None,
+    strict_branch_protection: bool = True,
 ) -> None:
     """Validate the classic protection contract for a frozen-ref update."""
 
@@ -1757,35 +1788,7 @@ def _validate_direct_merge_protection(
             "merge commits conflict with required linear history"
         )
 
-    if not isinstance(permission, dict):
-        raise _direct_merge_policy_error(
-            "publisher repository permission response is malformed"
-        )
-    role = permission.get("role_name")
-    user = permission.get("user")
-    permissions = user.get("permissions") if isinstance(user, dict) else None
-    if (
-        role not in _STANDARD_GITHUB_ROLES
-        or permission.get("permission") != _STANDARD_GITHUB_ROLES.get(role)
-        or not isinstance(user, dict)
-        or not isinstance(user.get("login"), str)
-        or user["login"].lower() != actor.lower()
-        or user.get("type") != "User"
-        or user.get("role_name") != role
-        or not isinstance(permissions, dict)
-        or permissions.get("push") is not True
-        or (
-            role == "admin"
-            and permissions.get("admin") is not True
-        )
-        or (
-            role == "maintain"
-            and permissions.get("maintain") is not True
-        )
-    ):
-        raise _direct_merge_policy_error(
-            "publisher must have a standard write, maintain, or admin role"
-        )
+    _validate_direct_merge_permission(permission, actor=actor)
 
 
 def _github_not_found(exc: GhError) -> bool:
@@ -1817,18 +1820,12 @@ async def _require_direct_merge_protection(
         or "\r" in base_ref
     ):
         raise _direct_merge_policy_error("configured base branch is invalid")
+    if type(strict_branch_protection) is not bool:
+        raise _direct_merge_policy_error(
+            "strict branch-protection mode is malformed"
+        )
     branch = quote(base_ref, safe="")
     username = quote(actor, safe="")
-    try:
-        protection = await _gh_api_json(
-            f"repos/{repo_name}/branches/{branch}/protection"
-        )
-    except GhError as exc:
-        if _github_not_found(exc):
-            raise _direct_merge_policy_error(
-                "the base branch has no classic protection"
-            ) from exc
-        raise
     try:
         permission = await _gh_api_json(
             f"repos/{repo_name}/collaborators/{username}/permission"
@@ -1837,6 +1834,19 @@ async def _require_direct_merge_protection(
         if _github_not_found(exc):
             raise _direct_merge_policy_error(
                 "the publisher is not a standard repository collaborator"
+            ) from exc
+        raise
+    if not strict_branch_protection:
+        _validate_direct_merge_permission(permission, actor=actor)
+        return
+    try:
+        protection = await _gh_api_json(
+            f"repos/{repo_name}/branches/{branch}/protection"
+        )
+    except GhError as exc:
+        if _github_not_found(exc):
+            raise _direct_merge_policy_error(
+                "the base branch has no classic protection"
             ) from exc
         raise
     try:
@@ -2740,6 +2750,7 @@ async def _publish_review_action(
     wait_for_ci: bool = False,
     required_checks: list[dict] | None = None,
     ensure_zero_threads: Callable[[], Awaitable[bool]] | None = None,
+    strict_branch_protection: bool = True,
 ) -> tuple[str, str]:
     """Reconcile or perform one durable, head-pinned GitHub publication."""
 
@@ -2796,6 +2807,7 @@ async def _publish_review_action(
                 base_ref=base_ref,
                 actor=actor,
                 merge_method=merge_method,
+                strict_branch_protection=strict_branch_protection,
             )
 
         if result == "review_comments":
@@ -3017,6 +3029,7 @@ async def _publish_review_action(
             frozen_required_checks=(required_checks if wait_for_ci else None),
             exact_ci=exact_ci,
             head_sha=(head_sha if wait_for_ci else None),
+            strict_branch_protection=strict_branch_protection,
         )
         # CI and thread reconciliation may take long enough for the base ref
         # to move. Re-read the complete subject at the last possible boundary;
@@ -4936,6 +4949,11 @@ async def _resume_publishing_review_under_lease(
     except DeliveryPRPolicyError as exc:
         delivery_policy = None
         delivery_policy_error = str(exc)
+    strict_branch_protection = (
+        delivery_policy.strict_branch_protection
+        if delivery_policy is not None
+        else True
+    )
     valid = (
         delivery_policy_error is None
         and repo is not None
@@ -5090,6 +5108,7 @@ async def _resume_publishing_review_under_lease(
             wait_for_ci=frozen_wait_for_ci,
             required_checks=frozen_required_checks,
             ensure_zero_threads=(ensure_zero_threads if panel_task else None),
+            strict_branch_protection=strict_branch_protection,
         )
     except GhError as exc:
         logger.error(

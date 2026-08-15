@@ -1520,6 +1520,7 @@ export interface DeliveryRunCreate {
   timeout_hours?: number | null;
   max_cycles?: number;
   max_no_progress?: number;
+  strict_branch_protection?: boolean;
 }
 
 export interface RequiredCheckPolicy {
