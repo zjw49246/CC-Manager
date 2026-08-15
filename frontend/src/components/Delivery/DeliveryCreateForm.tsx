@@ -20,6 +20,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
   const [title, setTitle] = useState('');
   const [requirements, setRequirements] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [strictBranchProtection, setStrictBranchProtection] = useState(false);
   const [error, setError] = useState('');
   const project = projects.find((item) => item.id === projectId);
   const providerOptions = useMemo(() => config?.provider_options || [], [config?.provider_options]);
@@ -51,6 +52,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       model: provider === 'codex' ? config.default_codex_model : config.default_model,
       codex_service_tier: provider === 'codex' ? (config.default_codex_service_tier || 'default') : 'default',
       effort_level: config.default_effort,
+      strict_branch_protection: strictBranchProtection,
     } as const;
     const request = prepareDeliveryAdmission(`delivery-page:${project.id}`, draft);
     setSubmitting(true);
@@ -96,6 +98,12 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
         <input aria-label="Delivery title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} required placeholder="What should this Delivery accomplish?" className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
       </div>
       <textarea aria-label="Delivery requirements" value={requirements} onChange={(event) => setRequirements(event.target.value)} required rows={4} placeholder="Describe requirements and acceptance criteria…" className="mt-3 w-full resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
+      {repo?.auto_merge && (
+        <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2.5">
+          <input aria-label="Require strict GitHub branch protection" type="checkbox" checked={strictBranchProtection} onChange={(event) => setStrictBranchProtection(event.target.checked)} className="mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-800 text-indigo-600" />
+          <span><span className="block text-xs font-medium text-gray-200">Strict branch-protection mode</span><span className="mt-0.5 block text-[11px] leading-4 text-gray-500">Off by default. Trusted mode still requires exact CI, Panel findings and GitHub write permission; enable this only when GitHub Branch Protection must also be proved.</span></span>
+        </label>
+      )}
       {project && repo && <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2 text-[11px] text-gray-500"><span>Repository <b className="text-gray-300">{repo.repo_full_name}</b></span><span>Branch <b className="text-gray-300">{project.default_branch}</b></span><span>Provider <b className="text-gray-300">{repo.provider}</b></span><span>Completion <b className="text-gray-300">{repo.auto_merge ? 'merged' : 'ready to merge'}</b></span></div>}
       {disabledReason && <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300"><AlertCircle size={14} className="mt-0.5 shrink-0" /><div>{disabledReason}<div className="mt-1 flex gap-3"><button type="button" onClick={onNavigateProjects} className="underline underline-offset-2">Open Projects</button><button type="button" onClick={onNavigatePRMonitor} className="underline underline-offset-2">Open PR Monitor</button></div></div></div>}
       {error && <div className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
