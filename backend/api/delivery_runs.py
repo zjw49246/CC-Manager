@@ -285,6 +285,7 @@ async def create_run(
                 timeout_hours=body.timeout_hours,
                 max_cycles=body.max_cycles,
                 max_no_progress=body.max_no_progress,
+                strict_branch_protection=body.strict_branch_protection,
             ),
             admission_disabled_reason=admission_disabled_reason,
         )
