@@ -29,11 +29,12 @@ export const THEME_OPTIONS = [
 ] as const satisfies readonly ThemeOption[];
 
 export type Theme = typeof THEME_OPTIONS[number]['value'];
+export const DEFAULT_THEME: Theme = 'light';
 
 const THEME_MAP = new Map(THEME_OPTIONS.map((t) => [t.value, t]));
 
 export function getThemeOption(theme: Theme): ThemeOption {
-  return THEME_MAP.get(theme) ?? THEME_OPTIONS[0];
+  return THEME_MAP.get(theme) ?? THEME_MAP.get(DEFAULT_THEME)!;
 }
 
 /** 主题变更订阅（useTheme hook 用 useSyncExternalStore 接入，
@@ -48,7 +49,7 @@ export function subscribeTheme(fn: () => void): () => void {
 
 export function getTheme(): Theme {
   const stored = localStorage.getItem(STORAGE_KEY);
-  return stored && THEME_MAP.has(stored as Theme) ? (stored as Theme) : 'dark';
+  return stored && THEME_MAP.has(stored as Theme) ? (stored as Theme) : DEFAULT_THEME;
 }
 
 export function setTheme(theme: Theme) {
@@ -59,7 +60,7 @@ export function setTheme(theme: Theme) {
 
 export function applyTheme(theme?: Theme) {
   const t = theme || getTheme();
-  const opt = THEME_MAP.get(t) ?? THEME_OPTIONS[0];
+  const opt = THEME_MAP.get(t) ?? THEME_MAP.get(DEFAULT_THEME)!;
   document.documentElement.classList.remove('light');
   document.documentElement.dataset.theme = t;
   // custom 的色阶是运行时算出来的内联变量；切走时必须清场，否则会盖住新主题

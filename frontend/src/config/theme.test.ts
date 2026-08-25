@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { THEME_OPTIONS, getTheme, setTheme, applyTheme } from './theme';
+import { DEFAULT_THEME, THEME_OPTIONS, getTheme, setTheme, applyTheme } from './theme';
 
 // vitest root = frontend/（jsdom 下 import.meta.url 非 file 协议，用 cwd 定位）
 const indexCss = readFileSync(join(process.cwd(), 'src/index.css'), 'utf-8');
@@ -71,16 +71,22 @@ describe('theme config', () => {
     ).toBe('#ecedef');
   });
 
-  it('getTheme 对无效存储值回退到 dark', () => {
+  it('首次访问和无效存储值都回退到浅色主题', () => {
+    expect(DEFAULT_THEME).toBe('light');
+    expect(getTheme()).toBe('light');
+
     localStorage.setItem('cc_theme', 'no-such-theme');
-    expect(getTheme()).toBe('dark');
+    expect(getTheme()).toBe('light');
     applyTheme();
-    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(
+      document.querySelector('meta[name="theme-color"]')!.getAttribute('content'),
+    ).toBe('#e9e9ec');
   });
 });
 
 describe('index.css 主题变量覆盖完整性', () => {
-  // 现代组非默认主题（默认 dark 定义在 @theme 里）都必须覆盖全档
+  // 现代组非 CSS 基础主题（dark 定义在 @theme 里）都必须覆盖全档
   const modernOverrideThemes = THEME_OPTIONS.filter(
     (o) => o.group === 'modern' && o.value !== 'dark',
   ).map((o) => o.value);

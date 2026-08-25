@@ -234,7 +234,7 @@ describe('AppShell layout and z-index architecture', () => {
 
     it('switching theme swaps nav icon sets live (feishu → IconPark, apple → Ionicons, 其余 → Lucide)', async () => {
       renderShell();
-      // 默认 dark：无 iconSet 包装（Lucide 直渲）
+      // 默认 light：无 iconSet 包装（Lucide 直渲）
       expect(document.querySelector('[data-nav-item] [data-icon-set]')).toBeNull();
 
       await act(async () => { setTheme('feishu'); });
