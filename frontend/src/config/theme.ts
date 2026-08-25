@@ -76,4 +76,9 @@ export function applyTheme(theme?: Theme) {
   // 同步移动端状态栏 / PWA 顶栏颜色
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', themeColor);
+  const statusBar = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+  if (statusBar) {
+    const scheme = t === 'custom' ? document.documentElement.dataset.scheme : opt.scheme;
+    statusBar.setAttribute('content', scheme === 'light' ? 'default' : 'black-translucent');
+  }
 }

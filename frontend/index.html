@@ -7,6 +7,36 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="theme-color" content="#e9e9ec" />
+    <script id="theme-bootstrap">
+      (() => {
+        const themes = {
+          dark: ['#131316', 'dark'],
+          light: ['#e9e9ec', 'light'],
+          feishu: ['#ecedef', 'light'],
+          apple: ['#f9f9f9', 'light'],
+          legacy: ['#030712', 'dark'],
+          ocean: ['#06131f', 'dark'],
+          forest: ['#07130d', 'dark'],
+          rose: ['#1a0b12', 'dark'],
+          custom: ['#131316', 'dark'],
+        };
+        let stored;
+        try { stored = localStorage.getItem('cc_theme'); } catch { /* use the light default */ }
+        const theme = Object.prototype.hasOwnProperty.call(themes, stored) ? stored : 'light';
+        const [defaultColor, scheme] = themes[theme];
+        let themeColor = defaultColor;
+        if (theme === 'custom') {
+          try {
+            const customColor = localStorage.getItem('cc_theme_custom_bg');
+            if (/^#[0-9a-f]{6}$/i.test(customColor || '')) themeColor = customColor;
+          } catch { /* use the custom theme default */ }
+        }
+        document.documentElement.dataset.theme = theme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', themeColor);
+        document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+          ?.setAttribute('content', scheme === 'light' ? 'default' : 'black-translucent');
+      })();
+    </script>
     <link rel="manifest" href="/manifest.json" />
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
     <link rel="apple-touch-icon" href="/icons/icon.svg" />

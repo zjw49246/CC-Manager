@@ -5,6 +5,13 @@ import { DEFAULT_THEME, THEME_OPTIONS, getTheme, setTheme, applyTheme } from './
 
 // vitest root = frontend/（jsdom 下 import.meta.url 非 file 协议，用 cwd 定位）
 const indexCss = readFileSync(join(process.cwd(), 'src/index.css'), 'utf-8');
+const indexHtml = readFileSync(join(process.cwd(), 'index.html'), 'utf-8');
+
+function runThemeBootstrap(): void {
+  const source = indexHtml.match(/<script id="theme-bootstrap">([\s\S]*?)<\/script>/)?.[1];
+  expect(source, 'index.html 应包含同步 theme bootstrap').toBeTruthy();
+  new Function(source!)();
+}
 
 /**
  * 提取 index.css 中所有作用于该主题的变量块（块内无嵌套大括号）。
@@ -39,6 +46,12 @@ describe('theme config', () => {
     meta.setAttribute('name', 'theme-color');
     meta.setAttribute('content', '#131316');
     document.head.appendChild(meta);
+    document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.remove();
+    const statusBar = document.createElement('meta');
+    statusBar.setAttribute('name', 'apple-mobile-web-app-status-bar-style');
+    statusBar.setAttribute('content', 'default');
+    document.head.appendChild(statusBar);
+    document.documentElement.dataset.theme = 'light';
   });
 
   it('注册了飞书主题（modern 组浅色）', () => {
@@ -82,6 +95,40 @@ describe('theme config', () => {
     expect(
       document.querySelector('meta[name="theme-color"]')!.getAttribute('content'),
     ).toBe('#e9e9ec');
+  });
+
+  it('首屏 bootstrap 在应用启动前恢复已保存的深色主题与浏览器 chrome', () => {
+    localStorage.setItem('cc_theme', 'dark');
+    runThemeBootstrap();
+
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content')).toBe('#131316');
+    expect(
+      document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')!.getAttribute('content'),
+    ).toBe('black-translucent');
+  });
+
+  it('首屏 bootstrap 对缺失或无效偏好使用浅色默认值', () => {
+    runThemeBootstrap();
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content')).toBe('#e9e9ec');
+
+    localStorage.setItem('cc_theme', 'invalid');
+    document.documentElement.dataset.theme = 'dark';
+    runThemeBootstrap();
+    expect(document.documentElement.dataset.theme).toBe('light');
+  });
+
+  it('运行时切换主题同步 Apple 状态栏对比度', () => {
+    setTheme('dark');
+    expect(
+      document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')!.getAttribute('content'),
+    ).toBe('black-translucent');
+
+    setTheme('light');
+    expect(
+      document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')!.getAttribute('content'),
+    ).toBe('default');
   });
 });
 
