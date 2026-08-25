@@ -2,16 +2,15 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DEFAULT_THEME, THEME_OPTIONS, getTheme, setTheme, applyTheme } from './theme';
+import { applyPrepaintTheme } from './themeBootstrap';
+import { buildCustomTheme, clearCustomTheme, setCustomColors } from './customTheme';
 
 // vitest root = frontend/（jsdom 下 import.meta.url 非 file 协议，用 cwd 定位）
 const indexCss = readFileSync(join(process.cwd(), 'src/index.css'), 'utf-8');
 const indexHtml = readFileSync(join(process.cwd(), 'index.html'), 'utf-8');
-
-function runThemeBootstrap(): void {
-  const source = indexHtml.match(/<script id="theme-bootstrap">([\s\S]*?)<\/script>/)?.[1];
-  expect(source, 'index.html 应包含同步 theme bootstrap').toBeTruthy();
-  new Function(source!)();
-}
+const packageJson = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf-8')) as {
+  scripts?: Record<string, string>;
+};
 
 /**
  * 提取 index.css 中所有作用于该主题的变量块（块内无嵌套大括号）。
@@ -51,6 +50,7 @@ describe('theme config', () => {
     statusBar.setAttribute('name', 'apple-mobile-web-app-status-bar-style');
     statusBar.setAttribute('content', 'default');
     document.head.appendChild(statusBar);
+    clearCustomTheme();
     document.documentElement.dataset.theme = 'light';
   });
 
@@ -73,6 +73,15 @@ describe('theme config', () => {
   it('主题 value 无重复', () => {
     const values = THEME_OPTIONS.map((o) => o.value);
     expect(new Set(values).size).toBe(values.length);
+  });
+
+  it('首屏主题脚本阻塞加载且开发/构建前强制从权威源码生成', () => {
+    const bootstrap = '<script src="/theme-bootstrap.js"></script>';
+    expect(indexHtml).toContain(bootstrap);
+    expect(indexHtml.indexOf(bootstrap)).toBeLessThan(indexHtml.indexOf('src="/src/main.tsx"'));
+    expect(packageJson.scripts?.predev).toContain('generate:theme-bootstrap');
+    expect(packageJson.scripts?.prebuild).toContain('generate:theme-bootstrap');
+    expect(packageJson.scripts?.['generate:theme-bootstrap']).toContain('themeBootstrapEntry.ts');
   });
 
   it('setTheme 持久化并应用 data-theme 与 theme-color', () => {
@@ -99,7 +108,7 @@ describe('theme config', () => {
 
   it('首屏 bootstrap 在应用启动前恢复已保存的深色主题与浏览器 chrome', () => {
     localStorage.setItem('cc_theme', 'dark');
-    runThemeBootstrap();
+    applyPrepaintTheme();
 
     expect(document.documentElement.dataset.theme).toBe('dark');
     expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content')).toBe('#131316');
@@ -109,14 +118,48 @@ describe('theme config', () => {
   });
 
   it('首屏 bootstrap 对缺失或无效偏好使用浅色默认值', () => {
-    runThemeBootstrap();
+    applyPrepaintTheme();
     expect(document.documentElement.dataset.theme).toBe('light');
     expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content')).toBe('#e9e9ec');
 
     localStorage.setItem('cc_theme', 'invalid');
     document.documentElement.dataset.theme = 'dark';
-    runThemeBootstrap();
+    applyPrepaintTheme();
     expect(document.documentElement.dataset.theme).toBe('light');
+  });
+
+  it.each(THEME_OPTIONS.filter((option) => option.value !== 'custom'))(
+    '首屏 bootstrap 与权威注册表同步恢复 $value',
+    (option) => {
+      localStorage.setItem('cc_theme', option.value);
+      expect(applyPrepaintTheme()).toBe(option.value);
+      expect(document.documentElement.dataset.theme).toBe(option.value);
+      expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content'))
+        .toBe(option.themeColor);
+      expect(
+        document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')!.getAttribute('content'),
+      ).toBe(option.scheme === 'light' ? 'default' : 'black-translucent');
+    },
+  );
+
+  it.each([
+    ['light', '#e9e9ec', '#4f7cf7'],
+    ['dark', '#131316', '#16a34a'],
+  ] as const)('首屏完整恢复 %s 自定义主题', (expectedScheme, bg, brand) => {
+    setCustomColors(bg, brand);
+    localStorage.setItem('cc_theme', 'custom');
+    const expected = buildCustomTheme(bg, brand);
+
+    expect(applyPrepaintTheme()).toBe('custom');
+    expect(document.documentElement.dataset.theme).toBe('custom');
+    expect(document.documentElement.dataset.scheme).toBe(expectedScheme);
+    expect(document.querySelector('meta[name="theme-color"]')!.getAttribute('content')).toBe(bg);
+    expect(
+      document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')!.getAttribute('content'),
+    ).toBe(expectedScheme === 'light' ? 'default' : 'black-translucent');
+    for (const [name, value] of Object.entries(expected.vars)) {
+      expect(document.documentElement.style.getPropertyValue(name), name).toBe(value);
+    }
   });
 
   it('运行时切换主题同步 Apple 状态栏对比度', () => {
