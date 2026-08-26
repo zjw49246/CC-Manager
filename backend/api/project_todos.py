@@ -27,6 +27,10 @@ from backend.schemas.project_todo import (
     ProjectTodoUpdate,
 )
 from backend.schemas.task import TaskResponse
+from backend.services.project_readiness import (
+    ProjectNotDispatchableError,
+    require_project_dispatchable,
+)
 from backend.services.task_creation import stage_task_record
 
 router = APIRouter(prefix="/api/projects/{project_id}/todos", tags=["project-todos"])
@@ -342,6 +346,10 @@ async def create_task_from_todo(
         raise HTTPException(409, "Todo is not open or is already claimed")
 
     if task is None:
+        try:
+            require_project_dispatchable(project)
+        except ProjectNotDispatchableError as exc:
+            raise HTTPException(422, exc.detail) from exc
         try:
             task = await stage_task_record(
                 db,

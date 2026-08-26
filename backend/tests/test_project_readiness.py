@@ -1,0 +1,387 @@
+"""Tests for the Project readiness gate (clone-failure containment).
+
+Covers the incident chain fix: the dispatch queue holds Tasks whose Project
+is not ready; user-facing Task creation rejects clone-failed Projects; a
+missing working directory raises the typed human-readable error instead of a
+bare ``[Errno 2]``; clone failure/success annotates queued Tasks.
+"""
+import os
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import select
+
+from backend.models.project import Project
+from backend.models.task import Task
+from backend.services.project_readiness import (
+    ProjectNotDispatchableError,
+    require_project_dispatchable,
+)
+from backend.services.task_queue import TaskQueue
+
+# ``backend.api.projects`` (and every FastAPI app test) transitively imports
+# ``deployment_start_guard`` whose module-level ``import fcntl`` is POSIX-only.
+# Production and CI run on Linux; keep these cases runnable there.
+requires_posix_backend = pytest.mark.skipif(
+    os.name == "nt",
+    reason="backend.api import chain requires POSIX fcntl",
+)
+
+
+@pytest_asyncio.fixture
+async def queue(db_session):
+    return TaskQueue(db_session)
+
+
+async def _seed_project(
+    db,
+    *,
+    status: str,
+    name: str,
+    error_message: str | None = None,
+) -> Project:
+    project = Project(
+        name=name,
+        git_url="https://github.com/example/readiness.git",
+        has_remote=True,
+        local_path=f"/tmp/{name}",
+        default_branch="main",
+        status=status,
+        error_message=error_message,
+    )
+    db.add(project)
+    await db.commit()
+    await db.refresh(project)
+    return project
+
+
+# ── require_project_dispatchable ─────────────────────────────────────────────
+
+
+def test_require_project_dispatchable_rejects_error_only():
+    class _P:
+        name = "p"
+        error_message = "git clone failed"
+
+    for status in ("pending", "cloning", "initializing", "ready"):
+        _P.status = status
+        require_project_dispatchable(_P)
+
+    _P.status = "error"
+    with pytest.raises(ProjectNotDispatchableError) as exc_info:
+        require_project_dispatchable(_P)
+    assert "git clone failed" in str(exc_info.value)
+    require_project_dispatchable(None)
+
+
+# ── Dispatch-queue readiness gate ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dequeue_holds_task_while_project_is_cloning(queue):
+    project = await _seed_project(
+        queue.db, status="cloning", name="readiness-cloning"
+    )
+    project_id = project.id
+    await queue.create(
+        title="Waits for clone",
+        description="d",
+        project_id=project_id,
+        target_repo=project.local_path,
+    )
+
+    assert await queue.dequeue() is None
+
+    fresh_project = await queue.db.get(
+        Project, project_id, populate_existing=True
+    )
+    fresh_project.status = "ready"
+    await queue.db.commit()
+
+    claimed = await queue.dequeue()
+    assert claimed is not None
+    assert claimed.title == "Waits for clone"
+    assert claimed.status == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_dequeue_holds_task_of_error_project_until_reclone(queue):
+    project = await _seed_project(
+        queue.db,
+        status="error",
+        name="readiness-error",
+        error_message="git clone failed: auth",
+    )
+    project_id = project.id
+    task = await queue.create(
+        title="Blocked by clone failure",
+        description="d",
+        project_id=project_id,
+        target_repo=project.local_path,
+    )
+    task_id = task.id
+
+    assert await queue.dequeue() is None
+    refreshed = await queue.db.get(Task, task_id, populate_existing=True)
+    assert refreshed.status == "pending"
+
+    # Re-clone flips the Project back to ready; the Task resumes untouched.
+    fresh_project = await queue.db.get(
+        Project, project_id, populate_existing=True
+    )
+    fresh_project.status = "ready"
+    await queue.db.commit()
+    claimed = await queue.dequeue()
+    assert claimed is not None
+    assert claimed.id == task_id
+
+
+@pytest.mark.asyncio
+async def test_dequeue_unaffected_without_project_or_with_dangling_project(queue):
+    await queue.create(
+        title="Manual target repo",
+        description="d",
+        target_repo="/tmp/manual-repo",
+    )
+    first = await queue.dequeue()
+    assert first is not None and first.title == "Manual target repo"
+
+    project = await _seed_project(
+        queue.db, status="ready", name="readiness-dangling"
+    )
+    await queue.create(
+        title="Dangling project pointer",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+    await queue.db.delete(project)
+    await queue.db.commit()
+    second = await queue.dequeue()
+    assert second is not None and second.title == "Dangling project pointer"
+
+
+# ── API admission ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_create_task_rejects_error_project(client, session_factory):
+    async with session_factory() as db:
+        project = await _seed_project(
+            db,
+            status="error",
+            name="api-error-project",
+            error_message="git clone failed: could not read Username",
+        )
+        project_id = project.id
+
+    resp = await client.post("/api/tasks", json={
+        "title": "Should be refused",
+        "description": "d",
+        "project_id": project_id,
+    })
+    assert resp.status_code == 422
+    assert "clone failed" in resp.json()["detail"]
+
+    async with session_factory() as db:
+        count = (
+            await db.execute(
+                select(Task).where(Task.project_id == project_id)
+            )
+        ).scalars().all()
+        assert count == []
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_create_task_allows_cloning_project(client, session_factory):
+    async with session_factory() as db:
+        project = await _seed_project(
+            db, status="cloning", name="api-cloning-project"
+        )
+        project_id = project.id
+
+    resp = await client.post("/api/tasks", json={
+        "title": "Queued behind clone",
+        "description": "d",
+        "project_id": project_id,
+    })
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "pending"
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_update_task_rejects_move_to_error_project(client, session_factory):
+    async with session_factory() as db:
+        source = await _seed_project(
+            db, status="ready", name="api-move-source"
+        )
+        target = await _seed_project(
+            db,
+            status="error",
+            name="api-move-target",
+            error_message="git clone failed",
+        )
+        source_id, target_id = source.id, target.id
+
+    created = await client.post("/api/tasks", json={
+        "title": "Movable",
+        "description": "d",
+        "project_id": source_id,
+    })
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    moved = await client.put(f"/api/tasks/{task_id}", json={
+        "project_id": target_id,
+    })
+    assert moved.status_code == 422
+    assert "clone failed" in moved.json()["detail"]
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_todo_run_rejects_error_project(client, session_factory):
+    async with session_factory() as db:
+        project = await _seed_project(
+            db,
+            status="error",
+            name="todo-error-project",
+            error_message="git clone failed",
+        )
+        project_id = project.id
+
+    todo = await client.post(f"/api/projects/{project_id}/todos", json={
+        "title": "Todo on broken project",
+        "prompt": "do it",
+    })
+    assert todo.status_code == 201
+    todo_id = todo.json()["id"]
+
+    run = await client.post(
+        f"/api/projects/{project_id}/todos/{todo_id}/task",
+        json={"title": "Todo on broken project", "prompt": "do it"},
+    )
+    assert run.status_code == 422
+    assert "clone failed" in run.json()["detail"]
+
+
+# ── Missing working directory ─────────────────────────────────────────────────
+
+
+def test_prepare_task_working_directory_rejects_missing_explicit_path(tmp_path):
+    from backend.services.task_agent_isolation import (
+        TaskWorkingDirectoryMissingError,
+        prepare_task_working_directory,
+    )
+
+    incarnation = "0123456789abcdef0123456789abcdef"
+    missing = str(tmp_path / "gone" / "repo")
+    with pytest.raises(TaskWorkingDirectoryMissingError) as exc_info:
+        prepare_task_working_directory(
+            1,
+            incarnation,
+            missing,
+            has_explicit_workspace=True,
+        )
+    assert "does not exist" in str(exc_info.value)
+
+    existing = tmp_path / "repo"
+    existing.mkdir()
+    resolved = prepare_task_working_directory(
+        1,
+        incarnation,
+        str(existing),
+        has_explicit_workspace=True,
+    )
+    assert os.path.isdir(resolved)
+
+
+def test_require_existing_task_cwd(tmp_path):
+    from backend.services.task_agent_isolation import (
+        TaskWorkingDirectoryMissingError,
+        require_existing_task_cwd,
+    )
+
+    assert require_existing_task_cwd(str(tmp_path)) == str(tmp_path)
+    with pytest.raises(TaskWorkingDirectoryMissingError):
+        require_existing_task_cwd(str(tmp_path / "missing"))
+
+
+# ── Clone failure/side-channel notes ─────────────────────────────────────────
+
+
+@requires_posix_backend
+def test_describe_clone_failure_prefixes_auth_errors():
+    from backend.api.projects import _describe_clone_failure
+
+    raw = (
+        "git clone failed: fatal: could not read Username for "
+        "'https://github.com': No such device or address"
+    )
+    described = _describe_clone_failure(raw)
+    assert described.startswith("git authentication failed")
+    assert raw in described
+
+    plain = "git clone failed: fatal: repository not found"
+    assert _describe_clone_failure(plain) == plain
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_clone_note_sync_annotates_and_clears(
+    queue, db_factory, monkeypatch
+):
+    import backend.api.projects as projects_module
+
+    monkeypatch.setattr(projects_module, "async_session", db_factory)
+
+    project = await _seed_project(
+        queue.db, status="cloning", name="note-sync-project"
+    )
+    task = await queue.create(
+        title="Waiting task",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+
+    await projects_module._sync_waiting_task_clone_notes(
+        project.id, "git clone failed: auth"
+    )
+    refreshed = await queue.db.get(Task, task.id, populate_existing=True)
+    assert refreshed.status == "pending"
+    assert refreshed.error_message.startswith("Project clone failed: ")
+    assert "git clone failed: auth" in refreshed.error_message
+
+    await projects_module._sync_waiting_task_clone_notes(project.id, None)
+    cleared = await queue.db.get(Task, task.id, populate_existing=True)
+    assert cleared.error_message is None
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_clone_note_clear_keeps_foreign_error_messages(
+    queue, db_factory, monkeypatch
+):
+    import backend.api.projects as projects_module
+
+    monkeypatch.setattr(projects_module, "async_session", db_factory)
+
+    project = await _seed_project(
+        queue.db, status="cloning", name="note-keep-project"
+    )
+    task = await queue.create(
+        title="Task with unrelated error note",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+    task.error_message = "some unrelated launch error"
+    await queue.db.commit()
+
+    await projects_module._sync_waiting_task_clone_notes(project.id, None)
+    kept = await queue.db.get(Task, task.id, populate_existing=True)
+    assert kept.error_message == "some unrelated launch error"

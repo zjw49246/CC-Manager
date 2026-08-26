@@ -17235,6 +17235,15 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         generation = int(snapshot["generation"])
         task_id = int(snapshot["task_id"])
         task_incarnation_id = str(snapshot["task_incarnation_id"] or "")
+        # Monitor turns spawn directly (never through the launch isolation
+        # path); fail with a typed, human-readable error instead of a bare
+        # ENOENT when the frozen cwd is gone. The bounded retry/terminal
+        # handling in _record_monitor_turn_failure stays in charge.
+        from backend.services.task_agent_isolation import (
+            require_existing_task_cwd,
+        )
+
+        require_existing_task_cwd(str(snapshot["cwd"]))
         from backend.services.project_share_admission import (
             require_unshared_project_auxiliary_effect,
         )
@@ -17947,6 +17956,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 context=sa_context,
             )
 
+            # Sub-agent turns spawn directly (never through the launch
+            # isolation path); fail with a typed error before the provider
+            # split instead of a bare ENOENT at subprocess creation.
+            from backend.services.task_agent_isolation import (
+                require_existing_task_cwd,
+            )
+
+            require_existing_task_cwd(task_cwd)
+
             if provider == "codex":
                 proc = await self._launch_codex_sub_agent(
                     prompt=prompt,
@@ -18136,7 +18154,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "termination receipt",
                 session_id,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(f"Sub-agent session {session_id} failed unexpectedly")
             try:
                 async with self.db_factory() as db:
@@ -18144,6 +18162,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     if sa and sa.status == "running":
                         sa.status = "failed"
                         sa.completed_at = datetime.utcnow()
+                        # Surface the reason in the UI; without this the panel
+                        # only shows a bare "failed" status.
+                        sa.last_error = str(exc)[:500]
                         await db.commit()
                         await self.broadcaster.broadcast(
                             f"task:{sa.task_id}",
@@ -24834,6 +24855,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CloudRouterAccountError,
                     CloudRouterUnsafePathError,
                 )
+                from backend.services.task_agent_isolation import (
+                    TaskWorkingDirectoryMissingError,
+                )
 
                 # Receipt recovery owns this exact Task generation and its
                 # launch reservation.  In particular, the provider-boundary
@@ -24862,9 +24886,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         CodexThreadHomeMismatchError,
                         CodexThreadTerminalStateError,
                         InstanceAlreadyRunningError,
+                        # Raised by the isolation preflight (and by the spawn
+                        # ENOENT translation, where create_subprocess_exec
+                        # provably created no process).
+                        TaskWorkingDirectoryMissingError,
                     ),
                 )
-                permanent_prelaunch = isinstance(exc, CloudRouterAccountError)
+                permanent_prelaunch = isinstance(
+                    exc,
+                    (CloudRouterAccountError, TaskWorkingDirectoryMissingError),
+                )
                 try:
                     (
                         source_preflight_proven,
@@ -25063,23 +25094,29 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     unsafe_cloudrouter_config = isinstance(
                         exc, CloudRouterUnsafePathError
                     )
+                    if isinstance(exc, TaskWorkingDirectoryMissingError):
+                        permanent_notice_content = (
+                            f"任务工作目录 {exc.path} 不存在，本条消息未执行。"
+                            "项目可能未克隆成功或工作区已被删除，请检查项目状态"
+                            "（必要时 Re-clone）后重新发送。"
+                        )
+                    elif unsafe_cloudrouter_config:
+                        permanent_notice_content = (
+                            "API 账号配置安全校验失败，本条消息未执行。"
+                            "请检查或重新保存该 API 账号后再发送。"
+                        )
+                    else:
+                        permanent_notice_content = (
+                            "API 账号当前不可用，本条消息未执行。"
+                            "请刷新账号，并检查启用状态、模型支持或额度后"
+                            "重新发送。"
+                        )
                     permanent_notice = LogEntry(
                         instance_id=None,
                         task_id=task_id,
                         event_type="system_event",
                         role="system",
-                        content=(
-                            (
-                                "API 账号配置安全校验失败，本条消息未执行。"
-                                "请检查或重新保存该 API 账号后再发送。"
-                            )
-                            if unsafe_cloudrouter_config
-                            else (
-                                "API 账号当前不可用，本条消息未执行。"
-                                "请刷新账号，并检查启用状态、模型支持或额度后"
-                                "重新发送。"
-                            )
-                        ),
+                        content=permanent_notice_content,
                         is_error=True,
                     )
                     db.add(permanent_notice)

@@ -68,7 +68,12 @@ export function ProjectSelect({
             </span>
           )}
           {showStatus && selected && selected.status !== 'ready' && (
-            <span className="text-yellow-400 text-[10px]">({selected.status})</span>
+            <span
+              className={`${selected.status === 'error' ? 'text-red-400' : 'text-yellow-400'} text-[10px]`}
+              title={selected.error_message ?? undefined}
+            >
+              ({selected.status})
+            </span>
           )}
         </span>
         <ChevronDown size={12} className={`shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
@@ -89,6 +94,7 @@ export function ProjectSelect({
             <div
               key={p.id}
               onClick={() => { onChange(String(p.id)); setOpen(false); }}
+              title={p.error_message ?? undefined}
               className={`px-3 py-1.5 text-xs cursor-pointer hover:bg-gray-700 transition-colors flex items-center gap-1.5 ${
                 String(p.id) === String(value) ? 'text-white bg-gray-700/50' : 'text-gray-300'
               }`}
@@ -100,7 +106,9 @@ export function ProjectSelect({
                 </span>
               )}
               {showStatus && p.status !== 'ready' && (
-                <span className="text-yellow-400 text-[10px] shrink-0">({p.status})</span>
+                <span className={`${p.status === 'error' ? 'text-red-400' : 'text-yellow-400'} text-[10px] shrink-0`}>
+                  ({p.status})
+                </span>
               )}
             </div>
           ))}

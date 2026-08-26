@@ -1997,6 +1997,20 @@ async def materialize_execution_task(
             if version.human_decision != "approved":
                 raise HTTPException(409, "Plan Version must be approved")
 
+            if plan.project_id is not None:
+                from backend.models.project import Project
+                from backend.services.project_readiness import (
+                    ProjectNotDispatchableError,
+                    require_project_dispatchable,
+                )
+
+                try:
+                    require_project_dispatchable(
+                        await db.get(Project, plan.project_id)
+                    )
+                except ProjectNotDispatchableError as exc:
+                    raise HTTPException(422, exc.detail) from exc
+
             metadata = dict(execution_metadata or {})
             # These audit keys are authoritative and cannot be overridden by an
             # embedding orchestrator's optional correlation metadata.

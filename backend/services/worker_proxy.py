@@ -2224,6 +2224,14 @@ class WorkerProxy:
                 # clone 是后台任务，等 status=ready（worker dispatch 需要 local_path 就绪）
                 deadline = asyncio.get_event_loop().time() + 300
                 while remote.get("status") != "ready":
+                    if remote.get("status") == "error":
+                        # Worker-side clone already failed; waiting out the
+                        # full deadline only hides the real reason as a
+                        # misleading timeout.
+                        raise RuntimeError(
+                            f"worker 项目 {project.name} clone 失败: "
+                            f"{remote.get('error_message') or 'unknown error'}"
+                        )
                     if asyncio.get_event_loop().time() > deadline:
                         raise RuntimeError(f"worker 项目 {project.name} clone 超时")
                     await asyncio.sleep(3)

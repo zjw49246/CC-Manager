@@ -5270,6 +5270,7 @@ class InstanceManager:
         claude_unrestricted_allowed_rules: tuple[str, ...] | None = None
         claude_delivery_git_boundary = None
         claude_task_runtime_scope_reserved = False
+        codex_task_runtime_scope_reserved = False
         if (
             provider == "claude"
             and task_id
@@ -5277,6 +5278,21 @@ class InstanceManager:
         ):
             self._reserve_task_runtime_scope(task_id)
             claude_task_runtime_scope_reserved = True
+        elif (
+            provider == "codex"
+            and task_id
+            and not pr_review_task
+        ):
+            # Codex spec construction below materializes frozen MCP entrypoint
+            # files into the same task-{id} scope Claude uses.  Without this
+            # reservation, a previous lifecycle's terminal cleanup (dispatcher
+            # finally) can delete those files in the window between spec
+            # materialization and the app-server/exec process spawn (e.g.
+            # while waiting on the codex home guard).  The exact-generation
+            # direct owner installed at spawn time takes over from here, and
+            # the shared _launch_impl failure path discards the reservation.
+            self._reserve_task_runtime_scope(task_id)
+            codex_task_runtime_scope_reserved = True
         if (
             provider == "claude"
             and task_id
@@ -5792,6 +5808,11 @@ class InstanceManager:
                         execution_principal_kind=execution_principal_kind,
                         attachment_paths=attachment_paths,
                         ssh_agent_socket_snapshot=ssh_agent_socket_snapshot,
+                        task_runtime_scope_task_id=(
+                            task_id
+                            if codex_task_runtime_scope_reserved
+                            else None
+                        ),
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
@@ -6270,6 +6291,11 @@ class InstanceManager:
                     cmd,
                     spawn_kwargs,
                     codex_home=config_dir,
+                    task_runtime_scope_task_id=(
+                        task_id
+                        if codex_task_runtime_scope_reserved
+                        else None
+                    ),
                 )
         else:
             spawn_kwargs = {
@@ -6893,6 +6919,7 @@ class InstanceManager:
         tools_disabled: bool = False,
         mcp_only: bool = False,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
+        task_runtime_scope_task_id: int | None = None,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
         registry = self._ensure_codex_app_server_registry()
@@ -6944,6 +6971,16 @@ class InstanceManager:
         if config_dir:
             self._config_dirs[instance_id] = config_dir
         self.processes[instance_id] = process
+        if task_runtime_scope_task_id is not None:
+            # Hand the pending scope reservation over to this exact turn's
+            # adapter, synchronously with the process registration. Terminal
+            # release reuses the shared direct-owner paths (consumer done,
+            # launch-commit failure reap, cancelled spawn, stop).
+            self._adopt_task_runtime_scope_direct(
+                task_runtime_scope_task_id,
+                instance_id,
+                process,
+            )
         # This instance may previously have used the exec fallback.  It is now
         # owned by the registry, whose active-turn check is authoritative.
         self._codex_exec_homes.pop(instance_id, None)
@@ -18154,7 +18191,22 @@ class InstanceManager:
             if cancellation is None:
                 cancellation = later_cancellation
 
-        process = spawn.result()
+        try:
+            process = spawn.result()
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            # Two ENOENT shapes reach this shared spawn point: a missing
+            # working directory and a missing executable. Translate the cwd
+            # case into the typed, human-readable error (the bare "[Errno 2]"
+            # otherwise lands verbatim in Task.error_message); the missing
+            # binary case keeps its original exception.
+            spawn_cwd = spawn_kwargs.get("cwd")
+            if spawn_cwd and not os.path.isdir(spawn_cwd):
+                from backend.services.task_agent_isolation import (
+                    TaskWorkingDirectoryMissingError,
+                )
+
+                raise TaskWorkingDirectoryMissingError(str(spawn_cwd)) from exc
+            raise
         self.processes[instance_id] = process
         if os.name == "posix":
             self._process_groups[instance_id] = process

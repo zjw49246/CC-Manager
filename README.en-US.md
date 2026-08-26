@@ -12,7 +12,7 @@ Web-based tool for scheduling and managing multiple Claude Code instances to wor
 - **Global Dispatcher** — Automatically creates workers and assigns tasks upon startup, no manual intervention required
 - **Fully Autonomous Claude Code** — Claude Code independently handles worktree creation, commit, fetch, merge, push, conflict resolution, and cleanup. The Dispatcher only assigns tasks and evaluates success/failure
 - **9-Step Task Lifecycle** — Claim → Create Workspace → Implement → Commit → Merge + Test → Merge to main → Mark Complete → Cleanup → Experience Accumulation
-- **Project Management** — Supports cloning existing repositories (with remote) and local git init (without remote). New projects can be created directly when creating tasks
+- **Project Management** — Supports cloning existing repositories (with remote) and local git init (without remote). New projects can be created directly when creating tasks. Background clones never hang waiting for credential input and authentication failures produce an actionable message; a project whose clone failed rejects new task creation (422) while already-queued tasks wait and start automatically after a successful re-clone
 - **Project Todo List** — Each project maintains a collapsible todo list (prompt template). Click "▶ Run" to directly create a Task and jump to Chat; todos are automatically marked complete upon creation and record the derived task. Supports archive/recover/permanent delete
 - **Task Queue** — Automatically schedules by priority (smaller number = higher priority)
 - **Multi-Instance Parallelism** — Runs multiple Claude Code instances simultaneously, each handling different tasks
@@ -56,7 +56,7 @@ Web-based tool for scheduling and managing multiple Claude Code instances to wor
 - **Safe One-Click Update & Restart** — Scheduled background checks with popup reminders; pauses new task claims during update, refuses restart if active tasks, manual instances without tasks, or pending resume messages aren't zeroed; detects manually pulled but unloaded code, then completes dependencies, migration, frontend build, and intelligent restart
 
 ### Projects & Collaboration
-- **Project Management** — Supports cloning existing repositories (with remote) and local git init (without remote), new projects can be created directly when creating tasks
+- **Project Management** — Supports cloning existing repositories (with remote) and local git init (without remote), new projects can be created directly when creating tasks. Background clones never hang waiting for credential input and authentication failures produce an actionable message; a project whose clone failed rejects new task creation (422) while already-queued tasks wait and start automatically after a successful re-clone
 - **PR Monitor** — Audits GitHub PRs with exact-head CI and isolated Reviewer Panel; each Finding can be audited with ignore/manual advice, or tool-free Task generates scoped candidate diffs. AI candidates must first be downloaded and bound to user/Action/patch hash by backend, then explicitly confirmed by user, backend only performs exact-old compare-and-swap push on matching PR source branches; any Finding operation cannot bypass Panel Gate
 - **PWA** — Add to Home Screen in mobile browsers, native App experience
 - **Android App** — Native APK packaged via Capacitor, configurable remote server URL in-app

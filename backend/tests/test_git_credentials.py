@@ -615,7 +615,13 @@ class TestCloneWithCredentials:
 
     @pytest.mark.asyncio
     async def test_clone_no_config_no_env(self):
-        """_clone_repo without git_config → no custom env."""
+        """_clone_repo without git_config → no credentials, but prompts off.
+
+        Background clones have no TTY; the env always carries
+        GIT_TERMINAL_PROMPT=0 (and stdin=DEVNULL) so an HTTPS clone without
+        credentials fails fast instead of hanging or dying with the cryptic
+        "could not read Username ... No such device or address".
+        """
         from backend.api.projects import _clone_repo
 
         captured_kwargs = []
@@ -642,11 +648,18 @@ class TestCloneWithCredentials:
             await _clone_repo(
                 project_id=1,
                 git_url="https://github.com/test/repo.git",
-                local_path="/tmp/test-clone-no-config",
                 project_name="test",
+                local_path="/tmp/test-clone-no-config",
                 default_branch="main",
                 git_config=None,
             )
 
-        # First subprocess call (clone) should have env=None
-        assert captured_kwargs[0].get("env") is None
+        clone_env = captured_kwargs[0].get("env")
+        assert clone_env is not None
+        assert clone_env["GIT_TERMINAL_PROMPT"] == "0"
+        assert "GIT_ASKPASS" not in clone_env
+        assert "GIT_SSH_COMMAND" not in clone_env or (
+            # instance-level fallback key may exist in the host env
+            "BatchMode=yes" in clone_env["GIT_SSH_COMMAND"]
+        )
+        assert captured_kwargs[0].get("stdin") is not None

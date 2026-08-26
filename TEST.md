@@ -1528,3 +1528,34 @@ manager(8003) 注册 worker → 建 git_url 项目 → 创建 task 选 worker �
 转发同 ID、状态回流、43 条日志镜像、README 真实修改 + merge push、
 chat 代理 + session_id 同步、回复经 relay 回流。测试仓库
 github.com/youchengsong/ccm-worker-e2e-test（可删）。
+
+## Project 就绪门禁与 clone 失败收口（2026-08-26）
+
+### 自动化测试（backend/tests/test_project_readiness.py）
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_require_project_dispatchable_rejects_error_only` | 只有 `status='error'` 拒绝；pending/cloning/initializing/ready 及无 Project 放行 |
+| `test_dequeue_holds_task_while_project_is_cloning` | cloning 项目的 pending Task 不被领取；项目 ready 后立即可领取 |
+| `test_dequeue_holds_task_of_error_project_until_reclone` | clone 失败项目的 Task 保持 pending（不烧 retry 预算）；reclone 回 ready 后自动恢复 |
+| `test_dequeue_unaffected_without_project_or_with_dangling_project` | `project_id` 为 NULL 或悬空（项目已删）时调度行为不回归 |
+| `test_create_task_rejects_error_project` | POST /api/tasks 引用 error 项目 → 422，不残留 Task 行 |
+| `test_create_task_allows_cloning_project` | cloning 项目仍可创建 Task（pending 等待就绪） |
+| `test_update_task_rejects_move_to_error_project` | PUT 把 Task 移入 error 项目 → 422 |
+| `test_todo_run_rejects_error_project` | Todo「▶ Run」对 error 项目 → 422 |
+| `test_prepare_task_working_directory_rejects_missing_explicit_path` | 显式工作目录不存在 → `TaskWorkingDirectoryMissingError`（人话+路径），存在则通过 |
+| `test_require_existing_task_cwd` | Monitor/Sub-Agent 直 spawn 路径 preflight 的存在性检查 |
+| `test_describe_clone_failure_prefixes_auth_errors` | 认证类 clone stderr 归一化为可操作文案且保留原始错误尾部 |
+| `test_clone_note_sync_annotates_and_clears` | clone 失败批量注记等待 Task 的 error_message；成功清除 |
+| `test_clone_note_clear_keeps_foreign_error_messages` | 清除只匹配自己的注记前缀，不误删任务真实错误 |
+
+注：标 `requires_posix_backend` 的用例依赖 `backend.api` 导入链（`deployment_start_guard` 的 POSIX `fcntl`），Windows 开发机自动跳过，Linux 上全量执行。
+
+### 手动验证清单
+
+1. 创建 HTTPS 无凭据的私有仓库项目 → 项目数秒内变 error（不再挂起等待凭据输入），error_message 以「git authentication failed」开头并给出补凭据指引；
+2. 对 error 项目新建任务 → API 422；前端 TaskForm/PlanCreateForm 选中该项目时显示红色警示（含失败原因）并禁用提交；
+3. 项目 cloning 期间创建任务 → 任务保持 pending，clone 完成后 ≤2s 自动开始（dispatcher.wake + 2s poll 兜底）；
+4. Re-clone 修复 error 项目 → 之前等待的 pending 任务自动开始，error_message 注记自动清除；
+5. chat 续聊一个 `last_cwd` 已被删除的任务 → 聊天出现红色 system_event「任务工作目录 … 不存在，本条消息未执行」，Task 回滚到发送前状态，消息不无限重试；
+6. Worker 项目 clone 失败 → Manager 侧秒级报「worker 项目 … clone 失败: <原因>」，不再等满 300s 超时。

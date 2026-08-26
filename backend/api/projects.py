@@ -915,6 +915,80 @@ async def _prepare_existing_project_remote(
     await _project_git(local_path, "fetch", "origin", env=env)
 
 
+_GIT_AUTH_ERROR_MARKERS = (
+    "could not read username",
+    "could not read password",
+    "terminal prompts disabled",
+    "authentication failed",
+    "permission denied (publickey",
+    "host key verification failed",
+)
+
+_CLONE_FAILURE_TASK_NOTE_PREFIX = "Project clone failed: "
+
+
+def _describe_clone_failure(raw: str) -> str:
+    """Prefix credential failures with actionable guidance, keep the git tail."""
+    lowered = raw.lower()
+    if any(marker in lowered for marker in _GIT_AUTH_ERROR_MARKERS):
+        return (
+            "git authentication failed — configure a valid HTTPS token or SSH "
+            "key in the Project Git settings, then re-clone. " + raw
+        )
+    return raw
+
+
+def _wake_dispatcher() -> None:
+    """Best-effort dispatcher nudge after a Project flips to ready.
+
+    Swallow every failure: raising here would land in the clone coroutine's
+    ``except`` block and mislabel an already-committed successful clone as an
+    error. The dispatcher's 2s poll remains the fallback.
+    """
+    try:
+        from backend.main import dispatcher
+
+        if dispatcher is not None:
+            dispatcher.wake()
+    except Exception:
+        pass
+
+
+async def _sync_waiting_task_clone_notes(project_id: int, reason: str | None) -> None:
+    """Annotate (or clear) queued Tasks held by the Project readiness gate.
+
+    Only ``error_message`` is written — status stays ``pending`` so a later
+    re-clone resumes the Tasks untouched (the dequeue claim also clears the
+    note). Best-effort: the authoritative failure record is the Project row.
+    """
+    from backend.models.task import Task
+
+    conditions = [
+        Task.project_id == project_id,
+        Task.status == "pending",
+        Task.worker_id.is_(None),
+        Task.shared_from_id.is_(None),
+    ]
+    if reason is None:
+        # Only clear our own note so a real per-task error is never erased.
+        conditions.append(
+            Task.error_message.like(_CLONE_FAILURE_TASK_NOTE_PREFIX + "%")
+        )
+        values = {"error_message": None}
+    else:
+        note = (_CLONE_FAILURE_TASK_NOTE_PREFIX + reason)[:400]
+        values = {
+            "error_message": note
+            + " — the task will start automatically after the project is re-cloned"
+        }
+    try:
+        async with async_session() as db:
+            await db.execute(update(Task).where(*conditions).values(**values))
+            await db.commit()
+    except Exception:
+        pass
+
+
 async def _clone_repo(project_id: int, git_url: str, local_path: str, project_name: str, default_branch: str, git_config: dict | None = None):
     """Clone a git repo in the background."""
     async with async_session() as db:
@@ -928,7 +1002,15 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
 
         # Build env with git credentials so clone/fetch can authenticate
         git_env = _build_git_env(git_config or {})
-        env = {**os.environ, **git_env} if git_env else None
+        env = {**os.environ, **git_env}
+        # Background clones have no TTY to answer a credential prompt: git
+        # either hangs the dev shell or fails with the cryptic "could not read
+        # Username ... No such device or address" under systemd. Fail fast
+        # instead — GIT_ASKPASS (set when a token is configured) is consulted
+        # before terminal prompts, so authenticated clones are unaffected.
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        if "GIT_SSH_COMMAND" in env:
+            env["GIT_SSH_COMMAND"] += " -o BatchMode=yes"
 
         if os.path.isdir(local_path):
             # Existing directories are common when a local project is later
@@ -943,6 +1025,7 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
         else:
             proc = await asyncio.create_subprocess_exec(
                 "git", "clone", git_url, local_path,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -983,6 +1066,12 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
             )
             await db.commit()
 
+        # Tasks created while the clone was still running are held back by the
+        # dispatch-queue readiness gate; nudge the dispatcher so they start now
+        # (the 2s poll is only the fallback) and drop any stale failure note.
+        await _sync_waiting_task_clone_notes(project_id, None)
+        _wake_dispatcher()
+
         if settings.ccm_node_role == "manager":
             # PR Monitor is Manager-authoritative state.  Worker Project copies
             # are compute caches and must not perform GitHub setup or create a
@@ -994,13 +1083,15 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
             await try_auto_configure_delivery_monitor(project_id)
 
     except Exception as e:
+        reason = _describe_clone_failure(str(e))
         async with async_session() as db:
             await db.execute(
                 update(Project)
                 .where(Project.id == project_id)
-                .values(status="error", error_message=str(e)[:1000])
+                .values(status="error", error_message=reason[:1000])
             )
             await db.commit()
+        await _sync_waiting_task_clone_notes(project_id, reason)
 
 
 async def _init_local_repo(project_id: int, local_path: str, project_name: str, default_branch: str, git_config: dict | None = None):
@@ -1060,14 +1151,19 @@ async def _init_local_repo(project_id: int, local_path: str, project_name: str, 
             )
             await db.commit()
 
+        await _sync_waiting_task_clone_notes(project_id, None)
+        _wake_dispatcher()
+
     except Exception as e:
+        reason = str(e)
         async with async_session() as db:
             await db.execute(
                 update(Project)
                 .where(Project.id == project_id)
-                .values(status="error", error_message=str(e)[:1000])
+                .values(status="error", error_message=reason[:1000])
             )
             await db.commit()
+        await _sync_waiting_task_clone_notes(project_id, reason)
 
 
 # ── Env files helpers ─────────────────────────────────────────────────────────
