@@ -1,4 +1,5 @@
 import { applyCustomTheme, clearCustomTheme } from './customTheme';
+import { applyBootstrapBgImage } from './customBg';
 import { DEFAULT_THEME, THEME_OPTIONS, type Theme } from './themeRegistry';
 
 const THEME_MAP = new Map(THEME_OPTIONS.map((theme) => [theme.value, theme]));
@@ -19,6 +20,7 @@ export function applyPrepaintTheme(): Theme {
   if (theme === 'custom') {
     try {
       themeColor = applyCustomTheme();
+      applyBootstrapBgImage();
       scheme = document.documentElement.dataset.scheme === 'light' ? 'light' : 'dark';
     } catch {
       clearCustomTheme();
@@ -27,6 +29,8 @@ export function applyPrepaintTheme(): Theme {
       themeColor = option.themeColor;
       scheme = option.scheme;
     }
+  } else {
+    clearCustomTheme();
   }
 
   document.documentElement.dataset.theme = theme;

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { DEFAULT_THEME, THEME_OPTIONS, getTheme, setTheme, applyTheme } from './theme';
 import { applyPrepaintTheme } from './themeBootstrap';
 import { buildCustomTheme, clearCustomTheme, setCustomColors } from './customTheme';
+import { applyBootstrapBgImage } from './customBg';
 
 // vitest root = frontend/（jsdom 下 import.meta.url 非 file 协议，用 cwd 定位）
 const indexCss = readFileSync(join(process.cwd(), 'src/index.css'), 'utf-8');
@@ -160,6 +161,19 @@ describe('theme config', () => {
     for (const [name, value] of Object.entries(expected.vars)) {
       expect(document.documentElement.style.getPropertyValue(name), name).toBe(value);
     }
+  });
+
+  it('首屏恢复已保存的自定义背景图快照', () => {
+    setCustomColors('#131316', '#4f7cf7');
+    localStorage.setItem('cc_theme', 'custom');
+    localStorage.setItem('cc_theme_custom_has_bg', '1');
+    localStorage.setItem('ccm-theme-bootstrap-image', 'data:image/jpeg;base64,ZmFrZQ==');
+
+    expect(applyPrepaintTheme()).toBe('custom');
+    expect(applyBootstrapBgImage()).toBe(true);
+    expect(document.documentElement.dataset.hasBg).toBe('1');
+    expect(document.documentElement.style.getPropertyValue('--ccm-bg-url')).toContain('data:image/jpeg');
+    expect(document.documentElement.style.getPropertyValue('--ccm-bg-scrim')).toContain('oklch(');
   });
 
   it('运行时切换主题同步 Apple 状态栏对比度', () => {
