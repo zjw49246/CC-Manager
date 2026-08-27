@@ -25,6 +25,7 @@ from backend.services.dispatcher import (
     WorkerTurnLaunchOutcomeUncertainError,
     _ModeTurnSequence,
     _ModeTurnTerminalProof,
+    _context_retry_permit_matches,
     _prepend_task_artifact_policy,
     _should_ensure_agent_docs,
 )
@@ -467,6 +468,261 @@ async def test_compact_retry_without_generation_permit_fails_closed(db_factory):
         assert current.retry_count == 1
         assert current.turn_generation == 3
         assert current.session_id is None
+
+
+def test_no_progress_retry_requires_and_matches_exact_generation_permit():
+    started_at = datetime(2026, 8, 24, 10, 0, 0)
+    task = Task(
+        id=41,
+        title="no-progress retry permit",
+        status="failed",
+        provider="claude",
+        retry_count=2,
+        turn_generation=8,
+        instance_id=17,
+        turn_source_log_id=91,
+        session_id=None,
+        started_at=started_at,
+        completed_at=None,
+    )
+    unproven = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="retry",
+        source="no_progress_retry",
+        no_progress_retry_attempt=1,
+    )
+    proven = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="retry",
+        source="no_progress_retry",
+        no_progress_retry_attempt=1,
+        context_retry_permit=ContextRetryPermit(
+            task_id=41,
+            instance_id=17,
+            retry_count=2,
+            turn_generation=8,
+            turn_source_log_id=91,
+            session_id=None,
+            started_at=started_at,
+            completed_at=None,
+        ),
+    )
+
+    assert _context_retry_permit_matches(task, unproven) is False
+    assert _context_retry_permit_matches(task, proven) is True
+
+
+@pytest.mark.asyncio
+async def test_no_progress_retry_claims_next_generation_with_fresh_session(
+    db_factory,
+):
+    started_at = datetime(2026, 8, 24, 10, 5, 0)
+    async with db_factory() as db:
+        previous = Instance(name="failed-no-progress", status="error")
+        idle = Instance(name="fresh-recovery-slot", status="idle")
+        db.add_all([previous, idle])
+        await db.flush()
+        task = Task(
+            title="no-progress automatic recovery",
+            description="retry once",
+            target_repo="/tmp",
+            status="failed",
+            provider="claude",
+            retry_count=0,
+            turn_generation=4,
+            instance_id=previous.id,
+            session_id=None,
+            started_at=started_at,
+            completed_at=None,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=previous.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="user_message",
+            role="user",
+            content="finish the document",
+            raw_json=_system_source_metadata(
+                raw_content="finish the document",
+            ),
+            is_error=False,
+            actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+        previous_id = previous.id
+        source_id = source.id
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    dispatcher._resolve_resume_config_dir = AsyncMock(return_value=None)
+    permit = dispatcher.issue_context_retry_permit(
+        task_id=task_id,
+        instance_id=previous_id,
+        retry_count=0,
+        turn_generation=4,
+        turn_source_log_id=source_id,
+        session_id=None,
+        started_at=started_at,
+        completed_at=None,
+    )
+    await dispatcher.enqueue_message(
+        task_id=task_id,
+        prompt="finish the document",
+        source="no_progress_retry",
+        source_log_id=source_id,
+        current_message="finish the document",
+        allow_new_session=True,
+        context_retry_permit=permit,
+        no_progress_retry_attempt=1,
+    )
+    queued = dispatcher._get_task_queue(task_id).get_nowait()
+
+    await dispatcher._process_queued_message(task_id, queued)
+
+    dispatcher.instance_manager.launch.assert_awaited_once()
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert launch["task_turn_generation"] == 5
+    assert launch["no_progress_retry_attempt"] == 1
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 5
+    assert current.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_no_progress_scheduler_validates_and_enqueues_recovery(db_factory):
+    started_at = datetime(2026, 8, 24, 10, 5, 0)
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-source", status="error")
+        task = Task(
+            title="scheduler recovery", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None,
+            session_id=None, started_at=started_at,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="authoritative input",
+            raw_json=_system_source_metadata(raw_content="authoritative input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    record = SimpleNamespace(task_retry_count=0, task_turn_generation=3)
+    ok = await dispatcher.enqueue_no_progress_recovery(
+        task_id=task_id,
+        instance_id=instance_id,
+        record=record,
+        params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+    )
+    assert ok is True
+    queued = dispatcher._get_task_queue(task_id).get_nowait()
+    assert queued.source == "no_progress_retry"
+    assert queued.prompt == "authoritative input"
+    assert queued.allow_new_session is True
+    assert queued.no_progress_retry_attempt == 1
+    assert queued.context_retry_permit is not None
+    assert dispatcher._context_retry_authority_is_live(queued)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"turn_generation": 4},
+        {"session_id": "already-live"},
+    ],
+)
+async def test_no_progress_scheduler_rejects_stale_generation_or_session(
+    db_factory, changes,
+):
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-reject", status="error")
+        task = Task(
+            title="scheduler reject", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="input",
+            raw_json=_system_source_metadata(raw_content="input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        for key, value in changes.items():
+            setattr(task, key, value)
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.enqueue_message = AsyncMock()
+    result = await dispatcher.enqueue_no_progress_recovery(
+        task_id=task_id, instance_id=instance_id,
+        record=SimpleNamespace(task_retry_count=0, task_turn_generation=3),
+        params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+    )
+    assert result is False
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_progress_scheduler_revokes_permit_on_enqueue_failure(db_factory):
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-failure", status="error")
+        task = Task(
+            title="scheduler failure", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="input",
+            raw_json=_system_source_metadata(raw_content="input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.enqueue_message = AsyncMock(side_effect=RuntimeError("queue down"))
+    with pytest.raises(RuntimeError):
+        await dispatcher.enqueue_no_progress_recovery(
+            task_id=task_id, instance_id=instance_id,
+            record=SimpleNamespace(task_retry_count=0, task_turn_generation=3),
+            params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+        )
+    assert dispatcher._context_retry_authorities == {}
 
 
 async def _bind_hidden_lifecycle_source(db_factory, task_id: int) -> None:

@@ -122,6 +122,9 @@ dispatcher = GlobalDispatcher(
 )
 dispatcher.cloudrouter_store = cloudrouter_store
 instance_manager.task_message_enqueuer = dispatcher.enqueue_message
+instance_manager.no_progress_recovery_scheduler = (
+    dispatcher.enqueue_no_progress_recovery
+)
 
 # Register provider-neutral capability adapters independently from admission.
 # Keeping them present while the feature flag is dark lets startup recovery

@@ -201,6 +201,8 @@ claude-manager/
 
 ## 关键约定
 
+- **Claude 无进展恢复**: 同一前台回合仅在连续相似的 `stop_reason=null` 回复持续至少两分钟、且从未出现 `tool_use/tool_result` 时才可中止并用 generation-bound 一次性许可在新 session 自动重放原消息；自动恢复最多一次，恢复回合再次异常或存在任何工具行为必须停止并等待用户重试，禁止盲目重放。
+
 - **数据库更新快照**: 数据库回滚快照只在权威 Alembic revision 检查确认有待迁移项时生成，并且只能由停服后的外部 worker 一次性生成、目标完整性检查和 fsync；禁止先做在线全量快照再被停服快照覆盖的双重 I/O。默认只保留当前和上一个恢复点。
 
 - **Codex 号池在线策略**: `pool_settings` 与账号记录一起原子保存在 `CODEX_POOL_CONFIG_PATH` 的私有 JSON 中，前端可在线修改启停、冷却、主动换号阈值、API/OAuth 路由顺序和首选账号并立即生效；部署级总开关和路径仍由环境变量控制。暂停后所有新 Codex 主任务、Monitor、Sub-Agent 与 Distill 必须 fail closed，禁止回落到 ambient `CODEX_HOME`。Worker 上的设置和首选账号写入必须参加 node account-mutation fence。

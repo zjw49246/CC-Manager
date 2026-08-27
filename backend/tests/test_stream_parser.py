@@ -90,6 +90,51 @@ def test_assistant_api_error_message_is_marked_error(parser):
     assert result["is_error"] is True
 
 
+def test_assistant_stop_reason_preserves_absent_vs_explicit_null(parser):
+    without_stop_reason = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "still working"}],
+        },
+    }))[0]
+    explicit_null = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "still working"}],
+            "stop_reason": None,
+        },
+    }))[0]
+
+    assert "stop_reason" not in without_stop_reason
+    assert "stop_reason" in explicit_null
+    assert explicit_null["stop_reason"] is None
+
+
+def test_assistant_mixed_envelope_marks_tool_before_text_processing(parser):
+    events = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I will inspect the file now."},
+                {"type": "tool_use", "name": "Read", "input": {}},
+            ],
+            "stop_reason": None,
+        },
+    }))
+
+    assert [event["event_type"] for event in events] == [
+        "message",
+        "tool_use",
+    ]
+    assert all(
+        event["assistant_envelope_has_tool_use"] is True
+        for event in events
+    )
+
+
 def test_tool_use(parser):
     line = json.dumps({
         "type": "tool_use",
@@ -264,6 +309,28 @@ def test_assistant_legacy_tool_markup_remains_inert_text(parser, text):
     assert results[0]["tool_input"] is None
     assert results[0]["is_error"] is False
     assert results[0]["protocol_anomaly"] == LEGACY_TOOL_MARKUP_ANOMALY
+
+
+def test_assistant_message_preserves_stop_reason(parser):
+    incomplete = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "I will rewrite it."}],
+            "stop_reason": None,
+        },
+    }))
+    complete = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Done."}],
+            "stop_reason": "end_turn",
+        },
+    }))
+
+    assert incomplete[0]["stop_reason"] is None
+    assert complete[0]["stop_reason"] == "end_turn"
 
 
 @pytest.mark.parametrize(

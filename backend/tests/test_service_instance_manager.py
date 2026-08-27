@@ -1,5 +1,6 @@
 """Tests for InstanceManager — subprocess lifecycle management."""
 import asyncio
+import difflib
 import json
 import os
 import signal
@@ -27,6 +28,7 @@ from backend.services.instance_manager import (
     LaunchSupersededError,
     LiveAttachmentInjectionUnsupportedError,
     SharedProjectAgentLaunchDisabledError,
+    _ClaudeNoProgressState,
     _OutputConsumerRecord,
     _SshAgentSocketSnapshot,
 )
@@ -160,6 +162,478 @@ def test_claude_terminal_result_suppresses_only_exact_assistant_duplicate():
         record,
         "claude",
     )["content"] == " Finished safely. "
+
+
+def _incomplete_claude_message(content: str) -> dict:
+    return {
+        "event_type": "message",
+        "role": "assistant",
+        "content": content,
+        "stop_reason": None,
+    }
+
+
+def test_claude_no_progress_state_reproduces_task_584_sequence():
+    state = _ClaudeNoProgressState()
+
+    assert not state.observe(
+        _incomplete_claude_message("让我重写一版更易读的文档。"),
+        now=0,
+    )
+    assert not state.observe(
+        _incomplete_claude_message("让我重写，用更通俗的方式讲。"),
+        now=60,
+    )
+    assert state.observe(
+        _incomplete_claude_message("让我重新写一版更通俗、更详细的文档。"),
+        now=121,
+    )
+    assert not state.observe(
+        _incomplete_claude_message("让我重写一版。"),
+        now=180,
+    )
+
+
+def test_claude_no_progress_similarity_bounds_large_repetitive_text(
+    monkeypatch,
+):
+    state = _ClaudeNoProgressState()
+    huge = "I will rewrite this now. " + ("abcabc" * 200_000) + " ending"
+    compared_lengths = []
+    real_matcher = difflib.SequenceMatcher
+
+    def bounded_matcher(_isjunk, left, right, *, autojunk):
+        compared_lengths.append((len(left), len(right)))
+        return real_matcher(None, left, right, autojunk=autojunk)
+
+    monkeypatch.setattr(
+        "backend.services.instance_manager.difflib.SequenceMatcher",
+        bounded_matcher,
+    )
+
+    assert not state.observe(_incomplete_claude_message(huge), now=0)
+    assert len(state.anchor_text) <= state.COMPARISON_TEXT_LIMIT
+    assert not state.observe(_incomplete_claude_message(huge), now=60)
+    assert state.observe(_incomplete_claude_message(huge), now=121)
+    assert len(state.anchor_text) <= state.COMPARISON_TEXT_LIMIT
+    assert compared_lengths
+    assert all(
+        left <= state.COMPARISON_TEXT_LIMIT
+        and right <= state.COMPARISON_TEXT_LIMIT
+        for left, right in compared_lengths
+    )
+
+
+def test_claude_no_progress_sampling_retains_both_response_ends():
+    state = _ClaudeNoProgressState()
+    middle = "x" * (state.COMPARISON_TEXT_LIMIT * 2)
+    normalized = state._normalize("START " + middle + " END")
+
+    assert len(normalized) <= state.COMPARISON_TEXT_LIMIT
+    assert normalized.startswith("start")
+    assert normalized.endswith("end")
+
+
+def test_claude_no_progress_state_ignores_real_progress_and_terminal_answers():
+    state = _ClaudeNoProgressState()
+
+    assert not state.observe(
+        _incomplete_claude_message("I will inspect the backend logs now."),
+        now=0,
+    )
+    assert not state.observe(
+        _incomplete_claude_message("The database query found 18 rows."),
+        now=130,
+    )
+    assert not state.observe(
+        {
+            **_incomplete_claude_message("The fix is complete."),
+            "stop_reason": "end_turn",
+        },
+        now=260,
+    )
+    assert not state.triggered
+
+
+def test_claude_no_progress_state_reads_pty_stop_reason_from_raw_json():
+    state = _ClaudeNoProgressState()
+    pty_event = {
+        "event_type": "message",
+        "role": "assistant",
+        "content": "I will rewrite the document now.",
+        "raw_json": json.dumps({
+            "type": "assistant",
+            "message": {"stop_reason": None},
+        }),
+    }
+
+    assert not state.observe(pty_event, now=0)
+    assert state.similar_messages == 1
+    assert not state.observe(
+        {**pty_event, "raw_json": "{}"},
+        now=200,
+    )
+    assert state.similar_messages == 1
+
+
+def test_claude_no_progress_state_ignores_missing_stop_reason():
+    state = _ClaudeNoProgressState()
+    event = {
+        "event_type": "message",
+        "role": "assistant",
+        "content": "I will rewrite the document now.",
+        "raw_json": json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant"},
+        }),
+    }
+
+    for now in (0, 130, 260):
+        assert not state.observe(event, now=now)
+    assert state.similar_messages == 0
+    assert not state.triggered
+
+
+def test_claude_no_progress_state_sees_sibling_tool_before_text():
+    state = _ClaudeNoProgressState()
+    for now in (0, 60):
+        assert not state.observe(
+            _incomplete_claude_message("I will rewrite the document now."),
+            now=now,
+        )
+
+    assert not state.observe(
+        {
+            **_incomplete_claude_message(
+                "I will rewrite the document now."
+            ),
+            "assistant_envelope_has_tool_use": True,
+        },
+        now=130,
+    )
+    assert state.tool_activity_seen
+    assert state.similar_messages == 0
+    assert not state.triggered
+
+
+def test_claude_no_progress_state_disables_detection_after_tool_activity():
+    state = _ClaudeNoProgressState()
+    assert not state.observe(
+        _incomplete_claude_message("I will read the file now."),
+        now=0,
+    )
+    assert not state.observe(
+        {"event_type": "tool_use", "role": "assistant"},
+        now=10,
+    )
+    for now in (130, 200, 270):
+        assert not state.observe(
+            _incomplete_claude_message("I will read the file now."),
+            now=now,
+        )
+    assert not state.triggered
+
+
+@pytest.mark.asyncio
+async def test_no_progress_failure_queues_one_fresh_session_recovery(db_factory):
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        instance = Instance(
+            name="no-progress-recovery",
+            status="error",
+            started_at=started_at,
+        )
+        task = Task(
+            title="safe no-progress recovery",
+            status="failed",
+            provider="claude",
+            retry_count=0,
+            turn_generation=4,
+            session_id=None,
+            started_at=started_at,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="user_message",
+            role="user",
+            content="finish the document",
+            is_error=False,
+            actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    record = _OutputConsumerRecord(
+        process=_make_mock_process(pid=58_401, returncode=130),
+        task=asyncio.current_task(),
+        chat_initiated=True,
+        provider="claude",
+        task_id=task_id,
+        task_retry_count=0,
+        task_turn_generation=4,
+        instance_started_at=started_at,
+    )
+    record.claude_no_progress.triggered = True
+    record.claude_no_progress.similar_messages = 3
+    dispatcher = MagicMock()
+    permit = object()
+    dispatcher.issue_context_retry_permit.return_value = permit
+    dispatcher.enqueue_message = AsyncMock(return_value=True)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_params[instance_id] = {
+        "prompt": "wrapped prompt",
+        "current_message": "stale launch parameter",
+        "source_log_id": source_id,
+        "model": "claude-opus-4-6[1m]",
+        "enabled_skills": {"monitor": True},
+        "no_progress_retry_attempt": 0,
+    }
+
+    scheduler = AsyncMock(return_value=True)
+    manager.no_progress_recovery_scheduler = scheduler
+    recovered = await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    )
+    duplicate = await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    )
+
+    assert recovered is True
+    assert duplicate is False
+    scheduler.assert_awaited_once()
+    request = scheduler.await_args.kwargs
+    assert request["task_id"] == task_id
+    assert request["instance_id"] == instance_id
+    assert request["params"]["source_log_id"] == source_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempt", "tool_activity"),
+    [(1, False), (0, True)],
+)
+async def test_no_progress_recovery_does_not_replay_unsafe_or_second_attempt(
+    db_factory,
+    attempt,
+    tool_activity,
+):
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_params[9] = {
+        "prompt": "must not replay",
+        "current_message": "must not replay",
+        "source_log_id": 10,
+        "no_progress_retry_attempt": attempt,
+    }
+    record = _OutputConsumerRecord(
+        process=_make_mock_process(pid=58_402, returncode=130),
+        task=asyncio.current_task(),
+        chat_initiated=True,
+        provider="claude",
+        task_id=8,
+        task_retry_count=0,
+        task_turn_generation=1,
+        instance_started_at=datetime.utcnow(),
+    )
+    record.claude_no_progress.triggered = True
+    record.claude_no_progress.similar_messages = 3
+    record.claude_no_progress.tool_activity_seen = tool_activity
+    dispatcher = MagicMock()
+    dispatcher.enqueue_message = AsyncMock()
+
+    manager.no_progress_recovery_scheduler = dispatcher.enqueue_message
+    recovered = await manager._try_enqueue_no_progress_recovery(9, 8, record)
+
+    assert recovered is False
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_result_from_process_event_blocks_no_progress_recovery(db_factory):
+    """A real parsed tool_result disables recovery before terminal handling."""
+    async with db_factory() as db:
+        instance = Instance(name="tool-result-recovery", status="running", pid=58403)
+        task = Task(
+            title="tool result safety", status="executing", provider="claude",
+            retry_count=0, turn_generation=1, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        started_at = datetime.utcnow()
+        instance.started_at = started_at
+        task.started_at = started_at
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=1, turn_scope="source",
+            event_type="user_message", role="user", content="do the work",
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    record = _OutputConsumerRecord(
+        process=_make_mock_process(pid=58_403, returncode=130),
+        task=asyncio.current_task(), chat_initiated=True, provider="claude",
+        task_id=task_id, task_retry_count=0, task_turn_generation=1,
+        instance_started_at=started_at,
+    )
+    record.process.session = MagicMock(session_id="tool-session")
+    scheduler = AsyncMock(return_value=True)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.no_progress_recovery_scheduler = scheduler
+    manager._consumer_records[instance_id] = record
+    manager.processes[instance_id] = record.process
+    manager._tasks[instance_id] = record.task
+    manager._launch_params[instance_id] = {
+        "source_log_id": source_id, "no_progress_retry_attempt": 0,
+    }
+
+    await manager._process_event(instance_id, task_id, {
+        "event_type": "tool_result", "role": "tool",
+        "content": "changed the file", "raw_json": json.dumps({
+            "type": "user", "message": {
+                "content": [{"type": "tool_result", "content": "ok"}],
+            },
+            "session_id": "tool-session",
+        }), "is_error": False,
+    })
+    record.claude_no_progress.triggered = True
+    record.claude_no_progress.similar_messages = 3
+    assert record.claude_no_progress.tool_activity_seen
+    assert await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    ) is False
+    scheduler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_event_interrupts_task_584_pty_loop_once(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(_ClaudeNoProgressState, "MIN_ELAPSED_SECONDS", 0)
+    async with db_factory() as db:
+        instance = Instance(name="claude-no-progress", status="running")
+        task = Task(
+            title="task 584 reproduction",
+            status="executing",
+            provider="claude",
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        started_at = datetime.utcnow()
+        task.instance_id = instance.id
+        task.started_at = started_at
+        instance.pid = 58_400
+        instance.started_at = started_at
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+        retry_count = task.retry_count
+        turn_generation = task.turn_generation
+
+    process = _make_mock_process(pid=58_400, returncode=None)
+    session = MagicMock(
+        session_id="cf5b187f-6a62-4c10-a75a-be97b378fe05",
+        send_interrupt=AsyncMock(),
+    )
+    process.session = session
+    consumer = asyncio.current_task()
+    assert consumer is not None
+    record = _OutputConsumerRecord(
+        process=process,
+        task=consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=task_id,
+        task_retry_count=retry_count,
+        task_turn_generation=turn_generation,
+        instance_started_at=started_at,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_backend = MagicMock()
+    manager._pty_backend._sessions = {instance_id: session}
+    manager.processes[instance_id] = process
+    manager._tasks[instance_id] = consumer
+    manager._consumer_records[instance_id] = record
+
+    await manager._process_event(
+        instance_id,
+        task_id,
+        {
+            "event_type": "message",
+            "role": "assistant",
+            "content": "让我重写一版更易读的文档。",
+            "raw_json": json.dumps({
+                "type": "assistant",
+                "session_id": "stale-session",
+                "message": {"stop_reason": None},
+            }),
+            "is_error": False,
+        },
+    )
+    assert record.claude_no_progress.similar_messages == 0
+
+    messages = (
+        "让我重写一版更易读的文档。",
+        "让我重写，用更通俗的方式讲。",
+        "让我重新写一版更通俗、更详细的文档。",
+        "让我重写一版更清楚的文档。",
+    )
+    for content in messages:
+        raw_json = json.dumps({
+            "type": "assistant",
+            "session_id": session.session_id,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": content}],
+                "stop_reason": None,
+            },
+        })
+        await manager._process_event(
+            instance_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": content,
+                "raw_json": raw_json,
+                "is_error": False,
+            },
+        )
+
+    session.send_interrupt.assert_awaited_once_with()
+    process.send_signal.assert_not_called()
+    assert record.fatal_provider_error is not None
+    assert record.claude_no_progress.triggered
+    async with db_factory() as db:
+        entries = list((await db.scalars(
+            select(LogEntry)
+            .where(LogEntry.task_id == task_id)
+            .order_by(LogEntry.id)
+        )).all())
+    assert [entry.event_type for entry in entries] == [
+        "message",
+        "message",
+        "message",
+        "system_event",
+    ]
+    assert entries[-1].is_error is True
+    assert "CCM 已中止" in entries[-1].content
 
 
 def test_claude_hot_runtime_fingerprint_covers_mcp_and_full_git_environment(

@@ -486,6 +486,57 @@ async def test_successful_auto_terminal_atomically_yields_to_capability(
 
 
 @pytest.mark.asyncio
+async def test_no_progress_pty_interrupt_fails_and_clears_native_session(
+    db_factory,
+):
+    scope = await _terminal_scope(
+        db_factory,
+        transport="claude_pty",
+        reason="must not execute after a no-progress loop",
+        generation=4,
+        pid=81_004,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    process = _process(pid=scope.pid, returncode=130)
+    manager.processes[scope.instance_id] = process
+    record = manager._track_output_consumer(
+        scope.instance_id,
+        process,
+        asyncio.current_task(),
+        chat_initiated=True,
+        provider="claude",
+        task_id=scope.task_id,
+        task_retry_count=scope.retry_count,
+        task_turn_generation=scope.generation,
+        instance_started_at=scope.started_at,
+    )
+    object.__setattr__(
+        record,
+        "fatal_provider_error",
+        "Claude response made no progress: test reproduction",
+    )
+
+    status = await manager.finalize_pty_chat_generation(
+        scope.instance_id,
+        scope.task_id,
+        130,
+        record,
+    )
+
+    assert status == "failed"
+    async with db_factory() as db:
+        task = await db.get(Task, scope.task_id)
+        instance = await db.get(Instance, scope.instance_id)
+        assert task.status == "failed"
+        assert task.session_id is None
+        assert task.context_window_usage is None
+        assert "made no progress" in task.error_message
+        assert instance.status == "error"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_resumed_generation_settles_then_requests_next_capability(
     db_factory,
     monkeypatch,
