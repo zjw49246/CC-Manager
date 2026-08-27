@@ -72,6 +72,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Linux rejects a single argv entry around 128 KiB (MAX_ARG_STRLEN), before
+# Claude Code can apply its own context-window guard. Keep ample room for
+# encoding/platform variance and send only large direct-Claude prompts over
+# stdin; ordinary launches retain their established argv shape.
+_CLAUDE_PROMPT_STDIN_THRESHOLD_BYTES = 64 * 1024
+
 
 async def _fence_worker_runtime_mutation(
     db: AsyncSession,
@@ -6118,9 +6124,17 @@ class InstanceManager:
                 "Codex isolated workflow execution forbids exec fallback"
             )
 
+        # PTY launches return above with the complete prompt. Only the direct
+        # exec transport reaches this argv-size fallback and owns stdin.
+        claude_prompt_via_stdin = bool(
+            provider == "claude"
+            and len(prompt.encode("utf-8"))
+            >= _CLAUDE_PROMPT_STDIN_THRESHOLD_BYTES
+        )
         cmd = self._build_command(
             provider=provider,
             prompt=prompt,
+            claude_prompt_via_stdin=claude_prompt_via_stdin,
             model=model,
             resume_session_id=resume_session_id,
             effort_level=effort_level,
@@ -6279,6 +6293,8 @@ class InstanceManager:
                 "env": env,
                 "limit": 10 * 1024 * 1024,
             }
+            if claude_prompt_via_stdin:
+                spawn_kwargs["stdin"] = asyncio.subprocess.PIPE
             if os.name == "posix":
                 spawn_kwargs["start_new_session"] = True
             await admit_external_launch("claude_exec")
@@ -6300,6 +6316,12 @@ class InstanceManager:
                         else None
                     ),
                 )
+                if claude_prompt_via_stdin:
+                    await self._write_direct_claude_prompt(
+                        instance_id,
+                        process,
+                        prompt,
+                    )
             except BaseException:
                 if task_private_tmpdir is not None:
                     exact_process = self.processes.get(instance_id)
@@ -12381,15 +12403,18 @@ class InstanceManager:
         claude_unrestricted_settings_path: Path | None = None,
         claude_unrestricted_tools: Sequence[str] | None = None,
         claude_unrestricted_allowed_rules: Sequence[str] | None = None,
+        claude_prompt_via_stdin: bool = False,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
             cmd = [
                 settings.claude_binary,
-                "-p", prompt,
+                "-p",
                 "--output-format", "stream-json",
                 "--verbose",
             ]
+            if not claude_prompt_via_stdin:
+                cmd.insert(2, prompt)
             if claude_isolation_settings_path is not None:
                 from backend.services.task_agent_isolation import (
                     CLAUDE_TASK_BUILTIN_TOOLS,
@@ -14526,20 +14551,24 @@ class InstanceManager:
         expected_turn_generation: int | None = None,
         expected_started_at: datetime | None = None,
     ) -> _ContextPreflightPermit | None:
-        """Prove a direct Codex chat overflow happened before agent activity.
+        """Prove a direct chat overflow happened before agent activity.
 
         This is deliberately independent of stderr and rendered message text.
         Only the current exact source, its committed runtime transport, and a
-        strict durable ``turn.failed`` envelope can authorize compaction and
-        replay.  Missing, stale, malformed, or mixed-turn evidence fails
-        closed.
+        strict durable provider envelope can authorize compaction and replay.
+        Missing, stale, malformed, or mixed-turn evidence fails closed.
         """
 
+        provider = (
+            str(params.get("provider") or "").strip().lower()
+            if isinstance(params, dict)
+            else ""
+        )
         if (
             type(task_id) is not int
             or task_id <= 0
             or not isinstance(params, dict)
-            or str(params.get("provider") or "").strip().lower() != "codex"
+            or provider not in {"codex", "claude"}
         ):
             return None
         requested_source_id = params.get("source_log_id")
@@ -14571,7 +14600,7 @@ class InstanceManager:
             if (
                 task is None
                 or instance is None
-                or (task.provider or "claude").lower() != "codex"
+                or (task.provider or "claude").lower() != provider
                 or task.status not in {"executing", "in_progress"}
                 or task.instance_id != instance_id
                 or task.retry_count != expected_retry_count
@@ -14603,7 +14632,11 @@ class InstanceManager:
                 or source.task_turn_generation != task.turn_generation
                 or source.turn_scope != "source"
                 or source.actual_transport
-                not in {"codex_app_server", "codex_exec"}
+                not in (
+                    {"codex_app_server", "codex_exec"}
+                    if provider == "codex"
+                    else {"claude_pty", "claude_exec"}
+                )
                 or not source_shape_is_canonical(source, original)
                 or requested_source_id not in {source.id, original_id}
             ):
@@ -14647,6 +14680,78 @@ class InstanceManager:
 
             terminal = rows[-1]
             terminal_raw = parsed_rows[-1]
+            if provider == "claude":
+                terminal_result = (
+                    terminal_raw if isinstance(terminal_raw, dict) else {}
+                )
+                terminal_message = terminal_result.get("result")
+                usage = terminal_result.get("usage")
+                required_usage_keys = (
+                    "input_tokens",
+                    "output_tokens",
+                )
+                optional_usage_keys = (
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                )
+                usage_is_canonical_zero = (
+                    isinstance(usage, dict)
+                    and set(usage).issubset(
+                        {*required_usage_keys, *optional_usage_keys}
+                    )
+                    and all(
+                        key in usage
+                        and type(usage[key]) is int
+                        and usage[key] == 0
+                        for key in required_usage_keys
+                    )
+                    and all(
+                        type(usage[key]) is int and usage[key] == 0
+                        for key in optional_usage_keys
+                        if key in usage
+                    )
+                )
+                if not (
+                    terminal.event_type == "result"
+                    and terminal.is_error is True
+                    and terminal_result.get("type") == "result"
+                    and terminal_result.get("is_error") is True
+                    and terminal_result.get("terminal_reason") == "blocking_limit"
+                    and isinstance(terminal_message, str)
+                    and "prompt is too long" in terminal_message.lower()
+                    and type(terminal_result.get("duration_api_ms")) is int
+                    and terminal_result.get("duration_api_ms") == 0
+                    and usage_is_canonical_zero
+                ):
+                    return None
+                for row, raw in zip(rows[:-1], parsed_rows[:-1], strict=True):
+                    if row.event_type == "message":
+                        if not (
+                            row.role == "assistant"
+                            and row.is_error is True
+                            and isinstance(raw, dict)
+                            and raw.get("type") == "assistant"
+                            and raw.get("isApiErrorMessage") is True
+                            and raw.get("error") == "invalid_request"
+                            and str(row.content or "").strip().lower()
+                            == "prompt is too long"
+                        ):
+                            return None
+                    elif row.event_type in {"system_init", "rate_limit_event"}:
+                        continue
+                    else:
+                        return None
+                return _ContextPreflightPermit(
+                    task_id=task.id,
+                    status=task.status,
+                    instance_id=instance_id,
+                    retry_count=task.retry_count,
+                    turn_generation=task.turn_generation,
+                    turn_source_log_id=task.turn_source_log_id,
+                    session_id=task.session_id,
+                    started_at=task.started_at,
+                    completed_at=task.completed_at,
+                )
             error = (
                 terminal_raw.get("error")
                 if isinstance(terminal_raw, dict)
@@ -18110,6 +18215,36 @@ class InstanceManager:
                 "behavior": behavior,
             })
         return bool(ok)
+
+    async def _write_direct_claude_prompt(
+        self,
+        instance_id: int,
+        process: asyncio.subprocess.Process,
+        prompt: str,
+    ) -> None:
+        """Deliver a large Claude prompt without exposing it through argv."""
+
+        writer = process.stdin
+        if writer is None:
+            raise RuntimeError("Claude stdin prompt transport was not created")
+        try:
+            writer.write(prompt.encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            wait_closed = getattr(writer, "wait_closed", None)
+            if wait_closed is not None:
+                await wait_closed()
+        except BaseException:
+            # The process was already registered as the exact generation.
+            # Reap it before surfacing input-delivery failure so a half-fed
+            # Claude process cannot remain attached to a reusable Instance.
+            if (
+                process.returncode is None
+                or self._process_group_alive(instance_id, process)
+            ):
+                self._signal_process_tree(instance_id, process, signal.SIGKILL)
+            await self._wait_process_tree(instance_id, process, 5.0)
+            raise
 
     async def _spawn_managed_direct_process(
         self,

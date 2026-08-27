@@ -4158,6 +4158,22 @@ def test_build_command_claude_basic():
     assert "--verbose" in cmd
 
 
+def test_build_command_claude_large_prompt_uses_stdin_shape():
+    im = InstanceManager(MagicMock(), MagicMock())
+    prompt = "x" * (64 * 1024)
+    cmd = im._build_command(
+        provider="claude",
+        prompt=prompt,
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        claude_prompt_via_stdin=True,
+    )
+    assert cmd[1] == "-p"
+    assert prompt not in cmd
+    assert "--output-format" in cmd
+
+
 def test_build_command_claude_with_resume_and_model():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="claude", prompt="follow up", model="opus", resume_session_id="sess-1", effort_level="high")
@@ -5933,6 +5949,37 @@ async def test_launch_creates_subprocess(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_launch_large_claude_prompt_streams_stdin(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="large-prompt-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+        inst_id = inst.id
+
+    prompt = "large prompt " * 7000
+    mock_proc = _make_mock_process()
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdin.drain = AsyncMock()
+    mock_proc.stdin.wait_closed = AsyncMock()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as mock_exec:
+        await im.launch(instance_id=inst_id, prompt=prompt, cwd="/tmp")
+
+    assert prompt not in mock_exec.call_args.args
+    assert mock_exec.call_args.kwargs["stdin"] == asyncio.subprocess.PIPE
+    mock_proc.stdin.write.assert_called_once_with(prompt.encode("utf-8"))
+    mock_proc.stdin.drain.assert_awaited_once()
+    mock_proc.stdin.close.assert_called_once()
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
 async def test_launch_with_resume(db_factory):
     """launch() with resume_session_id includes --resume flag."""
     async with db_factory() as db:
@@ -6993,7 +7040,7 @@ async def test_local_user_demotion_between_precheck_and_transport_commit_blocks_
 
 
 @pytest.mark.asyncio
-async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
+async def test_claude_pty_large_prompt_receives_task_ssh_guard_env_and_policy(
     db_factory,
     monkeypatch,
     tmp_path,
@@ -7030,9 +7077,10 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
     im._pty_backend = MagicMock()
     im._launch_pty = AsyncMock(return_value=54_321)
 
+    prompt = "inspect remote files\n" + "x" * (64 * 1024)
     pid = await im.launch(
         instance_id=inst.id,
-        prompt="inspect remote files",
+        prompt=prompt,
         task_id=task.id,
         cwd=str(tmp_path),
         provider="claude",
@@ -7052,6 +7100,7 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
 
     assert pid == 54_321
     kwargs = im._launch_pty.await_args.kwargs
+    assert kwargs["prompt"] == prompt
     assert kwargs["claude_binary_override"] == settings.claude_binary
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
@@ -22158,6 +22207,351 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
     assert "durable summary" in retry["prompt"]
     assert "continue the task" in retry["prompt"]
     assert "already wrapped history" not in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
+    """A real Claude blocking_limit stream compacts and retries once."""
+
+    started_at = datetime(2026, 8, 25, 10, 11, 12)
+    async with db_factory() as db:
+        instance = Instance(
+            name="claude-context-proof",
+            status="running",
+            pid=73_107,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude context proof",
+            provider="claude",
+            status="executing",
+            retry_count=0,
+            turn_generation=2,
+            instance_id=instance.id,
+            session_id="claude-old-session",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=2,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            raw_json=json.dumps({
+                "transport": "claude",
+                "original_source_log_id": None,
+            }),
+            actual_transport="claude_exec",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    process = _make_mock_process(pid=73_107, returncode=1)
+    output = iter((
+        json.dumps({
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": "invalid_request",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Prompt is too long"}],
+            },
+        }).encode() + b"\n",
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": "Prompt is too long",
+            "terminal_reason": "blocking_limit",
+            "duration_api_ms": 0,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }).encode() + b"\n",
+        b"",
+    ))
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "[already wrapped history]\ncontinue the task",
+        "current_message": "continue the task",
+        "provider": "claude",
+        "task_turn_generation": 2,
+        "source_log_id": source_id,
+        "model": "claude-opus-5",
+    }
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="durable summary")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        ))
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=2,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_awaited_once()
+    dispatcher.enqueue_message.assert_awaited_once()
+    retry = dispatcher.enqueue_message.await_args.kwargs
+    assert retry["source"] == "compact_retry"
+    assert retry["source_log_id"] == source_id
+    assert retry["current_message"] == "continue the task"
+    assert retry["model_override"] == "claude-opus-5"
+    assert "durable summary" in retry["prompt"]
+    assert "already wrapped history" not in retry["prompt"]
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.session_id is None
+        assert current.context_window_usage is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("activity", "synthetic_error", "usage", "duration_api_ms"),
+    [
+    (
+        {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/a"}},
+        "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
+    ),
+    (
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "started"}],
+            },
+        },
+        "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
+    ),
+    (
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I started working"}],
+            },
+        },
+        "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
+    ),
+    (None, None, {"input_tokens": 0, "output_tokens": 0}, 0),
+    (None, "invalid_request", {}, 0),
+    (None, "invalid_request", {"output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": None, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": True, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": "0", "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": 0.5, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": "unknown", "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": 1, "output_tokens": 0}, 0),
+    (
+        None,
+        "invalid_request",
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": "0",
+        },
+        0,
+    ),
+    (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, False),
+    (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, "0"),
+    (
+        {"_terminal_result": {"detail": "Prompt is too long"}},
+        "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
+    ),
+    (
+        None,
+        "invalid_request",
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "future_input_tokens": 1,
+        },
+        0,
+    ),
+], ids=(
+    "tool",
+    "thinking",
+    "assistant",
+    "missing-error-marker",
+    "empty-usage",
+    "missing-input",
+    "none-input",
+    "bool-input",
+    "string-input",
+    "fractional-input",
+    "unknown-input",
+    "nonzero-input",
+    "string-cache",
+    "bool-duration",
+    "string-duration",
+    "non-string-result",
+    "unknown-usage-field",
+))
+async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
+    db_factory,
+    activity,
+    synthetic_error,
+    usage,
+    duration_api_ms,
+):
+    """Prior activity or an inexact synthetic error fails closed."""
+
+    started_at = datetime(2026, 8, 25, 10, 12, 13)
+    async with db_factory() as db:
+        instance = Instance(
+            name="claude-context-activity",
+            status="running",
+            pid=73_108,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude context activity",
+            provider="claude",
+            status="executing",
+            retry_count=0,
+            turn_generation=3,
+            instance_id=instance.id,
+            session_id="claude-active-session",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=3,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            raw_json=json.dumps({
+                "transport": "claude",
+                "original_source_log_id": None,
+            }),
+            actual_transport="claude_exec",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    process = _make_mock_process(pid=73_108, returncode=1)
+    synthetic = {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Prompt is too long"}],
+        },
+    }
+    if synthetic_error is not None:
+        synthetic["error"] = synthetic_error
+    terminal_result_value = "Prompt is too long"
+    if isinstance(activity, dict) and "_terminal_result" in activity:
+        terminal_result_value = activity["_terminal_result"]
+        activity = None
+    output_lines = []
+    if activity is not None:
+        output_lines.append(json.dumps(activity).encode() + b"\n")
+    output_lines.extend((
+        json.dumps(synthetic).encode() + b"\n",
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": terminal_result_value,
+            "terminal_reason": "blocking_limit",
+            "duration_api_ms": duration_api_ms,
+            "usage": usage,
+        }).encode() + b"\n",
+        b"",
+    ))
+    output = iter(output_lines)
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "continue the task",
+        "current_message": "continue the task",
+        "provider": "claude",
+        "task_turn_generation": 3,
+        "source_log_id": source_id,
+    }
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="must not compact")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        ))
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=3,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.session_id == "claude-active-session"
 
 
 @pytest.mark.asyncio

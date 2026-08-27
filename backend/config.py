@@ -61,7 +61,8 @@ class Settings(BaseSettings):
     # 会话上下文利用率达到该比例即自动摘要+换新 session。超大 context 的请求
     # 在服务端易挂起（2026-07-08 task 22/27 连环 stall 均发生在 ~90% 区间），
     # 故不要设回 0.9 让 session 在重灾区长时间工作。
-    context_compact_threshold: float = 0.80
+    # Leave headroom for the next message, tool output, and provider framing.
+    context_compact_threshold: float = 0.70
     default_goal_evaluator_model: str = "claude-haiku-4-5"
     goal_evaluation_timeout: int = 120
     # --- Independent Plan Agent pipeline ---
