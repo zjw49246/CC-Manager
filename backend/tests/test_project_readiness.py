@@ -243,6 +243,44 @@ async def test_update_task_rejects_move_to_error_project(client, session_factory
 
 @pytest.mark.asyncio
 @requires_posix_backend
+async def test_update_task_keeps_unchanged_error_project_editable(
+    client, session_factory
+):
+    """A full-form PUT resubmitting the current project_id must stay allowed.
+
+    Tasks deliberately wait in the queue for a re-clone; only a *new*
+    association with an error Project is refused.
+    """
+    async with session_factory() as db:
+        project = await _seed_project(
+            db, status="ready", name="api-edit-keeps-project"
+        )
+        project_id = project.id
+
+    created = await client.post("/api/tasks", json={
+        "title": "Editable while waiting",
+        "description": "d",
+        "project_id": project_id,
+    })
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    async with session_factory() as db:
+        broken = await db.get(Project, project_id)
+        broken.status = "error"
+        broken.error_message = "git clone failed"
+        await db.commit()
+
+    edited = await client.put(f"/api/tasks/{task_id}", json={
+        "title": "Renamed while project waits for re-clone",
+        "project_id": project_id,
+    })
+    assert edited.status_code == 200
+    assert edited.json()["title"] == "Renamed while project waits for re-clone"
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
 async def test_todo_run_rejects_error_project(client, session_factory):
     async with session_factory() as db:
         project = await _seed_project(
@@ -385,3 +423,86 @@ async def test_clone_note_clear_keeps_foreign_error_messages(
     await projects_module._sync_waiting_task_clone_notes(project.id, None)
     kept = await queue.db.get(Task, task.id, populate_existing=True)
     assert kept.error_message == "some unrelated launch error"
+
+
+# ── Clone success is the final publication ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_post_clone_setup_failure_cannot_reverse_ready(
+    queue, db_factory, monkeypatch
+):
+    """``ready`` is authoritative: a failing post-clone step must not flip the
+    Project back to ``error``, and the dispatcher wake happens only after the
+    optional setup ran (so a claimed task never observes the reversal)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import backend.api.projects as projects_module
+    import backend.services.delivery_setup as delivery_setup_module
+
+    monkeypatch.setattr(projects_module, "async_session", db_factory)
+
+    project = await _seed_project(
+        queue.db, status="pending", name="ready-finality-project"
+    )
+    project_id = project.id
+    task = await queue.create(
+        title="Waits for final readiness",
+        description="d",
+        project_id=project_id,
+        target_repo=project.local_path,
+    )
+    task_id = task.id
+
+    events: list[str] = []
+
+    async def failing_auto_configure(*args, **kwargs):
+        events.append("auto_config")
+        raise RuntimeError("post-clone GitHub setup exploded")
+
+    monkeypatch.setattr(
+        delivery_setup_module,
+        "try_auto_configure_delivery_monitor",
+        failing_auto_configure,
+    )
+    monkeypatch.setattr(
+        projects_module,
+        "_wake_dispatcher",
+        lambda: events.append("wake"),
+    )
+
+    async def mock_subprocess(*args, **kwargs):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        proc.wait = AsyncMock()
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+         patch("os.path.isdir", return_value=False), \
+         patch("os.path.exists", return_value=True), \
+         patch("os.makedirs"), \
+         patch.object(projects_module, "_inject_agents_md", return_value=False), \
+         patch.object(projects_module, "_scan_env_files", return_value=[]):
+        await projects_module._clone_repo(
+            project_id,
+            "https://github.com/example/readiness.git",
+            f"/tmp/ready-finality-{project_id}",
+            "ready-finality-project",
+            "main",
+            None,
+        )
+
+    final_project = await queue.db.get(
+        Project, project_id, populate_existing=True
+    )
+    assert final_project.status == "ready"
+    assert final_project.error_message is None
+
+    final_task = await queue.db.get(Task, task_id, populate_existing=True)
+    assert final_task.status == "pending"
+    assert final_task.error_message is None
+
+    # The wake is the last step, after the isolated setup attempt.
+    assert events == ["auto_config", "wake"]

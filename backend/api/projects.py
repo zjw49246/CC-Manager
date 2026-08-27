@@ -1,5 +1,6 @@
 import asyncio
 import fnmatch
+import logging
 import os
 import pathlib
 from urllib.parse import urlsplit, urlunsplit
@@ -35,6 +36,7 @@ from backend.services.worker_assignment import (
 from backend.services.worker_node_control import fence_worker_node_mutation
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+logger = logging.getLogger(__name__)
 
 
 _DELIVERY_PROJECT_IDENTITY_FIELDS = frozenset(
@@ -1009,8 +1011,15 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
         # instead — GIT_ASKPASS (set when a token is configured) is consulted
         # before terminal prompts, so authenticated clones are unaffected.
         env["GIT_TERMINAL_PROMPT"] = "0"
+        # SSH can prompt via /dev/tty regardless of stdin, so batch mode must
+        # be present for every background clone: augment a configured command
+        # or fall back to a plain batch-mode ssh (clone scope only — the
+        # shared _build_git_env also feeds agent subprocesses and must keep
+        # interactive semantics).
         if "GIT_SSH_COMMAND" in env:
             env["GIT_SSH_COMMAND"] += " -o BatchMode=yes"
+        else:
+            env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
 
         if os.path.isdir(local_path):
             # Existing directories are common when a local project is later
@@ -1066,22 +1075,6 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
             )
             await db.commit()
 
-        # Tasks created while the clone was still running are held back by the
-        # dispatch-queue readiness gate; nudge the dispatcher so they start now
-        # (the 2s poll is only the fallback) and drop any stale failure note.
-        await _sync_waiting_task_clone_notes(project_id, None)
-        _wake_dispatcher()
-
-        if settings.ccm_node_role == "manager":
-            # PR Monitor is Manager-authoritative state.  Worker Project copies
-            # are compute caches and must not perform GitHub setup or create a
-            # second, invisible MonitoredRepo in the Worker database.
-            from backend.services.delivery_setup import (
-                try_auto_configure_delivery_monitor,
-            )
-
-            await try_auto_configure_delivery_monitor(project_id)
-
     except Exception as e:
         reason = _describe_clone_failure(str(e))
         async with async_session() as db:
@@ -1092,6 +1085,35 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
             )
             await db.commit()
         await _sync_waiting_task_clone_notes(project_id, reason)
+        return
+
+    # ``ready`` above is the authoritative final publication of this clone.
+    # Nothing below may route back to the failure handler and reverse it: a
+    # task claimed after the wake must never observe the Project flipping to
+    # error because an optional post-clone step failed.
+    if settings.ccm_node_role == "manager":
+        # PR Monitor is Manager-authoritative state.  Worker Project copies
+        # are compute caches and must not perform GitHub setup or create a
+        # second, invisible MonitoredRepo in the Worker database.
+        try:
+            from backend.services.delivery_setup import (
+                try_auto_configure_delivery_monitor,
+            )
+
+            await try_auto_configure_delivery_monitor(project_id)
+        except Exception:
+            logger.exception(
+                "Post-clone Delivery Monitor auto-configuration failed for "
+                "project %s; the Project stays ready",
+                project_id,
+            )
+
+    # Tasks created while the clone was still running are held back by the
+    # dispatch-queue readiness gate; drop any stale failure note and nudge the
+    # dispatcher last, after every post-publication step (the 2s poll is only
+    # the fallback).
+    await _sync_waiting_task_clone_notes(project_id, None)
+    _wake_dispatcher()
 
 
 async def _init_local_repo(project_id: int, local_path: str, project_name: str, default_branch: str, git_config: dict | None = None):
@@ -1151,9 +1173,6 @@ async def _init_local_repo(project_id: int, local_path: str, project_name: str, 
             )
             await db.commit()
 
-        await _sync_waiting_task_clone_notes(project_id, None)
-        _wake_dispatcher()
-
     except Exception as e:
         reason = str(e)
         async with async_session() as db:
@@ -1164,6 +1183,12 @@ async def _init_local_repo(project_id: int, local_path: str, project_name: str, 
             )
             await db.commit()
         await _sync_waiting_task_clone_notes(project_id, reason)
+        return
+
+    # ``ready`` above is the authoritative final publication; note cleanup and
+    # the dispatcher nudge stay outside the failure handler's reach.
+    await _sync_waiting_task_clone_notes(project_id, None)
+    _wake_dispatcher()
 
 
 # ── Env files helpers ─────────────────────────────────────────────────────────

@@ -1548,6 +1548,16 @@ github.com/youchengsong/ccm-worker-e2e-test（可删）。
 | `test_describe_clone_failure_prefixes_auth_errors` | 认证类 clone stderr 归一化为可操作文案且保留原始错误尾部 |
 | `test_clone_note_sync_annotates_and_clears` | clone 失败批量注记等待 Task 的 error_message；成功清除 |
 | `test_clone_note_clear_keeps_foreign_error_messages` | 清除只匹配自己的注记前缀，不误删任务真实错误 |
+| `test_update_task_keeps_unchanged_error_project_editable` | 全量表单 PUT 带未变更的 project_id（项目已 error）仍可编辑其他字段（评审 finding 修复） |
+| `test_post_clone_setup_failure_cannot_reverse_ready` | ready 是最终发布：post-clone 自动配置失败不得翻回 error，任务保持可调度，wake 在隔离后置步骤之后（评审 finding 修复） |
+
+test_git_credentials.py 同步更新/覆盖：
+- `test_clone_no_config_no_env` — 零配置 clone 也必须带 `GIT_TERMINAL_PROMPT=0`、默认 `ssh -o BatchMode=yes` 与 `stdin=DEVNULL`（评审 finding 修复）
+- `test_clone_passes_git_env_with_ssh` — 已配置的 SSH 命令被增补 BatchMode 而不是替换
+
+test_service_instance_manager.py 新增（Codex scope 竞态回归，评审 finding 覆盖）：
+- `test_codex_scope_reservation_blocks_stale_lifecycle_cleanup` — 新代次已 reserve（物化后、spawn 前窗口）时旧 lifecycle 的终态清理必须跳过；adopt 交接后仍跳过；只有 exact 代次终态释放才清理
+- `test_codex_launch_failure_after_reserve_discards_reservation` — reserve 之后、进程注册之前的任何异常经 `_launch_impl` 的 BaseException 分支释放 reservation，下一代次可立即重新 reserve（无泄漏）
 
 注：标 `requires_posix_backend` 的用例依赖 `backend.api` 导入链（`deployment_start_guard` 的 POSIX `fcntl`），Windows 开发机自动跳过，Linux 上全量执行。
 

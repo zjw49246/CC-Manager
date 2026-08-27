@@ -4796,7 +4796,12 @@ async def _update_task_impl(
         if "project_id" in updates:
             # Project.local_path is the sole workspace authority.  Never carry
             # a caller-supplied or stale host path across a Project move.
-            _require_dispatchable_project(target_project)
+            if updates["project_id"] != task.project_id:
+                # Only a *new* association with a clone-failed Project is
+                # refused. Full-form edits resubmitting the unchanged
+                # project_id stay allowed — those tasks deliberately wait for
+                # a re-clone and the dispatch gate already prevents execution.
+                _require_dispatchable_project(target_project)
             updates["target_repo"] = target_project.local_path
         if (
             "project_id" in updates
