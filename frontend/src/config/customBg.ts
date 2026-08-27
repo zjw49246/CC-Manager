@@ -19,6 +19,8 @@ const DB_VERSION = 1;
 const STORE = 'bg';
 const IMAGE_KEY = 'image';
 const BOOTSTRAP_KEY = 'ccm-theme-bootstrap-image';
+/** Keep the parser-blocking snapshot small; IDB remains authoritative for the full image. */
+const MAX_BOOTSTRAP_CHARS = 350_000;
 
 /** 壳色 scrim 的浓度：可见度=100 时最淡（图片最明显），越低越浓（图片渐隐）。 */
 const SCRIM_MIN = 0;
@@ -62,7 +64,7 @@ export async function loadBgImage(): Promise<string | null> {
 
 export async function saveBgImage(dataUrl: string): Promise<void> {
   await tx('readwrite', (s) => s.put(dataUrl, IMAGE_KEY));
-  try { localStorage.setItem(BOOTSTRAP_KEY, dataUrl); } catch { /* IDB remains the source of truth */ }
+  persistBootstrapSnapshot(dataUrl);
   setHasBgImage(true);
 }
 
@@ -173,6 +175,20 @@ function scrimColor(): string {
   return `oklch(${shell.l.toFixed(2)}% ${shell.c.toFixed(4)} ${shell.h.toFixed(2)} / ${a.toFixed(3)})`;
 }
 
+/** Store only a bounded first-paint representation. IDB is always the source of truth. */
+function persistBootstrapSnapshot(dataUrl: string): void {
+  try {
+    if (dataUrl.length > MAX_BOOTSTRAP_CHARS || !dataUrl.startsWith('data:image/')) {
+      localStorage.removeItem(BOOTSTRAP_KEY);
+      return;
+    }
+    localStorage.setItem(BOOTSTRAP_KEY, dataUrl);
+  } catch {
+    // A failed replacement must not leave an older image available to bootstrap.
+    try { localStorage.removeItem(BOOTSTRAP_KEY); } catch { /* storage may be unavailable */ }
+  }
+}
+
 /** Apply the last saved image synchronously during the pre-paint bootstrap.
  * IndexedDB remains authoritative; this bounded localStorage snapshot only
  * bridges the first paint, after which applyBgImage() refreshes from IDB. */
@@ -180,13 +196,18 @@ export function applyBootstrapBgImage(): boolean {
   if (!hasBgImage()) return false;
   try {
     const dataUrl = localStorage.getItem(BOOTSTRAP_KEY);
-    if (!dataUrl || !dataUrl.startsWith('data:image/')) return false;
+    if (!dataUrl || dataUrl.length > MAX_BOOTSTRAP_CHARS || !dataUrl.startsWith('data:image/')) {
+      localStorage.removeItem(BOOTSTRAP_KEY);
+      document.documentElement.style.backgroundColor = 'var(--color-gray-950)';
+      return false;
+    }
     const el = document.documentElement;
     el.style.setProperty('--ccm-bg-url', `url("${dataUrl}")`);
     el.style.setProperty('--ccm-bg-scrim', scrimColor());
     el.dataset.hasBg = '1';
     return true;
   } catch {
+    document.documentElement.style.backgroundColor = 'var(--color-gray-950)';
     return false;
   }
 }
@@ -200,8 +221,10 @@ export async function applyBgImage(): Promise<void> {
     el.style.removeProperty('--ccm-bg-url');
     el.style.removeProperty('--ccm-bg-scrim');
     delete el.dataset.hasBg;
+    el.style.backgroundColor = 'var(--color-gray-950)';
     return;
   }
+  persistBootstrapSnapshot(dataUrl);
   el.style.setProperty('--ccm-bg-url', `url("${dataUrl}")`);
   el.style.setProperty('--ccm-bg-scrim', scrimColor());
   el.dataset.hasBg = '1';

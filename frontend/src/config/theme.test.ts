@@ -176,6 +176,18 @@ describe('theme config', () => {
     expect(document.documentElement.style.getPropertyValue('--ccm-bg-scrim')).toContain('oklch(');
   });
 
+  it('首屏没有有效背景快照时回退到壳色并清除坏快照', () => {
+    setCustomColors('#131316', '#4f7cf7');
+    localStorage.setItem('cc_theme', 'custom');
+    localStorage.setItem('cc_theme_custom_has_bg', '1');
+    localStorage.setItem('ccm-theme-bootstrap-image', `data:image/jpeg;base64,${'x'.repeat(350_001)}`);
+
+    expect(applyPrepaintTheme()).toBe('custom');
+    expect(localStorage.getItem('ccm-theme-bootstrap-image')).toBeNull();
+    expect(document.documentElement.dataset.hasBg).toBeUndefined();
+    expect(document.documentElement.style.backgroundColor).toBe('var(--color-gray-950)');
+  });
+
   it('运行时切换主题同步 Apple 状态栏对比度', () => {
     setTheme('dark');
     expect(
