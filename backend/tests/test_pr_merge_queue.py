@@ -147,7 +147,19 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     run.current_review_id = review.id
     await db_session.commit()
     await record_gate_pass(db_session, review.id)
-    action = (await db_session.execute(select(PRMergeQueueAction))).scalar_one()
+    # Legacy recovery is exercised with an explicitly persisted Queue action;
+    # current Gate transitions intentionally do not create one.
+    action = PRMergeQueueAction(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        status="pending",
+        effect_kind="queue",
+        action_nonce="q" * 48,
+    )
+    db_session.add(action)
+    await db_session.commit()
     assert action.status == "pending"
     tracked_factory, assert_no_transaction = _transaction_asserting_factory(
         db_factory
@@ -185,7 +197,9 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", fake_enqueue)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_queue_entry", fake_entry)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_merge_group_ref", fake_group)
-    assert await reconcile_merge_queue(tracked_factory) == 1
+    # Existing legacy entries continue through the old queue reconciler only
+    # for recovery; no new Queue admission is possible.
+    assert await reconcile_merge_queue(tracked_factory) == 0
     action = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     assert action.status == "queued"
     assert action.github_queue_entry_id == "MQ1"
@@ -214,7 +228,7 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
 
 
 @pytest.mark.asyncio
-async def test_manual_merge_action_enters_queue_without_enabling_auto_policy(
+async def test_legacy_pending_queue_action_is_retired_without_enqueue(
     db_session,
     db_factory,
     monkeypatch,
@@ -258,6 +272,7 @@ async def test_manual_merge_action_enters_queue_without_enabling_auto_policy(
         trigger_base_sha=BASE,
         trigger_head_sha=HEAD,
         status="pending",
+        effect_kind="queue",
         trigger_kind="manual",
         action_nonce="d" * 48,
     )
@@ -275,15 +290,16 @@ async def test_manual_merge_action_enters_queue_without_enabling_auto_policy(
             "mergeCommit": None,
         }
 
-    async def fake_enqueue(_repo, _number, base_ref, base_sha, head_sha):
-        assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
-        return QueueEntry("MQ-manual", "QUEUED", "main", BASE, HEAD)
-
     monkeypatch.setattr(
         "backend.services.pr_review_service._gh_pr_view",
         fake_pr_view,
     )
-    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", fake_enqueue)
+    enqueue = AsyncMock()
+    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", enqueue)
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        AsyncMock(return_value=None),
+    )
 
     assert await reconcile_merge_queue(db_factory) == 1
     action = await db_session.get(
@@ -293,9 +309,11 @@ async def test_manual_merge_action_enters_queue_without_enabling_auto_policy(
     )
     run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert repo.merge_queue_mode == "manual"
-    assert action.status == "queued"
-    assert action.github_queue_entry_id == "MQ-manual"
-    assert run.status == "merge_queued"
+    assert action.status == "failed"
+    assert action.last_error == "merge_queue_remote_absence_proven:integration_retired"
+    assert action.github_queue_entry_id is None
+    assert run.status == "ready_to_merge"
+    enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -403,7 +421,17 @@ async def test_merge_queue_pauses_when_remote_base_changes_without_head_change(
     run.current_review_id = review.id
     await db_session.commit()
     await record_gate_pass(db_session, review.id)
-    action = (await db_session.execute(select(PRMergeQueueAction))).scalar_one()
+    action = PRMergeQueueAction(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        status="pending",
+        effect_kind="queue",
+        action_nonce="q" * 48,
+    )
+    db_session.add(action)
+    await db_session.commit()
 
     async def fake_pr_view(_number, _repo):
         return {
@@ -755,25 +783,22 @@ async def test_enqueue_lease_uses_database_clock_and_covers_confirmation(
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
-    async def fake_enqueue(
-        _repo_name, _number, base_ref, base_sha, head_sha
-    ):
-        assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
-        async with db_factory() as observer:
-            claimed = await observer.get(PRMergeQueueAction, action.id)
-            assert claimed.status == "enqueuing"
-            assert claimed.lease_expires_at == database_now + timedelta(minutes=10)
-        return QueueEntry("MQ-37", "QUEUED", "main", BASE, HEAD)
-
     monkeypatch.setattr("backend.services.pr_merge_queue._database_now", fake_clock)
     monkeypatch.setattr("backend.services.pr_review_service._gh_pr_view", fake_pr_view)
-    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", fake_enqueue)
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        AsyncMock(return_value=None),
+    )
+    enqueue = AsyncMock()
+    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", enqueue)
 
     assert await reconcile_merge_queue(db_factory) == 1
     refreshed = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
-    assert refreshed.status == "queued"
+    assert refreshed.status == "failed"
+    assert refreshed.last_error == "merge_queue_remote_absence_proven:integration_retired"
     assert refreshed.lease_token is None
     assert refreshed.lease_expires_at is None
+    enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -897,17 +922,21 @@ async def test_failed_wrong_subject_cleanup_pauses_high_risk_action(
     monkeypatch.setattr(
         "backend.services.pr_merge_queue._enqueue", unsafe_enqueue
     )
-    assert await reconcile_merge_queue(db_factory) == 0
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        AsyncMock(return_value=None),
+    )
+    assert await reconcile_merge_queue(db_factory) == 1
     refreshed = await db_session.get(
         PRMergeQueueAction, action.id, populate_existing=True
     )
     refreshed_run = await db_session.get(
         PRMonitorRun, run.id, populate_existing=True
     )
-    assert refreshed.status == "enqueuing"
-    assert refreshed.github_queue_entry_id == "MQ-risk"
-    assert refreshed.last_error.startswith("merge_queue_remote_cleanup_failed:")
-    assert refreshed_run.status == "paused"
+    assert refreshed.status == "failed"
+    assert refreshed.github_queue_entry_id is None
+    assert refreshed.last_error == "merge_queue_remote_absence_proven:integration_retired"
+    assert refreshed_run.status == "ready_to_merge"
 
 
 @pytest.mark.asyncio
@@ -965,20 +994,23 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
         "backend.services.pr_merge_queue._enqueue", fake_enqueue
     )
     monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
         "backend.services.pr_merge_queue._dequeue_queue_entry", fake_dequeue
     )
-    assert await reconcile_merge_queue(tracked_factory) == 0
+    assert await reconcile_merge_queue(tracked_factory) == 1
     refreshed = await db_session.get(
         PRMergeQueueAction, action.id, populate_existing=True
     )
     refreshed_run = await db_session.get(
         PRMonitorRun, run.id, populate_existing=True
     )
-    assert dequeued == ["MQ-owned"]
-    assert refreshed.status == "paused"
-    assert refreshed.status != "queued"
-    assert refreshed_run.status == "paused"
-    assert refreshed_run.status != "merge_queued"
+    assert dequeued == []
+    assert refreshed.status == "failed"
+    assert refreshed.last_error == "merge_queue_remote_absence_proven:integration_retired"
+    assert refreshed_run.status == "ready_to_merge"
 
 
 @pytest.mark.asyncio

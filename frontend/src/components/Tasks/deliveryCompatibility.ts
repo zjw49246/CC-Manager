@@ -23,6 +23,9 @@ export function isDeliveryCompatible(
     && repo.worker_id == null
     && repo.enabled
     && repo.status === 'active'
+    // The backend migration normalizes historical queue modes to manual and
+    // rejects any new non-manual value. Keep the preview fail-closed if an
+    // older response is still cached or a stale Worker mirror is returned.
     && repo.merge_queue_mode === 'manual'
     && repo.review_mode === 'panel'
     && repo.wait_for_ci === (repo.required_checks.length > 0)

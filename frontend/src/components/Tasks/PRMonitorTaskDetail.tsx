@@ -78,19 +78,19 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
     && result.review_id === currentReviewId
     && result.head_sha === monitorRun?.current_head_sha,
   );
-  const canEnqueueMerge = Boolean(
+  const canMerge = Boolean(
     result?.aggregate_verdict === 'pass'
     && resultMatchesCurrentHead
     && monitorRun?.status === 'ready_to_merge'
     && !mergePending,
   );
 
-  const enqueueMerge = async () => {
-    if (runId == null || !canEnqueueMerge) return;
+  const mergePR = async () => {
+    if (runId == null || !canMerge) return;
     setMergePending(true);
     setMergeError(null);
     try {
-      const updatedRun = await api.enqueuePRMonitorMerge(runId);
+      const updatedRun = await api.mergePRMonitorRun(runId);
       setHistoryState({
         loadKey: historyLoadKey ?? `${runId}:${refreshKey}`,
         value: updatedRun,
@@ -144,12 +144,12 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
                 {monitorRun.status === 'ready_to_merge' ? (
                   <button
                     type="button"
-                    onClick={() => void enqueueMerge()}
+                    onClick={() => void mergePR()}
                     disabled={mergePending}
                     className="inline-flex items-center gap-1.5 rounded border border-emerald-500/50 px-3 py-1.5 text-xs text-emerald-200 hover:bg-emerald-500/10 disabled:opacity-50"
                   >
                     <GitPullRequest size={14} aria-hidden="true" />
-                    {mergePending ? 'Enqueuing…' : 'Merge PR'}
+                    {mergePending ? 'Merging…' : 'Merge PR'}
                   </button>
                 ) : (
                   <span className="text-xs text-gray-400">
@@ -157,7 +157,12 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
                   </span>
                 )}
               </div>
-              {mergeError && <p role="alert" className="mt-2 text-xs text-amber-300">Merge request failed: {mergeError}</p>}
+              {mergeError && <p role="alert" className="mt-2 text-xs text-amber-300">Merge failed: {mergeError}</p>}
+              {monitorRun.merge_actions?.map((action) => action.last_error && (
+                <p key={`merge-error-${action.id}`} role="alert" className="mt-2 text-xs text-amber-300">
+                  Merge action #{action.id}: {action.last_error}
+                </p>
+              ))}
             </section>
           )}
           {detailLoading && <p className="text-xs text-gray-500">Loading reviewer details…</p>}
@@ -199,10 +204,7 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
 }
 
 function mergeStatusLabel(status: string): string {
-  if (status === 'merge_queue_pending') return 'Merge request pending';
-  if (status === 'merge_queued') return 'Merge Queue active';
-  if (status === 'merge_group_checking') return 'Merge checks running';
-  if (status === 'merge_group_passed') return 'Merge checks passed';
+  if (status === 'merge_pending') return 'Merging';
   if (status === 'merged') return 'Merged';
   return status.replaceAll('_', ' ').replace(/\b\w/g, (value) => value.toUpperCase());
 }

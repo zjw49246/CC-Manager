@@ -2773,7 +2773,7 @@ async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["entry", "merge_group"])
-async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
+async def test_resume_legacy_merge_queue_returns_conflict_when_remote_state_unknown(
     client, session_factory, monkeypatch, failure
 ):
     repo = await _create_repo(
@@ -2786,7 +2786,7 @@ async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
             "name": "tests",
             "app_slug": "github-actions",
         }],
-        merge_queue_mode="auto",
+        merge_queue_mode="manual",
     )
     async with session_factory() as db:
         run = PRMonitorRun(
@@ -3761,7 +3761,7 @@ async def test_direct_auto_merge_rejects_legacy_status_check_on_update(client):
 
 
 @pytest.mark.asyncio
-async def test_direct_auto_merge_remains_mutually_exclusive_with_merge_queue(
+async def test_new_merge_queue_policy_is_rejected(
     client,
 ):
     response = await client.post("/api/pr-monitor/repos", json={
@@ -3776,10 +3776,8 @@ async def test_direct_auto_merge_remains_mutually_exclusive_with_merge_queue(
         "auto_merge": True,
         "merge_queue_mode": "auto",
     })
-    assert response.status_code == 400
-    assert response.json()["detail"] == (
-        "auto_merge and Merge Queue are mutually exclusive"
-    )
+    assert response.status_code == 422
+    assert "Merge Queue is retired" in response.json()["detail"][0]["msg"]
 
 
 @pytest.mark.asyncio
@@ -5438,9 +5436,11 @@ async def test_webhook_synchronize_supersedes_old_review(client, session_factory
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("merge_route", ["merge", "enqueue-merge"])
 async def test_ready_run_manual_merge_persists_user_trigger(
     client,
     session_factory,
+    merge_route,
 ):
     repo = await _create_repo(
         client,
@@ -5458,19 +5458,37 @@ async def test_ready_run_manual_merge_persists_user_trigger(
         code_verdict="pass",
         publication_state="published",
     )
+    async with session_factory() as db:
+        seeded_review = await db.get(PRReview, review_id)
+        assert seeded_review is not None
+        seeded_review.action_taken = "lgtm_comment"
+        await db.commit()
 
-    response = await client.post(
-        f"/api/pr-monitor/runs/{run_id}/enqueue-merge"
-    )
+    with patch(
+        "backend.services.pr_review_service._gh_authenticated_login",
+        new=AsyncMock(return_value="alice"),
+    ), patch(
+        "backend.services.pr_review_service._freeze_safe_merge_method",
+        new=AsyncMock(return_value="fast-forward"),
+    ), patch(
+        "backend.services.pr_direct_merge.reconcile_direct_merge_action",
+        new=AsyncMock(return_value=False),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/{merge_route}"
+        )
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "merge_queue_pending"
+    assert response.json()["status"] == "merge_pending"
     async with session_factory() as db:
         action = (await db.execute(select(PRMergeQueueAction).where(
             PRMergeQueueAction.monitor_run_id == run_id,
             PRMergeQueueAction.review_id == review_id,
         ))).scalar_one()
         assert action.status == "pending"
+        assert action.effect_kind == "direct"
+        assert action.publishing_actor == "alice"
+        assert action.merge_method == "fast-forward"
         assert action.trigger_kind == "manual"
 
 

@@ -128,7 +128,9 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = UPDATE_CHANNEL_REVISION
+CURRENT_HEAD_REVISION = "b9d4e6f1a2c7"
+PR_MERGE_QUEUE_TRIGGER_REVISION = "a8c4e2f6b0d1"
+DIRECT_PR_MERGE_REVISION = "b9d4e6f1a2c7"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -10551,7 +10553,11 @@ class TestPublishedMigrationHistory:
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert set(script.get_heads()) == {UPDATE_CHANNEL_REVISION}
+        assert set(script.get_heads()) == {DIRECT_PR_MERGE_REVISION}
+        assert (
+            script.get_revision(DIRECT_PR_MERGE_REVISION).down_revision
+            == PR_MERGE_QUEUE_TRIGGER_REVISION
+        )
         assert set(
             script.get_revision(UPDATE_CHANNEL_REVISION).down_revision
         ) == {

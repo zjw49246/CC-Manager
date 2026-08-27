@@ -41,23 +41,14 @@ function renderRequiredChecks(repo: MonitoredRepo) {
 }
 
 function mergePolicyLabel(repo: MonitoredRepo): string {
-  if (repo.auto_merge) return 'AUTO';
-  if (repo.merge_queue_mode === 'auto') return 'QUEUE AUTO';
-  if (repo.merge_queue_mode === 'shadow') return 'SHADOW';
-  return 'MANUAL';
+  return repo.auto_merge ? 'AUTO' : 'MANUAL';
 }
 
-function mergePolicyHelp(autoMerge: boolean, mergeQueueMode: 'manual' | 'shadow' | 'auto'): string {
+function mergePolicyHelp(autoMerge: boolean): string {
   if (autoMerge) {
     return 'Direct auto-merge is ON: CCM confirms the exact-head merge, then comments that the PR was merged.';
   }
-  if (mergeQueueMode === 'auto') {
-    return 'Direct auto-merge is OFF. Merge Queue AUTO is a separate automatic policy and may still merge after its merge-group gate.';
-  }
-  if (mergeQueueMode === 'shadow') {
-    return 'Direct auto-merge is OFF. Merge Queue SHADOW only observes; CCM leaves the PR open and comments that it is ready to merge.';
-  }
-  return 'Direct auto-merge is OFF: CCM leaves the PR open and comments that it is ready to merge.';
+  return 'Direct auto-merge is OFF: CCM leaves the PR open until a human clicks Merge PR.';
 }
 
 function availableProvider(
@@ -168,7 +159,7 @@ const ACTIVE_REVIEW_STATUSES = new Set([
 ]);
 const ACTIVE_PUBLICATION_STATUSES = new Set(['publishing', 'superseding']);
 const STARTED_REPAIR_STATUSES = new Set(['delivering', 'accepted', 'awaiting_push', 'running']);
-const STARTED_MERGE_STATUSES = new Set(['enqueuing', 'queued', 'checking']);
+const STARTED_MERGE_STATUSES = new Set(['pending', 'enqueuing', 'queued', 'checking']);
 const ACTIVE_ADJUDICATION_STATUSES = new Set(['pending', 'adjudicating', 'accepted']);
 
 const REVIEW_STATUS_LABELS: Record<string, string> = {
@@ -187,6 +178,9 @@ const REVIEW_STATUS_LABELS: Record<string, string> = {
   superseded: 'Superseded by a newer head',
   merged: 'Merged',
   closed: 'Closed',
+  merge_pending: 'Merging',
+  merge_queued: 'Legacy queue recovery',
+  merge_group_checking: 'Legacy queue recovery',
 };
 
 const REVIEWER_ROLE_LABELS: Record<string, string> = {
@@ -356,7 +350,6 @@ function AddRepoModal({
   const [repoName, setRepoName] = useState('');
   const [autoMerge, setAutoMerge] = useState(false);
   const [autoRepair, setAutoRepair] = useState(false);
-  const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>('manual');
   const [reviewMode, setReviewMode] = useState<'single' | 'panel'>('single');
   const [waitForCi, setWaitForCi] = useState(false);
   const [requiredChecks, setRequiredChecks] = useState('');
@@ -411,7 +404,7 @@ function AddRepoModal({
         auto_merge: autoMerge,
         auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: 3,
-        merge_queue_mode: reviewMode === 'panel' && waitForCi ? mergeQueueMode : 'manual',
+        merge_queue_mode: 'manual',
         provider,
         review_model: reviewModel.trim() || undefined,
         review_effort: reviewEffort || undefined,
@@ -489,21 +482,13 @@ function AddRepoModal({
           </div>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="autoMerge" checked={autoMerge}
-              onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
+              onChange={(e) => setAutoMerge(e.target.checked)}
               className="rounded bg-gray-700 border-gray-600" />
             <label htmlFor="autoMerge" className="text-sm text-gray-300">Direct auto-merge after review and exact-head gates pass</label>
           </div>
           <p className="text-xs text-gray-500">
-            {mergePolicyHelp(autoMerge, mergeQueueMode)}
+            {mergePolicyHelp(autoMerge)}
           </p>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Merge Queue</label>
-            <select value={mergeQueueMode} onChange={(e) => { const value = e.target.value as 'manual' | 'shadow' | 'auto'; setMergeQueueMode(value); if (value !== 'manual') setAutoMerge(false); }}
-              disabled={reviewMode !== 'panel' || !waitForCi}
-              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2">
-              <option value="manual">Manual</option><option value="shadow">Shadow only</option><option value="auto">Automatic enqueue</option>
-            </select>
-          </div>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="autoRepair" checked={autoRepair}
               disabled={reviewMode !== 'panel'} onChange={(e) => setAutoRepair(e.target.checked)} />
@@ -524,7 +509,7 @@ function AddRepoModal({
               value={reviewMode} onChange={(e) => {
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
-                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); }
                 else setWaitForCi(true);
               }}>
               <option value="single">Single reviewer (recommended)</option>
@@ -542,7 +527,6 @@ function AddRepoModal({
             <input type="checkbox" id="newWaitForCi" checked={waitForCi}
               disabled={reviewMode !== 'panel'} onChange={(e) => {
                 setWaitForCi(e.target.checked);
-                if (!e.target.checked) setMergeQueueMode('manual');
               }} />
             <label htmlFor="newWaitForCi" className="text-sm text-gray-300">Wait for exact-head CI</label>
           </div>
@@ -639,9 +623,6 @@ function RepoDetail({
   const [autoMerge, setAutoMerge] = useState(Boolean(repo.auto_merge));
   const [autoRepair, setAutoRepair] = useState(initialReviewMode === 'panel' && Boolean(repo.auto_repair));
   const [maxRepairAttempts, setMaxRepairAttempts] = useState(repo.max_repair_attempts || 3);
-  const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>(
-    initialWaitForCi ? (repo.merge_queue_mode || 'manual') : 'manual',
-  );
   const [provider, setProvider] = useState(repo.provider || 'claude');
   const [reviewModel, setReviewModel] = useState(repo.review_model || '');
   const [reviewEffort, setReviewEffort] = useState(repo.review_effort || '');
@@ -828,7 +809,9 @@ function RepoDetail({
     refreshReviewData,
   );
 
-  const shouldPollReviews = reviews.some(isActiveReview) || Boolean(selectedReview && isActiveReview(selectedReview));
+  const shouldPollReviews = reviews.some(isActiveReview)
+    || Boolean(selectedReview && isActiveReview(selectedReview))
+    || Boolean(monitorRun?.merge_actions?.some((action) => STARTED_MERGE_STATUSES.has(action.status)));
   useEffect(() => {
     if (!shouldPollReviews) return;
     const timer = window.setInterval(refreshReviewData, 5000);
@@ -859,7 +842,7 @@ function RepoDetail({
         auto_merge: autoMerge,
         auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: maxRepairAttempts,
-        merge_queue_mode: reviewMode === 'panel' && waitForCi ? mergeQueueMode : 'manual',
+        merge_queue_mode: 'manual',
         provider,
         // 显式 null 才能清空（undefined 会被后端 exclude_unset 丢弃，
         // 换 provider 后旧模型残留会让 CLI 拿到错家族的 --model）
@@ -1022,7 +1005,7 @@ function RepoDetail({
     && !activeReview
     && !activePublication,
   );
-  const canEnqueue = Boolean(
+  const canMerge = Boolean(
     monitorRun?.status === 'ready_to_merge'
     && !busyRun
     && !activeRepair
@@ -1054,12 +1037,12 @@ function RepoDetail({
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center gap-2">
             <input type="checkbox" id="detailAutoMerge" checked={autoMerge}
-              onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
+              onChange={(e) => setAutoMerge(e.target.checked)}
               className="rounded bg-gray-700 border-gray-600" />
             <label htmlFor="detailAutoMerge" className="text-sm text-gray-300">Direct auto-merge after review and exact-head gates pass</label>
           </div>
           <p className="text-xs text-gray-500 md:col-span-2">
-            {mergePolicyHelp(autoMerge, mergeQueueMode)}
+            {mergePolicyHelp(autoMerge)}
           </p>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="detailAutoRepair" checked={autoRepair}
@@ -1071,14 +1054,6 @@ function RepoDetail({
             <input type="number" min={1} max={20} value={maxRepairAttempts}
               onChange={(e) => setMaxRepairAttempts(Number(e.target.value))}
               className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2" />
-          </div>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Merge Queue mode</label>
-            <select value={mergeQueueMode} onChange={(e) => { const value = e.target.value as 'manual' | 'shadow' | 'auto'; setMergeQueueMode(value); if (value !== 'manual') setAutoMerge(false); }}
-              disabled={reviewMode !== 'panel' || !waitForCi}
-              className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2">
-              <option value="manual">Manual</option><option value="shadow">Shadow</option><option value="auto">Automatic</option>
-            </select>
           </div>
           {reviewMode === 'panel' && waitForCi && (
             <div className="md:col-span-2">
@@ -1129,7 +1104,7 @@ function RepoDetail({
               value={reviewMode} onChange={(e) => {
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
-                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); }
                 else setWaitForCi(true);
               }}>
               <option value="single">Single reviewer (recommended)</option>
@@ -1147,7 +1122,6 @@ function RepoDetail({
             <input type="checkbox" id="waitForCi" checked={reviewMode === 'panel' && waitForCi}
               disabled={reviewMode !== 'panel'} onChange={(e) => {
                 setWaitForCi(e.target.checked);
-                if (!e.target.checked) setMergeQueueMode('manual');
               }} />
             <label htmlFor="waitForCi" className="text-sm text-gray-300">Wait for exact-head CI before review</label>
           </div>
@@ -1525,11 +1499,11 @@ function RepoDetail({
                           {runActionPending === 'unbind' ? 'Unbinding…' : 'Unbind Developer'}
                         </button>
                       )}
-                      {canEnqueue && (
+                      {canMerge && (
                         <button className="bg-green-700 text-white rounded px-2 py-1 disabled:opacity-50"
                           disabled={runActionPending !== null}
-                          onClick={() => performRunAction('enqueue', () => api.enqueuePRMonitorMerge(monitorRun.id))}>
-                          {runActionPending === 'enqueue' ? 'Enqueuing…' : 'Enqueue merge'}
+                          onClick={() => performRunAction('merge', () => api.mergePRMonitorRun(monitorRun.id))}>
+                          {runActionPending === 'merge' ? 'Merging…' : 'Merge PR'}
                         </button>
                       )}
                     </div>
@@ -1765,7 +1739,7 @@ export function PRMonitorPage() {
                   </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded text-xs ${
-                      repo.auto_merge || repo.merge_queue_mode === 'auto'
+                      repo.auto_merge
                         ? 'bg-green-500/20 text-green-400'
                         : 'bg-gray-600/50 text-gray-400'
                     }`}>

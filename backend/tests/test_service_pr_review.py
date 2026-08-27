@@ -2098,6 +2098,15 @@ async def test_auto_merge_revalidates_frozen_required_ci_before_put():
         with pytest.raises(GhError, match="required CI is not passed"):
             await pr_review_service._publish_review_action(**kwargs)
 
+    # A deterministic exact-head CI failure must stop the durable direct
+    # merge action immediately; retrying the same failed check cannot help.
+    assert pr_review_service._terminal_publication_error(
+        GhError(
+            "Exact-head required CI is not passed before merge: "
+            "failed: tests"
+        )
+    )
+
     ci.assert_awaited_once_with(
         "owner/repo",
         PR_DATA["head_sha"],

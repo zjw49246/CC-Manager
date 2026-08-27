@@ -104,8 +104,10 @@ class MonitoredRepoCreate(BaseModel):
     @field_validator("merge_queue_mode")
     @classmethod
     def validate_merge_queue_mode(cls, v: str) -> str:
-        if v not in {"manual", "shadow", "auto"}:
-            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+        if v != "manual":
+            raise ValueError(
+                "Merge Queue is retired; merge_queue_mode must be manual"
+            )
         return v
 
     @field_validator("default_branch")
@@ -164,8 +166,13 @@ class MonitoredRepoUpdate(BaseModel):
     @field_validator("merge_queue_mode")
     @classmethod
     def validate_merge_queue_mode(cls, v: str | None) -> str | None:
+        # Keep accepting historical values at the request parsing boundary so
+        # an active Delivery Run can return its durable 409 policy-freeze
+        # response before the retired setting is rejected by the route.
         if v is not None and v not in {"manual", "shadow", "auto"}:
-            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+            raise ValueError(
+                "merge_queue_mode must be manual, shadow, or auto"
+            )
         return v
 
     @field_validator("default_branch")
@@ -620,23 +627,40 @@ class PRRepairWakeResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class PRMergeQueueActionResponse(BaseModel):
+class PRMergeActionResponse(BaseModel):
+    """Generic merge outbox projection.
+
+    The database table keeps its historical Queue name so old effects can be
+    reconciled safely, while new human-triggered actions use ``effect_kind``
+    ``direct`` and never enter GitHub Merge Queue.
+    """
+
     id: int
     review_id: int
     trigger_base_sha: str
     trigger_head_sha: str
     status: str
-    github_queue_entry_id: str | None
-    merge_group_sha: str | None
-    merge_group_ref: str | None
-    ci_status: str | None
-    ci_details: dict | None
-    attempt_count: int
-    last_error: str | None
+    effect_kind: Literal["queue", "direct"] = "queue"
+    publishing_actor: str | None = None
+    publishing_started_at: datetime | None = None
+    merge_method: str | None = None
+    wait_for_ci: bool = False
+    required_checks: list[RequiredCheckPolicy] = Field(default_factory=list)
+    github_queue_entry_id: str | None = None
+    merge_group_sha: str | None = None
+    merge_group_ref: str | None = None
+    ci_status: str | None = None
+    ci_details: dict | None = None
+    attempt_count: int = 0
+    last_error: str | None = None
     created_at: datetime
     completed_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+# Compatibility import for callers that still use the old class name.
+PRMergeQueueActionResponse = PRMergeActionResponse
 
 
 class PRMonitorReviewAttemptResponse(BaseModel):
@@ -681,7 +705,7 @@ class PRMonitorRunResponse(BaseModel):
     updated_at: datetime
     completed_at: datetime | None
     wakes: list[PRRepairWakeResponse] = Field(default_factory=list)
-    merge_actions: list[PRMergeQueueActionResponse] = Field(default_factory=list)
+    merge_actions: list[PRMergeActionResponse] = Field(default_factory=list)
     review_history: list[PRMonitorReviewAttemptResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}

@@ -317,6 +317,7 @@ async def bind_merge_group(
         .where(
             PRMonitorRun.repo_id == repo.id,
             pr_monitor_run_no_terminal_intent_predicate(),
+            PRMergeQueueAction.effect_kind == "queue",
             PRMergeQueueAction.status.in_(("queued", "checking")),
         )
     )).scalars())
@@ -826,6 +827,7 @@ async def reconcile_merge_queue(db_factory) -> int:
     progressed = 0
     async with db_factory() as db:
         action_ids = list((await db.execute(select(PRMergeQueueAction.id).where(
+            PRMergeQueueAction.effect_kind == "queue",
             or_(
                 PRMergeQueueAction.status.in_((
                     "pending", "enqueuing", "queued", "checking"
@@ -1133,243 +1135,86 @@ async def reconcile_merge_queue(db_factory) -> int:
                 continue
 
             if action.status in {"pending", "enqueuing"}:
-                now = await _database_now(db)
-                lease_token = secrets.token_hex(24)
-                action_id = action.id
-                run_id = run.id
-                repo_id = repo.id
-                review_id = review.id
-                enqueue_repo_name = repo.repo_full_name
-                enqueue_pr_number = run.pr_number
-                enqueue_base_ref = review.base_ref
-                enqueue_base_sha = action.trigger_base_sha
-                enqueue_head_sha = action.trigger_head_sha
-                expected_run_status = run.status
-                expected_run_state_version = run.state_version
-                expected_review_status = review.status
-                claimed = await db.execute(update(PRMergeQueueAction).where(
-                    PRMergeQueueAction.id == action_id,
-                    PRMergeQueueAction.status.in_(("pending", "enqueuing")),
-                    or_(
-                        PRMergeQueueAction.lease_token.is_(None),
-                        PRMergeQueueAction.lease_expires_at < now,
-                    ),
-                ).values(
-                    status="enqueuing",
-                    attempt_count=PRMergeQueueAction.attempt_count + 1,
-                    lease_token=lease_token,
-                    lease_expires_at=now + timedelta(minutes=10),
-                ))
-                if claimed.rowcount != 1:
-                    await db.rollback()
-                    continue
-                await db.commit()
-                try:
-                    entry = await _enqueue(
-                        enqueue_repo_name,
-                        enqueue_pr_number,
-                        enqueue_base_ref,
-                        enqueue_base_sha,
-                        enqueue_head_sha,
-                    )
-                except QueueEntryCleanupError as exc:
-                    await _record_enqueue_failure(
-                        db,
-                        repo_id=repo_id,
-                        action_id=action_id,
-                        run_id=run_id,
-                        review_id=review_id,
-                        lease_token=lease_token,
-                        message=(
-                            "merge_queue_remote_cleanup_failed:"
-                            f"{type(exc).__name__}:{str(exc)[:700]}"
-                        ),
-                        unsafe_entry_id=exc.entry_id,
-                    )
-                    continue
-                except Exception as exc:
-                    await _record_enqueue_failure(
-                        db,
-                        repo_id=repo_id,
-                        action_id=action_id,
-                        run_id=run_id,
-                        review_id=review_id,
-                        lease_token=lease_token,
-                        message=(
-                            f"merge_queue_enqueue_failed:{type(exc).__name__}:"
-                            f"{str(exc)[:300]}"
-                        ),
-                    )
-                    continue
-                repo, action, run, review = await _lock_queue_effect_rows(
-                    db,
-                    repo_id=repo_id,
-                    action_id=action_id,
-                    run_id=run_id,
-                    review_id=review_id,
+                # Merge Queue admission has been retired. A legacy row whose
+                # mutation acknowledgement might have been lost must first
+                # prove the remote queue entry absent; it is never replayed.
+                expected_generation = _queue_effect_generation(
+                    repo, action, run, review
                 )
-                finalize_now = await _database_now(db)
-                lifecycle_error = None
-                if repo is None or action is None or run is None or review is None:
-                    lifecycle_error = "lifecycle_missing"
-                elif not repo.enabled:
-                    lifecycle_error = "repo_disabled"
-                elif not _merge_queue_policy_allows_enqueue(repo, action):
-                    lifecycle_error = "merge_queue_policy_changed"
-                elif action.status != "enqueuing":
-                    lifecycle_error = f"action_{action.status}"
-                elif action.lease_token != lease_token:
-                    lifecycle_error = "lease_owner_changed"
-                elif (
-                    action.lease_expires_at is None
-                    or action.lease_expires_at <= finalize_now
-                ):
-                    lifecycle_error = "lease_expired"
-                elif (
-                    action.monitor_run_id != run.id
-                    or action.review_id != review.id
-                    or action.trigger_base_sha != enqueue_base_sha
-                    or action.trigger_head_sha != enqueue_head_sha
-                ):
-                    lifecycle_error = "action_subject_changed"
-                elif (
-                    run.status != expected_run_status
-                    or run.state_version != expected_run_state_version
-                    or pr_monitor_run_has_terminal_intent(run)
-                    or run.current_base_sha != enqueue_base_sha
-                    or run.current_head_sha != enqueue_head_sha
-                    or run.current_review_id != review.id
-                ):
-                    lifecycle_error = "run_changed"
-                elif (
-                    review.monitor_run_id != run.id
-                    or review.status != expected_review_status
-                    or review.base_ref != enqueue_base_ref
-                    or review.base_sha != enqueue_base_sha
-                    or review.head_sha != enqueue_head_sha
-                ):
-                    lifecycle_error = "review_changed"
-                if lifecycle_error is not None:
-                    # A newer lease owner may already have adopted this exact
-                    # entry.  It alone decides the effect; the stale caller
-                    # must neither finalize nor dequeue it.
-                    newer_owner = bool(
-                        action is not None
-                        and action.status == "enqueuing"
-                        and action.lease_token not in {None, lease_token}
+                await db.rollback()
+                try:
+                    retired_entry = await _read_queue_entry(
+                        remote_repo_name,
+                        remote_pr_number,
                     )
-                    await db.commit()
-                    if not newer_owner:
-                        await _abort_enqueue_after_lifecycle_change(
+                except Exception as exc:
+                    repo, action, run, review = (
+                        await _relock_queue_effect_generation(
                             db,
                             repo_id=repo_id,
-                            action_id=action_id,
+                            action_id=action_id_candidate,
                             run_id=run_id,
                             review_id=review_id,
-                            repo_name=enqueue_repo_name,
-                            pr_number=enqueue_pr_number,
-                            lease_token=lease_token,
-                            entry=entry,
-                            reason=lifecycle_error,
-                            terminal_intent=(
-                                run is not None
-                                and pr_monitor_run_has_terminal_intent(run)
-                            ),
+                            expected_generation=expected_generation,
                         )
+                    )
+                    if action is None:
+                        continue
+                    action.last_error = (
+                        "merge_queue_retirement_entry_read_failed:"
+                        f"{type(exc).__name__}:{str(exc)[:300]}"
+                    )
+                    await db.commit()
                     continue
-
-                action_status = "queued"
-                action_error = (
-                    f"merge_queue_entry_{entry.state.lower()}"
-                    if entry.state in _QUEUE_ENTRY_BLOCKED_STATES
-                    else None
-                )
-                action_changed = await db.execute(
-                    update(PRMergeQueueAction)
-                    .where(
-                        PRMergeQueueAction.id == action.id,
-                        PRMergeQueueAction.monitor_run_id == run.id,
-                        PRMergeQueueAction.review_id == review.id,
-                        PRMergeQueueAction.status == "enqueuing",
-                        PRMergeQueueAction.lease_token == lease_token,
-                        PRMergeQueueAction.lease_expires_at.is_not(None),
-                        PRMergeQueueAction.lease_expires_at > finalize_now,
-                        PRMergeQueueAction.trigger_base_sha == enqueue_base_sha,
-                        PRMergeQueueAction.trigger_head_sha == enqueue_head_sha,
-                    )
-                    .values(
-                        github_queue_entry_id=entry.id,
-                        lease_token=None,
-                        lease_expires_at=None,
-                        status=action_status,
-                        last_error=action_error,
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                if action_changed.rowcount != 1:
-                    await db.rollback()
-                    await _abort_enqueue_after_lifecycle_change(
+                repo, action, run, review = (
+                    await _relock_queue_effect_generation(
                         db,
                         repo_id=repo_id,
-                        action_id=action_id,
+                        action_id=action_id_candidate,
                         run_id=run_id,
                         review_id=review_id,
-                        repo_name=enqueue_repo_name,
-                        pr_number=enqueue_pr_number,
-                        lease_token=lease_token,
-                        entry=entry,
-                        reason="action_cas_lost",
-                        terminal_intent=(
-                            run is not None
-                            and pr_monitor_run_has_terminal_intent(run)
-                        ),
+                        expected_generation=expected_generation,
                     )
-                    continue
-                run_status = (
-                    "paused"
-                    if entry.state in _QUEUE_ENTRY_BLOCKED_STATES
-                    else "merge_queued"
                 )
-                run_changed = await db.execute(
-                    update(PRMonitorRun)
-                    .where(
-                        PRMonitorRun.id == run.id,
-                        PRMonitorRun.repo_id == repo.id,
-                        PRMonitorRun.status == expected_run_status,
-                        PRMonitorRun.state_version == expected_run_state_version,
-                        pr_monitor_run_no_terminal_intent_predicate(),
-                        PRMonitorRun.current_base_sha == enqueue_base_sha,
-                        PRMonitorRun.current_head_sha == enqueue_head_sha,
-                        PRMonitorRun.current_review_id == review.id,
-                    )
-                    .values(
-                        status=run_status,
-                        pause_reason=action_error,
-                        state_version=PRMonitorRun.state_version + 1,
-                    )
-                    .execution_options(synchronize_session=False)
-                )
-                if run_changed.rowcount != 1:
-                    await db.rollback()
-                    await _abort_enqueue_after_lifecycle_change(
-                        db,
-                        repo_id=repo_id,
-                        action_id=action_id,
-                        run_id=run_id,
-                        review_id=review_id,
-                        repo_name=enqueue_repo_name,
-                        pr_number=enqueue_pr_number,
-                        lease_token=lease_token,
-                        entry=entry,
-                        reason="run_cas_lost",
-                        terminal_intent=(
-                            run is not None
-                            and pr_monitor_run_has_terminal_intent(run)
-                        ),
-                    )
+                if action is None:
                     continue
+                if retired_entry is None:
+                    action.status = "failed"
+                    action.last_error = (
+                        "merge_queue_remote_absence_proven:integration_retired"
+                    )
+                    action.github_queue_entry_id = None
+                    action.merge_group_sha = None
+                    action.merge_group_ref = None
+                    action.lease_token = None
+                    action.lease_expires_at = None
+                    action.completed_at = datetime.utcnow()
+                    run.status = "ready_to_merge"
+                    run.pause_reason = None
+                    run.state_version += 1
+                    await db.commit()
+                    progressed += 1
+                    continue
+                if (
+                    retired_entry.base_ref != review.base_ref
+                    or retired_entry.base_sha != action.trigger_base_sha
+                    or retired_entry.head_sha != action.trigger_head_sha
+                ):
+                    action.status = "paused"
+                    action.last_error = "merge_queue_retirement_subject_mismatch"
+                    run.status = "paused"
+                    run.pause_reason = action.last_error
+                    run.state_version += 1
+                    await db.commit()
+                    continue
+                action.status = "queued"
+                action.github_queue_entry_id = retired_entry.id
+                action.last_error = "merge_queue_integration_retired_entry_active"
+                action.lease_token = None
+                action.lease_expires_at = None
+                run.status = "merge_queued"
+                run.state_version += 1
                 await db.commit()
-                progressed += 1
                 continue
 
             # Freeze the complete effect generation, then execute the minimal

@@ -23,7 +23,7 @@ from sqlalchemy import (
     update as sa_update,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased, load_only
 from starlette.requests import ClientDisconnect
 
@@ -41,6 +41,7 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
     PRMonitorRun,
     PRRepairWake,
+    pr_merge_queue_action_has_ambiguous_remote_effect,
     pr_merge_queue_action_ambiguous_remote_effect_predicate,
     pr_monitor_run_has_terminal_intent,
 )
@@ -90,7 +91,7 @@ from backend.schemas.pr_monitor import (
     PRMonitorRunResponse,
     PRMonitorReviewAttemptResponse,
     PRRepairWakeResponse,
-    PRMergeQueueActionResponse,
+    PRMergeActionResponse,
     required_checks_support_direct_auto_merge,
 )
 
@@ -916,7 +917,9 @@ _STARTED_REPAIR_STATUSES = (
     "awaiting_push",
     "running",  # compatibility with rows written by older deployments
 )
-_STARTED_MERGE_QUEUE_STATUSES = ("enqueuing", "queued", "checking")
+# Includes an armed direct action before its first lease claim. The historical
+# name remains for compatibility with Queue recovery predicates.
+_STARTED_MERGE_QUEUE_STATUSES = ("pending", "enqueuing", "queued", "checking")
 _EXTERNALLY_BUSY_RUN_STATUSES = ("resolving_fixed_threads", "repair_migrating")
 
 
@@ -1207,7 +1210,7 @@ async def _quiesce_monitor_runs(
         raise HTTPException(
             409,
             "Cannot pause PR Monitor while review, Finding repair, "
-            "adjudication, Repair, thread resolution, or Merge Queue work is active",
+            "adjudication, Repair, thread resolution, or merge work is active",
         )
 
     if run_ids:
@@ -1326,12 +1329,8 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
             400,
             "auto_merge requires app-bound check_run required checks",
         )
-    if body.auto_merge and body.merge_queue_mode != "manual":
-        raise HTTPException(400, "auto_merge and Merge Queue are mutually exclusive")
-    if body.merge_queue_mode != "manual" and (
-        body.review_mode != "panel" or not body.wait_for_ci
-    ):
-        raise HTTPException(400, "Merge Queue requires panel review and exact-head CI")
+    if body.merge_queue_mode != "manual":
+        raise HTTPException(400, "Merge Queue is retired; use manual direct merge")
     worker_id = body.worker_id
     if body.project_id is not None:
         from backend.models.project import Project
@@ -1528,12 +1527,11 @@ async def update_repo(
                 400,
                 "auto_merge requires app-bound check_run required checks",
             )
-        if effective_auto_merge and effective_merge_queue != "manual":
-            raise HTTPException(400, "auto_merge and Merge Queue are mutually exclusive")
-        if effective_merge_queue != "manual" and (
-            effective_mode != "panel" or not effective_wait
-        ):
-            raise HTTPException(400, "Merge Queue requires panel review and exact-head CI")
+        if effective_merge_queue != "manual":
+            raise HTTPException(
+                400,
+                "Merge Queue is retired; use manual direct merge",
+            )
 
         frozen_review_policy = {
             "review_mode",
@@ -4395,7 +4393,7 @@ async def get_monitor_run(
         .order_by(desc(PRMergeQueueAction.id))
     )).scalars())
     payload["merge_actions"] = [
-        PRMergeQueueActionResponse.model_validate(item) for item in merge_actions
+        PRMergeActionResponse.model_validate(item) for item in merge_actions
     ]
     reviews = list((await db.execute(
         select(PRReview)
@@ -5208,8 +5206,9 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
     return await get_monitor_run(run_id, request, db)
 
 
+@router.post("/runs/{run_id}/merge", response_model=PRMonitorRunResponse)
 @router.post("/runs/{run_id}/enqueue-merge", response_model=PRMonitorRunResponse)
-async def enqueue_monitor_merge(
+async def merge_monitor_run(
     run_id: int, request: Request, db: AsyncSession = Depends(get_db)
 ):
     run = await db.get(PRMonitorRun, run_id)
@@ -5219,8 +5218,87 @@ async def enqueue_monitor_merge(
     if repo is None:
         raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
+    # Delivery-owned and terminalizing subjects must be rejected before any
+    # GitHub capability probe. Besides avoiding unnecessary remote I/O, this
+    # keeps the legacy PR Monitor controls from leaking a transport error for
+    # a lifecycle that is owned by Delivery.
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action="merged",
+        monitor_run=run,
+    )
+    if not repo.enabled:
+        raise HTTPException(409, "Enable the PR monitor before merging")
+    preflight_review = (
+        await db.get(PRReview, run.current_review_id)
+        if run.current_review_id is not None
+        else None
+    )
+    if (
+        preflight_review is None
+        or preflight_review.repo_id != repo.id
+        or preflight_review.monitor_run_id != run.id
+        or run.status != "ready_to_merge"
+        or run.completed_at is not None
+        or run.current_base_sha != preflight_review.base_sha
+        or run.current_head_sha != preflight_review.head_sha
+        or preflight_review.status not in {"approved", "commented"}
+        or preflight_review.action_taken != "lgtm_comment"
+        or preflight_review.publication_state != "published"
+    ):
+        raise HTTPException(409, "The exact reviewed PR head is not ready to merge")
+    preflight_blocker = await db.scalar(
+        select(PRFinding.id)
+        .join(PRReview, PRReview.id == PRFinding.pr_review_id)
+        .where(
+            PRReview.monitor_run_id == run.id,
+            PRFinding.severity.in_(("critical", "high", "medium")),
+            or_(
+                PRFinding.status == "open",
+                PRFinding.thread_status != "resolved",
+            ),
+        )
+        .limit(1)
+    )
+    if preflight_blocker is not None:
+        raise HTTPException(409, "The exact reviewed PR head no longer passes Gate")
     repo_id = repo.id
+    repo_name = repo.repo_full_name
+    frozen_wait_for_ci = bool(repo.wait_for_ci)
+    frozen_required_checks = json.loads(json.dumps(repo.required_checks or []))
+    db_factory = async_sessionmaker(
+        bind=db.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
     await db.rollback()
+
+    # Resolve network-backed capability and identity before taking any database
+    # writer boundary. The locked section below revalidates every frozen value
+    # before arming the durable exact-head effect.
+    from backend.services.pr_review_service import (
+        GhError,
+        GhRepositoryCapabilityError,
+        _freeze_safe_merge_method,
+        _gh_authenticated_login,
+    )
+
+    try:
+        publishing_actor = await _gh_authenticated_login()
+        merge_method = await _freeze_safe_merge_method(repo_name)
+    except GhRepositoryCapabilityError as exc:
+        raise HTTPException(
+            409,
+            f"GitHub repository cannot be merged directly: {exc}",
+        ) from exc
+    except GhError as exc:
+        logger.warning("Unable to freeze direct merge capability: %s", exc)
+        raise HTTPException(
+            503,
+            "GitHub merge capability could not be verified; retry shortly",
+        ) from exc
+
+    action_id: int
     async with _pr_repo_write_lock(repo_id):
         try:
             repo = await lock_pr_repo_action_boundary(db, repo_id)
@@ -5229,6 +5307,12 @@ async def enqueue_monitor_merge(
         await _reauthorize_pr_effect(request, db, repo)
         if not repo.enabled:
             raise HTTPException(409, "Enable the PR monitor before merging")
+        if (
+            repo.repo_full_name != repo_name
+            or bool(repo.wait_for_ci) != frozen_wait_for_ci
+            or (repo.required_checks or []) != frozen_required_checks
+        ):
+            raise HTTPException(409, "PR Monitor merge policy changed; retry")
         run = (
             await db.execute(
                 select(PRMonitorRun)
@@ -5257,15 +5341,41 @@ async def enqueue_monitor_merge(
             raise HTTPException(409, "PR Monitor Gate subject is incomplete")
         await _require_legacy_pr_effect_allowed(
             db,
-            action="enqueued for merge",
+            action="merged",
             review=review,
             monitor_run=run,
         )
         if run.status != "ready_to_merge":
             raise HTTPException(
                 409,
-                "The exact PR head is not ready to enter Merge Queue",
+                "The exact reviewed PR head is not ready to merge",
             )
+        blockers = await db.scalar(
+            select(PRFinding.id)
+            .join(PRReview, PRReview.id == PRFinding.pr_review_id)
+            .where(
+                PRReview.monitor_run_id == run.id,
+                PRFinding.severity.in_(("critical", "high", "medium")),
+                or_(
+                    PRFinding.status == "open",
+                    PRFinding.thread_status != "resolved",
+                ),
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if (
+            run.completed_at is not None
+            or pr_monitor_run_has_terminal_intent(run)
+            or run.current_base_sha != review.base_sha
+            or run.current_head_sha != review.head_sha
+            or review.monitor_run_id != run.id
+            or review.status not in {"approved", "commented"}
+            or review.action_taken != "lgtm_comment"
+            or review.publication_state != "published"
+            or blockers is not None
+        ):
+            raise HTTPException(409, "The exact reviewed PR head no longer passes Gate")
         action = (
             await db.execute(
                 select(PRMergeQueueAction)
@@ -5283,21 +5393,90 @@ async def enqueue_monitor_merge(
                 trigger_base_sha=run.current_base_sha,
                 trigger_head_sha=run.current_head_sha,
                 status="pending",
+                effect_kind="direct",
                 trigger_kind="manual",
                 action_nonce=secrets.token_hex(24),
+                publishing_actor=publishing_actor,
+                publishing_started_at=datetime.utcnow(),
+                merge_method=merge_method,
+                wait_for_ci=frozen_wait_for_ci,
+                required_checks=frozen_required_checks,
             )
             db.add(action)
-        elif action.status == "shadow":
+            await db.flush()
+        elif action.effect_kind == "queue":
+            if (
+                action.status not in {"shadow", "failed", "paused", "superseded"}
+                or pr_merge_queue_action_has_ambiguous_remote_effect(action)
+            ):
+                raise HTTPException(
+                    409,
+                    "A legacy Merge Queue action is still being reconciled; "
+                    "retry Merge PR after it returns to ready",
+                )
+            # Reuse the unique outbox row only after legacy reconciliation has
+            # proved it owns no possible remote Queue effect. This conversion is
+            # always caused by a fresh human click, never by recovery.
+            action.status = "pending"
+            action.effect_kind = "direct"
+            action.trigger_kind = "manual"
+            action.trigger_base_sha = run.current_base_sha
+            action.trigger_head_sha = run.current_head_sha
+            action.action_nonce = secrets.token_hex(24)
+            action.publishing_actor = publishing_actor
+            action.publishing_started_at = datetime.utcnow()
+            action.merge_method = merge_method
+            action.wait_for_ci = frozen_wait_for_ci
+            action.required_checks = frozen_required_checks
+            action.github_pr_node_id = None
+            action.github_queue_entry_id = None
+            action.merge_group_sha = None
+            action.merge_group_ref = None
+            action.ci_status = None
+            action.ci_details = None
+            action.attempt_count = 0
+            action.lease_token = None
+            action.lease_expires_at = None
+            action.last_error = None
+            action.completed_at = None
+        elif (
+            action.effect_kind == "direct"
+            and action.status in {"failed", "paused"}
+            and not pr_merge_queue_action_has_ambiguous_remote_effect(action)
+        ):
             action.status = "pending"
             action.trigger_kind = "manual"
+            action.action_nonce = secrets.token_hex(24)
+            action.publishing_actor = publishing_actor
+            action.publishing_started_at = datetime.utcnow()
+            action.merge_method = merge_method
+            action.wait_for_ci = frozen_wait_for_ci
+            action.required_checks = frozen_required_checks
+            action.attempt_count = 0
+            action.lease_token = None
+            action.lease_expires_at = None
+            action.last_error = None
+            action.completed_at = None
         else:
             raise HTTPException(
                 409,
-                f"Merge Queue action is already {action.status}",
+                f"Merge action is already {action.status}",
             )
-        run.status = "merge_queue_pending"
+        action_id = action.id
+        run.status = "merge_pending"
+        run.pause_reason = None
         run.state_version += 1
         await db.commit()
+
+    from backend.services.pr_direct_merge import reconcile_direct_merge_action
+
+    try:
+        await reconcile_direct_merge_action(db_factory, action_id)
+    except Exception:
+        # The durable outbox remains recoverable by the periodic reconciler. A
+        # response still exposes its persisted state instead of making a retry
+        # create an untracked second GitHub effect.
+        logger.exception("Immediate direct PR merge reconciliation failed")
     return await get_monitor_run(run_id, request, db)
 
 

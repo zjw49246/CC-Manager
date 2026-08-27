@@ -1136,28 +1136,6 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
             return
     run.status = "ready_to_merge"
     run.state_version += 1
-    repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
-    if (
-        not delivery_owned
-        and repo is not None
-        and (repo.merge_queue_mode or "manual") in {"shadow", "auto"}
-    ):
-        existing = (await db.execute(select(PRMergeQueueAction).where(
-            PRMergeQueueAction.monitor_run_id == run.id,
-            PRMergeQueueAction.review_id == review.id,
-        ))).scalar_one_or_none()
-        if existing is None:
-            db.add(PRMergeQueueAction(
-                monitor_run_id=run.id,
-                review_id=review.id,
-                trigger_base_sha=review.base_sha,
-                trigger_head_sha=review.head_sha,
-                status="pending" if repo.merge_queue_mode == "auto" else "shadow",
-                trigger_kind="policy",
-                action_nonce=secrets.token_hex(24),
-            ))
-            if repo.merge_queue_mode == "auto":
-                run.status = "merge_queue_pending"
     await db.commit()
 
 

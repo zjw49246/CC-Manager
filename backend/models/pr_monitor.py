@@ -656,7 +656,12 @@ class PRRepairWake(Base):
 
 
 class PRMergeQueueAction(Base):
-    """Durable enqueue/merge-group outbox for one exact PR head."""
+    """Durable merge outbox for one exact PR head.
+
+    ``queue`` rows are retained for recovery of deployments that enabled the
+    legacy GitHub Merge Queue integration. New manual merge requests use the
+    ``direct`` effect and the same lifecycle ownership fences.
+    """
 
     __tablename__ = "pr_merge_queue_actions"
     __table_args__ = (
@@ -678,10 +683,24 @@ class PRMergeQueueAction(Base):
     status: Mapped[str] = mapped_column(
         String(30), default="shadow", server_default="shadow", nullable=False
     )
+    effect_kind: Mapped[str] = mapped_column(
+        String(20), default="queue", server_default="queue", nullable=False
+    )
     trigger_kind: Mapped[str] = mapped_column(
         String(20), default="policy", server_default="policy", nullable=False
     )
     action_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    publishing_actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    publishing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    merge_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    wait_for_ci: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    required_checks: Mapped[list] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     github_pr_node_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     github_queue_entry_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     merge_group_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -705,6 +724,7 @@ _LEGACY_QUEUE_REMOTE_RISK_PREFIXES = (
     "merge_queue_entry_",
     "merge_group_",
 )
+_DIRECT_REMOTE_ABSENCE_PREFIX = "direct_merge_remote_absence_proven:"
 
 
 def pr_merge_queue_action_has_ambiguous_remote_effect(
@@ -715,6 +735,14 @@ def pr_merge_queue_action_has_ambiguous_remote_effect(
     if action is None or action.status not in {"paused", "failed"}:
         return False
     error = action.last_error or ""
+    if action.effect_kind == "direct":
+        if error.startswith(_DIRECT_REMOTE_ABSENCE_PREFIX):
+            return False
+        return bool(
+            action.lease_token is not None
+            or (action.attempt_count or 0) > 0
+            or error.startswith("direct_merge_")
+        )
     if error.startswith("merge_queue_remote_absence_proven:"):
         return False
     return bool(
@@ -728,7 +756,7 @@ def pr_merge_queue_action_has_ambiguous_remote_effect(
 
 
 def pr_merge_queue_action_ambiguous_remote_effect_predicate():
-    """SQL equivalent for startup, terminal, rerun, and reopen fences."""
+    """SQL equivalent for legacy Queue and direct-merge effect fences."""
 
     error = func.coalesce(PRMergeQueueAction.last_error, "")
     risk_error = or_(
@@ -737,7 +765,8 @@ def pr_merge_queue_action_ambiguous_remote_effect_predicate():
             for prefix in _LEGACY_QUEUE_REMOTE_RISK_PREFIXES
         )
     )
-    return and_(
+    queue_risk = and_(
+        PRMergeQueueAction.effect_kind == "queue",
         PRMergeQueueAction.status.in_(("paused", "failed")),
         ~error.like("merge_queue_remote_absence_proven:%"),
         or_(
@@ -749,3 +778,14 @@ def pr_merge_queue_action_ambiguous_remote_effect_predicate():
             risk_error,
         ),
     )
+    direct_risk = and_(
+        PRMergeQueueAction.effect_kind == "direct",
+        PRMergeQueueAction.status.in_(("paused", "failed")),
+        ~error.like(f"{_DIRECT_REMOTE_ABSENCE_PREFIX}%"),
+        or_(
+            PRMergeQueueAction.lease_token.is_not(None),
+            PRMergeQueueAction.attempt_count > 0,
+            error.like("direct_merge_%"),
+        ),
+    )
+    return or_(queue_risk, direct_risk)

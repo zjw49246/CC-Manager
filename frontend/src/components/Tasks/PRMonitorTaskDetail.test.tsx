@@ -8,6 +8,7 @@ vi.mock('../../api/client', () => ({
   api: {
     getReviewDetail: vi.fn(),
     getPRMonitorRun: vi.fn(),
+    mergePRMonitorRun: vi.fn(),
     enqueuePRMonitorMerge: vi.fn(),
   },
 }));
@@ -156,14 +157,15 @@ describe('PRMonitorTaskDetail', () => {
       review_history: [],
     };
     vi.mocked(api.getPRMonitorRun).mockResolvedValue(readyRun);
-    vi.mocked(api.enqueuePRMonitorMerge).mockResolvedValue({
+    vi.mocked(api.mergePRMonitorRun).mockResolvedValue({
       ...readyRun,
-      status: 'merge_queue_pending',
+      status: 'merge_pending',
       merge_actions: [{
         id: 31,
         review_id: 113,
         trigger_head_sha: 'a'.repeat(40),
         status: 'pending',
+        effect_kind: 'direct',
         github_queue_entry_id: null,
         merge_group_sha: null,
         ci_status: null,
@@ -186,8 +188,8 @@ describe('PRMonitorTaskDetail', () => {
 
     const mergeButton = await screen.findByRole('button', { name: 'Merge PR' });
     fireEvent.click(mergeButton);
-    await waitFor(() => expect(api.enqueuePRMonitorMerge).toHaveBeenCalledWith(14));
-    expect(await screen.findByText('Merge request pending')).toBeInTheDocument();
+    await waitFor(() => expect(api.mergePRMonitorRun).toHaveBeenCalledWith(14));
+    expect(await screen.findByText('Merging')).toBeInTheDocument();
   });
 
   it('does not offer merge for a stale result projection', async () => {

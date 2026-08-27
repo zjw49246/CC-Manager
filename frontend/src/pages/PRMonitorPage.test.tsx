@@ -29,6 +29,7 @@ vi.mock('../api/client', () => ({
     resumePRMonitorRun: vi.fn(),
     unbindPRMonitorDeveloper: vi.fn(),
     submitPRFindingRebuttal: vi.fn(),
+    mergePRMonitorRun: vi.fn(),
     enqueuePRMonitorMerge: vi.fn(),
     getWebhookInfo: vi.fn(),
   },
@@ -202,7 +203,7 @@ describe('PRMonitorPage safety controls', () => {
     vi.mocked(api.pausePRMonitorRun).mockResolvedValue(runFixture({ status: 'paused' }));
     vi.mocked(api.resumePRMonitorRun).mockResolvedValue(runFixture());
     vi.mocked(api.unbindPRMonitorDeveloper).mockResolvedValue(runFixture());
-    vi.mocked(api.enqueuePRMonitorMerge).mockResolvedValue(runFixture({ status: 'merge_queue_pending' }));
+    vi.mocked(api.mergePRMonitorRun).mockResolvedValue(runFixture({ status: 'merge_pending' }));
     vi.mocked(api.getWebhookInfo).mockResolvedValue({ webhook_url: '/api/github/webhook' });
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
@@ -280,7 +281,7 @@ describe('PRMonitorPage safety controls', () => {
     ));
   });
 
-  it('allows panel auto-merge and keeps it mutually exclusive with Merge Queue', async () => {
+  it('allows panel direct auto-merge with exact-head CI', async () => {
     const user = userEvent.setup();
     render(<PRMonitorPage />);
     await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
@@ -288,15 +289,10 @@ describe('PRMonitorPage safety controls', () => {
     await user.selectOptions(selectFollowingLabel('Review Harness'), 'panel');
     expect(screen.getByText(/three independent review Tasks/)).toHaveTextContent('roughly 3×');
     const autoMerge = screen.getByLabelText('Direct auto-merge after review and exact-head gates pass');
-    const mergeQueue = selectFollowingLabel('Merge Queue');
     expect(autoMerge).toBeEnabled();
     expect(autoMerge).not.toBeChecked();
-    await user.selectOptions(mergeQueue, 'auto');
-    expect(autoMerge).not.toBeChecked();
-    expect(screen.getByText(/Merge Queue AUTO is a separate automatic policy/)).toBeInTheDocument();
     await user.click(autoMerge);
     expect(autoMerge).toBeChecked();
-    expect(mergeQueue).toHaveValue('manual');
 
     await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/new-repo');
     await user.type(
@@ -417,19 +413,18 @@ describe('PRMonitorPage safety controls', () => {
     });
   });
 
-  it('shows direct and queued automatic merge policies distinctly', async () => {
+  it('shows only direct merge policies', async () => {
     vi.mocked(api.getMonitoredRepos).mockResolvedValue([
       { ...baseRepo, id: 1, repo_full_name: 'acme/shadow' },
       { ...baseRepo, id: 2, repo_full_name: 'acme/direct', auto_merge: true, merge_queue_mode: 'manual' },
-      { ...baseRepo, id: 3, repo_full_name: 'acme/queued', merge_queue_mode: 'auto' },
     ]);
 
     render(<PRMonitorPage />);
 
     expect(await screen.findByText('Merge Policy')).toBeInTheDocument();
-    expect(screen.getByText('SHADOW')).toBeInTheDocument();
+    expect(screen.getByText('MANUAL')).toBeInTheDocument();
     expect(screen.getByText('AUTO')).toBeInTheDocument();
-    expect(screen.getByText('QUEUE AUTO')).toBeInTheDocument();
+    expect(screen.queryByText('QUEUE AUTO')).not.toBeInTheDocument();
   });
 
   it('shows the CCM backend publishing identity between Webhook and Review History', async () => {
@@ -1203,12 +1198,12 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
   });
 
-  it('offers only enqueue for a ready run and renders an enqueue failure', async () => {
+  it('offers direct merge for a ready run and renders a merge failure', async () => {
     const user = userEvent.setup();
     const review = reviewFixture({ status: 'approved', ci_status: 'success', ci_summary: 'All required checks passed' });
     const run = runFixture({ status: 'ready_to_merge', developer_task_id: 55 });
-    const enqueueRequest = deferred<PRMonitorRun>();
-    vi.mocked(api.enqueuePRMonitorMerge).mockReturnValueOnce(enqueueRequest.promise);
+    const mergeRequest = deferred<PRMonitorRun>();
+    vi.mocked(api.mergePRMonitorRun).mockReturnValueOnce(mergeRequest.promise);
     await openReview(user, review, run);
 
     expect(screen.queryByRole('button', { name: 'Bind' })).not.toBeInTheDocument();
@@ -1216,10 +1211,10 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume loop' })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: 'Enqueue merge' }));
-    expect(screen.getByRole('button', { name: 'Enqueuing…' })).toBeDisabled();
-    await act(async () => enqueueRequest.reject(new Error('queue rejected')));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Error: queue rejected');
+    await user.click(screen.getByRole('button', { name: 'Merge PR' }));
+    expect(screen.getByRole('button', { name: 'Merging…' })).toBeDisabled();
+    await act(async () => mergeRequest.reject(new Error('merge rejected')));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Error: merge rejected');
   });
 
   it('shows unbind pending and failure states only when the run is safe to mutate', async () => {
@@ -1248,7 +1243,7 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('button', { name: 'Unbind Developer' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume loop' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Enqueue merge' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
   });
 
   it('hides pause and binding controls while repair delivery is active', async () => {

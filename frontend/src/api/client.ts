@@ -1742,6 +1742,12 @@ export interface PRMergeQueueAction {
   review_id: number;
   trigger_head_sha: string;
   status: string;
+  effect_kind?: 'queue' | 'direct';
+  publishing_actor?: string | null;
+  publishing_started_at?: string | null;
+  merge_method?: string | null;
+  wait_for_ci?: boolean;
+  required_checks?: RequiredCheckPolicy[];
   github_queue_entry_id: string | null;
   merge_group_sha: string | null;
   ci_status: string | null;
@@ -3355,6 +3361,9 @@ export const api = {
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/unbind-developer`, { method: 'POST' }),
   submitPRFindingRebuttal: (findingId: number, evidence: string) =>
     request<PRFindingRebuttal>(`/api/pr-monitor/findings/${findingId}/rebut`, { method: 'POST', body: JSON.stringify({ evidence }) }),
+  mergePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/merge`, { method: 'POST' }),
+  /** @deprecated compatibility alias; backend performs direct merge. */
   enqueuePRMonitorMerge: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/enqueue-merge`, { method: 'POST' }),
   getWebhookInfo: () =>

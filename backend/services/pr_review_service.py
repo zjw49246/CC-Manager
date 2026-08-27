@@ -3007,6 +3007,156 @@ async def _publish_blocking_finding_threads(
         await db.commit()
 
 
+async def _publish_direct_merge(
+    *,
+    repo_name: str,
+    pr_number: int,
+    base_ref: str,
+    base_sha: str,
+    head_sha: str,
+    merge_method: str,
+    nonce: str,
+    actor: str,
+    publishing_started_at: datetime,
+    ensure_current: Callable[[], Awaitable[bool]],
+    wait_for_ci: bool = False,
+    required_checks: list[dict] | None = None,
+    ensure_zero_threads: Callable[[], Awaitable[bool]] | None = None,
+    strict_branch_protection: bool = True,
+) -> tuple[str, str]:
+    """Reconcile or perform one durable, exact-head direct merge."""
+
+    merge_evidence_kwargs = {
+        "repo_name": repo_name,
+        "pr_number": pr_number,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "nonce": nonce,
+        "actor": actor,
+        "publishing_started_at": publishing_started_at,
+        "merge_method": merge_method,
+    }
+    merge_confirmed = await _find_merge_evidence(**merge_evidence_kwargs)
+    if not merge_confirmed and merge_method != "fast-forward":
+        raise GhError(
+            "Legacy GitHub merge outbox has no exact merge evidence; "
+            "automatic replay is disabled"
+        )
+    if not merge_confirmed:
+        guarded = _validated_pr_snapshot(
+            await _gh_pr_view(pr_number, repo_name)
+        )
+        _require_open_merge_head_snapshot(
+            guarded,
+            base_ref=base_ref,
+            head_sha=head_sha,
+        )
+        exact_ci = None
+        if wait_for_ci:
+            from backend.services.pr_review_panel import fetch_exact_head_ci
+
+            try:
+                ci_status, ci_summary, exact_ci = await fetch_exact_head_ci(
+                    repo_name,
+                    head_sha,
+                    required_checks,
+                )
+            except (GhError, ValueError) as exc:
+                raise GhError(
+                    f"Exact-head required CI could not be revalidated: {exc}"
+                ) from exc
+            if ci_status != "passed":
+                raise GhError(
+                    "Exact-head required CI is not passed before merge: "
+                    f"{ci_status}: {ci_summary}"
+                )
+        if (
+            ensure_zero_threads is not None
+            and not await ensure_zero_threads()
+        ):
+            raise GhError(
+                "Blocking Finding threads are not durably resolved before merge"
+            )
+        if not await ensure_current():
+            raise GhError("Direct merge generation is no longer current")
+        await _require_direct_merge_protection(
+            repo_name=repo_name,
+            base_ref=base_ref,
+            actor=actor,
+            merge_method=merge_method,
+            frozen_required_checks=(required_checks if wait_for_ci else None),
+            exact_ci=exact_ci,
+            head_sha=(head_sha if wait_for_ci else None),
+            strict_branch_protection=strict_branch_protection,
+        )
+        final_open = _validated_pr_snapshot(
+            await _gh_pr_view(pr_number, repo_name)
+        )
+        await _require_safe_open_merge_snapshot(
+            final_open,
+            repo_name=repo_name,
+            base_ref=base_ref,
+            captured_base=base_sha,
+            head_sha=head_sha,
+        )
+        await _require_fresh_github_publisher_actor(
+            actor,
+            effect="merge",
+        )
+        if not await ensure_current():
+            raise GhError("Direct merge generation is no longer current")
+        try:
+            assert merge_method == "fast-forward"
+            encoded_base = quote(base_ref, safe="")
+            updated = await _gh_api_json(
+                f"repos/{repo_name}/git/refs/heads/{encoded_base}",
+                method="PATCH",
+                payload={"sha": head_sha, "force": False},
+            )
+            updated_object = updated.get("object")
+            if (
+                updated.get("ref") != f"refs/heads/{base_ref}"
+                or not isinstance(updated_object, dict)
+                or updated_object.get("type") != "commit"
+                or not isinstance(updated_object.get("sha"), str)
+                or updated_object["sha"].lower() != head_sha
+            ):
+                raise GhError(
+                    "GitHub did not confirm the frozen base fast-forward"
+                )
+        except GhError as merge_exc:
+            merge_confirmed = await _find_merge_evidence(
+                **merge_evidence_kwargs
+            )
+            if not merge_confirmed:
+                raise merge_exc
+
+        if not merge_confirmed:
+            merge_confirmed = await _find_merge_evidence(
+                **merge_evidence_kwargs
+            )
+        if not merge_confirmed:
+            raise GhError(
+                "GitHub did not confirm the captured head was merged"
+            )
+
+    await _publish_merged_comment(
+        repo_name=repo_name,
+        pr_number=pr_number,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        nonce=nonce,
+        actor=actor,
+        current_actor=actor,
+        publishing_started_at=publishing_started_at,
+        merge_method=merge_method,
+        ensure_current=ensure_current,
+    )
+    return "merged", "approved_merged"
+
+
 async def _publish_review_action(
     *,
     repo_name: str,
@@ -3253,137 +3403,7 @@ async def _publish_review_action(
         return "approved", "lgtm_comment"
 
     assert merge_method is not None
-    merge_evidence_kwargs = {
-        "repo_name": repo_name,
-        "pr_number": pr_number,
-        "base_ref": base_ref,
-        "base_sha": base_sha,
-        "head_sha": head_sha,
-        "nonce": nonce,
-        "actor": actor,
-        "publishing_started_at": publishing_started_at,
-        "merge_method": merge_method,
-    }
-    merge_confirmed = await _find_merge_evidence(**merge_evidence_kwargs)
-    if not merge_confirmed and merge_method != "fast-forward":
-        # A legacy outbox may represent either a merge whose acknowledgement
-        # was lost or an effect that never started. Only exact remote evidence
-        # can distinguish the safe first case. Replaying GitHub's PR merge API
-        # would re-read the PR's mutable base ref and could merge into a branch
-        # other than the frozen subject after a retarget race.
-        raise GhError(
-            "Legacy GitHub merge outbox has no exact merge evidence; "
-            "automatic replay is disabled"
-        )
-    if not merge_confirmed:
-        guarded = _validated_pr_snapshot(
-            await _gh_pr_view(pr_number, repo_name)
-        )
-        _require_open_merge_head_snapshot(
-            guarded,
-            base_ref=base_ref,
-            head_sha=head_sha,
-        )
-        exact_ci = None
-        if wait_for_ci:
-            # CI is mutable even when the commit SHA is not.  Admission-time CI
-            # only authorizes reviewer execution; merge authorization requires
-            # a fresh read of the frozen identities before the ref update.
-            from backend.services.pr_review_panel import fetch_exact_head_ci
-
-            try:
-                ci_status, ci_summary, exact_ci = await fetch_exact_head_ci(
-                    repo_name,
-                    head_sha,
-                    required_checks,
-                )
-            except (GhError, ValueError) as exc:
-                raise GhError(
-                    f"Exact-head required CI could not be revalidated: {exc}"
-                ) from exc
-            if ci_status != "passed":
-                raise GhError(
-                    "Exact-head required CI is not passed before merge: "
-                    f"{ci_status}: {ci_summary}"
-                )
-        if (
-            ensure_zero_threads is not None
-            and not await ensure_zero_threads()
-        ):
-            raise GhError(
-                "Blocking Finding threads are not durably resolved before merge"
-            )
-        if not await ensure_current():
-            raise GhError(
-                "PR review publication generation is no longer current"
-            )
-        await _require_direct_merge_protection(
-            repo_name=repo_name,
-            base_ref=base_ref,
-            actor=actor,
-            merge_method=merge_method,
-            frozen_required_checks=(required_checks if wait_for_ci else None),
-            exact_ci=exact_ci,
-            head_sha=(head_sha if wait_for_ci else None),
-            strict_branch_protection=strict_branch_protection,
-        )
-        # CI and thread reconciliation may take long enough for the base ref
-        # to move. Re-read the complete subject at the last possible boundary;
-        # the following non-force write explicitly names the frozen target ref.
-        final_open = _validated_pr_snapshot(
-            await _gh_pr_view(pr_number, repo_name)
-        )
-        await _require_safe_open_merge_snapshot(
-            final_open,
-            repo_name=repo_name,
-            base_ref=base_ref,
-            captured_base=base_sha,
-            head_sha=head_sha,
-        )
-        await _require_fresh_github_publisher_actor(
-            actor,
-            effect="merge",
-        )
-        if not await ensure_current():
-            raise GhError(
-                "PR review publication generation is no longer current"
-            )
-        try:
-            assert merge_method == "fast-forward"
-            encoded_base = quote(base_ref, safe="")
-            updated = await _gh_api_json(
-                f"repos/{repo_name}/git/refs/heads/{encoded_base}",
-                method="PATCH",
-                payload={"sha": head_sha, "force": False},
-            )
-            updated_object = updated.get("object")
-            if (
-                updated.get("ref") != f"refs/heads/{base_ref}"
-                or not isinstance(updated_object, dict)
-                or updated_object.get("type") != "commit"
-                or not isinstance(updated_object.get("sha"), str)
-                or updated_object["sha"].lower() != head_sha
-            ):
-                raise GhError(
-                    "GitHub did not confirm the frozen base fast-forward"
-                )
-        except GhError as merge_exc:
-            merge_confirmed = await _find_merge_evidence(
-                **merge_evidence_kwargs
-            )
-            if not merge_confirmed:
-                raise merge_exc
-
-        if not merge_confirmed:
-            merge_confirmed = await _find_merge_evidence(
-                **merge_evidence_kwargs
-            )
-        if not merge_confirmed:
-            raise GhError(
-                "GitHub did not confirm the captured head was merged"
-            )
-
-    await _publish_merged_comment(
+    return await _publish_direct_merge(
         repo_name=repo_name,
         pr_number=pr_number,
         base_ref=base_ref,
@@ -3391,12 +3411,14 @@ async def _publish_review_action(
         head_sha=head_sha,
         nonce=nonce,
         actor=actor,
-        current_actor=current_actor,
         publishing_started_at=publishing_started_at,
         merge_method=merge_method,
         ensure_current=ensure_current,
+        wait_for_ci=wait_for_ci,
+        required_checks=required_checks,
+        ensure_zero_threads=ensure_zero_threads,
+        strict_branch_protection=strict_branch_protection,
     )
-    return "merged", "approved_merged"
 
 
 def _parse_pr_review_result_marker(content: str | None) -> str | None:
@@ -5838,6 +5860,7 @@ def _terminal_publication_error(exc: GhError) -> bool:
         "GitHub merge commit evidence is malformed or mismatched",
         "GitHub merged comment evidence is malformed or mismatched",
         "GitHub exact merge evidence is missing before merged comment",
+        "Exact-head required CI is not passed before merge",
         "Frozen GitHub merge evidence policy is invalid",
         "Frozen GitHub merge method is invalid",
         "Frozen GitHub merge method is no longer allowed",
@@ -7644,8 +7667,13 @@ async def recover_incomplete_pr_reviews(
     adjudications_recovered = await recover_adjudications(db_factory)
     rebuttals_resolved = await reconcile_rebuttal_resolutions(db_factory)
     fixed_findings_resolved = await reconcile_fixed_finding_resolutions(db_factory)
+    from backend.services.pr_direct_merge import reconcile_direct_merges
     from backend.services.pr_merge_queue import reconcile_merge_queue
-    merge_progressed = await reconcile_merge_queue(db_factory)
+
+    merge_progressed = (
+        await reconcile_direct_merges(db_factory)
+        + await reconcile_merge_queue(db_factory)
+    )
     # Finding-fix Tasks have a separate durable action state machine. Keep it
     # on the same periodic recovery producer as PR publication so Manager
     # restarts and a missed Worker terminal callback cannot strand an action.

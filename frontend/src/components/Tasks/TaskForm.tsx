@@ -916,8 +916,8 @@ export function TaskForm({ onCreated, prefill = null }: TaskFormProps) {
           </label>
           <p className="text-[11px] leading-relaxed text-indigo-200/70">
             Requires a local project and an enabled PR Monitor using panel review,
-            exact-head required CI checks, and no Merge Queue. Merge behavior is
-            inherited from the selected PR Monitor.
+            exact-head required CI checks. Merge behavior is inherited from the
+            selected PR Monitor.
           </p>
           {selectedDeliveryRepo && (
             <p className="text-[11px] leading-relaxed text-indigo-200/90">
