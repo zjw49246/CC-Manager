@@ -520,6 +520,69 @@ async def test_clone_note_clear_keeps_foreign_error_messages(
     assert kept.error_message == "some unrelated launch error"
 
 
+@pytest.mark.asyncio
+@requires_posix_backend
+async def test_clone_note_annotation_preserves_foreign_error_messages(
+    queue, db_factory, monkeypatch
+):
+    """Failure annotation must never clobber an independent task diagnostic.
+
+    Only tasks with an empty ``error_message`` or one previously written by
+    the helper itself receive the clone note; a subsequent success clears
+    only the generated note (PR #141 panel finding).
+    """
+    import backend.api.projects as projects_module
+
+    monkeypatch.setattr(projects_module, "async_session", db_factory)
+
+    project = await _seed_project(
+        queue.db, status="cloning", name="note-preserve-project"
+    )
+    independent = await queue.create(
+        title="Task with independent error",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+    independent.error_message = "independent task error"
+    empty = await queue.create(
+        title="Task without error",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+    noted = await queue.create(
+        title="Task with a prior helper note",
+        description="d",
+        project_id=project.id,
+        target_repo=project.local_path,
+    )
+    noted.error_message = (
+        projects_module._CLONE_FAILURE_TASK_NOTE_PREFIX + "old clone failure"
+    )
+    await queue.db.commit()
+
+    await projects_module._sync_waiting_task_clone_notes(
+        project.id, "git clone failed: auth"
+    )
+    kept = await queue.db.get(Task, independent.id, populate_existing=True)
+    assert kept.error_message == "independent task error"
+    annotated = await queue.db.get(Task, empty.id, populate_existing=True)
+    assert annotated.error_message.startswith("Project clone failed: ")
+    assert "git clone failed: auth" in annotated.error_message
+    renoted = await queue.db.get(Task, noted.id, populate_existing=True)
+    assert renoted.error_message.startswith("Project clone failed: ")
+    assert "git clone failed: auth" in renoted.error_message
+
+    await projects_module._sync_waiting_task_clone_notes(project.id, None)
+    still_kept = await queue.db.get(Task, independent.id, populate_existing=True)
+    assert still_kept.error_message == "independent task error"
+    cleared = await queue.db.get(Task, empty.id, populate_existing=True)
+    assert cleared.error_message is None
+    noted_cleared = await queue.db.get(Task, noted.id, populate_existing=True)
+    assert noted_cleared.error_message is None
+
+
 # ── Clone success is the final publication ────────────────────────────────────
 
 

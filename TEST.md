@@ -1548,6 +1548,7 @@ github.com/youchengsong/ccm-worker-e2e-test（可删）。
 | `test_describe_clone_failure_prefixes_auth_errors` | 认证类 clone stderr 归一化为可操作文案且保留原始错误尾部 |
 | `test_clone_note_sync_annotates_and_clears` | clone 失败批量注记等待 Task 的 error_message；成功清除 |
 | `test_clone_note_clear_keeps_foreign_error_messages` | 清除只匹配自己的注记前缀，不误删任务真实错误 |
+| `test_clone_note_annotation_preserves_foreign_error_messages` | 写入侧对称守卫：注记只写 error_message 为空或本 helper 前缀的任务，独立诊断不被 clone 注记覆盖；成功清除后独立诊断仍在（评审 finding 修复） |
 | `test_update_task_keeps_unchanged_error_project_editable` | 全量表单 PUT 带未变更的 project_id（项目已 error）仍可编辑其他字段（评审 finding 修复） |
 | `test_post_clone_setup_failure_cannot_reverse_ready` | ready 是最终发布：post-clone 自动配置失败不得翻回 error，任务保持可调度，wake 在隔离后置步骤之后（评审 finding 修复） |
 | `test_dequeue_holds_task_with_null_project_status` | NULL status（legacy 行）按 fail-closed 处理：SQL 三值逻辑下 `NULL != 'ready'` 为 UNKNOWN，谓词显式 `status IS NULL OR status != 'ready'`；测试用放宽 nullable 的 schema 副本 + Core UPDATE 构造真实 NULL（ORM 对 None 会应用列默认值）（评审 finding 修复） |
