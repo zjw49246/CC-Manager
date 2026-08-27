@@ -161,6 +161,101 @@ async def test_dequeue_unaffected_without_project_or_with_dangling_project(queue
     assert second is not None and second.title == "Dangling project pointer"
 
 
+@pytest.mark.asyncio
+async def test_dequeue_holds_task_with_null_project_status():
+    """A NULL status (legacy rows predating NOT NULL) must fail closed.
+
+    ``NULL != 'ready'`` is UNKNOWN in SQL, so a naive predicate would treat
+    such a Project as ready and dispatch a Task against a checkout that was
+    never proven to exist. The current model forbids NULL, so this test
+    recreates the legacy shape with a relaxed schema copy.
+    """
+    from sqlalchemy import MetaData
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.models.task_id_allocator import (
+        TASK_ID_ALLOCATOR_SINGLETON_ID,
+        TASK_ID_WORKER_NAMESPACE_START,
+        TaskIdAllocator,
+    )
+
+    legacy_metadata = MetaData()
+    for table in Base.metadata.tables.values():
+        table.to_metadata(legacy_metadata)
+    legacy_metadata.tables["projects"].columns["status"].nullable = True
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(legacy_metadata.create_all)
+            # ``to_metadata`` copies do not carry the original table's
+            # after_create seed hook; insert the allocator singleton the same
+            # way the canonical schema does.
+            await conn.execute(
+                legacy_metadata.tables[TaskIdAllocator.__tablename__]
+                .insert()
+                .values(
+                    id=TASK_ID_ALLOCATOR_SINGLETON_ID,
+                    node_role=None,
+                    next_worker_task_id=TASK_ID_WORKER_NAMESPACE_START,
+                )
+            )
+        factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
+        async with factory() as db:
+            queue = TaskQueue(db)
+            project = Project(
+                name="legacy-null-status",
+                git_url="https://github.com/example/legacy.git",
+                has_remote=True,
+                local_path="/tmp/legacy-null-status",
+                default_branch="main",
+            )
+            db.add(project)
+            await db.commit()
+            await db.refresh(project)
+            project_id = project.id
+
+            # The ORM applies the column default when the attribute is None,
+            # so the legacy NULL must be written through Core.
+            from sqlalchemy import update as sa_update
+
+            await db.execute(
+                sa_update(Project)
+                .where(Project.id == project_id)
+                .values(status=None)
+            )
+            await db.commit()
+            nulled = await db.get(Project, project_id, populate_existing=True)
+            assert nulled.status is None
+
+            task = await queue.create(
+                title="Held behind NULL status",
+                description="d",
+                project_id=project_id,
+                target_repo="/tmp/legacy-null-status",
+            )
+            task_id = task.id
+
+            assert await queue.dequeue() is None
+            held = await db.get(Task, task_id, populate_existing=True)
+            assert held.status == "pending"
+
+            fresh = await db.get(Project, project_id, populate_existing=True)
+            fresh.status = "ready"
+            await db.commit()
+            claimed = await queue.dequeue()
+            assert claimed is not None and claimed.id == task_id
+    finally:
+        await engine.dispose()
+
+
 # ── API admission ─────────────────────────────────────────────────────────────
 
 

@@ -182,7 +182,10 @@ def project_ready_dispatch_predicate():
 
     Written as "no non-ready Project row exists" so Tasks without a Project
     (manual ``target_repo``) and Tasks whose Project row was deleted keep the
-    existing dispatch behavior.
+    existing dispatch behavior. A NULL status (legacy/malformed rows predating
+    the NOT NULL model) must fail closed: ``NULL != 'ready'`` is UNKNOWN in
+    SQL and would otherwise slip through the EXISTS as if the Project were
+    ready.
     """
 
     from backend.models.project import Project
@@ -191,7 +194,10 @@ def project_ready_dispatch_predicate():
         select(Project.id)
         .where(
             Project.id == Task.project_id,
-            Project.status != "ready",
+            or_(
+                Project.status.is_(None),
+                Project.status != "ready",
+            ),
         )
         .correlate(Task)
         .exists()
