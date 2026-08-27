@@ -4,7 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "generate:theme-bootstrap": "esbuild src/config/themeBootstrapEntry.ts --bundle --format=iife --platform=browser --target=es2022 --minify --legal-comments=none --outfile=public/theme-bootstrap.js",
+    "predev": "npm run generate:theme-bootstrap",
     "dev": "vite",
+    "prebuild": "npm run generate:theme-bootstrap",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",

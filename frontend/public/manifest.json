@@ -4,8 +4,8 @@
   "description": "Manage multiple Claude Code instances",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#030712",
-  "theme_color": "#4f46e5",
+  "background_color": "#e9e9ec",
+  "theme_color": "#e9e9ec",
   "icons": [
     {
       "src": "/icons/icon.svg",
