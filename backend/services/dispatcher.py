@@ -60,6 +60,7 @@ from backend.services.instance_capacity import (
 from backend.services.instance_manager import (
     InstanceAlreadyRunningError,
     InstanceManager,
+    effective_task_effort,
 )
 from backend.services.process_identity import (
     persisted_process_is_definitively_dead,
@@ -11571,7 +11572,10 @@ class GlobalDispatcher:
 
                 ensure_agents_md(task.target_repo or cwd)
             thinking_budget = task.thinking_budget
-            effort_level = task.effort_level or settings.default_effort
+            effort_level = effective_task_effort(
+                task,
+                task.effort_level or settings.default_effort,
+            )
             if lifecycle_generation is None:
                 return
             async with self._test_harness_terminal_db(
@@ -23690,7 +23694,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
             git_env = _build_git_env(merged)
 
-            effort_level = task.effort_level or settings.default_effort
+            effort_level = effective_task_effort(
+                task,
+                task.effort_level or settings.default_effort,
+            )
 
             # Pool: pick the account for this resume. Resolves a fresh validated
             # account (migrating the session into it) when one is available, and

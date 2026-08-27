@@ -79,6 +79,36 @@ logger = logging.getLogger(__name__)
 # stdin; ordinary launches retain their established argv shape.
 _CLAUDE_PROMPT_STDIN_THRESHOLD_BYTES = 64 * 1024
 
+# CloudRouter deployments may reject Claude CLI's adaptive-thinking payload
+# even though the CLI accepts ``--effort max``.  Remember that exact provider
+# incompatibility per Task so a later user turn can use the compatible effort
+# without mutating the user's configured preference or replaying the failed
+# turn after it crossed the provider boundary.
+_CLAUDE_ADAPTIVE_EFFORT_METADATA_KEY = "_ccm_claude_adaptive_effort"
+
+
+def _is_claude_adaptive_schema_error(message: str | None) -> bool:
+    if not isinstance(message, str):
+        return False
+    normalized = message.strip().lower()
+    return (
+        "adaptive.budget_tokens" in normalized
+        and "extra inputs are not permitted" in normalized
+    )
+
+
+def effective_task_effort(task: Task, effort: str | None) -> str | None:
+    """Apply a task-local CloudRouter compatibility route to new turns."""
+
+    if (
+        effort == "max"
+        and (task.provider or "claude").lower() == "claude"
+        and isinstance(task.metadata_, dict)
+        and task.metadata_.get(_CLAUDE_ADAPTIVE_EFFORT_METADATA_KEY) == "high"
+    ):
+        return "high"
+    return effort
+
 
 async def _fence_worker_runtime_mutation(
     db: AsyncSession,
@@ -997,7 +1027,7 @@ class _ConsumerRecoveryEvidence:
 
 @dataclass(frozen=True)
 class _ContextPreflightPermit:
-    """Exact active Task snapshot allowed to compact one rejected Codex turn."""
+    """Exact active Task snapshot allowed to compact one rejected chat turn."""
 
     task_id: int
     status: str
@@ -11811,6 +11841,18 @@ class InstanceManager:
             if failure_sets_completed_at:
                 task.completed_at = datetime.utcnow()
             task.error_message = failure_message[:2000]
+            if (
+                (task.provider or "claude").lower() == "claude"
+                and _is_claude_adaptive_schema_error(failure_message)
+            ):
+                metadata = dict(task.metadata_ or {})
+                metadata[_CLAUDE_ADAPTIVE_EFFORT_METADATA_KEY] = "high"
+                task.metadata_ = metadata
+                logger.warning(
+                    "Task %s provider rejected adaptive thinking; routing "
+                    "future Claude turns at effort=high",
+                    task.id,
+                )
             task.pty_background_generation = None
         await db.flush()
         return admission
@@ -11860,6 +11902,7 @@ class InstanceManager:
         background_generation: str | None = None,
         preserve_background_failure: bool = False,
         background_session_id: str | None = None,
+        context_preflight_requeued: bool = False,
     ) -> str | None:
         """Finalize one exact PTY chat turn, or discard a stale exit callback.
 
@@ -12289,7 +12332,9 @@ class InstanceManager:
                         instance_id=instance_id,
                         successful_terminal=successful_terminal,
                         admit_agent_action=(ec == 0),
-                        failure_sets_completed_at=True,
+                        failure_sets_completed_at=(
+                            not context_preflight_requeued
+                        ),
                         failure_message=(
                             provider_error[:2000]
                             if provider_error
@@ -14893,6 +14938,78 @@ class InstanceManager:
             terminal = rows[-1]
             terminal_raw = parsed_rows[-1]
             if provider == "claude":
+                # claude-pty emits the API rejection as an assistant envelope
+                # followed by a synthetic ``turn_duration`` system envelope;
+                # unlike direct stream-json it has no separate result row.
+                # Validate the nested zero-usage payload and reject every
+                # other foreground event before granting compaction authority.
+                pty_terminal = (
+                    terminal.event_type == "system_event"
+                    and terminal.role is None
+                    and terminal.is_error is False
+                    and isinstance(terminal_raw, dict)
+                    and terminal_raw.get("type") == "system"
+                    and terminal_raw.get("subtype") == "turn_duration"
+                )
+                if pty_terminal:
+                    seen_api_error = False
+                    for row, raw in zip(rows[:-1], parsed_rows[:-1], strict=True):
+                        if row.event_type == "message":
+                            message = (
+                                raw.get("message")
+                                if isinstance(raw, dict)
+                                else None
+                            )
+                            usage = (
+                                message.get("usage")
+                                if isinstance(message, dict)
+                                else None
+                            )
+                            usage_is_zero = (
+                                isinstance(usage, dict)
+                                and type(usage.get("input_tokens")) is int
+                                and usage.get("input_tokens") == 0
+                                and type(usage.get("output_tokens")) is int
+                                and usage.get("output_tokens") == 0
+                                and all(
+                                    type(usage[key]) is int and usage[key] == 0
+                                    for key in (
+                                        "cache_creation_input_tokens",
+                                        "cache_read_input_tokens",
+                                    )
+                                    if key in usage
+                                )
+                            )
+                            if not (
+                                row.role == "assistant"
+                                and row.is_error is True
+                                and isinstance(raw, dict)
+                                and raw.get("type") == "assistant"
+                                and raw.get("isApiErrorMessage") is True
+                                and raw.get("error") == "invalid_request"
+                                and str(row.content or "").strip().lower()
+                                == "prompt is too long"
+                                and usage_is_zero
+                            ):
+                                return None
+                            seen_api_error = True
+                        elif row.event_type in {"system_init", "rate_limit_event"}:
+                            continue
+                        else:
+                            return None
+                    if not seen_api_error:
+                        return None
+                    return _ContextPreflightPermit(
+                        task_id=task.id,
+                        status=task.status,
+                        instance_id=instance_id,
+                        retry_count=task.retry_count,
+                        turn_generation=task.turn_generation,
+                        turn_source_log_id=task.turn_source_log_id,
+                        session_id=task.session_id,
+                        started_at=task.started_at,
+                        completed_at=task.completed_at,
+                    )
                 terminal_result = (
                     terminal_raw if isinstance(terminal_raw, dict) else {}
                 )
@@ -15013,6 +15130,168 @@ class InstanceManager:
                 started_at=task.started_at,
                 completed_at=task.completed_at,
             )
+
+    async def _try_chat_context_compaction_retry(
+        self,
+        task_id: int,
+        params: dict,
+        *,
+        instance_id: int,
+        expected_retry_count: int | None,
+        expected_turn_generation: int | None,
+        expected_started_at: datetime | None,
+        dispatcher=None,
+    ) -> bool:
+        """Compact and enqueue one exact preflight-rejected chat turn.
+
+        The provider may reject a resumed prompt before doing any work.  The
+        durable source/foreground proof is checked first; only then is the
+        native session summarized, cleared, and replaced by a one-shot queue
+        message carrying a ``ContextRetryPermit``.  Returning ``True`` means
+        the replacement was actually admitted, so callers can leave the
+        rejected generation with ``completed_at`` unset for that retry.
+        """
+
+        permit = await self._chat_structured_context_preflight_rejection(
+            task_id,
+            params,
+            instance_id=instance_id,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            expected_started_at=expected_started_at,
+        )
+        if permit is None:
+            return False
+        if dispatcher is None:
+            from backend.main import dispatcher as active_dispatcher
+
+            dispatcher = active_dispatcher
+        if dispatcher is None:
+            return False
+
+        try:
+            from backend.services.dispatcher import PRIORITY_USER
+
+            async with self.db_factory() as db:
+                exact_generation = self._context_preflight_permit_predicates(
+                    permit
+                )
+                still_exact = (
+                    await db.execute(select(Task.id).where(*exact_generation))
+                ).scalar_one_or_none()
+                if still_exact is None:
+                    await db.rollback()
+                    logger.info(
+                        "Discarding stale prompt-too-long proof for task %s "
+                        "before summary collection",
+                        task_id,
+                    )
+                    return False
+
+                logger.warning(
+                    "Task %d exceeded its context window, compacting session",
+                    task_id,
+                )
+                compact_kwargs = {}
+                if params.get("source_log_id") is not None:
+                    compact_kwargs["exclude_log_entry_id"] = params[
+                        "source_log_id"
+                    ]
+                    compact_kwargs["post_source_injects_are_current"] = True
+                summary = await dispatcher._compact_session(
+                    task_id,
+                    permit.session_id,
+                    db,
+                    **compact_kwargs,
+                )
+                if not summary:
+                    await db.rollback()
+                    return False
+                compacted = await db.execute(
+                    update(Task)
+                    .where(*exact_generation)
+                    .values(
+                        session_id=None,
+                        context_window_usage=None,
+                    )
+                )
+                if not compacted.rowcount:
+                    await db.rollback()
+                    logger.info(
+                        "Discarding stale prompt-too-long compaction for task %s",
+                        task_id,
+                    )
+                    return False
+                await db.commit()
+
+            current_message = (
+                params.get("current_message")
+                or params.get("prompt")
+                or "continue"
+            )
+            context_retry_permit = dispatcher.issue_context_retry_permit(
+                task_id=permit.task_id,
+                instance_id=permit.instance_id,
+                retry_count=permit.retry_count,
+                turn_generation=permit.turn_generation,
+                turn_source_log_id=permit.turn_source_log_id,
+                session_id=None,
+                started_at=permit.started_at,
+                completed_at=permit.completed_at,
+            )
+            retry_kwargs = dict(
+                task_id=task_id,
+                prompt=build_compacted_resume_prompt(
+                    summary,
+                    current_message,
+                    interrupted=True,
+                ),
+                priority=PRIORITY_USER,
+                source="compact_retry",
+                current_message=current_message,
+                context_retry_permit=context_retry_permit,
+            )
+            if isinstance(params.get("enabled_skills"), dict):
+                retry_kwargs["command_skills"] = dict(params["enabled_skills"])
+            if isinstance(params.get("model"), str):
+                retry_kwargs["model_override"] = params["model"]
+            if params.get("source_log_id") is not None:
+                retry_kwargs["source_log_id"] = params["source_log_id"]
+            if params.get("queue_timestamp") is not None:
+                retry_kwargs["queue_timestamp"] = params["queue_timestamp"]
+            retry_kwargs.update(
+                {
+                    "initiating_user_id": params.get("initiating_user_id"),
+                    "initiating_user_role": params.get(
+                        "initiating_user_role", "member"
+                    ),
+                    "execution_mode": params.get("execution_mode", "sandbox"),
+                    "execution_principal_kind": params.get(
+                        "execution_principal_kind", "system"
+                    ),
+                    "attachment_paths": tuple(
+                        params.get("attachment_paths") or ()
+                    ),
+                    "ssh_agent_socket_snapshot": params.get(
+                        "ssh_agent_socket_snapshot"
+                    ),
+                }
+            )
+            try:
+                admitted = await dispatcher.enqueue_message(**retry_kwargs)
+            except BaseException:
+                dispatcher.revoke_context_retry_permit(context_retry_permit)
+                raise
+            if admitted is False:
+                dispatcher.revoke_context_retry_permit(context_retry_permit)
+                return False
+            return True
+        except Exception:
+            logger.exception(
+                "Context-window compaction failed for task %d",
+                task_id,
+            )
+            return False
 
     async def _chat_automatic_relaunch_fence(
         self,

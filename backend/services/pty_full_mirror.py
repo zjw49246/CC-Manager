@@ -552,6 +552,39 @@ class FullMirrorCCMBackend(CCMBackend):
             # cannot override a failed API turn recorded in JSONL.
             ec = 1
 
+        context_preflight_requeued = False
+        if (
+            chat_initiated
+            and task_id
+            and owns_record
+            and not stop_owns_terminal
+            and ec not in (0, -2, 130)
+        ):
+            # PTY keeps the native process alive, so its consumer does not
+            # pass through InstanceManager's direct-exec cleanup path. Reuse
+            # the same durable proof/compaction authority here before any
+            # transient or account retry can classify the provider error.
+            params = self._im._launch_params.get(key) or {}
+            try:
+                from backend.main import dispatcher
+
+                context_preflight_requeued = (
+                    await self._im._try_chat_context_compaction_retry(
+                        task_id,
+                        params,
+                        instance_id=int(key),
+                        expected_retry_count=record.task_retry_count,
+                        expected_turn_generation=record.task_turn_generation,
+                        expected_started_at=record.instance_started_at,
+                        dispatcher=dispatcher,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "PTY context-window recovery check failed for instance %s",
+                    key,
+                )
+
         if (
             chat_initiated
             and task_id
@@ -674,6 +707,7 @@ class FullMirrorCCMBackend(CCMBackend):
                         record,
                         background_generation=None,
                         background_session_id=session_id,
+                        context_preflight_requeued=context_preflight_requeued,
                     )
                 )
                 if final_status == "background_armed":

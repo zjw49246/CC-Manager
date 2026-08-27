@@ -25,6 +25,7 @@ from sqlalchemy import select
 from backend.services.instance_manager import (
     InstanceManager,
     LaunchSupersededError,
+    effective_task_effort,
 )
 from backend.models.instance import Instance
 from backend.models.task import Task
@@ -5573,6 +5574,228 @@ class TestFullMirrorBackend:
         assert proxy.returncode == 1
         im._try_chat_transient_retry.assert_awaited_once()
         im._try_chat_pool_rotation.assert_awaited_once()
+
+    async def test_pty_prompt_too_long_compacts_and_requeues(
+        self, db_factory
+    ):
+        """A hot PTY session recovers the exact Claude overflow sequence."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "claude-pty-overflow-session"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.provider = "claude"
+            task.model = "claude-opus-4-6[1m]"
+            task.effort_level = "max"
+            task.status = "executing"
+            task.retry_count = 0
+            task.turn_generation = 3
+            task.instance_id = instance_id
+            task.session_id = session_id
+            source = LogEntry(
+                instance_id=instance_id,
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=3,
+                turn_scope="source",
+                event_type="turn_source",
+                role="system",
+                raw_json=json.dumps(
+                    {"transport": "claude", "original_source_log_id": None}
+                ),
+                actual_transport="claude_pty",
+                is_error=False,
+            )
+            db.add(source)
+            await db.flush()
+            task.turn_source_log_id = source.id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 881
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+            source_id = source.id
+
+        class Proxy:
+            pid = 881
+            returncode = None
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        proxy = Proxy()
+        session = MagicMock()
+        session.session_id = session_id
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+        im._launch_params[instance_id] = {
+            "prompt": "continue the task",
+            "current_message": "continue the task",
+            "provider": "claude",
+            "task_turn_generation": 3,
+            "source_log_id": source_id,
+            "model": "claude-opus-4-6[1m]",
+        }
+        dispatcher = MagicMock()
+        dispatcher._compact_session = AsyncMock(return_value="durable summary")
+        dispatcher.enqueue_message = AsyncMock()
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            record = im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=3,
+                instance_started_at=started_at,
+            )
+            await backend.on_event(
+                instance_id,
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "Prompt is too long",
+                    "is_error": True,
+                    "raw_json": json.dumps(
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "error": "invalid_request",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": "Prompt is too long"}
+                                ],
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0,
+                                },
+                            },
+                        }
+                    ),
+                },
+                task_id=task_id,
+            )
+            await backend.on_event(
+                instance_id,
+                {
+                    "event_type": "system_event",
+                    "role": None,
+                    "content": "turn_duration",
+                    "is_error": False,
+                    "raw_json": json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "turn_duration",
+                            "durationMs": 20,
+                            "messageCount": 1415,
+                        }
+                    ),
+                },
+                task_id=task_id,
+            )
+            assert record.fatal_provider_error == "Prompt is too long"
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        with patch("backend.main.dispatcher", dispatcher):
+            await exit_turn()
+
+        dispatcher._compact_session.assert_awaited_once()
+        dispatcher.enqueue_message.assert_awaited_once()
+        retry = dispatcher.enqueue_message.await_args.kwargs
+        assert retry["source"] == "compact_retry"
+        assert retry["source_log_id"] == source_id
+        assert retry["current_message"] == "continue the task"
+        assert "durable summary" in retry["prompt"]
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "failed"
+            assert task.completed_at is None
+            assert task.session_id is None
+            assert inst.status == "error"
+        assert proxy.returncode == 1
+
+    async def test_adaptive_schema_failure_routes_future_turns_to_high(
+        self, db_factory
+    ):
+        """CloudRouter adaptive schema failures change only future routing."""
+
+        im, _ = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.provider = "claude"
+            task.effort_level = "max"
+            task.status = "executing"
+            task.retry_count = 0
+            task.turn_generation = 1
+            task.instance_id = instance_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 882
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        consumer = asyncio.current_task()
+
+        class Proxy:
+            pid = 882
+            returncode = None
+
+        proxy = Proxy()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            instance_started_at=started_at,
+        )
+        object.__setattr__(
+            record,
+            "fatal_provider_error",
+            "API Error: 400 adaptive.budget_tokens: Extra inputs are not permitted",
+        )
+        await im.finalize_pty_chat_generation(
+            instance_id,
+            task_id,
+            1,
+            record,
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.metadata_["_ccm_claude_adaptive_effort"] == "high"
+            assert effective_task_effort(task, "max") == "high"
+            assert task.effort_level == "max"
 
     async def test_pty_timeout_event_fails_turn_even_when_event_persistence_fails(
         self, db_factory
