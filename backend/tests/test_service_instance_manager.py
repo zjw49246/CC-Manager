@@ -7720,7 +7720,7 @@ async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
     assert observed["response_timeout"] == (
         settings.claude_pty_response_idle_timeout_seconds
     )
-    assert observed["response_timeout"] == 7200.0
+    assert observed["response_timeout"] == 900.0
     assert env["SAFE_VALUE"] == ""
     assert env["AUTH_TOKEN"] == ""
     assert env["CCM_INTERNAL_SERVICE_TOKEN"] == ""

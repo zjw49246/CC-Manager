@@ -53,11 +53,12 @@ class Settings(BaseSettings):
     merge_push_retries: int = 3
     auto_push_to_origin: bool = True
     task_timeout_seconds: int = 7200  # 2 hours
-    # This is an inactivity timeout, refreshed whenever the main JSONL or a
-    # tracked sub-agent transcript advances.  A legitimate foreground tool
-    # can stay silent for more than 15 minutes, so keep the default aligned
-    # with the task-wide timeout instead of aborting a healthy tool call.
-    claude_pty_response_idle_timeout_seconds: float = 7200.0
+    # Bound foreground PTY silence separately from the task-wide timeout.
+    # Main JSONL and tracked sub-agent progress refresh this deadline, while a
+    # genuinely silent turn is failed instead of holding a Task executing for
+    # two hours. Known long-running tools can opt into a larger value through
+    # CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS.
+    claude_pty_response_idle_timeout_seconds: float = 900.0
     # 会话上下文利用率达到该比例即自动摘要+换新 session。超大 context 的请求
     # 在服务端易挂起（2026-07-08 task 22/27 连环 stall 均发生在 ~90% 区间），
     # 故不要设回 0.9 让 session 在重灾区长时间工作。
