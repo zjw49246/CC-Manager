@@ -3473,10 +3473,39 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     planVersionIds?: number[],
   ) => handleSend(text, true, uploadResults, planTaskIds, planVersionIds);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const composerHasContent = (
+    input.trim().length > 0
+    || fileUpload.uploadedResults.length > 0
+    || forkSeedUploads.length > 0
+  );
+  const composerSubmitDisabled = (
+    !composerHasContent
+    || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim())
+    || (!hasTaskSession && !task.shared_from_id)
+    || (frontendReviewComposerMode && !canStartFrontendReviewGoal)
+    || (workspaceReviewComposerMode && !canStartWorkspaceReview)
+    || (injectMode && canInjectNow && !foregroundActive && !backgroundActive)
+    || (injecting && (!foregroundActive || injectMode))
+    || fileUpload.isUploading
+  );
+  const composerSubmitTitle = fileUpload.hasFailed
+    ? 'Retry or remove failed attachments before sending'
+    : injectMode && canInjectNow
+      ? (foregroundActive || backgroundActive ? '注入到运行中的 Session (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
+      : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
+      : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
+      : foregroundActive ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)';
+
+  const handleComposerSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (composerSubmitDisabled) return;
+    void handleSend();
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      handleSend();
+      if (!composerSubmitDisabled) e.currentTarget.form?.requestSubmit();
     }
   };
 
@@ -4637,7 +4666,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <span className="truncate">单次黑盒审查当前分支：隔离 Preview → 浏览器验证 → 截图与报告（不修改代码）</span>
             </div>
           )}
-          <div className="flex gap-2 items-end">
+          <form className="flex gap-2 items-end" onSubmit={handleComposerSubmit}>
             <textarea
               ref={textareaRef}
               value={input}
@@ -4658,20 +4687,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               }
               disabled={(injecting && (!foregroundActive || injectMode)) || (!hasTaskSession && !task.shared_from_id)}
               rows={1}
-              className="flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
+              className="min-w-0 flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}
             />
             <button
-              onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !foregroundActive && !backgroundActive) || (injecting && (!foregroundActive || injectMode)) || fileUpload.isUploading || fileUpload.hasFailed}
-              title={fileUpload.hasFailed
-                ? 'Retry or remove failed attachments before sending'
-                : injectMode && canInjectNow
-                ? (foregroundActive || backgroundActive ? '注入到运行中的 Session (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
-                : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
-                : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
-                : foregroundActive ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
-              className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
+              type="submit"
+              disabled={composerSubmitDisabled}
+              title={composerSubmitTitle}
+              aria-label={composerSubmitTitle}
+              className={`inline-flex min-h-10 shrink-0 touch-manipulation items-center justify-center gap-1.5 px-3 py-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 injectMode && canInjectNow ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
                 : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
@@ -4679,8 +4703,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               }`}
             >
               {injectMode && canInjectNow ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : foregroundActive ? <ListPlus size={18} /> : <Send size={18} />}
+              <span className="text-xs font-medium">
+                {injectMode && canInjectNow
+                  ? '注入'
+                  : frontendReviewComposerMode
+                    ? '循环审查'
+                    : workspaceReviewComposerMode
+                      ? '单次审查'
+                      : foregroundActive ? '排队' : '发送'}
+              </span>
             </button>
-          </div>
+          </form>
           </div>
         </div>
       </div>

@@ -477,6 +477,54 @@ describe('ChatView', () => {
     }
   });
 
+  it.each([
+    ['send button', 'click'],
+    ['Command+Enter', 'keyboard'],
+  ] as const)('submits a follow-up through the same composer form with the %s', async (_label, method) => {
+    const task = makeTask({ id: method === 'click' ? 75 : 76, status: 'completed' });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/follow-up message/i);
+    await userEvent.type(textbox, `follow up via ${method}`);
+    const sendButton = screen.getByTitle('Send (Ctrl+Enter)');
+    expect(sendButton).toHaveTextContent('发送');
+
+    if (method === 'click') {
+      await userEvent.click(sendButton);
+    } else {
+      fireEvent.keyDown(textbox, { key: 'Enter', code: 'Enter', metaKey: true });
+    }
+
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+    expect(vi.mocked(api.sendTaskChat).mock.calls[0]?.slice(0, 2)).toEqual([
+      task.id,
+      `follow up via ${method}`,
+    ]);
+  });
+
+  it.each([
+    ['queue button', 'click'],
+    ['Command+Enter', 'keyboard'],
+  ] as const)('queues an active-task follow-up through the same composer form with the %s', async (_label, method) => {
+    const task = makeTask({ id: method === 'click' ? 77 : 78, status: 'executing' });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/next message to queue/i);
+    await userEvent.type(textbox, `queue via ${method}`);
+    const queueButton = screen.getByTitle('Add to queue (Ctrl+Enter)');
+    expect(queueButton).toHaveTextContent('排队');
+
+    if (method === 'click') {
+      await userEvent.click(queueButton);
+    } else {
+      fireEvent.keyDown(textbox, { key: 'Enter', code: 'Enter', metaKey: true });
+    }
+
+    expect(await screen.findByText('Queued messages (1)')).toBeInTheDocument();
+    expect(screen.getByText(`queue via ${method}`)).toBeInTheDocument();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
   it('renders Delivery-owned developer conversations as read-only', async () => {
     render(
       <ChatView
@@ -5340,7 +5388,7 @@ describe('failed attachment sending', () => {
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
   });
 
-  it('keeps Send disabled instead of posting an empty attachment placeholder', async () => {
+  it('keeps Send safe while allowing the button to explain the failed attachment', async () => {
     (api.uploadImages as ReturnType<typeof vi.fn>)
       .mockRejectedValueOnce(new Error('upload failed'));
     render(<ChatView task={makeTask()} projects={[]} onBack={vi.fn()} />);
@@ -5350,9 +5398,12 @@ describe('failed attachment sending', () => {
       target: { files: [new File(['evidence'], 'evidence.txt', { type: 'text/plain' })] },
     });
     await screen.findByTitle('Click to retry');
+    await userEvent.type(screen.getByRole('textbox'), 'send with the attachment');
 
     const send = screen.getByTitle('Retry or remove failed attachments before sending');
-    expect(send).toBeDisabled();
+    expect(send).not.toBeDisabled();
+    await userEvent.click(send);
+    expect(await screen.findByText('Retry or remove failed attachments before sending.')).toBeInTheDocument();
     expect(api.sendTaskChat).not.toHaveBeenCalled();
   });
 });
