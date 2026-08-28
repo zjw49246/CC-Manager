@@ -13,7 +13,7 @@ $$`,
       '| value |',
       '| --- |',
       '| [docs](https://example.test) |',
-      String.raw`\`\(not math\)\` and escaped dollars: \$5 and \$7.`,
+      '`\\(not math\\)` and escaped dollars: \\$5 and \\$7.',
       '```tex',
       String.raw`\[not math\]`,
       '```',
@@ -24,7 +24,7 @@ $$`,
     expect(container.querySelector('.katex-display')).not.toBeNull();
     expect(container.querySelector('table')).not.toBeNull();
     expect(container.querySelector('a[href="https://example.test"]')).not.toBeNull();
-    expect(container.querySelector('code')?.textContent).toContain(String.raw`\(not math\)`);
+    expect(container.querySelector('code:not(pre code)')?.textContent).toBe(String.raw`\(not math\)`);
     expect(container.querySelector('pre code')?.textContent).toContain(String.raw`\[not math\]`);
     expect(container.textContent).toContain('$5 and $7');
   });
