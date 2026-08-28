@@ -22965,6 +22965,144 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_claude_pty_prompt_too_long_turn_duration_compacts_and_requeues(
+    db_factory,
+):
+    """The real claude-pty API-error/turn-duration pair is replay-safe."""
+
+    started_at = datetime(2026, 8, 28, 4, 42, 49)
+    async with db_factory() as db:
+        instance = Instance(
+            name="claude-pty-context-proof",
+            status="running",
+            pid=73_109,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude PTY context proof",
+            provider="claude",
+            status="executing",
+            retry_count=0,
+            turn_generation=10,
+            instance_id=instance.id,
+            session_id="claude-pty-session",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=10,
+            turn_scope="source",
+            event_type="user_message",
+            role="user",
+            content="推进",
+            raw_json=json.dumps({"raw_content": "推进"}),
+            actual_transport="claude_pty",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+
+        # This is the shape emitted by Claude 2.1.241 in production Task 451:
+        # the synthetic API error carries zero usage and is followed by the
+        # PTY-only turn_duration sentinel (there is no result envelope).
+        db.add(
+            LogEntry(
+                instance_id=instance.id,
+                task_id=task.id,
+                task_retry_count=0,
+                task_turn_generation=10,
+                turn_scope="foreground",
+                event_type="message",
+                role="assistant",
+                content="Prompt is too long",
+                raw_json=json.dumps({
+                    "type": "assistant",
+                    "isApiErrorMessage": True,
+                    "error": "invalid_request",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "Prompt is too long",
+                        }],
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        },
+                    },
+                }),
+                actual_transport=None,
+                is_error=True,
+            )
+        )
+        db.add(
+            LogEntry(
+                instance_id=instance.id,
+                task_id=task.id,
+                task_retry_count=0,
+                task_turn_generation=10,
+                turn_scope="foreground",
+                event_type="system_event",
+                role=None,
+                content="turn_duration",
+                raw_json=json.dumps({
+                    "type": "system",
+                    "subtype": "turn_duration",
+                    "durationMs": 23,
+                }),
+                actual_transport=None,
+                is_error=False,
+            )
+        )
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_params[instance_id] = {
+        "prompt": "[already wrapped history]\n推进",
+        "current_message": "推进",
+        "provider": "claude",
+        "task_turn_generation": 10,
+        "source_log_id": source_id,
+        "model": "claude-opus-5",
+    }
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="durable summary")
+    dispatcher.enqueue_message = AsyncMock()
+
+    admitted = await manager._try_chat_context_compaction_retry(
+        task_id,
+        manager._launch_params[instance_id],
+        instance_id=instance_id,
+        expected_retry_count=0,
+        expected_turn_generation=10,
+        expected_started_at=started_at,
+        dispatcher=dispatcher,
+    )
+
+    assert admitted is True
+    dispatcher._compact_session.assert_awaited_once()
+    retry = dispatcher.enqueue_message.await_args.kwargs
+    assert retry["source"] == "compact_retry"
+    assert retry["current_message"] == "推进"
+    assert "durable summary" in retry["prompt"]
+    assert "already wrapped history" not in retry["prompt"]
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.session_id is None
+        assert current.context_window_usage is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("activity", "synthetic_error", "usage", "duration_api_ms"),
     [

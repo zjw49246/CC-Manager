@@ -3478,10 +3478,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     || fileUpload.uploadedResults.length > 0
     || forkSeedUploads.length > 0
   );
+  // Context compaction briefly clears the native session while the current
+  // foreground generation is still running. Keep the composer usable during
+  // that handoff so a follow-up is retained in the queue instead of looking
+  // like a dead send button; the queue consumer will send it after recovery.
+  const composerNoSessionBlocked = (
+    !hasTaskSession
+    && !task.shared_from_id
+    && !foregroundActive
+  );
   const composerSubmitDisabled = (
     !composerHasContent
     || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim())
-    || (!hasTaskSession && !task.shared_from_id)
+    || composerNoSessionBlocked
     || (frontendReviewComposerMode && !canStartFrontendReviewGoal)
     || (workspaceReviewComposerMode && !canStartWorkspaceReview)
     || (injectMode && canInjectNow && !foregroundActive && !backgroundActive)
@@ -4673,7 +4682,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={
-                !hasTaskSession && !task.shared_from_id
+                composerNoSessionBlocked
                   ? 'Run the task first to start a session...'
                   : injectMode && canInjectNow
                     ? '注入模式：消息将直接注入运行中的 turn...'
@@ -4685,7 +4694,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
-              disabled={(injecting && (!foregroundActive || injectMode)) || (!hasTaskSession && !task.shared_from_id)}
+              disabled={(injecting && (!foregroundActive || injectMode)) || composerNoSessionBlocked}
               rows={1}
               className="min-w-0 flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}

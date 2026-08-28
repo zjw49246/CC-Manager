@@ -502,6 +502,26 @@ describe('ChatView', () => {
     ]);
   });
 
+  it('queues a follow-up while an active task is rebuilding its session', async () => {
+    const task = makeTask({
+      id: 79,
+      status: 'executing',
+      session_id: null,
+      has_session: false,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/next message to queue/i);
+    await userEvent.type(textbox, 'queue during context recovery');
+    const queueButton = screen.getByTitle('Add to queue (Ctrl+Enter)');
+    expect(queueButton).not.toBeDisabled();
+    await userEvent.click(queueButton);
+
+    expect(await screen.findByText('Queued messages (1)')).toBeInTheDocument();
+    expect(screen.getByText('queue during context recovery')).toBeInTheDocument();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['queue button', 'click'],
     ['Command+Enter', 'keyboard'],
