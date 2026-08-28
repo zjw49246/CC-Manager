@@ -7129,7 +7129,7 @@ class InstanceManager:
             if on_launch_admitted is not None:
                 await on_launch_admitted()
 
-        process, _thread_id = await registry.start_turn(
+        process, thread_id = await registry.start_turn(
             codex_home=config_dir,
             prompt=prompt,
             cwd=actual_cwd,
@@ -7220,6 +7220,7 @@ class InstanceManager:
                 provider="codex",
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
+                native_session_id=thread_id,
             )
         except (InstanceNotFoundError, LaunchSupersededError):
             raise
@@ -7243,6 +7244,7 @@ class InstanceManager:
         provider: str,
         task_retry_count: int | None = None,
         task_turn_generation: int | None = None,
+        native_session_id: str | None = None,
     ) -> int:
         """Commit launch metadata and install the consumer as one guarded step."""
 
@@ -7252,6 +7254,15 @@ class InstanceManager:
         try:
             async with self.db_factory() as db:
                 if task_id:
+                    task_values = {"last_cwd": actual_cwd}
+                    # A fresh Codex app-server turn has already allocated its
+                    # native thread before this durable launch claim. Persist
+                    # it here instead of waiting for a later ``thread.started``
+                    # stream event: a compacted turn may complete before that
+                    # event reaches the consumer, which otherwise leaves the
+                    # Task with no resumable session_id.
+                    if native_session_id:
+                        task_values["session_id"] = native_session_id
                     task_update = await db.execute(
                         update(Task)
                         .where(
@@ -7271,7 +7282,7 @@ class InstanceManager:
                                 == task_turn_generation
                             ),
                         )
-                        .values(last_cwd=actual_cwd)
+                        .values(**task_values)
                     )
                     if task_update.rowcount == 0:
                         raise LaunchSupersededError(

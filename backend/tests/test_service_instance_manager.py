@@ -10268,6 +10268,83 @@ async def test_launch_codex_prefers_persistent_app_server(
 
 
 @pytest.mark.asyncio
+async def test_codex_fresh_thread_id_is_persisted_before_stream_events(
+    db_factory,
+):
+    """A compacted fresh turn remains resumable even if no event is consumed."""
+    async with db_factory() as db:
+        instance = Instance(name="codex-fresh-thread", provider="codex")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="fresh Codex thread",
+            status="executing",
+            provider="codex",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    manager = InstanceManager(db_factory, MagicMock())
+    manager._consume_output = AsyncMock()
+    process = MagicMock(pid=os.getpid(), returncode=None)
+
+    await manager._persist_and_track_launch(
+        instance_id=instance_id,
+        task_id=task_id,
+        process=process,
+        actual_cwd="/tmp",
+        loop_iteration=None,
+        chat_initiated=True,
+        provider="codex",
+        native_session_id="fresh-thread-after-compaction",
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.session_id == "fresh-thread-after-compaction"
+
+
+@pytest.mark.asyncio
+async def test_codex_app_server_passes_new_thread_id_to_durable_launch(
+    db_factory,
+):
+    """The app-server return value, not stream timing, owns a fresh session."""
+    manager = InstanceManager(db_factory, MagicMock())
+    process = MagicMock(pid=os.getpid(), returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "fresh-thread-after-compaction")
+    )
+    manager._ensure_codex_app_server_registry = MagicMock(return_value=registry)
+    manager._persist_and_track_launch = AsyncMock(return_value=12345)
+
+    pid = await manager._launch_codex_app_server(
+        instance_id=1,
+        prompt="continue after compaction",
+        task_id=42,
+        cwd="/tmp",
+        model="gpt-5.6-terra",
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        effort_level="high",
+        chat_initiated=True,
+        config_dir="/tmp/codex-home",
+        enable_workflows=False,
+        enabled_skills=None,
+    )
+
+    assert pid == 12345
+    assert (
+        manager._persist_and_track_launch.await_args.kwargs["native_session_id"]
+        == "fresh-thread-after-compaction"
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_codex_app_server_disables_project_config(
     db_factory, monkeypatch, tmp_path,
 ):
