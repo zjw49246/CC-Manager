@@ -590,6 +590,7 @@ export function TaskForm({ onCreated, prefill = null }: TaskFormProps) {
       && selectedDeliveryProvider != null
     )) &&
     (projectId || (isNewProject && newProjectName)) &&
+    selectedProject?.status !== 'error' &&
     !fileUpload.isUploading &&
     !fileUpload.hasFailed;
 
@@ -855,6 +856,24 @@ export function TaskForm({ onCreated, prefill = null }: TaskFormProps) {
           showStatus
           tagColorMap={Object.fromEntries(tagItems.map((t) => [t.name, t.color]))}
         />
+        {selectedProject && selectedProject.status && selectedProject.status !== 'ready' && (
+          selectedProject.status === 'error' ? (
+            <div className="bg-red-900/50 border border-red-700 text-red-300 text-xs rounded px-3 py-2 flex items-start gap-2">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <div>
+                项目克隆失败，请先在 Projects 页 Re-clone 项目。
+                {selectedProject.error_message && (
+                  <div className="mt-0.5 text-red-400">{selectedProject.error_message}</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="bg-yellow-900/50 border border-yellow-700 text-yellow-300 text-xs rounded px-3 py-2 flex items-start gap-2">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span>项目仍在克隆/初始化，任务将等待项目就绪后自动开始。</span>
+            </div>
+          )
+        )}
         {isNewProject && (
           <div className="flex flex-col sm:flex-row gap-2">
             <input

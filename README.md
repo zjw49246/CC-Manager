@@ -12,7 +12,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **全局调度器** — 启动时自动创建 worker、自动分配任务，无需手动操作
 - **Claude Code 完全自主** — Claude Code 自主完成 worktree 创建、commit、fetch、merge、push、冲突解决和清理，Dispatcher 只负责分配任务和判断成败
 - **9 步任务生命周期** — 领取 → 创建工作区 → 实现 → 提交 → merge + 测试 → 合并到 main → 标记完成 → 清理 → 经验沉淀
-- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
+- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目。后台 clone 不会因等待凭据输入而挂起，认证失败给出明确提示；clone 失败的项目会拒绝新建任务（422），已排队任务保持等待并在 Re-clone 成功后自动开始
 - **项目 Todo 清单** — 每个项目维护一个可折叠的待办清单（prompt 模板），一键「▶ Run」直接创建 Task 并跳转 Chat；创建后 Todo 自动标记完成并记录派生的 task。支持归档/恢复/永久删除
 - **任务队列** — 按优先级自动调度（数字越小优先级越高）
 - **多实例并行** — 同时运行多个 Claude Code 实例，各自处理不同任务
@@ -60,7 +60,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **安全的一键更新重启** — 后台定时检查并弹窗提醒；更新时暂停领取新工作，运行中 task、无 Task 的手动实例或待续跑消息未清零则拒绝重启；支持识别手动拉取但尚未加载的代码，再完成依赖、迁移、前端构建和智能重启
 
 ### 项目与协作
-- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
+- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目。后台 clone 不会因等待凭据输入而挂起，认证失败给出明确提示；clone 失败的项目会拒绝新建任务（422），已排队任务保持等待并在 Re-clone 成功后自动开始
 - **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；内部 Reviewer/Fix/Rebuttal Task 始终隐藏，Tasks 页面改为展示一张按 `PRMonitorRun` 聚合的只读结果卡，可直接看到代码 verdict、GitHub 发布状态、PR 生命周期和后端发布身份，并进入完整 Review History。每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址

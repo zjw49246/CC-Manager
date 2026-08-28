@@ -173,6 +173,36 @@ class TaskAgentIsolationError(RuntimeError):
     """The provider could not prove the required Task isolation boundary."""
 
 
+class TaskWorkingDirectoryMissingError(TaskAgentIsolationError):
+    """The Task's explicit working directory does not exist on this host.
+
+    Typical cause: the Project clone failed (or a worktree was removed) while
+    ``target_repo``/``last_cwd`` still points at the path. Raising a typed,
+    human-readable error here replaces the bare ``[Errno 2]`` the OS would
+    otherwise produce at subprocess spawn time.
+    """
+
+    def __init__(self, path: str):
+        super().__init__(
+            f"Task working directory {path} does not exist — the project may "
+            "not have been cloned successfully; check the Project status and "
+            "re-clone it if needed"
+        )
+        self.path = path
+
+
+def require_existing_task_cwd(cwd: str) -> str:
+    """Preflight for launch paths that spawn without the full isolation check.
+
+    Monitor and Sub-Agent turns spawn their processes directly and never pass
+    through ``prepare_task_working_directory``; give them the same typed error
+    instead of a bare OS-level ENOENT.
+    """
+    if not os.path.isdir(cwd):
+        raise TaskWorkingDirectoryMissingError(cwd)
+    return cwd
+
+
 @dataclass(frozen=True)
 class LinkedWorktreeGitReadBoundary:
     """Exact read-only metadata needed by Git in one linked worktree.
@@ -1029,6 +1059,8 @@ def prepare_task_working_directory(
         or _inside_trusted_root(candidate)
     )
     if not overlaps_boundary:
+        if has_explicit_workspace and not candidate.is_dir():
+            raise TaskWorkingDirectoryMissingError(str(candidate))
         return str(candidate)
     if has_explicit_workspace:
         raise TaskAgentIsolationError(

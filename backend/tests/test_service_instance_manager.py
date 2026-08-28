@@ -21569,6 +21569,83 @@ def test_task_runtime_scope_direct_owner_requires_exact_terminal_process(
     cleanup.assert_called_once_with(122)
 
 
+def test_codex_scope_reservation_blocks_stale_lifecycle_cleanup(monkeypatch):
+    """Codex reserve→adopt closes the pre-spawn deletion race.
+
+    A retry can advance the authoritative generation and start a new launch
+    while the previous lifecycle is still in its ``finally``. Between Codex
+    MCP spec materialization and process registration the new generation owns
+    the scope only through the pending reservation — the old lifecycle's
+    terminal cleanup must therefore skip, both before and after the exact
+    per-turn process object (app-server ``CodexTurnProcess`` adapter or exec
+    ``Process``) adopts it.
+    """
+    im = InstanceManager(MagicMock(), MagicMock())
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    # New generation reserved; specs materialized; process not spawned yet.
+    im._reserve_task_runtime_scope(301)
+
+    # Old lifecycle finally fires in exactly this window.
+    assert im.cleanup_task_runtime_scope_after_turn(301) is False
+    cleanup.assert_not_called()
+
+    # Registration hands the reservation to the exact new turn object.
+    adapter = _make_mock_process(pid=52_301, returncode=None)
+    im._adopt_task_runtime_scope_direct(301, 11, adapter)
+    assert 301 not in im._task_runtime_scope_pending
+    assert im.cleanup_task_runtime_scope_after_turn(301) is False
+    cleanup.assert_not_called()
+
+    # Only the exact adopted generation's terminal release cleans the scope.
+    adapter.returncode = 0
+    im._release_task_runtime_scope_direct_owner(11, adapter)
+    cleanup.assert_called_once_with(301)
+
+
+@pytest.mark.asyncio
+async def test_codex_launch_failure_after_reserve_discards_reservation(
+    monkeypatch,
+):
+    """A failure between reserve and process registration must not leak.
+
+    Every launch enters through ``_launch_impl``; its ``BaseException``
+    handler discards a still-pending reservation (provider-agnostic), so a
+    Codex spec/config error before spawn leaves the scope reservable by the
+    next turn instead of permanently blocking cleanup.
+    """
+    im = InstanceManager(MagicMock(), MagicMock())
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    async def reserve_then_fail(**kwargs):
+        im._reserve_task_runtime_scope(kwargs["task_id"])
+        raise RuntimeError("codex spec construction failed before spawn")
+
+    monkeypatch.setattr(im, "_launch_locked", reserve_then_fail)
+
+    with pytest.raises(RuntimeError, match="before spawn"):
+        await im._launch_impl(
+            9,
+            "prompt",
+            task_id=302,
+            provider="codex",
+        )
+
+    assert 302 not in im._task_runtime_scope_pending
+    cleanup.assert_called_once_with(302)
+    # The next generation can immediately reserve the scope again.
+    im._reserve_task_runtime_scope(302)
+    assert 302 in im._task_runtime_scope_pending
+
+
 @pytest.mark.asyncio
 async def test_replaced_consumer_releases_exact_terminal_direct_scope(
     monkeypatch,

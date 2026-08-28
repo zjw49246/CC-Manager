@@ -79,9 +79,14 @@ export function PlanCreateForm({ onCreated, onNavigateSettings }: Props) {
     setProjectId(value ? Number(value) : '');
   };
 
+  const selectedProject = projectId
+    ? projects.find((project) => project.id === projectId)
+    : undefined;
+
   const canSubmit = Boolean(
     request.trim()
     && (projectId || (isNewProject && newProjectName.trim()))
+    && selectedProject?.status !== 'error'
     && !uploads.isUploading
     && !uploads.hasFailed
     && !busy,
@@ -160,6 +165,11 @@ export function PlanCreateForm({ onCreated, onNavigateSettings }: Props) {
       <ProjectSelect projects={projects.filter((project) => project.show_in_selector)} value={isNewProject ? NEW_PROJECT_VALUE : projectId || undefined} onChange={handleProjectChange} placeholder="Select project…" extraOptions={isAdmin ? [{ value: NEW_PROJECT_VALUE, label: '+ New project' }] : []} showStatus tagColorMap={tagColorMap} />
       <div className="flex justify-end gap-2"><input ref={fileInputRef} type="file" multiple className="hidden" onChange={(event) => { addFiles(Array.from(event.target.files || []), setDropError); event.target.value = ''; }} /><button type="button" onClick={() => fileInputRef.current?.click()} className="rounded-lg border border-gray-600 p-2 text-gray-400 hover:text-gray-200" aria-label="Attach Plan files"><Paperclip size={14} /></button><button type="submit" disabled={!canSubmit} className="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-40">{busy ? 'Creating…' : 'Create Plan'}</button></div>
     </div>
+    {selectedProject && selectedProject.status && selectedProject.status !== 'ready' && (
+      selectedProject.status === 'error'
+        ? <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs leading-5 text-red-300"><AlertCircle size={14} className="mt-0.5 shrink-0" /><div>项目克隆失败，请先在 Projects 页 Re-clone 项目。{selectedProject.error_message && <div className="mt-0.5 text-red-400">{selectedProject.error_message}</div>}</div></div>
+        : <div className="flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-300"><AlertCircle size={14} className="mt-0.5 shrink-0" /><span>项目仍在克隆/初始化，任务将等待项目就绪后自动开始。</span></div>
+    )}
     {isNewProject && <div className="grid gap-2 sm:grid-cols-2"><input value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} required placeholder="Project name" className="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100" /><input value={newProjectUrl} onChange={(event) => setNewProjectUrl(event.target.value)} placeholder="Git URL (optional)" className="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100" /></div>}
     <details className="text-xs text-gray-500">
       <summary className="cursor-pointer hover:text-gray-300">Advanced</summary>

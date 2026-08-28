@@ -612,11 +612,26 @@ class TestCloneWithCredentials:
         clone_env = captured_envs[0]
         assert "GIT_SSH_COMMAND" in clone_env
         assert "/keys/my_ssh_key" in clone_env["GIT_SSH_COMMAND"]
+        # A configured SSH command is augmented (never replaced) with batch
+        # mode so background clones can never prompt via /dev/tty.
+        assert "IdentitiesOnly=yes" in clone_env["GIT_SSH_COMMAND"]
+        assert "-o BatchMode=yes" in clone_env["GIT_SSH_COMMAND"]
 
     @pytest.mark.asyncio
-    async def test_clone_no_config_no_env(self):
-        """_clone_repo without git_config → no custom env."""
+    async def test_clone_no_config_no_env(self, monkeypatch):
+        """_clone_repo without git_config → no credentials, but noninteractive.
+
+        Background clones have no TTY and SSH can prompt via /dev/tty
+        regardless of stdin. Even with zero git configuration the clone env
+        must therefore carry GIT_TERMINAL_PROMPT=0, a batch-mode SSH command,
+        and stdin=DEVNULL so it fails fast instead of hanging or dying with
+        the cryptic "could not read Username ... No such device or address".
+        """
         from backend.api.projects import _clone_repo
+
+        # The host shell may define its own SSH command; this case is about
+        # the zero-configuration default.
+        monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
 
         captured_kwargs = []
 
@@ -642,11 +657,15 @@ class TestCloneWithCredentials:
             await _clone_repo(
                 project_id=1,
                 git_url="https://github.com/test/repo.git",
-                local_path="/tmp/test-clone-no-config",
                 project_name="test",
+                local_path="/tmp/test-clone-no-config",
                 default_branch="main",
                 git_config=None,
             )
 
-        # First subprocess call (clone) should have env=None
-        assert captured_kwargs[0].get("env") is None
+        clone_env = captured_kwargs[0].get("env")
+        assert clone_env is not None
+        assert clone_env["GIT_TERMINAL_PROMPT"] == "0"
+        assert "GIT_ASKPASS" not in clone_env
+        assert clone_env["GIT_SSH_COMMAND"] == "ssh -o BatchMode=yes"
+        assert captured_kwargs[0].get("stdin") is not None

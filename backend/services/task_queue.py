@@ -169,6 +169,42 @@ def _dispatcher_scope_predicate():
     )
 
 
+def project_ready_dispatch_predicate():
+    """Hold Tasks whose local Project checkout is not ready yet.
+
+    Background clones are asynchronous, so a Task may legitimately be created
+    while its Project is still ``pending``/``cloning``/``initializing`` — or
+    after the clone failed (``error``) and ``local_path`` points at a missing
+    directory. Launching such a Task burns its retry budget on a bare
+    ``[Errno 2]`` spawn failure. Keep it queued instead: the Project flipping
+    to ``ready`` (clone completion or re-clone) makes it dispatchable again
+    without touching ``Task.status``.
+
+    Written as "no non-ready Project row exists" so Tasks without a Project
+    (manual ``target_repo``) and Tasks whose Project row was deleted keep the
+    existing dispatch behavior. A NULL status (legacy/malformed rows predating
+    the NOT NULL model) must fail closed: ``NULL != 'ready'`` is UNKNOWN in
+    SQL and would otherwise slip through the EXISTS as if the Project were
+    ready.
+    """
+
+    from backend.models.project import Project
+
+    unready_project = (
+        select(Project.id)
+        .where(
+            Project.id == Task.project_id,
+            or_(
+                Project.status.is_(None),
+                Project.status != "ready",
+            ),
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return or_(Task.project_id.is_(None), ~unready_project)
+
+
 def _task_kind_predicate(task_kind: str):
     if task_kind == TASK_KIND_STANDALONE_PLAN:
         return and_(Task.mode == "plan", Task.plan_target_task_id.is_(None))
@@ -2298,6 +2334,7 @@ class TaskQueue:
         while True:
             dispatcher_scope = _dispatcher_scope_predicate()
             pr_review_scope = pr_review_dispatch_predicate()
+            project_ready_scope = project_ready_dispatch_predicate()
             stmt = (
                 select(Task.id)
                 # worker task 不走本地 instance；shadow task (shared_from_id) 不执行
@@ -2309,6 +2346,7 @@ class TaskQueue:
                     no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
                     pr_review_scope,
+                    project_ready_scope,
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(1)
@@ -2456,6 +2494,7 @@ class TaskQueue:
                     no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
                     pr_review_scope,
+                    project_ready_scope,
                 )
                 .values(**values)
             )

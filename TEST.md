@@ -1528,3 +1528,46 @@ manager(8003) 注册 worker → 建 git_url 项目 → 创建 task 选 worker �
 转发同 ID、状态回流、43 条日志镜像、README 真实修改 + merge push、
 chat 代理 + session_id 同步、回复经 relay 回流。测试仓库
 github.com/youchengsong/ccm-worker-e2e-test（可删）。
+
+## Project 就绪门禁与 clone 失败收口（2026-08-26）
+
+### 自动化测试（backend/tests/test_project_readiness.py）
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_require_project_dispatchable_rejects_error_only` | 只有 `status='error'` 拒绝；pending/cloning/initializing/ready 及无 Project 放行 |
+| `test_dequeue_holds_task_while_project_is_cloning` | cloning 项目的 pending Task 不被领取；项目 ready 后立即可领取 |
+| `test_dequeue_holds_task_of_error_project_until_reclone` | clone 失败项目的 Task 保持 pending（不烧 retry 预算）；reclone 回 ready 后自动恢复 |
+| `test_dequeue_unaffected_without_project_or_with_dangling_project` | `project_id` 为 NULL 或悬空（项目已删）时调度行为不回归 |
+| `test_create_task_rejects_error_project` | POST /api/tasks 引用 error 项目 → 422，不残留 Task 行 |
+| `test_create_task_allows_cloning_project` | cloning 项目仍可创建 Task（pending 等待就绪） |
+| `test_update_task_rejects_move_to_error_project` | PUT 把 Task 移入 error 项目 → 422 |
+| `test_todo_run_rejects_error_project` | Todo「▶ Run」对 error 项目 → 422 |
+| `test_prepare_task_working_directory_rejects_missing_explicit_path` | 显式工作目录不存在 → `TaskWorkingDirectoryMissingError`（人话+路径），存在则通过 |
+| `test_require_existing_task_cwd` | Monitor/Sub-Agent 直 spawn 路径 preflight 的存在性检查 |
+| `test_describe_clone_failure_prefixes_auth_errors` | 认证类 clone stderr 归一化为可操作文案且保留原始错误尾部 |
+| `test_clone_note_sync_annotates_and_clears` | clone 失败批量注记等待 Task 的 error_message；成功清除 |
+| `test_clone_note_clear_keeps_foreign_error_messages` | 清除只匹配自己的注记前缀，不误删任务真实错误 |
+| `test_clone_note_annotation_preserves_foreign_error_messages` | 写入侧对称守卫：注记只写 error_message 为空或本 helper 前缀的任务，独立诊断不被 clone 注记覆盖；成功清除后独立诊断仍在（评审 finding 修复） |
+| `test_update_task_keeps_unchanged_error_project_editable` | 全量表单 PUT 带未变更的 project_id（项目已 error）仍可编辑其他字段（评审 finding 修复） |
+| `test_post_clone_setup_failure_cannot_reverse_ready` | ready 是最终发布：post-clone 自动配置失败不得翻回 error，任务保持可调度，wake 在隔离后置步骤之后（评审 finding 修复） |
+| `test_dequeue_holds_task_with_null_project_status` | NULL status（legacy 行）按 fail-closed 处理：SQL 三值逻辑下 `NULL != 'ready'` 为 UNKNOWN，谓词显式 `status IS NULL OR status != 'ready'`；测试用放宽 nullable 的 schema 副本 + Core UPDATE 构造真实 NULL（ORM 对 None 会应用列默认值）（评审 finding 修复） |
+
+test_git_credentials.py 同步更新/覆盖：
+- `test_clone_no_config_no_env` — 零配置 clone 也必须带 `GIT_TERMINAL_PROMPT=0`、默认 `ssh -o BatchMode=yes` 与 `stdin=DEVNULL`（评审 finding 修复）
+- `test_clone_passes_git_env_with_ssh` — 已配置的 SSH 命令被增补 BatchMode 而不是替换
+
+test_service_instance_manager.py 新增（Codex scope 竞态回归，评审 finding 覆盖）：
+- `test_codex_scope_reservation_blocks_stale_lifecycle_cleanup` — 新代次已 reserve（物化后、spawn 前窗口）时旧 lifecycle 的终态清理必须跳过；adopt 交接后仍跳过；只有 exact 代次终态释放才清理
+- `test_codex_launch_failure_after_reserve_discards_reservation` — reserve 之后、进程注册之前的任何异常经 `_launch_impl` 的 BaseException 分支释放 reservation，下一代次可立即重新 reserve（无泄漏）
+
+注：标 `requires_posix_backend` 的用例依赖 `backend.api` 导入链（`deployment_start_guard` 的 POSIX `fcntl`），Windows 开发机自动跳过，Linux 上全量执行。
+
+### 手动验证清单
+
+1. 创建 HTTPS 无凭据的私有仓库项目 → 项目数秒内变 error（不再挂起等待凭据输入），error_message 以「git authentication failed」开头并给出补凭据指引；
+2. 对 error 项目新建任务 → API 422；前端 TaskForm/PlanCreateForm 选中该项目时显示红色警示（含失败原因）并禁用提交；
+3. 项目 cloning 期间创建任务 → 任务保持 pending，clone 完成后 ≤2s 自动开始（dispatcher.wake + 2s poll 兜底）；
+4. Re-clone 修复 error 项目 → 之前等待的 pending 任务自动开始，error_message 注记自动清除；
+5. chat 续聊一个 `last_cwd` 已被删除的任务 → 聊天出现红色 system_event「任务工作目录 … 不存在，本条消息未执行」，Task 回滚到发送前状态，消息不无限重试；
+6. Worker 项目 clone 失败 → Manager 侧秒级报「worker 项目 … clone 失败: <原因>」，不再等满 300s 超时。

@@ -69,6 +69,10 @@ from backend.services.pr_review_runtime import (
     is_pr_review_task,
     is_pr_sandbox_task,
 )
+from backend.services.project_readiness import (
+    ProjectNotDispatchableError,
+    require_project_dispatchable,
+)
 from backend.services.process_identity import (
     persisted_process_liveness,
 )
@@ -209,6 +213,16 @@ from backend.api.deps import (
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
 _MANUAL_RETRYABLE_STATUSES = frozenset({"failed", "cancelled", "conflict", "completed"})
+
+
+def _require_dispatchable_project(project) -> None:
+    """HTTP adapter for the Project readiness gate (error projects → 422)."""
+    try:
+        require_project_dispatchable(project)
+    except ProjectNotDispatchableError as exc:
+        raise HTTPException(422, exc.detail) from exc
+
+
 _TASK_CONTROL_EFFECT_GATE_FIELD = "task_control_effect"
 _TASK_CONTROL_EFFECT_GATE_VERSION_FIELD = "task_control_effect_version"
 _TASK_CONTROL_EFFECT_GATE_STATE_FIELD = "task_control_effect_state"
@@ -1955,6 +1969,7 @@ async def create_task(
         if project is None:
             raise HTTPException(404, "Project not found")
         await require_project_access(request, project.id, db)
+        _require_dispatchable_project(project)
         if body.worker_id is not None and body.worker_id != project.worker_id:
             raise HTTPException(
                 400,
@@ -2312,6 +2327,7 @@ async def create_task(
                 project_id,
                 db,
             )
+            _require_dispatchable_project(project)
             if body.worker_id is not None and body.worker_id != project.worker_id:
                 raise HTTPException(
                     400,
@@ -4780,6 +4796,12 @@ async def _update_task_impl(
         if "project_id" in updates:
             # Project.local_path is the sole workspace authority.  Never carry
             # a caller-supplied or stale host path across a Project move.
+            if updates["project_id"] != task.project_id:
+                # Only a *new* association with a clone-failed Project is
+                # refused. Full-form edits resubmitting the unchanged
+                # project_id stay allowed — those tasks deliberately wait for
+                # a re-clone and the dispatch gate already prevents execution.
+                _require_dispatchable_project(target_project)
             updates["target_repo"] = target_project.local_path
         if (
             "project_id" in updates
