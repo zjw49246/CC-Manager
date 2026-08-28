@@ -487,7 +487,7 @@ describe('ChatView', () => {
     const textbox = screen.getByPlaceholderText(/follow-up message/i);
     await userEvent.type(textbox, `follow up via ${method}`);
     const sendButton = screen.getByTitle('Send (Ctrl+Enter)');
-    expect(sendButton).toHaveTextContent('发送');
+    expect(sendButton.textContent).toBe('');
 
     if (method === 'click') {
       await userEvent.click(sendButton);
@@ -532,7 +532,7 @@ describe('ChatView', () => {
     const textbox = screen.getByPlaceholderText(/next message to queue/i);
     await userEvent.type(textbox, `queue via ${method}`);
     const queueButton = screen.getByTitle('Add to queue (Ctrl+Enter)');
-    expect(queueButton).toHaveTextContent('排队');
+    expect(queueButton.textContent).toBe('');
 
     if (method === 'click') {
       await userEvent.click(queueButton);

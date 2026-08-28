@@ -4704,7 +4704,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               disabled={composerSubmitDisabled}
               title={composerSubmitTitle}
               aria-label={composerSubmitTitle}
-              className={`inline-flex min-h-10 shrink-0 touch-manipulation items-center justify-center gap-1.5 px-3 py-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
+              className={`inline-flex h-10 w-10 shrink-0 touch-manipulation items-center justify-center p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 injectMode && canInjectNow ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
                 : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
@@ -4712,15 +4712,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               }`}
             >
               {injectMode && canInjectNow ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : foregroundActive ? <ListPlus size={18} /> : <Send size={18} />}
-              <span className="text-xs font-medium">
-                {injectMode && canInjectNow
-                  ? '注入'
-                  : frontendReviewComposerMode
-                    ? '循环审查'
-                    : workspaceReviewComposerMode
-                      ? '单次审查'
-                      : foregroundActive ? '排队' : '发送'}
-              </span>
             </button>
           </form>
           </div>
