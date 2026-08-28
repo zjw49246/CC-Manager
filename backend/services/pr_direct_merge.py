@@ -107,6 +107,36 @@ async def _has_blocking_findings(db, run_id: int) -> bool:
     return blocker is not None
 
 
+def _direct_merge_has_exact_merged_intent(
+    *,
+    run: PRMonitorRun,
+    review: PRReview,
+    action: PRMergeQueueAction,
+) -> bool:
+    """Return whether a durable merged intent resolves this exact outbox.
+
+    A merged GitHub lifecycle is immutable, so an exact-head terminal intent
+    can safely finish a direct action without replaying its remote write.  Keep
+    every identity edge in this predicate: partial intents and actions for an
+    older Review must continue to fail closed.
+    """
+
+    return bool(
+        action.effect_kind == "direct"
+        and action.monitor_run_id == run.id
+        and action.review_id == review.id
+        and run.current_review_id == review.id
+        and run.current_base_sha == action.trigger_base_sha
+        and run.current_head_sha == action.trigger_head_sha
+        and review.base_sha == action.trigger_base_sha
+        and review.head_sha == action.trigger_head_sha
+        and run.terminal_intent_status == "merged"
+        and run.terminal_intent_base_ref == review.base_ref
+        and run.terminal_intent_head_sha == action.trigger_head_sha
+        and isinstance(run.terminal_intent_observed_at, datetime)
+    )
+
+
 async def _action_is_current(
     db_factory,
     *,
@@ -300,6 +330,16 @@ async def reconcile_direct_merge_action(db_factory, action_id: int) -> bool:
 
     async with db_factory() as db:
         repo, run, review, action = await _lock_action_rows(db, action_id)
+        exact_merged_intent = bool(
+            run is not None
+            and review is not None
+            and action is not None
+            and _direct_merge_has_exact_merged_intent(
+                run=run,
+                review=review,
+                action=action,
+            )
+        )
         if (
             repo is None
             or run is None
@@ -318,7 +358,10 @@ async def reconcile_direct_merge_action(db_factory, action_id: int) -> bool:
             or review.head_sha != action.trigger_head_sha
             or run.status != "merge_pending"
             or run.completed_at is not None
-            or pr_monitor_run_has_terminal_intent(run)
+            or (
+                pr_monitor_run_has_terminal_intent(run)
+                and not exact_merged_intent
+            )
             or review.status not in {"approved", "commented"}
             or review.action_taken != "lgtm_comment"
             or review.publication_state != "published"
@@ -378,6 +421,17 @@ async def reconcile_direct_merge_action(db_factory, action_id: int) -> bool:
     assert isinstance(actor, str)
     assert isinstance(publishing_started_at, datetime)
     assert isinstance(merge_method, str)
+
+    if exact_merged_intent:
+        # The terminal intent already identifies the immutable merged head.
+        # Claiming the expired/unowned action above prevents racing a live
+        # publisher; settle it locally and never replay a GitHub mutation.
+        return await _settle_remote_terminal(
+            db_factory,
+            action_id=action_id,
+            lease_token=lease_token,
+            remote_state="merged",
+        )
 
     async def ensure_current() -> bool:
         return await _action_is_current(

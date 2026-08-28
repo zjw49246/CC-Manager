@@ -177,3 +177,99 @@ async def test_direct_merge_unknown_remote_error_stays_recoverable(
         "direct_merge_reconcile_pending:"
     )
     assert refreshed_run.status == "merge_pending"
+
+
+@pytest.mark.asyncio
+async def test_exact_merged_terminal_intent_recovers_uncertain_direct_action(
+    db_session, db_factory,
+):
+    _repo, run, _review, action = await _seed_direct_action(db_session)
+
+    with (
+        patch(
+            "backend.services.pr_direct_merge._remote_state",
+            new=AsyncMock(side_effect=["open_exact", "unknown"]),
+        ),
+        patch(
+            "backend.services.pr_review_service._publish_direct_merge",
+            new=AsyncMock(side_effect=GhError("temporary GitHub timeout")),
+        ),
+    ):
+        assert not await reconcile_direct_merge_action(db_factory, action.id)
+
+    run.terminal_intent_status = "merged"
+    run.terminal_intent_base_ref = "main"
+    run.terminal_intent_head_sha = HEAD_SHA
+    run.terminal_intent_delivery_id = "merged-after-direct-timeout"
+    run.terminal_intent_observed_at = datetime.utcnow()
+    await db_session.commit()
+
+    remote_state = AsyncMock()
+    publish = AsyncMock()
+    with (
+        patch(
+            "backend.services.pr_direct_merge._remote_state",
+            new=remote_state,
+        ),
+        patch(
+            "backend.services.pr_review_service._publish_direct_merge",
+            new=publish,
+        ),
+    ):
+        assert await reconcile_direct_merge_action(db_factory, action.id)
+
+    remote_state.assert_not_awaited()
+    publish.assert_not_awaited()
+    refreshed_action = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed_action is not None
+    assert refreshed_run is not None
+    assert refreshed_action.status == "merged"
+    assert refreshed_action.last_error is None
+    assert refreshed_action.completed_at is not None
+    assert refreshed_action.lease_token is None
+    assert refreshed_run.status == "merge_pending"
+    assert refreshed_run.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_mismatched_terminal_intent_does_not_release_direct_action(
+    db_session, db_factory,
+):
+    _repo, run, _review, action = await _seed_direct_action(db_session)
+    action.status = "enqueuing"
+    action.attempt_count = 1
+    action.last_error = "direct_merge_reconcile_pending:GhError:timeout"
+    run.terminal_intent_status = "merged"
+    run.terminal_intent_base_ref = "main"
+    run.terminal_intent_head_sha = "c" * 40
+    run.terminal_intent_delivery_id = "different-head-merged"
+    run.terminal_intent_observed_at = datetime.utcnow()
+    await db_session.commit()
+
+    remote_state = AsyncMock()
+    publish = AsyncMock()
+    with (
+        patch(
+            "backend.services.pr_direct_merge._remote_state",
+            new=remote_state,
+        ),
+        patch(
+            "backend.services.pr_review_service._publish_direct_merge",
+            new=publish,
+        ),
+    ):
+        assert not await reconcile_direct_merge_action(db_factory, action.id)
+
+    remote_state.assert_not_awaited()
+    publish.assert_not_awaited()
+    refreshed_action = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    assert refreshed_action is not None
+    assert refreshed_action.status == "enqueuing"
+    assert refreshed_action.completed_at is None

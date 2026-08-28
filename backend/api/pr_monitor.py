@@ -1133,6 +1133,70 @@ async def _quiesce_monitor_runs(
         .with_for_update()
     )).scalar_one_or_none()
 
+    if terminal_reconciliation and run_ids:
+        # A signed, remote-verified merged intent is immutable. If its exact
+        # direct outbox no longer has a live lease, consume that evidence here
+        # so the terminal webhook can atomically close both projections. Queue
+        # actions, closed intents, mismatched heads, and live publishers remain
+        # behind the active-effect fence below.
+        from backend.services.pr_direct_merge import (
+            _database_now,
+            _direct_merge_has_exact_merged_intent,
+        )
+
+        current_review_ids = [
+            item.current_review_id
+            for item in runs
+            if item.current_review_id is not None
+        ]
+        current_reviews = (
+            list((await db.execute(
+                select(PRReview)
+                .where(PRReview.id.in_(current_review_ids))
+                .with_for_update()
+            )).scalars())
+            if current_review_ids
+            else []
+        )
+        reviews_by_id = {item.id: item for item in current_reviews}
+        runs_by_id = {item.id: item for item in runs}
+        direct_actions = list((await db.execute(
+            select(PRMergeQueueAction)
+            .where(
+                PRMergeQueueAction.monitor_run_id.in_(run_ids),
+                PRMergeQueueAction.effect_kind == "direct",
+                PRMergeQueueAction.status.in_(("pending", "enqueuing")),
+            )
+            .with_for_update()
+        )).scalars())
+        db_now = await _database_now(db)
+        for action in direct_actions:
+            run = runs_by_id.get(action.monitor_run_id)
+            review = reviews_by_id.get(action.review_id)
+            live_lease = bool(
+                action.lease_token is not None
+                and (
+                    action.lease_expires_at is None
+                    or action.lease_expires_at > db_now
+                )
+            )
+            if (
+                run is None
+                or review is None
+                or live_lease
+                or not _direct_merge_has_exact_merged_intent(
+                    run=run,
+                    review=review,
+                    action=action,
+                )
+            ):
+                continue
+            action.status = "merged"
+            action.last_error = None
+            action.completed_at = db_now
+            action.lease_token = None
+            action.lease_expires_at = None
+
     active_fix_action = await _active_finding_action_for_repo(db, repo_id)
     active_adjudication = active_repair = active_merge = active_resolution = None
     if run_ids:

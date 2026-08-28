@@ -1993,6 +1993,138 @@ async def test_closed_webhook_projects_terminal_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "live_lease",
+    (False, True),
+    ids=("unowned", "waits-for-live-publisher"),
+)
+async def test_merged_webhook_settles_uncertain_direct_action_after_lease_quiesces(
+    client,
+    session_factory,
+    monkeypatch,
+    live_lease,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/terminal-direct-merge-race")
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=120,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="merge_pending",
+        code_verdict="pass",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.action_taken = "lgtm_comment"
+        action = PRMergeQueueAction(
+            monitor_run_id=run_id,
+            review_id=review_id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            status="enqueuing",
+            effect_kind="direct",
+            trigger_kind="manual",
+            action_nonce="d" * 48,
+            publishing_actor="ccm-bot",
+            publishing_started_at=datetime.utcnow() - timedelta(minutes=1),
+            merge_method="fast-forward",
+            wait_for_ci=False,
+            required_checks=[],
+            attempt_count=1,
+            lease_token="e" * 48 if live_lease else None,
+            lease_expires_at=(
+                datetime.utcnow() + timedelta(minutes=5)
+                if live_lease
+                else None
+            ),
+            last_error=(
+                "direct_merge_reconcile_pending:GhError:"
+                "GitHub did not confirm the captured head was merged"
+            ),
+        )
+        db.add(action)
+        await db.commit()
+        action_id = action.id
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value={
+            "state": "MERGED",
+            "mergedAt": "2026-08-28T07:26:51Z",
+            "baseRefName": "main",
+            "baseRefOid": HEAD_SHA_1,
+            "headRefOid": HEAD_SHA_1,
+            "isDraft": False,
+            "mergeCommit": {"oid": HEAD_SHA_1},
+        }),
+    )
+    payload = _pr_payload(
+        repo["repo_full_name"],
+        action="closed",
+        number=120,
+        head_sha=HEAD_SHA_1,
+    )
+    payload["pull_request"]["merged"] = True
+
+    response = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        payload,
+        delivery_id="terminal-direct-merge-race-120",
+    )
+
+    if live_lease:
+        assert response.status_code == 503, response.text
+        async with session_factory() as db:
+            run = await db.get(PRMonitorRun, run_id)
+            action = await db.get(PRMergeQueueAction, action_id)
+            assert run is not None
+            assert action is not None
+            assert run.status == "merge_pending"
+            assert run.terminal_intent_status == "merged"
+            assert run.terminal_intent_head_sha == HEAD_SHA_1
+            assert action.status == "enqueuing"
+            assert action.lease_token == "e" * 48
+            action.lease_token = None
+            action.lease_expires_at = None
+            await db.commit()
+        response = await _post_webhook(
+            client,
+            repo["webhook_secret"],
+            payload,
+            delivery_id="terminal-direct-merge-race-120",
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "accepted"
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        action = await db.get(PRMergeQueueAction, action_id)
+        assert run is not None
+        assert action is not None
+        assert run.status == "merged"
+        assert run.completed_at is not None
+        assert run.terminal_intent_status == "merged"
+        assert run.terminal_intent_head_sha == HEAD_SHA_1
+        assert action.status == "merged"
+        assert action.last_error is None
+        assert action.completed_at is not None
+        assert action.lease_token is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_remote_fences_never_hold_request_db_transaction(
     client,
     session_factory,
