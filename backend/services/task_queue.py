@@ -180,6 +180,12 @@ def project_ready_dispatch_predicate():
     to ``ready`` (clone completion or re-clone) makes it dispatchable again
     without touching ``Task.status``.
 
+    Isolated PR Monitor reviewer Tasks are deliberately exempt: they use a
+    fresh remote checkout under ``pr_review_runtime`` and do not consume the
+    Project's local checkout. Their durable owner predicate is included here
+    rather than relying on tags or metadata, so only a currently runnable
+    reviewer can bypass the Project gate.
+
     Written as "no non-ready Project row exists" so Tasks without a Project
     (manual ``target_repo``) and Tasks whose Project row was deleted keep the
     existing dispatch behavior. A NULL status (legacy/malformed rows predating
@@ -202,7 +208,11 @@ def project_ready_dispatch_predicate():
         .correlate(Task)
         .exists()
     )
-    return or_(Task.project_id.is_(None), ~unready_project)
+    return or_(
+        pr_review_dispatch_predicate(require_owner=True),
+        Task.project_id.is_(None),
+        ~unready_project,
+    )
 
 
 def _task_kind_predicate(task_kind: str):
@@ -272,7 +282,7 @@ def _ordinary_task_visibility_predicate():
     return ordinary_task_visibility_predicate()
 
 
-def pr_review_dispatch_predicate():
+def pr_review_dispatch_predicate(*, require_owner: bool = False):
     """Only dispatch a reviewer Task while its durable owner is runnable.
 
     The first panel Task is also stored in ``PRReview.task_id`` for legacy
@@ -329,6 +339,17 @@ def pr_review_dispatch_predicate():
         .correlate(Task)
         .exists()
     )
+    if require_owner:
+        # Readiness exemptions are only valid for a currently runnable PR
+        # owner.  The default predicate intentionally also admits ordinary
+        # Tasks that have no PR ownership rows.
+        return and_(
+            ~tombstoned,
+            or_(
+                runnable_panel_review,
+                and_(~panel_review, runnable_single_review),
+            ),
+        )
     return and_(
         ~tombstoned,
         or_(
