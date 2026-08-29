@@ -780,6 +780,21 @@ async def _browser_page(
                 options,
                 proxy_url=proxy.url if proxy is not None else None,
             )
+            if options.browser_channel != "chrome":
+                # Playwright's headless-shell package does not ship its own
+                # setuid sandbox. On Linux hosts where unprivileged user
+                # namespaces are disabled, point Chromium at the matching
+                # Playwright sandbox helper instead of weakening the browser
+                # with --no-sandbox.
+                sandbox = Path(playwright.chromium.executable_path).with_name(
+                    "chrome_sandbox"
+                )
+                try:
+                    sandbox_stat = sandbox.stat()
+                except OSError:
+                    sandbox_stat = None
+                if sandbox_stat is not None and sandbox_stat.st_mode & 0o4000:
+                    launch_options["env"]["CHROME_DEVEL_SANDBOX"] = str(sandbox)
             browser = await playwright.chromium.launch(**launch_options)
             context = await browser.new_context(
                 viewport={
@@ -876,8 +891,13 @@ def _browser_launch_options(
         # Chromium otherwise bypasses explicit proxies for loopback
         # destinations, which would reopen localhost/intranet access.
         launch_options["args"].append("--proxy-bypass-list=<-loopback>")
-    if options.browser_channel:
-        launch_options["channel"] = options.browser_channel
+    # ``chromium`` is the product-level name for Playwright's bundled
+    # browser, not a Playwright channel. Passing channel="chromium" makes
+    # recent Playwright versions look for the optional headless-shell
+    # download, which is absent on otherwise valid installations. System
+    # Chrome remains opt-in and is the only channel we pass through.
+    if options.browser_channel == "chrome":
+        launch_options["channel"] = "chrome"
     return launch_options
 
 

@@ -340,6 +340,20 @@ def test_external_browser_launch_forces_validating_proxy_without_loopback_bypass
     assert any("disable_non_proxied_udp" in value for value in launch["args"])
 
 
+def test_bundled_chromium_is_not_treated_as_a_playwright_channel():
+    bundled = browser_review._browser_launch_options(
+        BrowserReviewOptions(url="https://example.com", browser_channel="chromium"),
+        proxy_url=None,
+    )
+    system = browser_review._browser_launch_options(
+        BrowserReviewOptions(url="https://example.com", browser_channel="chrome"),
+        proxy_url=None,
+    )
+
+    assert "channel" not in bundled
+    assert system["channel"] == "chrome"
+
+
 def test_managed_preview_blocks_every_cross_origin_subresource():
     options = BrowserReviewOptions(
         url="http://127.0.0.1:5173",
