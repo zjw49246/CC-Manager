@@ -1766,6 +1766,17 @@ class UpdateService:
             return None
         return tuple(int(part) for part in match.groups())
 
+    @staticmethod
+    def _friendly_tag_fetch_error(stderr: str) -> str:
+        """Turn the common local/remote tag collision into an actionable message."""
+        detail = (stderr or "").strip()
+        if "would clobber existing tag" in detail:
+            return (
+                "Stable 版本检查失败：本地存在与远端同名但指向不同提交的版本标签。"
+                "请先同步或清理冲突标签，再重新切换 Stable 版本。"
+            )
+        return f"拉取 Stable 版本信息失败：{detail or '未知 Git 错误'}"
+
     async def _check_stable_updates(self) -> dict[str, Any]:
         fetch = await self._run_cmd(["git", "fetch", "--tags"], timeout=60)
         head = await self._disk_commit()
@@ -1775,7 +1786,7 @@ class UpdateService:
                 "channel": "stable",
                 "current_commit": head,
                 "running_commit": self._running_commit,
-                "error": fetch["stderr"],
+                "error": self._friendly_tag_fetch_error(fetch["stderr"]),
             }
         tags_result = await self._run_cmd(["git", "tag", "--list", "v*"])
         candidates = []

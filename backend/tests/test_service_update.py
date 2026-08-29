@@ -117,6 +117,22 @@ def test_stable_tag_parser_accepts_only_semver_releases(tag, expected):
     assert UpdateService._stable_tag_key(tag) == expected
 
 
+def test_stable_tag_fetch_collision_has_actionable_message():
+    message = UpdateService._friendly_tag_fetch_error(
+        "! [rejected] v1.0.0 -> v1.0.0 (would clobber existing tag)"
+    )
+
+    assert "Stable 版本检查失败" in message
+    assert "同名但指向不同提交" in message
+    assert "重新切换 Stable" in message
+
+
+def test_stable_tag_fetch_error_keeps_non_collision_context():
+    message = UpdateService._friendly_tag_fetch_error("fatal: could not resolve host")
+
+    assert message == "拉取 Stable 版本信息失败：fatal: could not resolve host"
+
+
 @pytest.mark.asyncio
 async def test_stable_check_treats_main_ahead_as_explicit_channel_switch(
     tmp_path,
