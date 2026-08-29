@@ -230,6 +230,10 @@ Planner 返回 `request_input` 后：
 7. 新 Planner Step 使用原请求、冻结上下文、全部既有问答、base Version 和当前 candidate
    继续规划。
 
+选择题的模型选项不是强制穷举集合。若所有选项都不适用，用户可以保持未选择并在补充说明中
+给出替代答案；服务端只在补充说明非空时接受 required choice 的空结构化值，恢复后的
+Planner/Reviewer 必须把 `null choice + additional response` 作为一个明确答案处理。
+
 如果提问发生在第一版方案之前，不创建空 Version。
 
 ### 3.4 Reviewer 请求输入
@@ -245,6 +249,9 @@ Reviewer 的 `revise` 反馈仍在同一个 Run 内返回 Planner；Planner 下�
 candidate，不增加 Version number。达到 `max_revision_cycles` 后，最新 candidate 以一个
 `review_exhausted` Version 发布并交给用户，不自动失败。
 
+每个 Reviewer Step 都是独立调用；下一轮 Reviewer 必须同时收到上一轮 Reviewer feedback，
+逐项验证闭环后再执行完整审查，不能假定新 Reviewer 记得上一轮输出。
+
 ### 3.6 用户请求 Revise
 
 用户从当前或历史 Version 发起 Revise 时：
@@ -254,7 +261,11 @@ candidate，不增加 Version number。达到 `max_revision_cycles` 后，最新
 - 创建 `user_revision` Run，而不是 Plan/Task；
 - 新 Run 默认重新快照主 Task 当前对话和 repo；
 - 旧 Version、Reviewer 记录、审批和 application 历史不变；
-- 新 Run 的第一条 Planner prompt 包含 base Version 和用户 feedback。
+- 新 Run 的 Planner 与 Reviewer prompt 都明确包含 Plan 初始请求、Run 类型、增量 revision
+  语义、base Version、base 审查状态和用户 feedback；未被用户撤销的原始要求与 base 中合理
+  决策继续属于 scope。Reviewer 必须比较 base 与 candidate，检查未授权删除、回退和扩 scope；
+- Plan 初始附件与当前 Run 附件都进入有来源标记的引用清单，Manager 本地与 Worker 路径语义
+  一致。
 
 如果当前 Version 已变化，返回 409，让用户确认基于新版本重写反馈，不能静默从旧 base 分叉。
 显式 Fork 操作除外：Fork 创建新 Plan，并记录 `forked_from_version_id`。
@@ -410,11 +421,17 @@ Reviewer verdict：
 每次恢复使用有界、结构化上下文：
 
 1. Plan 初始请求及附件清单；
-2. Run 类型、用户 revision feedback、base Version；
+2. Run 类型及其语义、用户 revision feedback；
 3. 冻结的主 Task transcript；
-4. base Version、当前 candidate 和 Reviewer feedback；
-5. 按时间排序的全部 InputRequest/answers；
+4. base Version 及其审查状态、当前 candidate 和 Reviewer feedback；
+5. 按时间排序的本 Run 全部 InputRequest/answers；跨 Run 的最终用户决定必须已经收敛进
+   自包含的 base Version，旧模型 Step/原始问答不作为新 Run 的隐式会话历史；
 6. 当前 repo 指纹及与 Run 开始时的变化提示。
+
+Reviewer 使用相同的原始 scope、Run 语义、base Version 与审查审计，并额外收到 exact
+candidate 和同一 Run 的上一轮 Reviewer feedback。`user_revision` 的 request 是增量，不是对
+原始 scope 的替换；Reviewer 不得仅因某项未在本轮 revision 中重复就判定原始/base 要求为
+out of scope。
 
 Plan 答案不写回主 Task LogEntry；它只属于 Plan。等待期间主 Session 的新消息不会静默进入
 当前 Run。用户需要纳入最新对话时显式选择 `Refresh contexts and regenerate Plan`，创建新 Run。

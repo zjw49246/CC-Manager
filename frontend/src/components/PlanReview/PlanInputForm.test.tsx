@@ -110,6 +110,42 @@ describe('PlanInputForm', () => {
     expect(option).not.toHaveClass('text-indigo-100');
   });
 
+  it('submits free-form context when no required single-choice option fits', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Blue-green', value: 'blue_green' },
+        { label: 'Rolling', value: 'rolling' },
+      ],
+    };
+    const onAnswered = vi.fn();
+    render(<PlanInputForm run={run} request={request} onAnswered={onAnswered} />);
+
+    expect(screen.getByRole('button', { name: 'Submit answers' })).toBeDisabled();
+    await userEvent.click(screen.getByText('Blue-green'));
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    expect(screen.getByLabelText('Blue-green')).not.toBeChecked();
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use a canary rollout with a manual gate instead.',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
+
+    await waitFor(() => expect(api.answerPlanInput).toHaveBeenCalledWith(
+      71,
+      81,
+      expect.objectContaining({
+        answers: [{ question_id: 'question_0', value: null }],
+        response_text: 'Use a canary rollout with a manual gate instead.',
+      }),
+    ));
+    expect(onAnswered).toHaveBeenCalledTimes(1);
+  });
+
   it('clears answers when the InputRequest identity changes', async () => {
     const { rerender } = render(
       <PlanInputForm

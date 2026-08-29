@@ -19,6 +19,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const additionalRef = useRef<HTMLTextAreaElement>(null);
   const uploads = useFileUpload();
   const clearUploads = uploads.clear;
   const answerIdempotencyKey = useMemo(
@@ -38,9 +39,10 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
     () => request.questions.some((question) => {
       if (!question.required) return false;
       const value = answers[question.id];
-      return value == null || value === '' || (Array.isArray(value) && value.length === 0);
+      const missing = value == null || value === '' || (Array.isArray(value) && value.length === 0);
+      return missing && !additional.trim();
     }),
-    [answers, request.questions],
+    [additional, answers, request.questions],
   );
 
   const submit = async () => {
@@ -144,6 +146,22 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
                       </label>
                     );
                   })}
+                  {question.response_type === 'single_choice' && (
+                    <button
+                      type="button"
+                      className="w-full rounded-lg border border-dashed border-gray-700 px-3 py-2 text-left text-xs text-gray-400 transition-colors hover:border-indigo-500/50 hover:bg-indigo-500/5 hover:text-gray-200"
+                      onClick={() => {
+                        setAnswers((current) => {
+                          const next = { ...current };
+                          delete next[question.id];
+                          return next;
+                        });
+                        additionalRef.current?.focus();
+                      }}
+                    >
+                      None of these options fit — answer in additional context
+                    </button>
+                  )}
                 </div>
               )}
             </fieldset>
@@ -152,9 +170,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       </div>
 
       <textarea
+        ref={additionalRef}
         value={additional}
         onChange={(event) => setAdditional(event.target.value)}
-        placeholder="Additional context (optional)"
+        aria-label="Additional context"
+        placeholder="Additional context (may replace an option when none fit)"
         rows={2}
         maxLength={50000}
         className="w-full resize-y rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
@@ -176,6 +196,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
       )}
       {error && <p className="text-xs text-red-400">{error}</p>}
+      {missingRequired && additional.trim() === '' && (
+        <p className="text-xs text-gray-500">
+          Answer each required question, or explain your alternative in Additional context.
+        </p>
+      )}
       <div className="flex items-center justify-between gap-3">
         <div>
           <input

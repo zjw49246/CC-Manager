@@ -763,21 +763,39 @@ def _answer_map(answers: Iterable[PlanInputAnswer | dict]) -> dict[str, object]:
 
 
 def validate_input_answers(
-    questions: list[dict], answers: Iterable[PlanInputAnswer | dict]
+    questions: list[dict],
+    answers: Iterable[PlanInputAnswer | dict],
+    *,
+    response_text: str | None = None,
 ) -> list[dict]:
-    """Validate all questions without imposing a question-count limit."""
+    """Validate all questions without imposing a question-count limit.
+
+    A non-empty free-form response is an intentional escape hatch when none
+    of a required choice question's model-generated options fit. The resumed
+    Planner receives both the null structured answer and this response and can
+    ask a narrower follow-up if the explanation is still insufficient.
+    """
 
     parsed = [PlanQuestion.model_validate(question) for question in questions]
     by_id = {question.id: question for question in parsed}
     values = _answer_map(answers)
+    has_free_form_answer = bool(response_text and response_text.strip())
     unknown = set(values) - set(by_id)
     if unknown:
         raise HTTPException(422, f"Unknown question ids: {sorted(unknown)}")
     normalized: list[dict] = []
     for question in parsed:
         value = values.get(question.id)
-        if question.required and (value is None or value == "" or value == []):
-            raise HTTPException(422, f"Question {question.id!r} requires an answer")
+        if (
+            question.required
+            and (value is None or value == "" or value == [])
+            and not has_free_form_answer
+        ):
+            raise HTTPException(
+                422,
+                f"Question {question.id!r} requires an answer or a non-empty "
+                "additional response",
+            )
         if value is None:
             normalized.append({"question_id": question.id, "value": None})
             continue
@@ -830,7 +848,11 @@ async def answer_input_request(
         raise HTTPException(409, "Plan Run generation changed")
     if run.open_input_request_id != input_request.id or input_request.status != "open":
         raise HTTPException(409, "Input request is no longer open")
-    normalized = validate_input_answers(input_request.questions, answers)
+    normalized = validate_input_answers(
+        input_request.questions,
+        answers,
+        response_text=response_text,
+    )
     from backend.services.plan_input_safety import contains_high_confidence_secret
 
     if contains_high_confidence_secret(

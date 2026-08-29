@@ -1207,6 +1207,110 @@ async def test_canonical_create_and_revision_keep_stable_plan_identity(
 
 
 @pytest.mark.asyncio
+async def test_revision_runner_restores_original_scope_base_and_review_feedback(
+    client, session_factory
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Implement authentication, caching, and audit logs"},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    base_version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+        content="# Base\nAuthentication\nCaching\nAudit logs",
+    )
+    async with session_factory() as db:
+        base = await db.get(PlanVersion, base_version_id)
+        base.review_verdict = "exhausted"
+        base.review_exhausted = True
+        base.review_feedback = "Retain an explicit rollback procedure"
+        await db.commit()
+
+    revised = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "user_revision",
+            "request": "Change only the cache invalidation strategy",
+            "base_version_id": base_version_id,
+            "expected_current_version_id": base_version_id,
+        },
+    )
+    assert revised.status_code == 201, revised.text
+    run_id = revised.json()["id"]
+    outputs = [
+        {
+            "action": "propose",
+            "plan": "# Candidate 1\nAuthentication\nNew caching\nAudit logs",
+        },
+        {
+            "action": "revise",
+            "feedback": "Specify cache rollback behavior",
+        },
+        {
+            "action": "propose",
+            "plan": "# Candidate 2\nAuthentication\nNew caching with rollback\nAudit logs",
+        },
+        {"action": "approve", "feedback": "All findings are resolved"},
+    ]
+    prompts: list[str] = []
+
+    async def fake_stage(**kwargs):
+        prompts.append(kwargs["prompt"])
+        output = outputs.pop(0)
+        async with session_factory() as db:
+            db.add(
+                PlanAgentStep(
+                    run_id=kwargs["run_id"],
+                    plan_id=kwargs["plan_id"],
+                    step_type=kwargs["step_type"],
+                    round=kwargs["round_number"],
+                    generation=kwargs["generation"],
+                    provider="claude",
+                    model="test-model",
+                    route_slot="primary",
+                    status="completed",
+                    output=json.dumps(output),
+                    finished_at=datetime.utcnow(),
+                )
+            )
+            await db.commit()
+        return output, json.dumps(output), object(), "primary", "test-account"
+
+    async def claim_run():
+        async with session_factory() as db:
+            run = await db.get(PlanAgentRun, run_id)
+            assert run.status == "queued"
+            run.status = "running"
+            run.generation += 1
+            run.last_execution_started_at = datetime.utcnow()
+            await db.commit()
+
+    runner = PlanAgentRunner(
+        db_factory=session_factory,
+        instance_manager=AsyncMock(),
+    )
+    runner._run_stage = fake_stage
+
+    for expected in ("queued", "queued", "queued", "completed"):
+        await claim_run()
+        assert await runner.advance_versioned(run_id, cwd="/tmp") == expected
+
+    assert len(prompts) == 4
+    for prompt in prompts:
+        assert "Implement authentication, caching, and audit logs" in prompt
+        assert "user_revision" in prompt
+        assert "incremental revision" in prompt
+        assert "Change only the cache invalidation strategy" in prompt
+    assert "# Base" in prompts[0]
+    assert "Retain an explicit rollback procedure" in prompts[0]
+    assert "# Base" in prompts[1]
+    assert "Specify cache rollback behavior" in prompts[2]
+    assert "Specify cache rollback behavior" in prompts[3]
+
+
+@pytest.mark.asyncio
 async def test_related_plan_creation_rejects_migrating_target(client, session_factory):
     target = await _target(client, session_factory)
     async with session_factory() as db:
@@ -1311,6 +1415,97 @@ async def test_input_request_accepts_many_questions_and_resumes_same_run(
         assert run.generation == 8
         assert run.open_input_request_id is None
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_required_choice_accepts_free_form_alternative(
+    client, session_factory
+):
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Choose a safe rollout", "target_task_id": target.id},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    run_id = created.json()["active_run"]["id"]
+
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        run.status = "waiting_user"
+        run.current_stage = "planner"
+        run.generation = 3
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan_id,
+            step_type="planner",
+            round=1,
+            generation=3,
+            provider="claude",
+            status="completed",
+        )
+        db.add(step)
+        await db.flush()
+        input_request = PlanInputRequest(
+            plan_id=plan_id,
+            run_id=run.id,
+            source_step_id=step.id,
+            requested_by="planner",
+            reason="Select the rollout strategy",
+            questions=[{
+                "id": "rollout",
+                "header": "Rollout",
+                "question": "Which rollout strategy should be used?",
+                "response_type": "single_choice",
+                "options": [
+                    {"value": "blue_green", "label": "Blue-green"},
+                    {"value": "rolling", "label": "Rolling"},
+                ],
+                "required": True,
+            }],
+            status="open",
+            idempotency_key=f"free-form:{run.id}:{step.id}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(input_request)
+        await db.flush()
+        run.open_input_request_id = input_request.id
+        await db.commit()
+        request_id = input_request.id
+
+    missing = await client.post(
+        f"/api/plan-runs/{run_id}/input-requests/{request_id}/answer",
+        json={
+            "expected_run_generation": 3,
+            "idempotency_key": "missing-choice",
+            "answers": [{"question_id": "rollout", "value": None}],
+        },
+    )
+    assert missing.status_code == 422
+    assert "additional response" in missing.text
+
+    answered = await client.post(
+        f"/api/plan-runs/{run_id}/input-requests/{request_id}/answer",
+        json={
+            "expected_run_generation": 3,
+            "idempotency_key": "free-form-choice",
+            "answers": [{"question_id": "rollout", "value": None}],
+            "response_text": (
+                "Neither option fits. Use a canary rollout with a manual gate."
+            ),
+        },
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["answers"] == [
+        {"question_id": "rollout", "value": None}
+    ]
+    assert "canary rollout" in answered.json()["response_text"]
+
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        input_request = await db.get(PlanInputRequest, request_id)
+        assert run.status == "queued"
+        assert input_request.status == "answered"
 
 
 @pytest.mark.asyncio
