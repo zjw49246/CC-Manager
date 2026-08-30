@@ -394,7 +394,19 @@ type MessageGroup =
 function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
   const systemDedup = new Set(['system_init', 'system_event']);
   const result: ChatMessage[] = [];
+  let lastUserTurnAssistant = new Set<string>();
   for (const msg of messages) {
+    if (msg.role === 'user' && msg.event_type === 'user_message') {
+      lastUserTurnAssistant = new Set();
+    }
+    if (
+      msg.role === 'assistant'
+      && (msg.event_type === 'message' || msg.event_type === 'result')
+      && msg.content
+      && lastUserTurnAssistant.has(msg.content)
+    ) {
+      continue;
+    }
     if (systemDedup.has(msg.event_type)) {
       const prev = result[result.length - 1];
       if (
@@ -404,6 +416,9 @@ function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
       ) {
         continue; // skip duplicate
       }
+    }
+    if (msg.role === 'assistant' && (msg.event_type === 'message' || msg.event_type === 'result') && msg.content) {
+      lastUserTurnAssistant.add(msg.content);
     }
     result.push(msg);
   }
