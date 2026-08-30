@@ -403,7 +403,7 @@ function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
       msg.role === 'assistant'
       && (msg.event_type === 'message' || msg.event_type === 'result')
       && msg.content
-      && lastUserTurnAssistant.has(msg.content)
+      && lastUserTurnAssistant.has(msg.content.replace(/\s+/g, ' ').trim())
     ) {
       continue;
     }
@@ -418,7 +418,7 @@ function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
       }
     }
     if (msg.role === 'assistant' && (msg.event_type === 'message' || msg.event_type === 'result') && msg.content) {
-      lastUserTurnAssistant.add(msg.content);
+      lastUserTurnAssistant.add(msg.content.replace(/\s+/g, ' ').trim());
     }
     result.push(msg);
   }
