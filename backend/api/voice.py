@@ -4,6 +4,8 @@ from backend.services.whisper_client import whisper_client
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
 
+_MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024
+
 
 @router.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
@@ -11,10 +13,10 @@ async def transcribe(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(400, "No file uploaded")
 
-    audio_bytes = await file.read()
+    audio_bytes = await file.read(_MAX_AUDIO_SIZE_BYTES + 1)
     if len(audio_bytes) == 0:
         raise HTTPException(400, "Empty audio file")
-    if len(audio_bytes) > 25 * 1024 * 1024:  # 25MB limit
+    if len(audio_bytes) > _MAX_AUDIO_SIZE_BYTES:
         raise HTTPException(400, "File too large (max 25MB)")
 
     try:

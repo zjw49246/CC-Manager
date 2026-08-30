@@ -24,11 +24,23 @@ from typing import Any
 class PendingAsk:
     request_id: str
     task_id: int
+    task_incarnation_id: str
+    task_retry_count: int
+    task_turn_generation: int
+    task_status: str
     session_id: str
     questions: list[dict]
     future: asyncio.Future
     tool_use_id: str | None = None
+    answer_claim_id: str | None = None
     created_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass(frozen=True)
+class AskUserRevocation:
+    """A registry-side turn revocation, distinct from ASGI cancellation."""
+
+    reason: str
 
 
 class AskUserRegistry:
@@ -40,6 +52,10 @@ class AskUserRegistry:
     def create(
         self,
         task_id: int,
+        task_incarnation_id: str,
+        task_retry_count: int,
+        task_turn_generation: int,
+        task_status: str,
         session_id: str,
         questions: list[dict],
         tool_use_id: str | None = None,
@@ -49,6 +65,10 @@ class AskUserRegistry:
         pending = PendingAsk(
             request_id=request_id,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
             session_id=session_id,
             questions=questions,
             future=future,
@@ -63,24 +83,160 @@ class AskUserRegistry:
     def resolve(self, request_id: str, answers: Any) -> bool:
         """前端回包：把答案塞进 future。未知/已完成返回 False。"""
         pending = self._pending.get(request_id)
-        if pending is None or pending.future.done():
+        if (
+            pending is None
+            or pending.future.done()
+            or pending.answer_claim_id is not None
+        ):
             return False
         pending.future.set_result(answers)
         return True
 
-    def discard(self, request_id: str) -> None:
-        self._pending.pop(request_id, None)
+    def claim_answer(
+        self,
+        request_id: str,
+        *,
+        task_id: int,
+        task_incarnation_id: str,
+        task_retry_count: int,
+        task_turn_generation: int,
+        task_status: str,
+        session_id: str,
+    ) -> str | None:
+        """Atomically reserve one exact pending request for DB persistence."""
 
-    def list_for_task(self, task_id: int) -> list[PendingAsk]:
+        pending = self._pending.get(request_id)
+        if (
+            pending is None
+            or pending.task_id != task_id
+            or pending.task_incarnation_id != task_incarnation_id
+            or pending.task_retry_count != task_retry_count
+            or pending.task_turn_generation != task_turn_generation
+            or pending.task_status != task_status
+            or pending.session_id != session_id
+            or pending.future.done()
+            or pending.answer_claim_id is not None
+        ):
+            return None
+        claim_id = uuid.uuid4().hex
+        pending.answer_claim_id = claim_id
+        return claim_id
+
+    def release_answer_claim(self, request_id: str, claim_id: str) -> bool:
+        """Release a reservation after a definite pre-commit/DB failure."""
+
+        pending = self._pending.get(request_id)
+        if (
+            pending is None
+            or pending.future.done()
+            or pending.answer_claim_id != claim_id
+        ):
+            return False
+        pending.answer_claim_id = None
+        return True
+
+    def fulfill_answer(
+        self,
+        request_id: str,
+        claim_id: str,
+        answers: Any,
+    ) -> bool:
+        """Wake the hook only for the reservation whose audit committed."""
+
+        pending = self._pending.get(request_id)
+        if (
+            pending is None
+            or pending.future.done()
+            or pending.answer_claim_id != claim_id
+        ):
+            return False
+        pending.future.set_result(answers)
+        return True
+
+    def discard(
+        self,
+        request_id: str,
+        *,
+        reason: str = "The Task turn ended before the user answered.",
+    ) -> None:
+        pending = self._pending.pop(request_id, None)
+        if pending is not None and not pending.future.done():
+            pending.future.set_result(AskUserRevocation(reason))
+
+    def discard_for_task(
+        self,
+        task_id: int,
+        task_incarnation_id: str,
+    ) -> None:
+        """Revoke pending prompts for one exact deleted Task incarnation."""
+
+        for request_id, pending in tuple(self._pending.items()):
+            if (
+                pending.task_id == task_id
+                and pending.task_incarnation_id == task_incarnation_id
+            ):
+                self._pending.pop(request_id, None)
+                if not pending.future.done():
+                    pending.future.set_result(AskUserRevocation(
+                        "The Task was deleted before the user answered."
+                    ))
+
+    def list_for_task(
+        self,
+        task_id: int,
+        task_incarnation_id: str,
+        task_retry_count: int,
+        task_turn_generation: int,
+        task_status: str,
+    ) -> list[PendingAsk]:
         """仍在等待回答的请求（前端重连时回填卡片用）。"""
         return [
             p for p in self._pending.values()
-            if p.task_id == task_id and not p.future.done()
+            if (
+                p.task_id == task_id
+                and p.task_incarnation_id == task_incarnation_id
+                and p.task_retry_count == task_retry_count
+                and p.task_turn_generation == task_turn_generation
+                and p.task_status == task_status
+                and not p.future.done()
+                and p.answer_claim_id is None
+            )
         ]
+
+    def discard_stale_for_task(
+        self,
+        task_id: int,
+        task_incarnation_id: str,
+        task_retry_count: int,
+        task_turn_generation: int,
+        task_status: str,
+    ) -> None:
+        """Drop prompts that no longer belong to the current active turn."""
+
+        for request_id, pending in tuple(self._pending.items()):
+            if (
+                pending.task_id == task_id
+                and pending.task_incarnation_id == task_incarnation_id
+                and (
+                    pending.task_retry_count != task_retry_count
+                    or pending.task_turn_generation != task_turn_generation
+                    or pending.task_status != task_status
+                    or task_status not in {"in_progress", "executing"}
+                )
+            ):
+                self._pending.pop(request_id, None)
+                if not pending.future.done():
+                    pending.future.set_result(AskUserRevocation(
+                        "The Task generation changed before the user answered."
+                    ))
 
     def list_all(self) -> list[PendingAsk]:
         """所有仍在等待回答的请求（全局通知 / 跨页面重连回填用）。"""
-        return [p for p in self._pending.values() if not p.future.done()]
+        return [
+            p
+            for p in self._pending.values()
+            if not p.future.done() and p.answer_claim_id is None
+        ]
 
 
 # 进程内单例

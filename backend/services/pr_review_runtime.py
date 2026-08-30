@@ -15,6 +15,7 @@ from pathlib import Path
 
 PR_REVIEW_TAG = "pr-review"
 PR_REVIEW_FIX_TAG = "pr-review-fix"
+PRE_PR_CODE_REVIEW_TAG = "pre-pr-code-review"
 # v3 extends the tool-free sandbox contract to ``pr-review-fix`` tasks.  A
 # v2 Worker only understands the original ``pr-review`` tag and must therefore
 # fail closed instead of accepting a fix task with inherited tools.
@@ -62,10 +63,33 @@ def is_pr_review_fix_task(task: object) -> bool:
     )
 
 
-def is_pr_sandbox_task(task: object) -> bool:
-    """Return whether a review or fix Task needs tool-free isolation."""
+def is_pre_pr_code_review_task(task: object) -> bool:
+    """Return whether a Task is a Controller-owned pre-PR review turn.
 
-    return is_pr_review_task(task) or is_pr_review_fix_task(task)
+    The tag survives on older Worker mirrors, while Manager rows retain the
+    exact Capability/Run identity tuple even if a legacy client edits tags.
+    Either representation must preserve the sandbox boundary.
+    """
+
+    if _has_tag(task, PRE_PR_CODE_REVIEW_TAG):
+        return True
+    metadata = getattr(task, "metadata_", None)
+    return bool(
+        isinstance(metadata, dict)
+        and type(metadata.get("code_review_run_id")) is int
+        and type(metadata.get("capability_invocation_id")) is int
+        and type(metadata.get("capability_execution_id")) is int
+    )
+
+
+def is_pr_sandbox_task(task: object) -> bool:
+    """Return whether a review/fix Task needs the tool-free runtime boundary."""
+
+    return (
+        is_pr_review_task(task)
+        or is_pr_review_fix_task(task)
+        or is_pre_pr_code_review_task(task)
+    )
 
 
 def _trusted_runtime_anchor() -> Path:

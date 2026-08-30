@@ -72,12 +72,11 @@ async def test_terminal_owner_evidence_consumes_capacity_everywhere(
         await db.commit()
 
     dispatcher = _dispatcher(db_factory)
+    dispatcher.configure_capacity_override(2)
     with (
-        patch("backend.api.instances.settings") as api_settings,
+        patch("backend.main.dispatcher._max_concurrent_instances_override", 2),
         patch("backend.services.dispatcher.settings") as dispatcher_settings,
     ):
-        api_settings.max_concurrent_instances = 2
-        dispatcher_settings.max_concurrent_instances = 2
         dispatcher_settings.min_idle_instances = 1
 
         response = await client.post(
@@ -135,10 +134,14 @@ async def test_startup_cleanup_reconciles_owner_only_idle_and_error_rows(
             assert instance.status == "error"
             assert instance.pid is None
             assert instance.current_task_id is None
-            assert task.status == "pending"
+            # A generation-zero active row predates exact source/transport
+            # evidence. Replaying it from Task.description could duplicate
+            # provider side effects, so startup now fails it closed.
+            assert task.status == "failed"
+            assert "provider-boundary proof" in task.error_message
             assert task.instance_id is None
             assert task.started_at is None
-            assert task.completed_at is None
+            assert task.completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -159,6 +162,8 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
             title=f"{evidence_kind} evidence",
             description="must remain owned",
             status="executing",
+            retry_count=3,
+            turn_generation=11,
         )
         db.add(task)
         await db.flush()
@@ -175,6 +180,8 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
         generation = dispatcher._task_lifecycle_generation(task)
         instance_id = instance.id
         task_id = task.id
+        task_retry_count = task.retry_count
+        task_turn_generation = task.turn_generation
 
     consumer = None
     recovery_process = None
@@ -189,9 +196,16 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
             error=RuntimeError("durable recovery is unconfirmed"),
             tracked_generation=True,
             task_id=task_id,
-            task_retry_count=0,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            instance_pid=920_001,
             instance_started_at=None,
         )
+        recovery_evidence = manager._consumer_recovery_pending[
+            (instance_id, recovery_process)
+        ]
+        assert recovery_evidence.task_retry_count == task_retry_count
+        assert recovery_evidence.task_turn_generation == task_turn_generation
 
     try:
         assert instance_id not in manager.processes

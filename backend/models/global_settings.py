@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Float, Integer, JSON, String, Text
+from sqlalchemy import JSON, Boolean, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -24,6 +24,8 @@ class GlobalSettings(Base):
     # Context compaction threshold (0-1); None = follow env default
     # (settings.context_compact_threshold)
     context_compact_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Local Task/Plan launch capacity; None = follow MAX_CONCURRENT_INSTANCES.
+    max_concurrent_instances: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Org registry URL override (set via registry-changed callback, takes precedence over env)
     org_registry_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Default skills/plugins selection for new tasks
@@ -33,3 +35,9 @@ class GlobalSettings(Base):
     plan_pipeline_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # CC settings template (JSON string) synced to all pool account config dirs
     cc_settings_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which repository channel this independent CCM instance follows.
+    # Existing installations are migrated to stable; tests without a DB row
+    # retain the historical main behavior in UpdateService.
+    update_channel: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="stable", server_default="stable"
+    )

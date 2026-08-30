@@ -29,6 +29,14 @@ cd frontend && npx tsc --noEmit
 
 测试使用内存 SQLite，不依赖真实数据库或外部服务。
 
+#### `test_task_ssh_sharing.py` — Task 凭据沙箱边界
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_protected_paths_cover_all_git_credential_sources` | 已存在的 repo `.git/credentials` 继续进入 deny 列表；不存在的叶子路径不生成 Bubblewrap 挂载，父 `.git` deny 保持不变 |
+| `test_codex_app_server.py::test_task_ssh_profile_collapses_only_redundant_nested_denies` | 父目录已 deny 时折叠冗余子 deny，避免 Bubblewrap 在只读父挂载中创建子挂载点；若中间 workspace 已重新开放则保留子 deny，精确只读例外仍可覆盖父 deny |
+| `test_task_agent_isolation.py::test_claude_isolation_collapses_missing_key_below_denied_managed_root` / `test_task_ssh_sharing.py::test_stale_profile_key_is_collapsed_under_managed_root_for_claude` | Claude 2.1.168 的 Task settings 同样折叠已被 managed 根目录完全覆盖的缺失/陈旧 key 子路径；父根仍保留 `denyRead`、`denyWrite` 与 credential deny，sibling prefix 和精确 Git `allowRead` 不受影响 |
+
 #### `test_tmp_space_manager.py` — `/tmp` 压力保护
 
 测试在 pytest 隔离目录中注入容量/inode 读数；全局测试环境关闭真实宿主
@@ -104,6 +112,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_user_event_tool_result_error` | type=user 事件含 is_error → 正确设置错误标记 |
 | `test_system_non_init` | system 非 init 子类型 → 映射为 system_event |
 | `test_assistant_empty_content_blocks` | assistant 空 content 块 → 默认为 message 事件 |
+| `test_assistant_legacy_tool_markup_remains_inert_text` / `test_protocol_anomaly_classifier_*` | Claude 将旧式 `<invoke>`/`<function_calls>` 作为文本输出时只标记协议异常、保持原文且绝不执行；Codex 和残缺/文档片段不误报 |
 
 #### `test_models.py` — ORM 模型
 
@@ -128,6 +137,10 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_delete_task` | DELETE 删除任务 |
 | `test_cancel_task` | 取消任务 |
 | `test_retry_task` | 重试任务 |
+| `test_task_flag_controls_reject_group_revoked_at_final_effect_fence` / `test_star_rejects_real_wal_group_revoke_before_final_effect_fence` | star/read/unread/archive 在最终 Project→Task→membership→User writer fence 重验 group ACL；SQLite WAL 双 session 中撤权先提交时不产生 Task effect |
+| `test_local_task_controls_reject_group_revoked_before_effect_gate` / `test_worker_task_controls_reject_group_revoked_before_receipt` | stop/cancel/delete 在本机 Harness gate 或 Worker termination/delete receipt 落库前重验 ACL；撤权胜出时无进程/网络 effect、无 durable receipt |
+| `test_star_rejects_admin_demoted_before_final_user_fence` | HTTP 鉴权后并发降级 admin 时，最终 User exact-role fence 拒绝 stale 管理员 effect |
+| `test_completed_stop_400_settles_gate_before_later_delete` / `test_terminal_cancel_settles_gate_before_later_delete` | 已确定无进程/幂等终态的 stop/cancel 将 control gate 标为 settled，同时保留 Harness gate，使下一次 fresh-ACL delete 可接管而不会永久锁死 Task |
 | `test_attention_tag_create_update_and_clear_preserves_system_tags` | 关注标签会裁剪首尾空白、可清空，且不改写系统内部 `tags` |
 | `test_cloned_task_inherits_attention_tag_unless_overridden` | Clone 默认继承关注标签，显式覆盖或清空时按请求处理 |
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
@@ -152,6 +165,8 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_plan_reject_not_plan_review` | 非 plan_review 状态 reject 返回 400 |
 | `test_plan_approve_success` | plan_review 状态 approve → status=completed、plan_approved=True，且不启动执行 turn |
 | `test_plan_reject_success` | plan_review 状态 reject → status=cancelled, plan_approved=False |
+| `test_plan_approve_rejects_target_group_acl_revoked_at_final_fence` / `test_legacy_plan_decision_rejects_group_acl_revoked_at_final_fence` | Legacy Plan approve 同时锁定 Plan+target ACL；本机/Worker approve/reject 在最终 gate 前撤权时不提交 decision、不发 Worker 请求 |
+| `test_plan_stop_400_settles_gate_before_later_approval` | plan_review 无进程 stop 返回 400 后仅 settle control receipt，后续 fresh-ACL approve 可接管同一 Harness terminal gate |
 | `test_plan_approve_not_found` | 不存在的 task approve 返回 404 |
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
 | `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
@@ -175,6 +190,11 @@ Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `t
 | `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
 | `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
 | `test_execution_task_materializer_is_directly_callable_and_idempotent` | Auto/内部调用方可直接经 `plan_service` 物化 exact Version，重放返回同一 Task/Application，且 Plan 审计 metadata 不可覆盖 |
+| `test_execution_materialization_rolls_back_inline_approval_on_failure` / `test_execution_materialization_rejects_active_refresh_run` / `test_execution_materialization_loses_cleanly_to_concurrent_plan_writer` | standalone 物化以 Plan/Version 行锁 + `lock_version` 条件写入建立跨进程 fence；Refresh/new Run 不得并发穿透，SQLite WAL 旧读快照必须收敛为确定的 409 CAS 冲突，Task staging 失败会同时回滚 approval、Application 与 fence |
+| `test_alembic_migrations.py::TestPlanRuntimeReceiptMigration` | `8d2f5b7a1c90` 只回填可证明 terminal 的旧 Step；升级拒绝 active/malformed legacy runtime，降级拒绝 non-clean/malformed receipt 与 active cancellation，并覆盖 upgrade→downgrade→upgrade |
+| `test_worker_plan_cancellation.py` / `test_worker_plan_recovery.py` | Worker Plan 取消绑定 exact Run/Plan/digest/protocol；cancel-before-import 永久 tombstone、normal/fork import receipt gate、同 ID foreign Run 隔离、ACK 丢失保留 durable `cancelling`、post-commit/reap repeated cancellation shield、旧 lifecycle reap 失败后的恢复重试、completed/failed 终态胜者真实导入，以及 raw JSON bool/重复/跨 Run 子图/Worker owner 篡改拒绝 |
+| `test_worker_plan_recovery.py` | `prepared` 才可重排，`remote_possible` 只做 exact audit；重启持续重放 durable cancel、ACK 再丢失继续退避，malformed audit 在任何 answer replay 前 fail closed |
+| `test_alembic_migrations.py::TestWorkerPlanImportReceiptMigration` | `d3c8a7f1e620` 回填永久 import identity；覆盖 old-writer two-valued Run gate、PG/SQLite writer fence、MySQL 8.0.16+/InnoDB/enforced CHECK/partial DDL replay/双 downgrade gate，以及 tombstone、historical graph、NULL/nonpositive identity 的不安全 downgrade 拒绝 |
 | `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
 | `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
 | `test_interactive_planner_accepts_all_known_questions_without_count_limit` | 模型侧 question schema 使用非关键字 `is_required`，校验边界精确映射回领域/API 的 `required`，且不限制有效问题数 |
@@ -231,10 +251,10 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 | 测试文件 | 验证内容 |
 |---------|---------|
 | `test_claude_pool.py` | API-first 模型兼容选择、quota/auth fail-closed、Claude session + sidecar 安全迁移，以及候选选择不会提前更新 `last_selected` |
-| `test_codex_pool.py` | API-first 与原生 fallback、独立 round-robin cursor、额度终态分类和最终路由 marker |
+| `test_codex_pool.py` | 可持久化运行策略、暂停 fail-closed、API/OAuth 路由顺序、独立 round-robin cursor、额度终态分类和最终路由 marker |
 | `test_resume_config_dir.py` | preferred 手动切换、已有会话粘性、Task durable binding、多副本消歧、runtime-busy 短退避、disabled source 等待可迁移目标，以及 rollout copy 期间取消/代次变化不会产生无主副本 |
 | `test_service_instance_manager.py` | Claude/Codex reactive/proactive 换号、精确 queued message 保留、Codex copy→rebind→binding 的 cancellation-settled 事务、direct/ephemeral per-home admission，以及 silent exit/`turn.failed` 按真实 provider 归因且不重复报错 |
-| `PoolDrawer.test.tsx` | Claude/Codex 的「优先账号」「最近使用」独立展示，以及恢复自动后的 API-first/旧会话绑定提示 |
+| `PoolDrawer.test.tsx` | Claude/Codex 的「优先账号」「最近使用」独立展示、Codex 在线策略保存，以及恢复自动后的 API-first/旧会话绑定提示 |
 
 #### `test_api_projects.py` — 项目 API
 
@@ -357,6 +377,12 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 | `test_webhook_non_pull_request_event_ignored` / `test_webhook_draft_pr_ignored` / `test_webhook_wrong_base_branch_ignored` / `test_webhook_author_not_allowed_ignored` | 各类过滤条件忽略 |
 | `test_webhook_duplicate_opened_ignored_while_in_progress` | 进行中重复 opened 事件去重 |
 | `test_webhook_synchronize_supersedes_old_review` | synchronize 将旧 review 标记 superseded 并新建 |
+| PR result projection verdict/publication/lifecycle matrix | 已有 aggregate verdict 时，publication stale/failed/not-applicable 不得改成 infrastructure error 或 no-verdict；只有 Reviewer 结果不可用时才返回 `verdict_state=unavailable`，并精确标记 `failure_stage` |
+| PR result feed public-field allowlist | `GET /api/pr-monitor/results` 对新记录一 Run 一项、Panel 不展开；缺少可靠 Run 快照的历史 Single 以不可重跑的 `review:<id>` 项展示；不返回内部 Task ID、prompt、patch、session、nonce、pending body 或原始协议字段 |
+| immutable publication evidence | 成功写入或恢复对账后保留 actor/time/GitHub Review ID/URL/`github_event=COMMENT`；后续 lifecycle 变化不清空，浏览器 Connector/Codex 登录态不能冒充 CCM publisher |
+| exact-head rerun admission/idempotency | `POST /reviews/{id}/rerun` 必须匹配 current open/non-draft exact head；重复 idempotency key 不双建，head/PR lifecycle 漂移拒绝且旧 history/evidence 保留 |
+| terminal/reopen webhook matrix | `closed` 分别收口 closed/merged：terminal intent 阻止新 effect，未 dispatch 工作直接取消，已开始的外部 effect 等待安全对账；`reopened`/`ready_for_review` 对当前 subject 重新 admission；迟到 callback 不得把终态 Run 翻回 paused/reviewing |
+| Delivery-owned webhook isolation | exact Delivery edge 与 adoption pre-bind（active subject + reserved marker）下的 `synchronize`/`reopened`/`ready_for_review` 均 409；Run/current Review/terminal evidence、Task/ReviewerRun 计数不变，且不得调用 GitHub effect |
 
 #### `test_mcp_server.py` — MCP Server 工具
 
@@ -421,12 +447,17 @@ Codex 版本兼容基线（2026-07-24）：
 - 两版 app-server 均已用真实 `thread/start` 启动 CCM FastMCP server，`required`、`enabled_tools` 和 timeout 配置可正常完成 session 初始化。
 - 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
 - smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
+- Managed public proxy 有独立安全版本门槛：只接受同一 live app-server generation 的 `initialize.userAgent` 所证明的稳定版 `>=0.146.0`；`0.144.6`/`0.145.0`、不可解析版本或 process generation 不匹配都必须在 `thread/start` 前降级为 network-off。
 
 #### `test_codex_app_server.py` / `test_service_instance_manager.py` — Codex 主任务 MCP 按 thread 注入
 
 | 测试 | 验证内容 |
 |------|---------|
 | `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
+| `test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume` / `test_network_isolated_delivery_resume_recycles_loaded_runtime` / `test_task_isolated_resume_loads_not_loaded_runtime_without_recycle` | 旧 loaded Task 与 Delivery thread 每次 resume 都先以 Goal + `thread/read=idle` 证明静止并 settle archive→unarchive；新 app-server 中已 `notLoaded` 的 rollout 不做多余 native mutation，直接以关闭 code-mode host 的精确隔离配置加载 |
+| `test_task_isolated_resume_refuses_recycle_without_idle_proof` / `test_task_isolated_resume_recycle_failure_is_uncertain_and_fail_closed` / `test_registry_preserves_owner_when_task_recycle_effect_is_uncertain` | active/未知 runtime 在 mutation 前拒绝；archive 发出后的失败属于不确定结果，保留 exact-home owner、禁止 `thread/resume`/`turn/start` 与 queued replay |
+| `test_task_isolated_resume_retry_recycles_after_preflight_failure` / `test_registry_preserves_owner_when_task_recycle_is_cancelled` | replay-safe 的 response audit 失败可在下一次 admission 重新加载；recycle mutation 期间取消则保留 owner 并 fail closed |
+| `test_task_isolation_interrupts_unbound_mcp_tool_call` / `test_task_ssh_profile_denies_host_keys_and_direct_network` | Task profile 关闭 `code_mode`/`code_mode_host`；调用级 MCP server identity 只允许显式 CCM server，`codex` broker、缺失或歧义身份继续 fail closed |
 | `test_start_turn_uses_native_resume_and_turn_start` | `thread/resume` 同时合并 MCP 配置和线程级 Git 环境，不互相覆盖 |
 | `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
 | `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread admission 失败转为可安全重试的 `CodexRequiredMcpPreTurnError` |
@@ -442,6 +473,8 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | transport 启动失败/no-thread-id 只在 turn 前回退，且 exec argv 保留当前 task 的 required MCP |
 | `test_required_mcp_unknown_app_server_failure_does_not_launch_exec` | required MCP 下未知 adapter 异常继续 fail closed |
 | `test_launch_codex_does_not_fallback_when_replay_is_unsafe` | timeout、busy、required 非 pre-turn、owner mismatch 和已启动 turn 的持久化失败均禁止重放 |
+| `test_managed_network_runtime_version_gate` / `test_old_runtime_downgrades_managed_task_before_thread_start` | exact initialize version + process generation 门控 managed proxy；旧版/未知版仍以 network-off 执行，不发送 direct-network Task |
+| `test_ordinary_task_uses_exact_managed_public_network_profile` / `test_ordinary_task_managed_network_requires_exact_thread_proof` / profile-id 与 drift/recheck 用例 | 每 turn 随机 profile；精确网络配置、thread response、ambient MCP/config/skills/instruction sources 和最终 turn admission 漂移均 fail closed |
 | `test_codex_sub_agent_requires_app_server_and_never_uses_exec` | app-server 关闭时 Sub-Agent 明确失败，绝不降级到没有 live thread control 的 exec |
 | `test_codex_sub_agent_mcp_failure_does_not_launch_exec` | 即使是 pre-turn 错误，Sub-Agent 仍不得走 exec |
 | `test_codex_app_server_rejects_home_owned_by_exec_generation` | 同一 `CODEX_HOME` 有 exec generation 时 app-server 返回 busy |
@@ -463,7 +496,7 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
 | `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
 
-Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；Standard 清除 sticky tier；已加载 thread 的 Standard↔Fast 切换等待 `thread/settings/updated`，root lineage 有活跃请求时拒绝切换；`model/list` 不支持、admission 不一致或无法确认时不得发送 `turn/start`；Fast 在 app-server 关闭/失败时禁止 `codex exec` fallback；选号、限额轮换、Worker 迁移和 ApexRouter capability 均保留 tier。loopback Responses 代理必须覆盖 secret path/loopback/endpoint/WS 门禁、请求 thread/turn/parent lineage、request priority 校验、上游非 2xx，以及在释放任何成功 SSE 前要求首个 `response.created.response.service_tier=priority`；缺字段、Standard、非法值或后续同 turn 失败都不能留下可用 Fast proof。Standard 请求不得携带 priority，但兼容上游不返回 informational tier。Fast Goal evaluator 必须继承任务模型并走 priority app-server 与实际 tier 证明，且在主回合前拒绝不同/不兼容 evaluator；Standard Goal evaluator 显式固定 Standard。Fast Task 的 Distill 必须在启动其 Standard auxiliary 前返回 409。
+Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；Standard 清除 sticky tier；已加载 thread 的 Standard↔Fast 切换等待 `thread/settings/updated`，root lineage 有活跃请求时拒绝切换；`model/list` 不支持、admission 不一致或无法确认时不得发送 `turn/start`；Fast 在 app-server 关闭/失败时禁止 `codex exec` fallback；选号、限额轮换、Worker 迁移和 API 网关 capability 均保留 tier。所有 API 网关只信账号目录的显式 tier，未知模型和 malformed tier 都必须 fail closed。loopback Responses 代理必须覆盖 secret path/loopback/endpoint/WS 门禁、请求 thread/turn/parent lineage、出站 `priority` 校验和上游非 2xx；成功 `response.created` 的信息性响应 tier 为 `priority/auto/default` 或缺失均继续执行并记录遥测，不得形成账号 denial。Codex 0.147 custom-provider `thread/start` 省略 `serviceTier` 时只允许 exact proxy request-proof 路径继续；Standard 请求不得携带 priority。Fast Goal evaluator 必须继承任务模型并走相同的 priority 请求验证链路，且在主回合前拒绝不同/不兼容 evaluator；Standard Goal evaluator 显式固定 Standard。Fast Task 的 Distill 必须在启动其 Standard auxiliary 前返回 409。
 
 路由配置一致性回归还必须覆盖：本机 active/运行中子 Agent 更新明确 409；Worker stage 只落 durable candidate，Manager exact CAS 后才 ack；stage/ack 响应丢失、orphan reconcile、Instance/pre-owner launch、queued recovery/final barrier、重启恢复及 Codex 子 Agent commit/cancel 均不得让旧 Standard turn 越过 Fast 配置。Manager 已 commit 后即使 ACK/readback 暂不可用，API 也返回 Manager 权威 Task，Worker marker 在后续 readback 收敛前持续阻断执行。
 
@@ -490,7 +523,7 @@ Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；S
 8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
 9. 设置 `CODEX_MAIN_MCP_ENABLED=false` 重启并确认普通 Codex exec 无 `ccm_skills`；测试完移除该覆盖并恢复原来的 `CODEX_APP_SERVER_ENABLED` 设置。
 
-Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模型、相同 effort 和 prompt 分别运行 Standard/Fast，确认 Fast 日志和聊天事件记录 requested/admitted=`priority`、`actual_service_tier_verified=true` 及上游 response id；再用 mini/Spark、未广告 priority 的 API 账号、关闭 app-server，以及代理模拟返回 `service_tier=default`/缺字段四种场景验证都明确失败且没有成功 Fast 输出。随后把同一已加载 Task 从 Fast 切 Standard、再切回 Fast，确认下一轮请求配置分别为 default/priority，且 Standard 没有继承旧 Fast。ApexRouter 需单独实测其实际速度与计费，不能套用 OpenAI 官方倍率。
+Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模型、相同 effort 和 prompt 分别运行 Standard/Fast，抓取出站请求确认 CLI 配置 `fast` 最终转换为 Responses API 的 `service_tier=priority`，并确认日志和聊天事件记录 requested/admitted=`priority`、`service_tier_request_verified=true`、信息性上游 tier 及 response id。再用 mini/Spark、未知模型、关闭 app-server、请求 tier 错误和上游非 2xx 验证都明确失败；代理模拟返回 `service_tier=auto/default` 或缺字段则必须继续成功且不得改变账号 capability。之后把同一已加载 Task 从 Fast 切 Standard、再切回 Fast，确认下一轮请求配置分别为 default/priority，且 Standard 没有继承旧 Fast。网关速度与计费需单独实测，不能套用 OpenAI 官方倍率。
 
 真实验收记录（2026-07-24）：
 
@@ -608,6 +641,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_claude_pool.py::TestChatPoolRotationCodexGate` | codex 任务绝不进 claude 号池轮换（不 gate 会用 claude --resume 重启 codex session） |
 | `test_service_instance_manager.py::test_parse_codex_reasoning_becomes_thinking` 等 | codex 解析器：reasoning→thinking、file_change/mcp_tool_call/web_search→tool 事件、todo_list、error item、turn.failed 嵌套 message |
 | `test_codex_models.py::TestCodexContextWindow` | codex 模型窗口表（272K/128K，models_cache.json 实测）与回退 |
+| `test_oversized_codex_log_db_is_quarantined_then_removed` | 超过阈值的 Codex `logs_2.sqlite{,-wal,-shm}` 原子隔离并在成功证明新运行时后清理，不影响 config/session |
+| `test_codex_log_rotation_rejects_unsafe_sidecar_without_partial_move` | 日志 sidecar 为 symlink/非安全文件时移动前 fail closed，不产生半轮换 |
+| `test_successful_codex_log_cleanup_recovers_stale_quarantine` | Manager 在 rename 后崩溃留下的合法 quarantine 会由下一次成功启动收敛 |
 | `test_task_migrator.py::test_migrate_codex_task_uses_codex_session_mover` 等 | 迁移按 provider 分流搬 session；rollout 文件 glob 定位 |
 | `test_api_monitor.py::test_create_monitor_accepts_local_codex_task` / `test_create_sub_agent_accepts_codex_task` | 本地 Codex Monitor 与 Sub-Agent 都走各自的 Codex runtime；Worker/Shared Monitor 仍在启动任何错误 provider 子进程前显式拒绝 |
 | `test_service_pr_review.py::test_create_pr_review_task_codex_provider` | PR 审核 task 透传 repo.provider，codex 未配模型时补默认 |
@@ -620,7 +656,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_codex_app_server.py::test_existing_goal_turn_notification_rebinds_submission_id` | adopted goal 同时保留 active/submission 两个通知 ID，任一 ID 的 assistant/terminal 事件都不能丢 |
 | `test_codex_app_server.py::test_signal_interrupt_reconciles_and_pauses_existing_goal_turn` | adopted goal Interrupt 只做一次 pause RPC，再中断权威 active turn |
 | `test_service_instance_manager.py::test_internal_codex_abort_is_not_a_successful_chat_terminal` | transport/admission 内部 abort 不得伪装成用户 Interrupt 的 completed |
-| `test_codex_app_server.py::test_claimed_stop_preserves_shared_transport_when_interrupt_unconfirmed` / `test_claimed_stop_rejects_an_in_flight_steer_before_interrupt` / `test_unconfirmed_descendant_abandon_escalates_transport_shutdown` | 已持久 claim 的 stop 在 peer/steer 存在时保留共享 transport 与所有 turn；drain 后拒绝新 steer；真正 unclaimed cleanup 仍 fail closed 关闭账号 transport |
+| `test_codex_app_server.py::test_claimed_stop_terminates_all_live_turns_for_same_task` / `test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer` / `test_claimed_stop_rejects_an_in_flight_steer_before_interrupt` / `test_unconfirmed_descendant_abandon_escalates_transport_shutdown` | 已持久 claim 的 stop 按 `task_id` 终止同 Task 全部 live turn 并统一标记 interrupt；不同 Task peer/steer 存在时保留共享 transport 与所有运行证据；drain 后拒绝新 steer；真正 unclaimed cleanup 仍 fail closed 关闭账号 transport |
 | `test_service_instance_manager.py::test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy` / `test_api_tasks.py::test_stop_session_reports_unresolved_exact_owner` | 无法隔离的停止保留 Task→Instance、process 和 consumer，不影响 peer；API 返回 409 且不写伪终态/广播 |
 | `test_codex_app_server.py::test_reader_exit_zero_during_shutdown_is_not_reported_as_unexpected` / `test_eof_observed_before_shutdown_intent_remains_unexpected` / `test_reader_exit_does_not_leak_shared_stderr_to_tasks` | exact-generation 计划关闭只中断 target，EOF 先发生仍算真实崩溃；账号级 stderr tail 不泄漏给 Task |
 | `test_service_dispatcher.py::test_cancelled_task_followup_reclaims_session_instead_of_dropping` | Cancel 仅终止当前 generation，后续 chat 可安全领取原生 session 并恢复 executing |
@@ -739,6 +775,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_plan_phase` | plan 模式进入 plan_review |
 | `test_concurrent_task_consumers_reserve_distinct_idle_instances` | 不同 task 的 queued-message consumer 同时选 instance 时原子预留，分配到不同 idle worker |
 | `test_reserve_idle_instance_excludes_only_integer_running_keys` | 远端 Worker 的字符串 lifecycle key 不进入本地 `Instance.id` 整数 SQL 过滤 |
+| `test_dispatch_loop_browser_child_keeps_reserved_instance_identity` | Browser 子任务领取时即使 `dequeue()` commit/expire 当前 Session，Dispatcher 仍只用预先快照的 Instance 标量身份启动生命周期并释放 reservation，不访问 detached ORM 对象 |
+| `test_browser_child_expiry_then_plan_claim_uses_reserved_scalar` | Browser child 竞争导致 `rollback()+expire_all()` 后若回退领取 Plan，仍只以预快照 `instance_id` 完成双向 owner claim，不触发 `MissingGreenlet` |
+| `test_runtime_recycle_uncertainty_fails_without_queued_replay` | Codex archive mutation 结果不确定时，即使没有 process/transport 证据也将 Task fail closed，消息不进入 5 秒自动重排队 |
 | `test_instance_contention_requeues_exact_message` | 底层 `InstanceAlreadyRunningError` 防线触发时，原 `QueuedMessage` 重排队且不丢用户消息 |
 
 ##### `test_service_update.py` / `UpdateButton.test.tsx` — 安全更新与自动提醒
@@ -794,8 +833,14 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_deployment_start_guard.py` | repo lease 优先于 `/tmp` 状态；commit/port/token 精确匹配；损坏、未知 PID 身份和活动 lease fail closed；失败事务只进入 maintenance-only；task shared fence 阻止跨进程部署竞态 |
 | `test_main_deployment_start.py` | guard 在 `init_db` 前执行；maintenance-only 不访问数据库、不启动 Dispatcher/Worker；受控 handoff 跳过重复 mutation |
 | `test_deployment_maintenance_auth.py` | 维护模式只开放 health/status/repair/rollback/restart；legacy recovery token 与已签名 admin JWT 无 DB 可恢复，member JWT 和密码登录被拒绝 |
+| `test_member_chat_turn_is_durably_sandboxed` | Member 消息冻结 sandbox principal，管理员消息冻结 unrestricted principal |
+| `test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp` | 管理员普通回合不生成 Claude sandbox settings，但保留受管 SSH MCP |
+| `test_sandbox_loading_canary_accepts_claude_2_1_168_bwrap_error` | Claude 2.1.168 canary 在零模型、缺 bwrap 的新错误协议下仍能证明 fail-closed |
+| `test_claude_task_isolation_allows_every_injected_task_mcp_tool` | Claude scrub 强制 `default` 权限模式时，Task 隔离设置精确允许全部内置工具与可能注入的 CCM MCP（含 frontend/workspace/browser review），避免隐藏权限框卡住 PTY |
+| `test_task_isolation_allows_verified_internal_codex_code_mode` | Member Codex sandbox 允许冻结的内置 code-mode，同时继续拒绝 ambient MCP |
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
 | `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障；仅对白名单内的 `systemd --user [--deserialize=N]` user-manager 进程放行不可读 FD |
+| `test_server_side_sshd_session_allowlist_requires_root_parent` | 仅当 child 名称、账号绑定的 `pts/N`/`notty` 命令、user session scope、root-owned `[priv]` parent 与同 cgroup 全部精确匹配时放行不可读 FD；任一字段漂移仍阻断迁移 |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
 | `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
@@ -804,7 +849,11 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_build_review_prompt_auto_merge_on` / `..._off` | auto_merge 开关影响 prompt（是否含 `gh pr merge`） |
+| `test_build_review_prompt_*` | Reviewer prompt 始终禁止 Agent 执行 `gh pr merge`；合并权限只在后端 |
+| `test_fetch_base_guidance_ignores_unmanifested_root_documents` / `test_single_prompt_keeps_the_complete_patch_within_budget` / Panel prompt budget / superseding recovery | Reviewer 仅消费 manifest 显式授权 Guide、紧凑文件清单和完整 patch；legacy 隐式文档/changed-file base/head 全文不会在恢复时回流。Codex prompt 上限 786,432 字符并预留 262,144 runtime envelope；超限在 Task 物化前以 reviewer input unavailable fail closed，不误称 publication infrastructure error |
+| `test_review_evidence_marker_is_hidden_from_rendered_human_body` / `test_review_evidence_reader_requires_an_exact_final_marker` / `test_find_review_evidence_reads_legacy_visible_marker_for_recovery` | 新 publication 只写末尾 HTML comment，human-visible body 无 nonce/schema；仅精确末尾 current/legacy marker 可恢复，legacy marker 不再写出 |
+| `test_publish_auto_merge_*` / `test_publish_merged_comment_*` | OFF 只发布 ready-to-merge Review；ON 固定 head merge，并以 nonce/head/actor/time 对账最终 merged comment；merge/comment ACK 丢失均不重复写 |
+| `test_delivery_durable_publication_*` | Delivery publication 只能恢复 Run 冻结的 merge policy，错配 outbox fail closed |
 | `test_create_pr_review_task_happy_path` | 创建 PRReview + Task 并广播 `review_created` |
 | `test_create_pr_review_task_broadcast_failure_logged_not_raised` | 广播失败 → logger.warning，不中断流程 |
 | `test_check_and_update_review_merged` / `..._approved` / `..._changes_requested` | gh 状态映射 merged/approved/commented |
@@ -949,6 +998,10 @@ python -m pytest \
 | 测试用例 | 说明 |
 |---------|------|
 | `TestRateLimitDetection` / `TestAuthFailureDetection` / `TestPoolRotatable` | 限速/认证失败文案检测（窄正则，含中英文与各时区变体） |
+| `test_cloudrouter_claude_launch_replaces_inherited_auth_env` / `test_cloudrouter_claude_pty_projects_direct_auth_for_model_only` | CloudRouter Claude direct/PTY 启动均以所选账号 Key 覆盖 ambient auth，保留子进程凭据清洗开关 |
+| `test_real_claude_pty_uses_managed_bearer_token` | opt-in 真实 Claude PTY 调用：预置当前 Key 为 rejected，验证 Bearer 投影仍能完成首轮响应；需 `CCM_RUN_REAL_CLAUDE_API_TESTS=1`、`CCM_REAL_CLAUDE_API_KEY_FILE` 和 `CCM_REAL_CLAUDE_BASE_URL` |
+| `test_add_apibest_builds_private_dual_provider_home` / `test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog` / `test_generic_api_accounts_require_upstream_fast_capability_and_reload` | APIBest 双 provider 私有账号目录、「认证 models 空目录 → 公开 pricing 模型发现」，以及 API 网关显式 Fast 能力来源校验 |
+| `test_claude_login_error_message_is_turn_fatal` | Claude 以 exit 0 返回普通 `Not logged in` error message 时仍判定回合失败 |
 | `TestTransientOverloadDetection` | **瞬时 429/过载检测**：命中 Anthropic 官方文案 `Server is temporarily limiting requests (not your usage limit)` / overloaded；与「额度用尽/认证失败」互斥（那些走换号）；无误报 |
 | `TestTransientRetryDelay` | 退避计算：首次≈base、指数增长、封顶 cap、最小 1s |
 | `TestClaudePool` | 账号加载、select 轮转、冷却标记/过期/清除、status 汇总 |
@@ -1035,9 +1088,12 @@ python -m pytest \
 
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
-| 1 | 人 | 一次性创建 10 个任务 |
-| 2 | 人 | 观察同时 executing 的任务数量 |
-| 3 | AI | 查 DB `SELECT COUNT(*) FROM instances WHERE status='running'`，确认不超过 MAX_CONCURRENT_INSTANCES |
+| 1 | 人 | 在管理员 Settings 将本地并发上限改为 3 |
+| 2 | 人 | 一次性创建 10 个本地任务，确认同时 executing 的任务不超过 3 |
+| 3 | 人 | 运行中把上限降为 1，确认已有任务不中断且新任务等待 |
+| 4 | 人 | 把上限升为 4，确认无需重启即可继续领取等待任务 |
+| 5 | AI | 调 `GET /api/settings/capacity` 并查 running Instance，核对 effective/active/pending 状态 |
+| 6 | 人 | 点击“恢复环境默认值”，确认重新使用 `MAX_CONCURRENT_INSTANCES` |
 
 ### 测试 7：前端 UI 状态
 
@@ -1135,6 +1191,14 @@ cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
 | `test_alembic_migrations.py` | `b7c9e2f4a610` 是唯一 head 且继承 `7a1d4e9c2b60`；fresh schema 含 `pr_finding_actions` 的审计/回执列、active-slot unique、idempotency/check/FK 约束；upgrade→downgrade→upgrade 可逆且 ORM 无漂移 |
 | `FindingActions.test.tsx` | 只有当前 snapshot 可创建 Action；下载成功且 receipt/hash 仍匹配当前候选后才开放确认；轮询、重试对账与错误提示不把 candidate 误报为已 push |
 
+迁移 `b1d7e4a9c302` 的 upgrade 支持 SQLite、PostgreSQL，以及通过版本与
+InnoDB 门控的 MySQL/MariaDB。自动 downgrade 只允许能持有 writer fence 的
+SQLite/PostgreSQL；MySQL/MariaDB 会 fail closed，必须先停写并备份，再通过单独
+验证的人工回滚流程处理。降级恢复旧 subject UNIQUE 时只把所有 key 列均非 NULL 的
+真实冲突视为 rerun；旧 SQLite/PostgreSQL/MySQL 都合法保留的 NULL subject 重复不得误阻断。
+attempt/lineage CHECK 还须允许首次 ready-for-review 的 parentless idempotency key 与
+父 Review `ON DELETE SET NULL` 后的历史 attempt，同时拒绝 attempt 1 指向父 Review。
+
 手动验收：在当前 Panel 的 open Finding 上先记录 Human advice，再生成 AI fix；确认 Task 页面所有公共修改入口返回 409。候选就绪后刷新页面，直接确认应被后端拒绝；下载 diff 并人工核对 target repo、PR、source ref、expected base/head、文件列表和 SHA-256，再确认应只产生一个以旧 head 为唯一 parent 的普通 commit。确认前 retarget PR、删除源分支或另行 push 改变源分支时，CCM 必须报告 stale/lease rejection，且不得重建或覆盖 ref；模拟确认请求超时后重试时，系统必须先用持久 nonce 与 parent 证据对账，不能重复 push。
 
 ### 手动测试: Webhook（需要构造 HMAC 签名）
@@ -1142,7 +1206,7 @@ cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
 ```bash
 # 生成签名并发送模拟 webhook
 SECRET="<webhook_secret>"
-PAYLOAD='{"action":"opened","pull_request":{"number":1,"title":"Test PR","draft":false,"user":{"login":"user1"},"base":{"ref":"main"},"html_url":"https://github.com/test/repo/pull/1"},"repository":{"full_name":"test/repo"}}'
+PAYLOAD='{"action":"opened","pull_request":{"number":1,"title":"Test PR","draft":false,"user":{"login":"user1"},"base":{"ref":"main","sha":"1111111111111111111111111111111111111111"},"head":{"ref":"test-pr","sha":"2222222222222222222222222222222222222222"},"html_url":"https://github.com/test/repo/pull/1"},"repository":{"full_name":"test/repo"}}'
 SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print "sha256="$2}')
 
 curl -X POST http://localhost:8000/api/github/webhook \
@@ -1151,6 +1215,38 @@ curl -X POST http://localhost:8000/api/github/webhook \
   -H "X-Hub-Signature-256: $SIG" \
   -d "$PAYLOAD"
 ```
+
+除 `opened` 外，再以新 delivery id 发送 `ready_for_review`、`closed`（分别含
+`pull_request.merged=false/true`）和 `reopened`。每次都核对 Run 的 lifecycle、旧 Reviewer generation 是否
+终止、迟到 callback 是否被 fencing，以及 reopened 后的 subject 是否与 GitHub 当前 base/head 完全一致。
+对 Delivery-owned Run 重放 `synchronize`、`reopened` 与 `ready_for_review` 时必须得到 409，并核对
+Delivery/Monitor/Review 的 owner edge、终态证据和 current Review 均未变化。
+
+### 结果工作项、发布身份与重新审查
+
+```bash
+# Tasks 页面使用的只读聚合 feed
+curl 'http://localhost:8000/api/pr-monitor/results?page=1&size=20' \
+  -H 'Authorization: Bearer <token>'
+
+# exact-head 重新审查；重复发送同一 key 必须返回同一个 attempt
+curl -X POST http://localhost:8000/api/pr-monitor/reviews/<review_id>/rerun \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_head_sha":"<40-hex-head>","idempotency_key":"manual-check-1"}'
+```
+
+必须人工核对：
+
+1. Panel 在 Tasks 只出现一张 `PR Review Result` 卡，普通 Task 分页、搜索和操作仍正常；卡片没有 Chat、Retry
+   Task、中断、分享、prompt、session 或日志入口。
+2. 详情分别显示 code verdict、publication、PR lifecycle 和 failure stage。构造“Review 已完成后外部合并 PR”
+   的竞态，应显示原 verdict + merged + publication not applicable，不出现自相矛盾的 no-verdict/infra 文案。
+3. 用运行 CCM 后端的同一系统用户执行 `gh api user --jq .login`，应与成功 publication 的 actor evidence 一致；
+   浏览器 Connector 或 Reviewer Codex 未登录不影响该结果。GitHub 页面上的新 Review event 必须为 COMMENT，
+   内部 pass 在 CCM 中也不能显示为 GitHub Approved。
+4. 在 current open/non-draft head 重审会新增 history；重复 key 不重复创建。随后 push 新 head、close/merge 或转为
+   draft，再提交旧 `expected_head_sha` 必须被拒绝，旧结果不得被覆盖。
 
 ### 前端测试
 
@@ -1165,6 +1261,9 @@ Markdown 数学公式回归：
 3. 点击仓库 → 验证详情页、Webhook 配置、复制按钮
 4. 切换 enabled → 验证开关状态
 5. 删除仓库 → 验证列表更新
+6. 导航到 Tasks → 验证 `PR Review Result` 与普通 Task 使用不同只读卡片，点击可进入精确 PR Monitor detail/GitHub
+7. 验证 Changes required、published COMMENT、publication not applicable、closed/merged 和 reviewer unavailable
+   的标签互不覆盖；列表摘要有界，detail 保留全文与 Review History
 
 ## Task 状态同步（status_change 广播收口，2026-07-12）
 
@@ -1217,6 +1316,107 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
+## Delivery Loop V1
+
+```bash
+# Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
+uv run pytest -q backend/tests/test_delivery_*.py
+
+# Delivery 页快速启动、六阶段进度、Plan 内联输入与侧栏 attention
+cd frontend && npx vitest run \
+  src/components/Delivery/DeliveryCreateForm.test.tsx \
+  src/components/Delivery/DeliveryRunDialog.test.tsx \
+  src/components/Tasks/DeliveryRunPanel.test.tsx \
+  src/components/Layout/AppShell.test.tsx
+
+# 真实 Codex app-server 隔离探针（显式 opt-in，不发送模型请求）
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
+
+# 需让 PATH 中的 codex 指向可验证的稳定版 >=0.146.0
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_managed_public_network_extended_boundary
+```
+
+两项真实探针都不调用 `turn/start`，因此不发送模型请求。Delivery 探针通过
+`initialize` / `thread/start` / `command/exec` 验证 network-off 的宿主文件、
+凭据环境和 linked-worktree 边界。Managed 探针要求 PATH 中是可由同一
+app-server `initialize.userAgent` 证明的稳定版 Codex `>=0.146.0`，并让
+`codex sandbox` 使用与生产相同的 permission profile 和
+`shell_environment_policy.inherit=none` + safe explicit set/TMP；它验证公网
+HTTPS 经 managed proxy 成功，同时 direct public TCP、host loopback/private
+destination、pathname/abstract AF_UNIX、UDP、SOCKS 和 deployment upstream
+proxy 全部失败；sandbox loopback bind/self-connect 仅在隔离 netns 内成立，
+不暴露给宿主。缺少 CLI、版本不足或非 Linux 时对应用例跳过。
+
+真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
+一次性 canary 仓库执行。`auto_merge=false` 的成功终点必须是 `ready_to_merge`；
+`auto_merge=true` 会真实合并，只能在明确授权的 disposable canary 验证。两种模式都不得 deploy。
+
+`test_delivery_setup.py` 覆盖默认 Monitor 的幂等创建、已有 Monitor 防接管、分支保护
+required check 精确映射、无 required CI 时仍强制 Panel，以及
+`/api/delivery-runs/quick-start` 从一段需求完成内部配置与 Run admission。自动合并
+为每次 Run 的显式、默认关闭选择；没有 app-bound exact CI 时必须在 admission 拒绝。
+`test_delivery_controller.py` 另外覆盖 Frontend Review 的 auto skip、unbound Harness
+崩溃恢复、exact owner/head/profile、最终 diff 同时命中多个 Preview Profile 后的串行执行、
+冻结配置复用、逐项归档报告+截图门禁和 finding 回流新 Cycle；
+`test_workspace_review.py` 覆盖 v1→v2 兼容映射、路径匹配/default 选择和无 default 的能力检测；
+`test_test_harness_contracts.py` / `test_test_harness_execution_context.py` 覆盖显式 Profile ID
+契约与 Run-scoped Preview 冻结；`test_delivery_workspace.py` 覆盖精确 changed-path manifest；
+`test_alembic_migrations.py` 覆盖多 Profile Cycle 字段的 upgrade/downgrade 与唯一 migration head。
+`test_delivery_api.py` 与 `test_auth_ws_security.py` 覆盖统一 progress、Plan input/attention
+投影、失败 Run 的 state-version fenced 同 Run 新 Cycle 重试，以及 Run-scoped WebSocket
+的 Project ACL。`test_plan_capability.py` 覆盖失败 Plan Run 在 Invocation 终态前自动创建
+第二个独立 Execution/Plan Run，避免一次短暂路由故障直接终止 Delivery。
+`DeliveryRunDialog.test.tsx` 覆盖当前 Round/预算/开轮原因的醒目展示、历史 Round 切换、
+按轮阶段与时间线过滤，以及新 Round/Plan input 自动回到当前轮。
+
+## Auto Capability policy、terminal admission 与 durable resume
+
+```bash
+uv run pytest -q backend/tests/test_auto_capability_policy.py \
+  backend/tests/test_agent_capability_admission.py \
+  backend/tests/test_agent_capability_production_adapters.py \
+  backend/tests/test_capability_result.py \
+  backend/tests/test_capability_resume.py \
+  backend/tests/test_capability_resume_outbox_schema.py \
+  backend/tests/test_instance_manager_capability_terminal.py
+uv run pytest -q backend/tests/test_api_tasks.py -k waiting_capability
+uv run pytest -q backend/tests/test_service_dispatcher.py \
+  -k 'capability_resume or initial_capability or background_capability_retry or auto_terminal'
+uv run pytest -q backend/tests/test_api_capabilities.py \
+  -k 'public_mutation_rejects_agent_resume_invocation'
+cd frontend && npx vitest run \
+  src/components/Chat/ChatView.test.tsx \
+  src/components/Tasks/TaskForm.test.tsx \
+  src/components/Tasks/TaskList.test.tsx \
+  src/components/Tasks/taskStatus.test.ts
+```
+
+| 测试 | 覆盖 |
+|------|------|
+| `test_policy_rejects_ambiguous_or_unbounded_shapes` | V1 静态 Plan/Review 白名单、严格整数、总预算/分类预算、未知字段与硬上限 |
+| `test_task_policy_is_create_only_and_local_auto_only` | policy 只在本机普通 Auto Task 创建时冻结；PUT、Worker 与非 Auto 明确拒绝 |
+| `test_default_policy_is_real_sql_null` | 默认关闭持久化为 SQL `NULL`，不落 JSON `null` |
+| `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
+| `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
+| `test_auto_capability_switch_is_independent_and_fail_closed` | 三个 admission 开关默认开启；Capability Core 关闭时 Auto/Delivery 有效值仍为 false |
+| `test_agent_capability_admission.py` | 只接受当前 exact source/output/terminal 的严格 terminal action，并在 provider 提供时校验 native turn；原子消费总预算与分类预算，失败请求不退预算 |
+| `test_agent_capability_production_adapters.py` | Agent Plan/Review 请求进入真实 executor，原 Task 保持 `waiting_capability`，结果 identity 反向验证 |
+| `test_capability_result.py` | completed Execution、结果类型/id/hash 与 Plan/Review 权威聚合必须完整反向匹配 |
+| `test_capability_resume.py` | `pending → ready → claiming → claimed → launched → completed` outbox、lease、G+1 重放、崩溃恢复与 provider boundary |
+| `test_capability_resume_outbox_schema.py` | SQLite/PostgreSQL/MySQL migration preflight、约束、partial schema crash replay 与 downgrade writer gate |
+| `test_instance_manager_capability_terminal.py` | Claude/Codex 终态先 settle 旧 resume，再按同一 exact generation 接纳连续 Capability |
+| `test_waiting_capability_*` | stop/cancel 先静止 queue consumer 与 executor，再终态化 Invocation/outbox/Task；claimed/launched 分界 fail closed |
+| `test_initial_capability_*` / `test_background_capability_retry_*` | PTY autonomous tail、exact state、marker 清除与 termination receipt 竞态下不提前 admission、不重复 ledger |
+| `test_capability_resume_releases_fence_before_terminal_consumer` | Phase 1 持 capability fence，Phase 2 在等待 output consumer 前释放，防止 G+1 自锁 |
+| `test_public_mutation_rejects_agent_resume_invocation` | 人工 advisory consume/cancel 不能改写 Agent/Controller-owned resume 状态机 |
+| 前端 Chat/TaskForm/TaskList/taskStatus | policy 总预算与分类预算配置、`waiting_capability` 状态/等待提示和旧 turn 事件隔离 |
+
+Capability Core 与 Auto Capability 的全局 admission 默认开启；仍只有创建时显式
+冻结了 `capability_policy` 的本地普通 Auto Task 可由模型请求 Plan/Review。
+Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail closed。
+
 ## 开发规范
 
 ### Claude Code 开发时必须遵守：
@@ -1244,6 +1444,8 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
+| Claude PTY chat post-exit retained proof | `test_inject_pty_message_uses_chat_post_exit_proof_after_maps_clear` + `test_process_event_accepts_exact_chat_proof_after_maps_clear` + `test_inject_pty_message_rejects_same_slot_replacement_proof` + `test_autonomous_mirror.py::TestFullMirrorBackend::test_exact_pty_generation_finalizes_task_and_instance` |
+| Claude PTY CLI 路由 | `test_claude_pty_receives_task_ssh_guard_env_and_policy` 同时确认 PTY wrapper 使用配置的 `CLAUDE_BINARY`，不回落到 ambient `claude` |
 | `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
@@ -1253,6 +1455,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
 | `backend/services/task_artifact_contract.py` + `backend/api/task_artifacts.py` + Task 产物提示/Worker capability | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` + `backend/tests/test_api_system.py`（跨 Task namespace、旧 Worker fail-closed、伪造 tag、非法项目根） |
+| `backend/services/auto_capability_policy.py` + Task policy schemas/API | `backend/tests/test_auto_capability_policy.py` + `backend/tests/test_api_system.py` |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |
@@ -1260,6 +1463,12 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/mcp/ccm_skills_server.py` | `backend/tests/test_mcp_server.py` |
 | `backend/models/monitor_session.py` | `backend/tests/test_monitor_models.py` |
 | `backend/services/mcp_config.py` | `backend/tests/test_mcp_config.py` |
+| `backend/services/browser_review.py` | `backend/tests/test_browser_review.py` |
+| `backend/services/browser_review_jobs.py` | `backend/tests/test_browser_review_jobs.py` |
+| `backend/services/test_harness.py` + `test_harness_contracts.py` + `test_harness_targets.py` + `backend/api/test_harness.py` | `backend/tests/test_test_harness.py` + `test_test_harness_contracts.py` + `test_test_harness_targets.py` + `test_api_test_harness.py` + migration tests |
+| `backend/api/browser_reviews.py` + `backend/mcp/ccm_browser_review_server.py` | `backend/tests/test_api_browser_reviews.py` + `backend/tests/test_mcp_config.py` + 真实浏览器冒烟 |
+| `backend/services/workspace_review.py` + `backend/services/workspace_review_intent.py` + `backend/api/workspace_reviews.py` + `backend/mcp/ccm_workspace_review_server.py` | `backend/tests/test_workspace_review.py` + `backend/tests/test_workspace_review_intent.py` + `backend/tests/test_api_workspace_reviews.py` + `frontend/src/components/Chat/{ChatView,BrowserReviewPanel}.test.tsx` |
+| Test Harness 慢扫描/轮询资源隔离 | `test_api_test_harness.py::test_list_test_runs_releases_route_connection_before_service_sessions` + `test_test_harness.py::test_current_workspace_slow_start_releases_owner_fence_and_stop_wins` + `test_workspace_review.py::{test_staleness_refresh_*,test_workspace_start_snapshots_without_db_or_manager_writer_fences}` + `BrowserReviewPanel.test.tsx` 的 single-flight/退避/跨 Task fencing 用例 |
 | `backend/api/monitor.py` | `backend/tests/test_api_monitor.py` |
 | `backend/api/settings.py` (runtime) | `backend/tests/test_api_settings_runtime.py`（含 context_compact_threshold 默认/更新/越界拒绝） |
 | `backend/services/dispatcher.py` (monitor) | `backend/tests/test_monitor_dispatcher.py` |
@@ -1269,8 +1478,16 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/api/pr_monitor.py` | curl 测试 CRUD + webhook |
 | `backend/services/pr_review_service.py` | 集成测试（webhook → task 创建） |
 | `frontend/src/pages/PRMonitorPage.tsx` | TypeScript 类型检查 + 手动 UI 测试 |
+| `frontend/src/pages/BrowserReviewPage.tsx` | `frontend/src/pages/BrowserReviewPage.test.tsx` + TypeScript build + 手动 UI 测试 |
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
 | `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
+
+Codex Fast transport compatibility is covered by
+`backend/tests/test_codex_tier_proxy.py`: an exact priority lineage repairs
+Codex 0.147's missing/default outgoing `service_tier` to the Responses API
+wire value `priority`, while Standard and unsupported request-tier mismatches
+remain fail-closed. A successful `response.created` accepts the request even
+when its informational response tier is `auto/default` or absent.
 
 ## 分布式 Worker 测试
 
@@ -1283,6 +1500,16 @@ uv run python -m pytest backend/tests/test_api_workers.py -v
 覆盖：API 状态守卫（409/503/404）、双击防护（同步置过渡态）、provisioner 状态机
 （收养/创建/stop/start/destroy/retry，cloud+SSH 全替身）、健康检查降级与自动恢复
 （bootstrap 失败不被洗白）、.deploy_commit 版本回退。
+
+Plan/Worker 销毁门禁重点覆盖：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_destroy_finds_dispatch_receipt_by_frozen_worker_identity` | destroy 直接按 receipt 冻结的 Worker identity 查证；Run/Plan 改绑、脱离或 Run 丢失都不能隐藏 uncertain remote boundary |
+| `test_destroy_rejects_forged_cleaned_worker_plan_runtime` / `test_destroy_rejects_cleaned_runtime_with_wrong_generation` | terminal Run 逐 Step/generation/attempt 审计 runtime aggregate，伪造 `cleaned` shape 或错代 receipt 仍 fail closed |
+| `test_clean_proof_rejects_late_worker_local_harness_run` | terminal 高区 owner 在 clean proof 后启动 Harness 必须被 node fence 拒绝，不能留下 Run/Event |
+| `test_migration_finish_rejects_target_destroying_after_remote_create` / `test_migration_import_exact_rollback_survives_destination_drain` | destination import 与 destroy 竞态只清理 exact nonce/incarnation/retry/turn mirror；Manager 指针已切换或目标已有日志/证据时 fail closed |
+| `test_active_receipt_blocks_completed_only_autonomous_admission` 及 permission relay drain 用例 | stop ACK 后的 PTY autonomous、permission、Log/Sub-Agent late producer 仍受 node-first writer fence，clean proof 后不能提交 |
 
 ### 真机冒烟（收养一台已有 EC2 跑完整 bootstrap）
 
@@ -1301,3 +1528,46 @@ manager(8003) 注册 worker → 建 git_url 项目 → 创建 task 选 worker �
 转发同 ID、状态回流、43 条日志镜像、README 真实修改 + merge push、
 chat 代理 + session_id 同步、回复经 relay 回流。测试仓库
 github.com/youchengsong/ccm-worker-e2e-test（可删）。
+
+## Project 就绪门禁与 clone 失败收口（2026-08-26）
+
+### 自动化测试（backend/tests/test_project_readiness.py）
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_require_project_dispatchable_rejects_error_only` | 只有 `status='error'` 拒绝；pending/cloning/initializing/ready 及无 Project 放行 |
+| `test_dequeue_holds_task_while_project_is_cloning` | cloning 项目的 pending Task 不被领取；项目 ready 后立即可领取 |
+| `test_dequeue_holds_task_of_error_project_until_reclone` | clone 失败项目的 Task 保持 pending（不烧 retry 预算）；reclone 回 ready 后自动恢复 |
+| `test_dequeue_unaffected_without_project_or_with_dangling_project` | `project_id` 为 NULL 或悬空（项目已删）时调度行为不回归 |
+| `test_create_task_rejects_error_project` | POST /api/tasks 引用 error 项目 → 422，不残留 Task 行 |
+| `test_create_task_allows_cloning_project` | cloning 项目仍可创建 Task（pending 等待就绪） |
+| `test_update_task_rejects_move_to_error_project` | PUT 把 Task 移入 error 项目 → 422 |
+| `test_todo_run_rejects_error_project` | Todo「▶ Run」对 error 项目 → 422 |
+| `test_prepare_task_working_directory_rejects_missing_explicit_path` | 显式工作目录不存在 → `TaskWorkingDirectoryMissingError`（人话+路径），存在则通过 |
+| `test_require_existing_task_cwd` | Monitor/Sub-Agent 直 spawn 路径 preflight 的存在性检查 |
+| `test_describe_clone_failure_prefixes_auth_errors` | 认证类 clone stderr 归一化为可操作文案且保留原始错误尾部 |
+| `test_clone_note_sync_annotates_and_clears` | clone 失败批量注记等待 Task 的 error_message；成功清除 |
+| `test_clone_note_clear_keeps_foreign_error_messages` | 清除只匹配自己的注记前缀，不误删任务真实错误 |
+| `test_clone_note_annotation_preserves_foreign_error_messages` | 写入侧对称守卫：注记只写 error_message 为空或本 helper 前缀的任务，独立诊断不被 clone 注记覆盖；成功清除后独立诊断仍在（评审 finding 修复） |
+| `test_update_task_keeps_unchanged_error_project_editable` | 全量表单 PUT 带未变更的 project_id（项目已 error）仍可编辑其他字段（评审 finding 修复） |
+| `test_post_clone_setup_failure_cannot_reverse_ready` | ready 是最终发布：post-clone 自动配置失败不得翻回 error，任务保持可调度，wake 在隔离后置步骤之后（评审 finding 修复） |
+| `test_dequeue_holds_task_with_null_project_status` | NULL status（legacy 行）按 fail-closed 处理：SQL 三值逻辑下 `NULL != 'ready'` 为 UNKNOWN，谓词显式 `status IS NULL OR status != 'ready'`；测试用放宽 nullable 的 schema 副本 + Core UPDATE 构造真实 NULL（ORM 对 None 会应用列默认值）（评审 finding 修复） |
+
+test_git_credentials.py 同步更新/覆盖：
+- `test_clone_no_config_no_env` — 零配置 clone 也必须带 `GIT_TERMINAL_PROMPT=0`、默认 `ssh -o BatchMode=yes` 与 `stdin=DEVNULL`（评审 finding 修复）
+- `test_clone_passes_git_env_with_ssh` — 已配置的 SSH 命令被增补 BatchMode 而不是替换
+
+test_service_instance_manager.py 新增（Codex scope 竞态回归，评审 finding 覆盖）：
+- `test_codex_scope_reservation_blocks_stale_lifecycle_cleanup` — 新代次已 reserve（物化后、spawn 前窗口）时旧 lifecycle 的终态清理必须跳过；adopt 交接后仍跳过；只有 exact 代次终态释放才清理
+- `test_codex_launch_failure_after_reserve_discards_reservation` — reserve 之后、进程注册之前的任何异常经 `_launch_impl` 的 BaseException 分支释放 reservation，下一代次可立即重新 reserve（无泄漏）
+
+注：标 `requires_posix_backend` 的用例依赖 `backend.api` 导入链（`deployment_start_guard` 的 POSIX `fcntl`），Windows 开发机自动跳过，Linux 上全量执行。
+
+### 手动验证清单
+
+1. 创建 HTTPS 无凭据的私有仓库项目 → 项目数秒内变 error（不再挂起等待凭据输入），error_message 以「git authentication failed」开头并给出补凭据指引；
+2. 对 error 项目新建任务 → API 422；前端 TaskForm/PlanCreateForm 选中该项目时显示红色警示（含失败原因）并禁用提交；
+3. 项目 cloning 期间创建任务 → 任务保持 pending，clone 完成后 ≤2s 自动开始（dispatcher.wake + 2s poll 兜底）；
+4. Re-clone 修复 error 项目 → 之前等待的 pending 任务自动开始，error_message 注记自动清除；
+5. chat 续聊一个 `last_cwd` 已被删除的任务 → 聊天出现红色 system_event「任务工作目录 … 不存在，本条消息未执行」，Task 回滚到发送前状态，消息不无限重试；
+6. Worker 项目 clone 失败 → Manager 侧秒级报「worker 项目 … clone 失败: <原因>」，不再等满 300s 超时。

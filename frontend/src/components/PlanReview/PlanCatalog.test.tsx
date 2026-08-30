@@ -44,6 +44,7 @@ describe('PlanCatalog', () => {
   it.each([
     ['queued', 'text-blue-300'],
     ['waiting_user', 'text-amber-300'],
+    ['cancelling', 'text-orange-300'],
     ['awaiting_review', 'text-purple-300'],
     ['approved', 'text-emerald-300'],
     ['applied', 'text-teal-300'],
@@ -76,6 +77,12 @@ describe('PlanCatalog', () => {
     expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
   });
 
+  it('labels Capability ownership and hides archive for a terminal read-only Plan', () => {
+    render(<PlanCatalog plans={[{ ...plan(1, 'Capability Plan'), ownership: 'capability', read_only: true }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={vi.fn()} />);
+    expect(screen.getByText('Capability · read-only')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
+  });
+
   it('disables the archive action while it is pending and keeps its accessible name', async () => {
     let resolve!: () => void;
     const pending = new Promise<void>((done) => { resolve = done; });
@@ -100,5 +107,16 @@ describe('PlanCatalog', () => {
 
     expect(onNavigateTask).toHaveBeenCalledWith(200);
     expect(onSelectPlan).not.toHaveBeenCalled();
+  });
+
+  it('opens the Delivery workspace for a Delivery-owned Plan', async () => {
+    const onNavigateTask = vi.fn();
+    const onNavigateDelivery = vi.fn();
+    render(<PlanCatalog plans={[{ ...plan(2, 'Delivery Plan'), target_task_id: 1005, delivery_run_id: 1 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} onSetArchived={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open Delivery DLV-1' }));
+
+    expect(onNavigateDelivery).toHaveBeenCalledWith(1);
+    expect(onNavigateTask).not.toHaveBeenCalled();
   });
 });

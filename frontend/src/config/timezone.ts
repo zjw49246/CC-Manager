@@ -57,15 +57,20 @@ function getDateParts(date: Date, tz: string): { year: number; month: number; da
 /** Normalize an ISO timestamp to ensure UTC interpretation.
  *  Backend sends naive datetimes (no Z suffix) that are actually UTC. */
 function ensureUtc(iso: string): string {
-  if (/[Z+\-]\d/.test(iso) || iso.endsWith('Z')) return iso;
+  if (/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(iso)) return iso;
   return iso + 'Z';
+}
+
+/** Parse backend DateTime values, whose missing offset always means UTC. */
+export function parseBackendTimestamp(iso: string): Date {
+  return new Date(ensureUtc(iso));
 }
 
 /** Format an ISO timestamp string for display in chat.
  *  Today → HH:MM, same year → MM/DD HH:MM, different year → YYYY/MM/DD HH:MM */
 export function formatMessageTime(isoString: string, now?: Date): string {
   const tz = resolveTimezone();
-  const date = new Date(ensureUtc(isoString));
+  const date = parseBackendTimestamp(isoString);
   const msgParts = getDateParts(date, tz);
   const nowParts = getDateParts(now ?? new Date(), tz);
 
@@ -94,7 +99,7 @@ export function formatMessageTime(isoString: string, now?: Date): string {
  *  Always shows date + time: YYYY/MM/DD HH:MM or MM/DD HH:MM (same year). */
 export function formatDateTime(isoString: string, now?: Date): string {
   const tz = resolveTimezone();
-  const date = new Date(ensureUtc(isoString));
+  const date = parseBackendTimestamp(isoString);
   const msgParts = getDateParts(date, tz);
   const nowParts = getDateParts(now ?? new Date(), tz);
 

@@ -6,6 +6,8 @@
 """
 import asyncio
 import json
+import os
+import socket
 import subprocess
 import sys
 import threading
@@ -15,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from backend.services.ask_user import (
+    AskUserRevocation,
     AskUserRegistry,
     format_answer_reason,
 )
@@ -28,14 +31,40 @@ from backend.services.ask_user_settings import (
 
 # ----------------------------------------------------------------- registry
 
+TASK_RETRY_COUNT = 2
+TASK_TURN_GENERATION = 7
+TASK_STATUS = "executing"
+
+
+def _generation_kwargs():
+    return {
+        "task_retry_count": TASK_RETRY_COUNT,
+        "task_turn_generation": TASK_TURN_GENERATION,
+        "task_status": TASK_STATUS,
+    }
+
 @pytest.mark.asyncio
 async def test_registry_create_resolve_roundtrip():
     reg = AskUserRegistry()
-    pending = reg.create(task_id=7, session_id="sid", questions=[{"question": "?"}])
+    incarnation = "7" * 32
+    pending = reg.create(
+        task_id=7,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="sid",
+        questions=[{"question": "?"}],
+    )
     assert pending.request_id
     assert reg.get(pending.request_id) is pending
-    assert reg.list_for_task(7) == [pending]
-    assert reg.list_for_task(8) == []
+    assert reg.list_for_task(
+        7, incarnation, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    ) == [pending]
+    assert reg.list_for_task(
+        8, incarnation, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    ) == []
+    assert reg.list_for_task(
+        7, "8" * 32, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    ) == []
 
     answers = [{"labels": ["A"], "text": ""}]
     assert reg.resolve(pending.request_id, answers) is True
@@ -46,21 +75,89 @@ async def test_registry_create_resolve_roundtrip():
 async def test_registry_resolve_unknown_and_double():
     reg = AskUserRegistry()
     assert reg.resolve("nope", []) is False
-    pending = reg.create(task_id=1, session_id="s", questions=[{"question": "?"}])
+    pending = reg.create(
+        task_id=1,
+        task_incarnation_id="1" * 32,
+        **_generation_kwargs(),
+        session_id="s",
+        questions=[{"question": "?"}],
+    )
     assert reg.resolve(pending.request_id, [{"labels": ["x"]}]) is True
     # second resolve must fail (future already done)
     assert reg.resolve(pending.request_id, [{"labels": ["y"]}]) is False
 
 
 @pytest.mark.asyncio
+async def test_registry_answer_claim_allows_one_committer_and_release():
+    reg = AskUserRegistry()
+    incarnation = "4" * 32
+    pending = reg.create(
+        task_id=4,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="session-4",
+        questions=[{"question": "?"}],
+    )
+    first = reg.claim_answer(
+        pending.request_id,
+        task_id=4,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="session-4",
+    )
+    assert first is not None
+    assert reg.list_for_task(
+        4, incarnation, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    ) == []
+    assert reg.claim_answer(
+        pending.request_id,
+        task_id=4,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="session-4",
+    ) is None
+    assert reg.release_answer_claim(pending.request_id, first) is True
+
+    second = reg.claim_answer(
+        pending.request_id,
+        task_id=4,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="session-4",
+    )
+    assert second is not None and second != first
+    answers = [{"labels": ["A"]}]
+    assert reg.fulfill_answer(pending.request_id, first, answers) is False
+    assert reg.fulfill_answer(pending.request_id, second, answers) is True
+    assert await pending.future == answers
+
+
+@pytest.mark.asyncio
 async def test_registry_discard_and_list_excludes_done():
     reg = AskUserRegistry()
-    p1 = reg.create(task_id=3, session_id="s", questions=[{"question": "?"}])
-    p2 = reg.create(task_id=3, session_id="s", questions=[{"question": "?"}])
-    assert len(reg.list_for_task(3)) == 2
+    incarnation = "3" * 32
+    p1 = reg.create(
+        task_id=3,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="s",
+        questions=[{"question": "?"}],
+    )
+    p2 = reg.create(
+        task_id=3,
+        task_incarnation_id=incarnation,
+        **_generation_kwargs(),
+        session_id="s",
+        questions=[{"question": "?"}],
+    )
+    assert len(reg.list_for_task(
+        3, incarnation, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    )) == 2
     reg.resolve(p1.request_id, [])
     # resolved (future done) → excluded from pending list
-    assert reg.list_for_task(3) == [p2]
+    assert reg.list_for_task(
+        3, incarnation, TASK_RETRY_COUNT, TASK_TURN_GENERATION, TASK_STATUS,
+    ) == [p2]
     reg.discard(p2.request_id)
     assert reg.get(p2.request_id) is None
 
@@ -68,13 +165,57 @@ async def test_registry_discard_and_list_excludes_done():
 @pytest.mark.asyncio
 async def test_registry_list_all_spans_tasks_and_excludes_done():
     reg = AskUserRegistry()
-    a = reg.create(task_id=1, session_id="s", questions=[{"question": "?"}])
-    b = reg.create(task_id=2, session_id="s", questions=[{"question": "?"}])
+    a = reg.create(
+        task_id=1,
+        task_incarnation_id="1" * 32,
+        **_generation_kwargs(),
+        session_id="s",
+        questions=[{"question": "?"}],
+    )
+    b = reg.create(
+        task_id=2,
+        task_incarnation_id="2" * 32,
+        **_generation_kwargs(),
+        session_id="s",
+        questions=[{"question": "?"}],
+    )
     # list_all 跨 task 汇总（驱动全局通知）
     assert {p.request_id for p in reg.list_all()} == {a.request_id, b.request_id}
     reg.resolve(a.request_id, [])
     # 已回答（future done）从全局列表剔除
     assert [p.request_id for p in reg.list_all()] == [b.request_id]
+
+
+@pytest.mark.asyncio
+async def test_registry_discards_old_turn_and_terminal_pending():
+    reg = AskUserRegistry()
+    incarnation = "5" * 32
+    old = reg.create(
+        task_id=5,
+        task_incarnation_id=incarnation,
+        task_retry_count=1,
+        task_turn_generation=3,
+        task_status="executing",
+        session_id="session-5",
+        questions=[{"question": "old?"}],
+    )
+
+    reg.discard_stale_for_task(5, incarnation, 1, 4, "executing")
+    assert reg.get(old.request_id) is None
+    assert isinstance(await old.future, AskUserRevocation)
+
+    terminal = reg.create(
+        task_id=5,
+        task_incarnation_id=incarnation,
+        task_retry_count=1,
+        task_turn_generation=4,
+        task_status="executing",
+        session_id="session-5",
+        questions=[{"question": "terminal?"}],
+    )
+    reg.discard_stale_for_task(5, incarnation, 1, 4, "completed")
+    assert reg.get(terminal.request_id) is None
+    assert isinstance(await terminal.future, AskUserRevocation)
 
 
 # ------------------------------------------------------------------- format
@@ -208,14 +349,19 @@ def test_inject_hook_carries_cli_timeout(tmp_path):
 _HOOK_SCRIPT = Path(__file__).resolve().parents[1] / "hooks" / "ask_user_hook.py"
 
 
-def _run_hook_against(response_body: dict) -> subprocess.CompletedProcess:
+def _run_hook_against(
+    response_body: dict,
+    *,
+    status: int = 200,
+    scoped_token: bool = False,
+) -> subprocess.CompletedProcess:
     """跑真实 hook 脚本，stub 后端返回给定 /wait 响应。"""
 
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             body = json.dumps(response_body).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -232,11 +378,20 @@ def _run_hook_against(response_body: dict) -> subprocess.CompletedProcess:
             "session_id": "sid-hook-test",
             "tool_input": {"questions": [{"question": "?"}]},
         })
+        env = os.environ.copy()
+        if scoped_token:
+            env["CCM_ASK_USER_TOKEN"] = "scoped-hook-test-token"
+        else:
+            env.pop("CCM_ASK_USER_TOKEN", None)
         return subprocess.run(
             [sys.executable, str(_HOOK_SCRIPT),
              "--api-base", f"http://127.0.0.1:{srv.server_address[1]}",
              "--timeout", "10"],
-            input=payload, capture_output=True, text=True, timeout=30,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
         )
     finally:
         srv.shutdown()
@@ -257,6 +412,95 @@ def test_hook_script_timed_out_denies_not_fail_open():
     out = json.loads(cp.stdout)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "best judgment" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_hook_script_stale_generation_revocation_denies_not_fail_open():
+    cp = _run_hook_against({
+        "answered": False,
+        "revoked": True,
+        "reason": "The Task generation changed before the user answered.",
+    })
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Task generation changed" in reason
+    assert "best judgment" in reason
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 410])
+def test_hook_script_scoped_http_rejection_denies_not_fail_open(status):
+    cp = _run_hook_against(
+        {"detail": "Internal hook Task generation is stale"},
+        status=status,
+        scoped_token=True,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "generation is stale" in reason
+    assert "best judgment" in reason
+
+
+def test_hook_script_structured_stale_http_response_denies_without_token():
+    cp = _run_hook_against(
+        {"answered": False, "revoked": True, "reason": "Generation revoked."},
+        status=422,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Generation revoked" in out["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+
+
+def test_hook_script_scoped_server_error_denies_not_fail_open():
+    cp = _run_hook_against(
+        {"detail": "temporary failure"},
+        status=503,
+        scoped_token=True,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "best judgment" in out["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+
+
+def test_hook_script_true_network_unreachable_still_fails_open():
+    payload = json.dumps({
+        "tool_name": "AskUserQuestion",
+        "session_id": "sid-unreachable-test",
+        "tool_input": {"questions": [{"question": "?"}]},
+    })
+    env = os.environ.copy()
+    env["CCM_ASK_USER_TOKEN"] = "scoped-unreachable-test-token"
+    with socket.socket() as probe:
+        # Keep the port bound but deliberately not listening so another test
+        # process cannot claim it between discovery and the hook connection.
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        cp = subprocess.run(
+            [
+                sys.executable,
+                str(_HOOK_SCRIPT),
+                "--api-base",
+                f"http://127.0.0.1:{port}",
+                "--timeout",
+                "2",
+            ],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    assert cp.returncode == 0
+    assert cp.stdout.strip() == ""
+    assert "CCM unreachable" in cp.stderr
 
 
 def test_hook_script_no_session_fails_open():

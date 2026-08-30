@@ -6,9 +6,9 @@ cd "$(dirname "$0")/.."
 
 echo "=== CCM 环境初始化 ==="
 
-# ── 1. 系统依赖（Xvfb 虚拟显示 + xdotool 模拟点击，CDP 登录需要）──
+# ── 1. 系统依赖（登录 UI + Claude Task fail-closed sandbox preflight）──
 echo "[1/5] 安装系统依赖..."
-PACKAGES=(xvfb xauth xdotool)
+PACKAGES=(xvfb xauth xdotool bubblewrap socat)
 MISSING=()
 for pkg in "${PACKAGES[@]}"; do
     if ! dpkg -s "$pkg" &>/dev/null; then
@@ -44,7 +44,25 @@ fi
 if ! command -v claude &>/dev/null; then
     sudo npm install -g @anthropic-ai/claude-code
 fi
-CODEX_CLI_VERSION="0.144.6"
+# Claude treats the Linux seccomp helper as optional and otherwise leaves Unix
+# sockets open. CCM's Task sandbox is fail-closed, so install and verify the
+# architecture-matched helper explicitly.
+SANDBOX_RUNTIME_VERSION="0.0.71"
+case "$(uname -m)" in
+    x86_64|amd64) SANDBOX_RUNTIME_ARCH="x64" ;;
+    aarch64|arm64) SANDBOX_RUNTIME_ARCH="arm64" ;;
+    *) echo "Unsupported Claude sandbox architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+SANDBOX_NPM_ROOT="$(sudo npm root -g)"
+APPLY_SECCOMP="${SANDBOX_NPM_ROOT}/@anthropic-ai/sandbox-runtime/vendor/seccomp/${SANDBOX_RUNTIME_ARCH}/apply-seccomp"
+if [ ! -f "$APPLY_SECCOMP" ] || [ -L "$APPLY_SECCOMP" ] || [ ! -x "$APPLY_SECCOMP" ]; then
+    sudo npm install -g "@anthropic-ai/sandbox-runtime@${SANDBOX_RUNTIME_VERSION}"
+fi
+if [ ! -f "$APPLY_SECCOMP" ] || [ -L "$APPLY_SECCOMP" ] || [ ! -x "$APPLY_SECCOMP" ]; then
+    echo "Claude apply-seccomp helper installation could not be verified" >&2
+    exit 1
+fi
+CODEX_CLI_VERSION="0.147.0"
 if [ "$(codex --version 2>/dev/null | head -1)" != "codex-cli ${CODEX_CLI_VERSION}" ]; then
     sudo npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 fi
@@ -127,6 +145,7 @@ if [ ! -f .env ]; then
 AUTH_TOKEN=${TOKEN}
 DATABASE_URL=sqlite+aiosqlite:///./claude_manager.db
 WORKSPACE_DIR=~/Projects
+CCM_NODE_ROLE=manager
 AUTO_START_DISPATCHER=true
 PORT=8002
 POOL_ENABLED=true
@@ -139,6 +158,10 @@ else
     if ! grep -q "WORKER_SSH_KEY_PATH" .env; then
         echo "WORKER_SSH_KEY_PATH=${CCM_KEY}" >> .env
         echo "  已追加 WORKER_SSH_KEY_PATH 到 .env"
+    fi
+    if ! grep -q "^CCM_NODE_ROLE=" .env; then
+        echo "CCM_NODE_ROLE=manager" >> .env
+        echo "  已追加 CCM_NODE_ROLE=manager 到 .env"
     fi
     echo "  .env 已存在，跳过生成"
 fi

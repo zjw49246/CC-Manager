@@ -163,8 +163,7 @@ export function PluginsBadge({ task, onRefresh }: { task: Task; onRefresh: () =>
   const [tools, setTools] = useState<{ key: string; label: string }[]>([]);
   const remoteTaskScope = task.worker_id != null
     || task.shared_from_id != null
-    || task.metadata_?.ccm_worker_managed_task === true
-    || task.metadata_?.ccm_user_skill_snapshots !== undefined;
+    || task.is_worker_managed;
 
   useEffect(() => {
     Promise.all([loadPlugins(), loadCodexTaskSkillsCapability()])

@@ -9,6 +9,11 @@ interface Group {
   members: { id: number; name: string }[];
 }
 
+interface TeamShareRecord {
+  target_id: number;
+  target_type: string;
+}
+
 interface TeamShareModalProps {
   type: 'project' | 'task';
   itemId: number;
@@ -21,20 +26,37 @@ export function TeamShareModal({ type, itemId, itemTitle, onClose }: TeamShareMo
   const [groups, setGroups] = useState<Group[]>([]);
   const [shares, setShares] = useState<{ target_id: number; target_type: string }[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
 
   const me = JSON.parse(localStorage.getItem('cc_user') || '{}');
 
   useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    setLoadError(null);
     Promise.all([
       api.getTeamUsers(),
       type === 'project' ? api.teamGetProjectShares(itemId) : api.getTaskSharesTeam(itemId),
       api.getTeamGroups(),
     ]).then(([u, s, g]) => {
+      if (disposed) return;
       setUsers(u);
-      setShares(s.map((x: any) => ({ target_id: x.target_id, target_type: x.target_type })));
+      setShares(s.map((share: TeamShareRecord) => ({
+        target_id: share.target_id,
+        target_type: share.target_type,
+      })));
       setGroups(g);
-    }).catch(() => {}).finally(() => setLoading(false));
+    }).catch((reason: unknown) => {
+      if (disposed) return;
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setLoadError(`Unable to load sharing options: ${detail}`);
+    }).finally(() => {
+      if (!disposed) setLoading(false);
+    });
+    return () => {
+      disposed = true;
+    };
   }, [type, itemId]);
 
   const isSharedUser = (userId: number) => shares.some(s => s.target_type === 'user' && s.target_id === userId);
@@ -94,6 +116,10 @@ export function TeamShareModal({ type, itemId, itemTitle, onClose }: TeamShareMo
         <div className="p-4 space-y-3 max-h-[60vh] overflow-y-auto">
           {loading ? (
             <p className="text-gray-400 text-sm">Loading...</p>
+          ) : loadError ? (
+            <p role="alert" className="rounded border border-red-500/40 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+              {loadError}
+            </p>
           ) : (
             <>
               {/* Groups */}

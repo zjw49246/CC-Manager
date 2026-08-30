@@ -25,8 +25,10 @@ from typing import Any
 
 from sqlalchemy import or_, select
 
+from backend.models.global_settings import GlobalSettings
 from backend.models.instance import Instance
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable, settle_awaitable
 from backend.services.git_info import git_head_commit
 from backend.services.update_runtime import (
     TrustedUpdateRuntime,
@@ -37,7 +39,10 @@ from backend.services.ws_broadcaster import WebSocketBroadcaster
 logger = logging.getLogger(__name__)
 
 WS_CHANNEL = "system_update"
-MAX_BACKUPS = 5
+# A database snapshot is only useful for the deployment that produced it (plus
+# one previous recovery point).  Large SQLite deployments can otherwise consume
+# tens of GiB after only a handful of updates.
+MAX_BACKUPS = 2
 ACTIVE_TASK_STATUSES = ("in_progress", "executing")
 DRY_RUN_CACHE_SECONDS = 30.0
 DRY_RUN_ERROR_CACHE_SECONDS = 5.0
@@ -99,6 +104,8 @@ class UpdateState:
     started_at: str = ""
     completed_at: str = ""
     error: str = ""
+    update_channel: str = "main"
+    target_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +138,8 @@ class UpdateState:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "update_channel": self.update_channel,
+            "target_version": self.target_version,
         }
 
 
@@ -704,6 +713,13 @@ class UpdateService:
             database_migration_applied=(
                 self._current.database_migration_applied if self._current else False
             ),
+            update_id=self._current.update_id if self._current else "",
+            update_channel=(
+                self._current.update_channel if self._current else "main"
+            ),
+            target_version=(
+                self._current.target_version if self._current else ""
+            ),
         ):
             raise RuntimeError("部署租约已被其他进程替换，拒绝停服")
 
@@ -774,7 +790,17 @@ class UpdateService:
             # A tokened v2 worker commits its result to the durable lease after
             # health verification. The /tmp mirror can be one write ahead and
             # therefore must never announce success while the lease is active.
-            data = lease
+            data = dict(lease)
+            # Releases before update-channel metadata was added to the lease
+            # already wrote it to the exact owner-token status/journal record.
+            # Enrich display-only metadata without allowing that mirror to
+            # override the lease's status, commit, migration, or fencing data.
+            for record in reversed(records[1:]):
+                if record.get("owner_token") != owner_token:
+                    continue
+                for key in ("update_id", "update_channel", "target_version"):
+                    if not data.get(key) and record.get(key):
+                        data[key] = record[key]
         else:
             records.sort(
                 key=lambda item: str(
@@ -863,6 +889,13 @@ class UpdateService:
                 if normalized in {"failed", "rolled_back"}
                 else ""
             ),
+            update_channel=(
+                str(data.get("update_channel") or "main")
+                if str(data.get("update_channel") or "main")
+                in {"stable", "main"}
+                else "main"
+            ),
+            target_version=str(data.get("target_version") or ""),
             steps=[StepInfo(name=name) for name in STEP_NAMES],
         )
         step_name = str(data.get("step") or "")
@@ -1014,6 +1047,19 @@ class UpdateService:
             or terminal_record.get("updated_at")
             or datetime.now(timezone.utc).isoformat()
         )
+        recovered_channel = str(
+            terminal_record.get("update_channel") or ""
+        )
+        if recovered_channel in {"stable", "main"}:
+            self._current.update_channel = recovered_channel
+        self._current.target_version = str(
+            terminal_record.get("target_version")
+            or self._current.target_version
+        )
+        if status in {"completed", "rolled_back"}:
+            for step in self._current.steps:
+                step.status = "completed"
+                step.message = None
         if status in {"completed", "rolled_back"}:
             self._running_commit = (
                 self._current.new_commit
@@ -1680,10 +1726,16 @@ class UpdateService:
         branch: str | None = None,
         *,
         force: bool = False,
+        channel: str | None = None,
     ) -> dict[str, Any]:
         """Check for available updates without applying them."""
-        target_branch = branch or "main"
-        version_result = await self._cached_version_check(target_branch, force=force)
+        selected_channel = channel or await self._configured_update_channel()
+        if selected_channel == "stable":
+            version_result = await self._cached_stable_version_check(force=force)
+        else:
+            target_branch = branch or "main"
+            version_result = await self._cached_version_check(target_branch, force=force)
+        version_result.setdefault("channel", selected_channel)
         environment = await self._inspect_environment()
         active_tasks = await self._get_blocking_tasks()
         return {
@@ -1691,6 +1743,114 @@ class UpdateService:
             **environment,
             **self._blocker_payload(active_tasks),
         }
+
+    async def _configured_update_channel(self) -> str:
+        """Read this independent CCM instance's persisted update channel."""
+        if self.db_factory is None:
+            # Service unit tests without a DB retain the historical behavior.
+            return "main"
+        try:
+            async with self.db_factory() as db:
+                row = await db.get(GlobalSettings, 1)
+                return row.update_channel if row and row.update_channel in {"stable", "main"} else "stable"
+        except Exception:
+            logger.exception("Unable to read update channel; refusing stable ambiguity")
+            return "stable"
+
+    @staticmethod
+    def _stable_tag_key(tag: str) -> tuple[int, int, int] | None:
+        match = re.fullmatch(
+            r"v?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", tag
+        )
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups())
+
+    async def _check_stable_updates(self) -> dict[str, Any]:
+        fetch = await self._run_cmd(["git", "fetch", "--tags"], timeout=60)
+        head = await self._disk_commit()
+        if fetch["returncode"] != 0:
+            return {
+                "has_updates": False,
+                "channel": "stable",
+                "current_commit": head,
+                "running_commit": self._running_commit,
+                "error": fetch["stderr"],
+            }
+        tags_result = await self._run_cmd(["git", "tag", "--list", "v*"])
+        candidates = []
+        for raw_tag in tags_result["stdout"].splitlines():
+            tag = raw_tag.strip()
+            version = self._stable_tag_key(tag)
+            if version is None:
+                continue
+            commit_result = await self._run_cmd(["git", "rev-list", "-n", "1", tag])
+            commit = commit_result["stdout"].strip()
+            if commit_result["returncode"] == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+                candidates.append((version, tag, commit))
+        if not candidates:
+            return {
+                "has_updates": False,
+                "channel": "stable",
+                "current_commit": head,
+                "running_commit": self._running_commit,
+                "error": "仓库没有可用的正式版本 tag",
+            }
+        _, version_tag, release_commit = max(candidates, key=lambda item: item[0])
+        # Stable is also an explicit escape hatch from a Main/test build.  A
+        # release tag behind the current checkout is a channel switch (and
+        # potentially a rollback), not "already up to date".
+        ancestry = await self._run_cmd(
+            ["git", "merge-base", "--is-ancestor", release_commit, head],
+            timeout=30,
+        )
+        is_downgrade = bool(head != release_commit and ancestry["returncode"] == 0)
+        commits_output = await self._run_cmd(["git", "log", "--oneline", f"{head}..{release_commit}"])
+        commits = [line for line in commits_output["stdout"].splitlines() if line.strip()]
+        diff_output = await self._run_cmd(["git", "diff", "--name-only", f"{head}..{release_commit}"])
+        files = [line for line in diff_output["stdout"].splitlines() if line.strip()]
+        migration_files = [path for path in files if path.startswith("alembic/versions/")]
+        downgrade_blocked = bool(is_downgrade and migration_files)
+        result = {
+            "has_updates": head != release_commit,
+            "update_kind": "stable_switch" if is_downgrade else "stable_upgrade",
+            "is_stable_downgrade": is_downgrade,
+            "stable_switch_blocked": downgrade_blocked,
+            "channel": "stable",
+            "version": version_tag,
+            "latest_version": version_tag,
+            "current_commit": head,
+            "running_commit": self._running_commit,
+            "latest_commit": release_commit,
+            "commits_behind": len(commits),
+            "commit_messages": [line.split(" ", 1)[-1] for line in commits[:20]],
+            "has_new_migrations": bool(migration_files),
+            "migration_count": len(migration_files),
+            "has_frontend_changes": any(path.startswith("frontend/") for path in files),
+            "has_package_changes": "frontend/package.json" in files,
+        }
+        if downgrade_blocked:
+            result["has_updates"] = False
+            result["error"] = (
+                "当前测试版与正式版之间包含数据库迁移，不能自动切回 Stable；"
+                "请先备份并制定数据库降级方案"
+            )
+        return result
+
+    async def _cached_stable_version_check(self, *, force: bool = False) -> dict[str, Any]:
+        key = "stable"
+        now = time.monotonic()
+        cached = self._dry_run_cache.get(key)
+        if not force and cached and cached[0] > now:
+            return dict(cached[1])
+        async with self._dry_run_lock:
+            cached = self._dry_run_cache.get(key)
+            if not force and cached and cached[0] > time.monotonic():
+                return dict(cached[1])
+            result = await self._check_stable_updates()
+            ttl = DRY_RUN_ERROR_CACHE_SECONDS if result.get("error") else DRY_RUN_CACHE_SECONDS
+            self._dry_run_cache[key] = (time.monotonic() + ttl, dict(result))
+            return result
 
     async def _check_remote_updates(self, target_branch: str) -> dict[str, Any]:
         """Fetch and compare versions; caller handles caching and task blockers."""
@@ -1762,6 +1922,7 @@ class UpdateService:
         skip_frontend_build: bool = False,
         force: bool = False,
         branch: str | None = None,
+        channel: str | None = None,
     ) -> dict[str, Any]:
         async with self._operation_lock:
             self._reconcile_external_terminal_status()
@@ -1794,6 +1955,10 @@ class UpdateService:
                     ),
                     "dirty_files": dirty_files,
                 }
+
+            selected_channel = channel or await self._configured_update_channel()
+            if selected_channel not in {"stable", "main"}:
+                return {"error": "无效的更新渠道"}
 
             # Freeze new claims before checking the DB.  Existing tasks are
             # never cancelled; callers retry after they finish.
@@ -1837,6 +2002,7 @@ class UpdateService:
                     operation="update",
                     started_at=datetime.now(timezone.utc).isoformat(),
                     steps=[StepInfo(name=n) for n in STEP_NAMES],
+                    update_channel=selected_channel,
                 )
                 self._current = state
                 self._inspection_cache = None
@@ -1844,10 +2010,12 @@ class UpdateService:
                     status="running",
                     old_commit=self._running_commit,
                     deployment_incomplete=False,
+                    update_id=update_id,
+                    update_channel=selected_channel,
                 )
 
                 asyncio.create_task(
-                    self._run_pipeline(state, skip_frontend_build=skip_frontend_build, force=force, branch=branch)
+                    self._run_pipeline(state, skip_frontend_build=skip_frontend_build, force=force, branch=branch, channel=selected_channel)
                 )
                 return {"update_id": update_id, "status": "started"}
             except asyncio.CancelledError:
@@ -2241,10 +2409,11 @@ class UpdateService:
         skip_frontend_build: bool = False,
         force: bool = False,
         branch: str | None = None,
+        channel: str = "main",
     ):
         async with self._lock:
             try:
-                await self._pipeline_inner(state, skip_frontend_build, force, branch=branch)
+                await self._pipeline_inner(state, skip_frontend_build, force, branch=branch, channel=channel)
             except Exception as e:
                 state.status = "failed"
                 state.error = str(e)
@@ -2393,12 +2562,14 @@ class UpdateService:
         skip_frontend_build: bool,
         force: bool,
         branch: str | None = None,
+        channel: str = "main",
     ):
         target_branch = branch or "main"
         remote = await self._resolve_remote(target_branch)
         has_new_migrations = False
         has_frontend_changes = False
         has_package_changes = False
+        is_stable_downgrade = False
 
         # Step 1: check clean → git pull
         step = state.steps[0]
@@ -2424,13 +2595,38 @@ class UpdateService:
             )
             return
 
-        (
-            protocol_ok,
-            protocol_error,
-            target_commit,
-        ) = await self._fetch_and_validate_target_protocol(
-            remote, target_branch, step
-        )
+        if channel == "stable":
+            stable_check = await self._check_stable_updates()
+            protocol_ok = False
+            protocol_error = stable_check.get("error", "无法解析正式版本")
+            target_commit = stable_check.get("latest_commit", "")
+            is_stable_downgrade = bool(stable_check.get("is_stable_downgrade"))
+            state.target_version = stable_check.get("latest_version", "")
+            self._update_deployment_lease(
+                target_version=state.target_version,
+            )
+            if stable_check.get("stable_switch_blocked"):
+                await self._fail_step(
+                    step,
+                    state,
+                    stable_check.get("error")
+                    or "当前数据库状态不允许自动切回 Stable",
+                )
+                return
+            if target_commit:
+                show = await self._run_cmd(["git", "show", f"{target_commit}:scripts/update_migrate.sh"], timeout=30)
+                protocol = self._parse_update_script_protocol(show["stdout"])
+                protocol_ok = show["returncode"] == 0 and protocol == UPDATE_SCRIPT_PROTOCOL_VERSION
+                if not protocol_ok:
+                    protocol_error = "正式版本的部署协议不兼容，拒绝更新"
+        else:
+            (
+                protocol_ok,
+                protocol_error,
+                target_commit,
+            ) = await self._fetch_and_validate_target_protocol(
+                remote, target_branch, step
+            )
         if not protocol_ok:
             await self._fail_step(step, state, protocol_error)
             return
@@ -2438,7 +2634,12 @@ class UpdateService:
         # Checkout target branch before pulling (keeps main clean when
         # updating to a feature branch for testing)
         current_branch = (await self._run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"]))["stdout"].strip()
-        if current_branch != target_branch:
+        if channel == "stable":
+            checkout_result = await self._run_cmd(["git", "checkout", "--detach", target_commit], step=step)
+            if checkout_result["returncode"] != 0:
+                await self._fail_step(step, state, f"正式版本 checkout 失败: {checkout_result['stderr']}")
+                return
+        elif current_branch != target_branch:
             # Create or reset local branch to match remote
             checkout_result = await self._run_cmd(
                 ["git", "checkout", "-B", target_branch, target_commit],
@@ -2473,6 +2674,25 @@ class UpdateService:
             )
             return
         self._update_deployment_lease(expected_commit=state.new_commit)
+
+        # Never attempt an Alembic upgrade against a release whose schema is
+        # older than the currently-running Main build.  Alembic's normal
+        # ``upgrade head`` cannot downgrade safely; leave the checkout exactly
+        # as we found it and fail closed with an actionable message.
+        if channel == "stable" and is_stable_downgrade:
+            target_database = await self._database_revision_status()
+            if target_database["database_up_to_date"] is not True:
+                await self._run_cmd(
+                    ["git", "checkout", "--detach", disk_commit],
+                    timeout=60,
+                )
+                await self._fail_step(
+                    step,
+                    state,
+                    "当前测试版数据库包含正式版没有的迁移，不能自动切回 Stable；"
+                    "请先备份并按降级方案处理数据库",
+                )
+                return
 
         same_commit = state.old_commit == state.new_commit
         if same_commit and not force:
@@ -2538,21 +2758,11 @@ class UpdateService:
         }
         await self._complete_step(step)
 
-        # Step 3: backup database
+        # Step 3 is completed only after the authoritative revision check below.
+        # No database bytes have changed yet, so taking an online snapshot here
+        # would only be overwritten by the stopped-service snapshot immediately
+        # before Alembic runs.
         step = state.steps[2]
-        if self._automatic_rollback_supported:
-            await self._start_step(step)
-            try:
-                state.backup_file = await self._backup_database()
-                await self._complete_step(step)
-            except Exception as e:
-                await self._fail_step(step, state, f"备份数据库失败: {e}")
-                return
-        else:
-            step.status = "skipped"
-            step.message = "当前数据库不是可安全自动恢复的文件型 SQLite"
-            await self._broadcast_step(step)
-
         try:
             state.frontend_dist_backup = await self._backup_frontend_dist()
         except Exception as exc:
@@ -2660,6 +2870,23 @@ class UpdateService:
             )
             return
 
+        if has_new_migrations:
+            await self._start_step(step)
+            try:
+                state.backup_file = self._reserve_database_backup()
+                step.message = "已预留回滚快照路径，停服后生成权威快照"
+                await self._complete_step(step)
+            except Exception as exc:
+                await self._fail_step(
+                    step, state, f"无法准备数据库回滚快照: {exc}"
+                )
+                return
+        else:
+            step.status = "skipped"
+            step.message = "数据库已是最新，无需生成回滚快照"
+            await self._broadcast_step(step)
+        self._update_deployment_lease(backup_file=state.backup_file)
+
         # Steps 8-10: migration path vs fast path
         active_tasks = await self._get_blocking_tasks()
         if active_tasks:
@@ -2700,20 +2927,6 @@ class UpdateService:
                 await self._broadcast_step(state.steps[index])
 
         backup_step = state.steps[2]
-        if self._automatic_rollback_supported:
-            await self._start_step(backup_step)
-            try:
-                state.backup_file = await self._backup_database()
-                await self._complete_step(backup_step)
-            except Exception as exc:
-                await self._fail_step(
-                    backup_step, state, f"备份数据库失败: {exc}"
-                )
-                return
-        else:
-            backup_step.status = "skipped"
-            backup_step.message = "当前数据库不支持 CCM 自动回滚"
-            await self._broadcast_step(backup_step)
 
         try:
             state.frontend_dist_backup = await self._backup_frontend_dist()
@@ -2822,8 +3035,26 @@ class UpdateService:
                     "当前数据库无法由 CCM 自动快照回滚，拒绝自动迁移",
                 )
                 return
+            await self._start_step(backup_step)
+            try:
+                state.backup_file = self._reserve_database_backup()
+                backup_step.message = (
+                    "已预留回滚快照路径，停服后生成权威快照"
+                )
+                await self._complete_step(backup_step)
+            except Exception as exc:
+                await self._fail_step(
+                    backup_step,
+                    state,
+                    f"无法准备数据库回滚快照: {exc}",
+                )
+                return
+            self._update_deployment_lease(backup_file=state.backup_file)
             await self._migration_path(state)
         else:
+            backup_step.status = "skipped"
+            backup_step.message = "数据库已是最新，无需生成回滚快照"
+            await self._broadcast_step(backup_step)
             await self._fast_restart_path(state)
 
     async def _fail_and_maybe_rollback(
@@ -3208,9 +3439,7 @@ class UpdateService:
             return [self._tools["sudo"], "-n", self._tools["systemd-run"]]
         return [self._tools["systemd-run"], "--user"]
 
-    async def _backup_database(self) -> str:
-        import sqlite3 as _sqlite3
-
+    def _reserve_database_backup(self) -> str:
         if not self._automatic_rollback_supported:
             raise RuntimeError("当前数据库不是可安全自动恢复的文件型 SQLite")
         db_path = self.db_path
@@ -3221,36 +3450,12 @@ class UpdateService:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = backup_dir / f"claude_manager.db.bak.{timestamp}"
-        temporary = backup_path.with_suffix(f"{backup_path.suffix}.tmp")
-
-        def do_backup():
-            src = _sqlite3.connect(str(db_path))
-            dst = _sqlite3.connect(str(temporary))
-            try:
-                src.backup(dst)
-                result = dst.execute("PRAGMA integrity_check").fetchone()
-                if not result or str(result[0]).lower() != "ok":
-                    raise RuntimeError("SQLite 备份完整性检查失败")
-                dst.commit()
-            finally:
-                dst.close()
-                src.close()
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, backup_path)
-            directory_fd = os.open(backup_dir, os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, do_backup)
-        finally:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-        self._cleanup_old_backups(backup_dir)
+        if backup_path.exists():
+            raise RuntimeError("数据库回滚快照路径已存在")
+        # The external worker creates the snapshot atomically after stopping all
+        # writers.  Make room first so the newly-created snapshot leaves at most
+        # MAX_BACKUPS recovery points.
+        self._cleanup_old_backups(backup_dir, keep=MAX_BACKUPS - 1)
         return str(backup_path)
 
     async def _backup_frontend_dist(self) -> str:
@@ -3279,9 +3484,11 @@ class UpdateService:
             shutil.rmtree(snapshots.pop(0), ignore_errors=True)
         return str(destination)
 
-    def _cleanup_old_backups(self, backup_dir: Path):
+    def _cleanup_old_backups(
+        self, backup_dir: Path, *, keep: int = MAX_BACKUPS
+    ) -> None:
         backups = sorted(backup_dir.glob("claude_manager.db.bak.*"), key=lambda p: p.stat().st_mtime)
-        while len(backups) > MAX_BACKUPS:
+        while len(backups) > keep:
             old = backups.pop(0)
             old.unlink()
             logger.info("Removed old backup: %s", old.name)
@@ -3329,6 +3536,15 @@ class UpdateService:
             try:
                 stdout_task = asyncio.create_task(read_stream(proc.stdout))
                 stderr_task = asyncio.create_task(read_stream(proc.stderr, True))
+
+                async def settle_process() -> None:
+                    await proc.wait()
+                    await asyncio.gather(
+                        stdout_task,
+                        stderr_task,
+                        return_exceptions=True,
+                    )
+
                 await asyncio.wait_for(proc.wait(), timeout=timeout)
                 stdout = await stdout_task
                 stderr = await stderr_task
@@ -3340,10 +3556,7 @@ class UpdateService:
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                await proc.wait()
-                await asyncio.gather(
-                    stdout_task, stderr_task, return_exceptions=True
-                )
+                await finish_awaitable(settle_process())
                 return {"returncode": -1, "stdout": "", "stderr": f"命令超时 ({timeout}s)"}
             except asyncio.CancelledError:
                 try:
@@ -3353,10 +3566,8 @@ class UpdateService:
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                await asyncio.shield(proc.wait())
-                await asyncio.gather(
-                    stdout_task, stderr_task, return_exceptions=True
-                )
+                operation, _ = await settle_awaitable(settle_process())
+                operation.result()
                 raise
 
             return {
@@ -3437,6 +3648,10 @@ class UpdateService:
             "port": self.port,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if self._current:
+            data.setdefault("update_id", self._current.update_id)
+            data.setdefault("update_channel", self._current.update_channel)
+            data.setdefault("target_version", self._current.target_version)
         data.update(extra)
         try:
             self._atomic_write_json(self._status_file, data)

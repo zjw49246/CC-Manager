@@ -14,6 +14,9 @@ class LogEntryResponse(BaseModel):
     tool_input: str | None
     tool_output: str | None
     item_id: str | None
+    # This diagnostic needs the owning Task/Instance provider, which is not
+    # available on a bare LogEntry ORM row. Endpoints derive it explicitly.
+    protocol_anomaly: str | None = None
     is_error: bool
     timestamp: datetime
 

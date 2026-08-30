@@ -10,7 +10,10 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     CheckConstraint,
+    and_,
     false,
+    func,
+    or_,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.database import Base
@@ -53,29 +56,106 @@ class MonitoredRepo(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class PRMonitorTaskTombstone(Base):
+    """Durable identity for a PR Monitor Task after its owner graph is deleted."""
+
+    __tablename__ = "pr_monitor_task_tombstones"
+
+    # This intentionally has no foreign key.  The identity must not disappear
+    # when a monitor's owner rows are removed, and must remain safe even while
+    # legacy databases clean up Task rows outside an FK-enabled transaction.
+    task_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        server_default=func.now(),
+    )
+
+
 class PRReview(Base):
     __tablename__ = "pr_reviews"
     __table_args__ = (
         UniqueConstraint(
             "repo_id",
             "pr_number",
+            "base_ref",
             "base_sha",
             "head_sha",
-            name="uq_pr_reviews_repo_pr_base_head",
+            "attempt",
+            name="uq_pr_reviews_repo_pr_base_ref_base_head_attempt",
         ),
         UniqueConstraint(
             "repo_id",
             "delivery_id",
             name="uq_pr_reviews_repo_delivery",
         ),
+        UniqueConstraint(
+            "rerun_of_review_id",
+            "rerun_idempotency_key",
+            name="uq_pr_reviews_rerun_idempotency",
+        ),
+        CheckConstraint(
+            "attempt >= 1",
+            name="ck_pr_reviews_attempt",
+        ),
+        CheckConstraint(
+            "(attempt = 1 AND rerun_of_review_id IS NULL) OR ("
+            "attempt > 1 AND rerun_idempotency_key IS NOT NULL AND ("
+            "rerun_of_review_id IS NULL OR rerun_of_review_id <> id))",
+            name="ck_pr_reviews_rerun_shape",
+        ),
+        CheckConstraint(
+            "(error_category IS NULL AND error_measured IS NULL "
+            "AND error_limit IS NULL AND error_unit IS NULL) OR ("
+            "error_category IS NOT NULL "
+            "AND error_category = 'unsupported_input_size' "
+            "AND length(error_category) = 22 "
+            "AND length(replace(error_category, 'unsupported_input_size', '')) = 0 "
+            "AND error_measured IS NOT NULL "
+            "AND error_limit IS NOT NULL "
+            "AND error_unit IS NOT NULL "
+            "AND error_limit > 0 "
+            "AND error_measured > error_limit "
+            "AND error_measured <= 9007199254740991 "
+            "AND error_unit IN ('characters', 'UTF-8 bytes') "
+            "AND ((length(error_unit) = 10 "
+            "AND length(replace(error_unit, 'characters', '')) = 0) OR ("
+            "length(error_unit) = 11 "
+            "AND length(replace(error_unit, 'UTF-8 bytes', '')) = 0)))",
+            name="ck_pr_reviews_input_error_evidence",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # A new immutable row is created for every explicit exact-head rerun.  The
+    # original webhook admission is attempt 1; no reviewer Task or result is
+    # ever reset in place.
+    attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    rerun_of_review_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("pr_reviews.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    rerun_idempotency_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     monitor_run_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("pr_monitor_runs.id"), nullable=True, index=True
     )
     repo_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_repos.id"), index=True, nullable=False)
     pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Immutable target branch captured when this PR subject is admitted.
+    # Old binaries fail closed after the migration's backfill rather than
+    # writing an ambiguous NULL subject during a rolling restart.
+    base_ref: Mapped[str] = mapped_column(String(200), nullable=False)
     base_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -84,6 +164,21 @@ class PRReview(Base):
     pr_url: Mapped[str] = mapped_column(String(500), nullable=False)
     task_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+    # Immutable code result for the exact reviewed subject.  Publication and
+    # PR lifecycle transitions are independent axes and must never rewrite or
+    # erase this value once the completed Task generation freezes it.
+    code_verdict: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Exact provenance for newly frozen verdicts.  These deliberately are not
+    # foreign keys: result evidence must survive archived Reviewer Task cleanup
+    # and legacy backfill may have no recoverable Task generation.
+    code_verdict_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    code_verdict_retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    code_verdict_task_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    code_verdict_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     review_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     action_taken: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ci_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -109,6 +204,35 @@ class PRReview(Base):
     )
     publishing_started_at: Mapped[datetime | None] = mapped_column(
         DateTime,
+        nullable=True,
+    )
+    # Public result state is deliberately separate from reviewer verdict and
+    # PR lifecycle.  The transient outbox fields below may be cleared after a
+    # successful write; these fields are immutable publication evidence and
+    # remain available to operators and the read-only Tasks result feed.
+    publication_state: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="not_started", server_default="not_started"
+    )
+    publication_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_stage: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Deterministic admission failures are structured separately from both
+    # the code-review body and GitHub publication diagnostics.  The current
+    # supported category is intentionally narrow so the public result feed
+    # can expose bounded evidence without selecting or leaking raw exceptions.
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_measured: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_limit: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    published_actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    github_review_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    github_review_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    github_review_state: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Immutable GitHub merge strategy selected before the first publication
+    # mutation. New rows use an explicit frozen-ref fast-forward; merge/squash
+    # remain valid only for recovery of outboxes armed by an older binary.
+    merge_method: Mapped[str | None] = mapped_column(
+        String(16),
         nullable=True,
     )
     # Cross-process publication lease.  ``publishing`` alone is a durable
@@ -415,6 +539,16 @@ class PRMonitorRun(Base):
     current_base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     current_head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     current_review_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Stable human-facing Task identity for this PR lifecycle. Reviewer Tasks
+    # are immutable execution records and may be replaced on every new head;
+    # this row remains one-to-one with the repo/PR Run.
+    display_task_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("tasks.id"),
+        nullable=True,
+        index=True,
+        unique=True,
+    )
     developer_task_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
     head_repo_full_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     head_branch: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -423,10 +557,69 @@ class PRMonitorRun(Base):
     no_progress_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     state_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A signed closed/merged webhook commits this exact intent before any
+    # active-effect quiescence. Recovery scans only these rows, never every
+    # open PR, so a long-running reviewer cannot outlive GitHub's retry window
+    # or create a rate-limit-heavy polling loop.
+    terminal_intent_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    terminal_intent_base_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    terminal_intent_head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    terminal_intent_delivery_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    terminal_intent_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    terminal_intent_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Set only by the migration for historical lifecycle/publication races.
+    # New rows never enter the unsigned legacy recovery scanner by shape.
+    legacy_terminal_recovery_pending: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+    )
     binding_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+def pr_monitor_run_has_terminal_intent(run: PRMonitorRun | None) -> bool:
+    """Fail closed on a complete, partial, or legacy terminal intent shape.
+
+    ``terminal_intent_checked_at`` is deliberately excluded: recovery uses it
+    as a harmless throttle after disproving a legacy candidate. Every other
+    intent field can be the surviving half of an interrupted durable write and
+    must revoke new effects until recovery or a signed reopen resolves it.
+    """
+
+    if run is not None and hasattr(run, "terminal_intent_present"):
+        return bool(run.terminal_intent_present)
+    return bool(
+        run is not None
+        and (
+            run.legacy_terminal_recovery_pending is True
+            or run.terminal_intent_status is not None
+            or run.terminal_intent_base_ref is not None
+            or run.terminal_intent_head_sha is not None
+            or run.terminal_intent_delivery_id is not None
+            or run.terminal_intent_observed_at is not None
+        )
+    )
+
+
+def pr_monitor_run_no_terminal_intent_predicate():
+    """SQL equivalent of ``not pr_monitor_run_has_terminal_intent``.
+
+    Keep every effect-admission CAS on the same fail-closed partial/legacy
+    shape. ``terminal_intent_checked_at`` remains intentionally irrelevant.
+    """
+
+    return and_(
+        PRMonitorRun.legacy_terminal_recovery_pending.is_(False),
+        PRMonitorRun.terminal_intent_status.is_(None),
+        PRMonitorRun.terminal_intent_base_ref.is_(None),
+        PRMonitorRun.terminal_intent_head_sha.is_(None),
+        PRMonitorRun.terminal_intent_delivery_id.is_(None),
+        PRMonitorRun.terminal_intent_observed_at.is_(None),
+    )
 
 
 class PRRepairWake(Base):
@@ -463,13 +656,18 @@ class PRRepairWake(Base):
 
 
 class PRMergeQueueAction(Base):
-    """Durable enqueue/merge-group outbox for one exact PR head."""
+    """Durable merge outbox for one exact PR head.
+
+    ``queue`` rows are retained for recovery of deployments that enabled the
+    legacy GitHub Merge Queue integration. New manual merge requests use the
+    ``direct`` effect and the same lifecycle ownership fences.
+    """
 
     __tablename__ = "pr_merge_queue_actions"
     __table_args__ = (
         UniqueConstraint(
-            "monitor_run_id", "trigger_head_sha",
-            name="uq_pr_merge_queue_actions_run_head",
+            "monitor_run_id", "review_id",
+            name="uq_pr_merge_queue_actions_run_review",
         ),
     )
 
@@ -485,7 +683,24 @@ class PRMergeQueueAction(Base):
     status: Mapped[str] = mapped_column(
         String(30), default="shadow", server_default="shadow", nullable=False
     )
+    effect_kind: Mapped[str] = mapped_column(
+        String(20), default="queue", server_default="queue", nullable=False
+    )
+    trigger_kind: Mapped[str] = mapped_column(
+        String(20), default="policy", server_default="policy", nullable=False
+    )
     action_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    publishing_actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    publishing_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    merge_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    wait_for_ci: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    required_checks: Mapped[list] = mapped_column(
+        JSON, default=list, nullable=False
+    )
     github_pr_node_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     github_queue_entry_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     merge_group_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -501,3 +716,76 @@ class PRMergeQueueAction(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+_LEGACY_QUEUE_REMOTE_RISK_PREFIXES = (
+    "merge_queue_remote_cleanup_failed:",
+    "merge_queue_existing_entry_",
+    "merge_queue_entry_",
+    "merge_group_",
+)
+_DIRECT_REMOTE_ABSENCE_PREFIX = "direct_merge_remote_absence_proven:"
+
+
+def pr_merge_queue_action_has_ambiguous_remote_effect(
+    action: PRMergeQueueAction | None,
+) -> bool:
+    """Recognize pre-fix terminal-looking rows that may still queue a PR."""
+
+    if action is None or action.status not in {"paused", "failed"}:
+        return False
+    error = action.last_error or ""
+    if action.effect_kind == "direct":
+        if error.startswith(_DIRECT_REMOTE_ABSENCE_PREFIX):
+            return False
+        return bool(
+            action.lease_token is not None
+            or (action.attempt_count or 0) > 0
+            or error.startswith("direct_merge_")
+        )
+    if error.startswith("merge_queue_remote_absence_proven:"):
+        return False
+    return bool(
+        action.github_queue_entry_id is not None
+        or action.merge_group_sha is not None
+        or action.merge_group_ref is not None
+        or action.lease_token is not None
+        or (action.attempt_count or 0) > 0
+        or error.startswith(_LEGACY_QUEUE_REMOTE_RISK_PREFIXES)
+    )
+
+
+def pr_merge_queue_action_ambiguous_remote_effect_predicate():
+    """SQL equivalent for legacy Queue and direct-merge effect fences."""
+
+    error = func.coalesce(PRMergeQueueAction.last_error, "")
+    risk_error = or_(
+        *(
+            error.like(f"{prefix}%")
+            for prefix in _LEGACY_QUEUE_REMOTE_RISK_PREFIXES
+        )
+    )
+    queue_risk = and_(
+        PRMergeQueueAction.effect_kind == "queue",
+        PRMergeQueueAction.status.in_(("paused", "failed")),
+        ~error.like("merge_queue_remote_absence_proven:%"),
+        or_(
+            PRMergeQueueAction.github_queue_entry_id.is_not(None),
+            PRMergeQueueAction.merge_group_sha.is_not(None),
+            PRMergeQueueAction.merge_group_ref.is_not(None),
+            PRMergeQueueAction.lease_token.is_not(None),
+            PRMergeQueueAction.attempt_count > 0,
+            risk_error,
+        ),
+    )
+    direct_risk = and_(
+        PRMergeQueueAction.effect_kind == "direct",
+        PRMergeQueueAction.status.in_(("paused", "failed")),
+        ~error.like(f"{_DIRECT_REMOTE_ABSENCE_PREFIX}%"),
+        or_(
+            PRMergeQueueAction.lease_token.is_not(None),
+            PRMergeQueueAction.attempt_count > 0,
+            error.like("direct_merge_%"),
+        ),
+    )
+    return or_(queue_risk, direct_risk)

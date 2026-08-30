@@ -18,6 +18,11 @@ from starlette.requests import Request
 import backend.services.cloudrouter_accounts as cloudrouter_module
 import backend.api.cloudrouter_accounts as cloudrouter_api
 from backend.services.cloudrouter_accounts import (
+    APIBEST_CLAUDE_BASE_URL,
+    APIBEST_CODEX_BASE_URL,
+    APIBEST_MODELS_URL,
+    APIBEST_PRICING_URL,
+    APEX_CLAUDE_BASE_URL,
     APEX_CODEX_BASE_URL,
     APEX_MODELS_URL,
     APEX_USAGE_URL,
@@ -39,11 +44,26 @@ MODELS = {
 }
 
 
+def test_apex_gateway_uses_apexin_endpoint():
+    assert APEX_CLAUDE_BASE_URL == "https://api.apexin.ai"
+    assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
+    assert APEX_MODELS_URL == "https://api.apexin.ai/v1/models"
+    assert APEX_USAGE_URL == "https://api.apexin.ai/v1/usage"
+
+
 def test_api_auth_kind_is_limited_to_registered_gateways():
     assert cloudrouter_module.is_api_auth_kind("cloudrouter_api")
     assert cloudrouter_module.is_api_auth_kind("apex_api")
+    assert cloudrouter_module.is_api_auth_kind("apibest_api")
     assert not cloudrouter_module.is_api_auth_kind("legacy_api")
     assert not cloudrouter_module.is_api_auth_kind("oauth")
+
+
+def test_apibest_gateway_uses_fixed_compatible_endpoints():
+    assert APIBEST_CLAUDE_BASE_URL == "https://apibest.ai"
+    assert APIBEST_CODEX_BASE_URL == "https://apibest.ai/v1"
+    assert APIBEST_MODELS_URL == "https://apibest.ai/v1/models"
+    assert APIBEST_PRICING_URL == "https://apibest.ai/api/pricing"
 
 
 async def _add(
@@ -118,7 +138,7 @@ async def test_add_builds_private_dual_cli_home_without_leaking_key(
 
 
 @pytest.mark.asyncio
-async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
+async def test_add_apex_builds_private_dual_provider_home_without_leaking_key(
     tmp_path, monkeypatch,
 ):
     store = CloudRouterAccountStore(tmp_path / "accounts")
@@ -141,13 +161,21 @@ async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
     assert account.id == "apex-1"
     assert account.api_provider == "apex"
     assert account.auth_kind == "apex_api"
-    assert account.providers == ["codex"]
-    assert account.models == {"claude": [], "codex": ["gpt-5.4"]}
-    assert not (root / "claude" / "settings.json").exists()
-    assert not (root / "claude" / ".claude.json").exists()
+    assert account.providers == ["claude", "codex"]
+    assert account.models == {
+        "claude": ["claude-opus-4-8"],
+        "codex": ["gpt-5.4"],
+    }
+    settings = json.loads((root / "claude" / "settings.json").read_text())
+    assert settings["env"] == {"ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL}
+    assert settings["apiKeyHelper"] == cloudrouter_module._claude_helper_command(root)
+    assert json.loads((root / "claude" / ".claude.json").read_text()) == {
+        "hasCompletedOnboarding": True,
+    }
 
     metadata = json.loads((root / "account.json").read_text())
     assert metadata["api_provider"] == "apex"
+    assert metadata["endpoints"]["claude_base_url"] == APEX_CLAUDE_BASE_URL
     assert metadata["endpoints"]["codex_base_url"] == APEX_CODEX_BASE_URL
     assert metadata["endpoints"]["usage_url"] == APEX_USAGE_URL
     assert "lck-test-secret" not in json.dumps(metadata)
@@ -163,6 +191,181 @@ async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
     assert str(root / "key-helper") in codex_config
     assert "lck-test-secret" not in codex_config
     assert os.popen(str(root / "key-helper")).read() == "lck-test-secret"
+
+
+@pytest.mark.asyncio
+async def test_legacy_codex_only_apex_account_adds_safe_claude_runtime(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    settings_path = account.root / "claude" / "settings.json"
+    onboarding_path = account.root / "claude" / ".claude.json"
+    settings_path.unlink()
+    onboarding_path.unlink()
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"]["claude_base_url"] = None
+    metadata_path.write_text(json.dumps(metadata))
+
+    migrated = store.reload()[0]
+
+    assert migrated.id == account.id
+    assert json.loads(settings_path.read_text()) == {
+        "env": {"ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL},
+        "apiKeyHelper": cloudrouter_module._claude_helper_command(account.root),
+        cloudrouter_module.CLAUDE_SKIP_DANGEROUS_PROMPT: True,
+    }
+    assert json.loads(onboarding_path.read_text()) == {
+        "hasCompletedOnboarding": True,
+    }
+    assert json.loads(metadata_path.read_text())["endpoints"] == (
+        cloudrouter_module.API_PROVIDER_SPECS["apex"].endpoints
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_migration_preflights_codex_before_writing(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    settings_path = account.root / "claude" / "settings.json"
+    onboarding_path = account.root / "claude" / ".claude.json"
+    settings_path.unlink()
+    onboarding_path.unlink()
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"] = dict(
+        cloudrouter_module.LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    metadata_before = metadata_path.read_bytes()
+    codex_path = account.root / "codex" / "config.toml"
+    codex_path.write_text(
+        codex_path.read_text().replace(
+            APEX_CODEX_BASE_URL,
+            "https://attacker.invalid/v1",
+        ),
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Modified Codex API routing",
+    ):
+        store.reload()
+
+    assert not settings_path.exists()
+    assert not onboarding_path.exists()
+    assert metadata_path.read_bytes() == metadata_before
+
+
+@pytest.mark.asyncio
+async def test_legacy_codex_only_apex_rejects_existing_claude_redirect(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    settings_path = account.root / "claude" / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["env"]["ANTHROPIC_BASE_URL"] = "https://attacker.invalid"
+    settings_path.write_text(json.dumps(settings))
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"]["claude_base_url"] = None
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Modified legacy Apex Claude config",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
+async def test_add_apibest_builds_private_dual_provider_home(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+
+    account = await store.add_account(
+        "APIBest primary", "sk-test-secret", api_provider="apibest",
+    )
+
+    assert account.id == "apibest-1"
+    assert account.api_provider == "apibest"
+    assert account.auth_kind == "apibest_api"
+    assert account.providers == ["claude", "codex"]
+    settings = json.loads((account.root / "claude" / "settings.json").read_text())
+    assert settings["env"] == {"ANTHROPIC_BASE_URL": APIBEST_CLAUDE_BASE_URL}
+    codex = (account.root / "codex" / "config.toml").read_text()
+    assert 'model_provider = "apibest"' in codex
+    assert f'base_url = "{APIBEST_CODEX_BASE_URL}"' in codex
+    assert "sk-test-secret" not in settings.__repr__() + codex
+    usage = await store.fetch_usage(account.id, force=True)
+    assert usage["known"] is False
+    assert usage["available"] is True
+    assert usage["reason"] == "usage_not_supported"
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_endpoint_is_migrated_to_apexin(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    legacy_base_url = "https://35-75-22-186.sslip.io/v1"
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"] = {
+        "claude_base_url": None,
+        "codex_base_url": legacy_base_url,
+        "models_url": f"{legacy_base_url}/models",
+        "usage_url": f"{legacy_base_url}/usage",
+    }
+    metadata_path.write_text(json.dumps(metadata))
+    config_path = account.root / "codex" / "config.toml"
+    config_path.write_text(
+        config_path.read_text().replace(APEX_CODEX_BASE_URL, legacy_base_url)
+    )
+
+    assert [item.id for item in store.reload()] == [account.id]
+    migrated_metadata = json.loads(metadata_path.read_text())
+    assert migrated_metadata["endpoints"]["codex_base_url"] == APEX_CODEX_BASE_URL
+    migrated_config = tomllib.loads(config_path.read_text())
+    assert {
+        provider["base_url"]
+        for provider in migrated_config["model_providers"].values()
+    } == {APEX_CODEX_BASE_URL}
 
 
 @pytest.mark.asyncio
@@ -642,6 +845,86 @@ async def test_failed_retirement_is_disabled_and_idempotently_resumable(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_diagnostics_are_bounded_persistent_and_idempotent(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    first_attempt = await store.mark_cleanup_attempt(account.id)
+    assert first_attempt.cleanup_last_attempt_at is not None
+
+    failure = CloudRouterAccountBusyError(
+        "active sk-secret-value\n" + ("x" * 1000),
+        code="../invalid",
+    )
+    failed = await store.record_cleanup_failure(
+        account.id,
+        code=failure.code,
+        reason=failure.reason,
+    )
+    assert failed.cleanup_code == "cleanup_blocked"
+    assert "sk-secret-value" not in failed.cleanup_reason
+    assert "\n" not in failed.cleanup_reason
+    assert len(failed.cleanup_reason.encode("utf-8")) <= 512
+    assert failed.cleanup_last_error_at is not None
+
+    # Starting a retry updates the attempt receipt but preserves the last
+    # useful diagnosis if the process exits before it reaches the runtime
+    # fence or writes a replacement failure.
+    retrying = await store.mark_cleanup_attempt(account.id)
+    assert retrying.cleanup_code == failed.cleanup_code
+    assert retrying.cleanup_reason == failed.cleanup_reason
+    assert retrying.cleanup_last_error_at == failed.cleanup_last_error_at
+    assert retrying.cleanup_last_attempt_at >= failed.cleanup_last_attempt_at
+
+    restarted = CloudRouterAccountStore(store.root)
+    restored = restarted.account(account.id)
+    assert restored is not None
+    assert restored.cleanup_code == retrying.cleanup_code
+    assert restored.cleanup_reason == retrying.cleanup_reason
+    assert restored.cleanup_last_attempt_at == retrying.cleanup_last_attempt_at
+    assert restored.cleanup_last_error_at == retrying.cleanup_last_error_at
+
+    completed = await restarted.finalize_retirement(account.id)
+    assert completed.cleanup_pending is False
+    assert completed.cleanup_code is None
+    assert completed.cleanup_reason is None
+    assert completed.cleanup_last_attempt_at is None
+    assert completed.cleanup_last_error_at is None
+
+    # A late duplicate error receipt is a no-op after successful finalization.
+    duplicate = await restarted.record_cleanup_failure(
+        account.id,
+        code="runtime_busy",
+        reason="late runtime",
+    )
+    assert duplicate == completed
+
+
+@pytest.mark.asyncio
+async def test_modified_cleanup_diagnostics_fail_closed(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({
+        "cleanup_code": "runtime_busy",
+        "cleanup_reason": "unexpected\nsecond line",
+        "cleanup_last_attempt_at": 1.0,
+        "cleanup_last_error_at": 1.0,
+    })
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Invalid cleanup metadata",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
 async def test_finalize_retirement_refuses_active_credential_lease(
     tmp_path, monkeypatch,
 ):
@@ -1107,7 +1390,13 @@ async def test_probe_models_uses_bounded_non_redirecting_request(
 
         async def aiter_bytes(self):
             yield json.dumps({
-                "data": [{"id": "claude-opus-4-8"}, {"id": "gpt-5.5"}],
+                "data": [
+                    {"id": "claude-opus-4-8"},
+                    {
+                        "id": "gpt-5.5",
+                        "service_tiers": [{"id": "priority"}],
+                    },
+                ],
             }).encode()
 
     class Stream:
@@ -1138,14 +1427,18 @@ async def test_probe_models_uses_bounded_non_redirecting_request(
 
     models = await store.probe_models("cr-private")
 
-    assert models == {"claude": ["claude-opus-4-8"], "codex": ["gpt-5.5"]}
+    assert models == {
+        "claude": ["claude-opus-4-8"],
+        "codex": ["gpt-5.5"],
+        "service_tiers": {"gpt-5.5": ["priority"]},
+    }
     assert captured["follow_redirects"] is False
     assert captured["method"] == "GET"
     assert captured["headers"]["Authorization"] == "Bearer cr-private"
 
 
 @pytest.mark.asyncio
-async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
+async def test_apex_model_probe_uses_apex_endpoint_and_projects_both_providers(
     tmp_path, monkeypatch,
 ):
     store = CloudRouterAccountStore(tmp_path / "accounts")
@@ -1172,7 +1465,7 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
     )
 
     assert models == {
-        "claude": [],
+        "claude": ["claude-opus-4-8"],
         "codex": ["gpt-5.4"],
         "service_tiers": {"gpt-5.4": ["priority"]},
     }
@@ -1183,6 +1476,110 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
         ),
         "lck-test-secret",
     )
+
+
+@pytest.mark.asyncio
+async def test_apex_model_probe_accepts_openai_compatible_response(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "object": "list",
+            "data": [
+                {"id": "claude-opus-4-8"},
+                {
+                    "id": "gpt-5.4",
+                    "service_tiers": [{"id": "priority"}],
+                },
+                {"id": "gpt-5.4"},
+                {"id": "unknown-model"},
+            ],
+        }),
+    )
+
+    models = await store.probe_models(
+        "lck-test-secret",
+        api_provider="apex",
+    )
+
+    assert models == {
+        "claude": ["claude-opus-4-8"],
+        "codex": ["gpt-5.4"],
+        "service_tiers": {"gpt-5.4": ["priority"]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    request = AsyncMock(side_effect=[
+        {"object": "list", "data": [], "success": True},
+        {
+            "data": [
+                {
+                    "model_name": "claude-sonnet-5",
+                    "supported_endpoint_types": ["anthropic", "openai"],
+                },
+                {
+                    "model_name": "gpt-5.6-luna",
+                    "supported_endpoint_types": ["openai-response"],
+                    "service_tiers": [{"id": "priority"}],
+                },
+                {
+                    "model_name": "gpt-5.5",
+                    "supported_endpoint_types": ["openai"],
+                },
+                {
+                    "model_name": "claude-openai-only",
+                    "supported_endpoint_types": ["openai"],
+                },
+            ],
+        },
+    ])
+    monkeypatch.setattr(store, "_request_json", request)
+
+    models = await store.probe_models("sk-test", api_provider="apibest")
+
+    assert models == {
+        "claude": ["claude-sonnet-5"],
+        "codex": ["gpt-5.5", "gpt-5.6-luna"],
+        "service_tiers": {"gpt-5.6-luna": ["priority"]},
+    }
+    assert [item.args for item in request.await_args_list] == [
+        (APIBEST_MODELS_URL, "sk-test"),
+        (APIBEST_PRICING_URL, "sk-test"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apibest_pricing_rejects_non_string_endpoint_types(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(side_effect=[
+            {"object": "list", "data": [], "success": True},
+            {
+                "data": [{
+                    "model_name": "gpt-5.6-luna",
+                    "supported_endpoint_types": [{}],
+                }],
+            },
+        ]),
+    )
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_models_response",
+    ):
+        await store.probe_models("sk-test", api_provider="apibest")
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1620,92 @@ async def test_apex_service_tiers_are_persisted_and_reloaded(
     }
     public = store.reload()[0].public_dict()
     assert public["service_tiers"] == {"gpt-5.4": ["priority"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_provider", ["cloudrouter", "apibest"])
+async def test_generic_api_accounts_require_upstream_fast_capability_and_reload(
+    tmp_path, monkeypatch, api_provider,
+):
+    store = CloudRouterAccountStore(tmp_path / f"{api_provider}-accounts")
+    probe = AsyncMock(return_value={
+        "claude": [],
+        "codex": ["gpt-5.4", "gpt-5.4-mini"],
+    })
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        probe,
+    )
+
+    account = await store.add_account(
+        f"{api_provider} Fast",
+        "sk-test-secret",
+        api_provider=api_provider,
+    )
+
+    assert account.service_tiers == {}
+    assert not account.supports_service_tier(
+        "codex", "gpt-5.4", "priority",
+    )
+    assert not account.supports_service_tier(
+        "codex", "gpt-5.4-mini", "priority",
+    )
+    metadata = json.loads((account.root / "account.json").read_text())
+    assert metadata["service_tiers"] == {}
+    assert metadata["service_tiers_source"] == "none"
+
+    # An intermediate development build persisted model-name inference without
+    # provenance. It must not make existing accounts look Fast-capable.
+    metadata["service_tiers"] = {"gpt-5.4": ["priority"]}
+    metadata["service_tier_denials"] = {"gpt-5.4": ["priority"]}
+    metadata.pop("service_tiers_source")
+    (account.root / "account.json").write_text(json.dumps(metadata))
+    assert store.reload()[0].service_tiers == {}
+
+    with pytest.raises(
+        CloudRouterAccountError,
+        match="does not advertise service tier",
+    ):
+        async with store.runtime_admission(
+            "codex",
+            account.codex_home,
+            "gpt-5.4",
+            service_tier="priority",
+        ):
+            pass
+
+    probe.return_value = {
+        "claude": [],
+        "codex": ["gpt-5.5", "gpt-5.4-mini"],
+        "service_tiers": {"gpt-5.5": ["priority"]},
+    }
+    refreshed = await store.refresh_account(account.id)
+    assert refreshed.service_tiers == {"gpt-5.5": ["priority"]}
+    refreshed_metadata = json.loads(
+        (refreshed.root / "account.json").read_text()
+    )
+    assert refreshed_metadata["service_tiers_source"] == "upstream"
+    assert "service_tier_denials" not in refreshed_metadata
+    assert store.reload()[0].service_tiers == {"gpt-5.5": ["priority"]}
+
+
+@pytest.mark.asyncio
+async def test_generic_account_rejects_tiers_claimed_by_none_source(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["service_tiers"] = {"gpt-5.5": ["priority"]}
+    assert metadata["service_tiers_source"] == "none"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Inconsistent service tier metadata",
+    ):
+        store.reload()
 
 
 @pytest.mark.asyncio
@@ -1284,7 +1767,7 @@ async def test_legacy_apex_uses_exact_nofollow_models_cache_as_fast_candidate(
 
 
 @pytest.mark.asyncio
-async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
+async def test_explicit_apex_and_generic_accounts_never_use_models_cache_fallback(
     tmp_path, monkeypatch,
 ):
     apex_store = CloudRouterAccountStore(tmp_path / "apex-accounts")
@@ -1316,7 +1799,7 @@ async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
     generic_store, generic = await _add(
         tmp_path,
         monkeypatch,
-        models={"claude": [], "codex": ["gpt-5.4"]},
+        models={"claude": [], "codex": ["gpt-provider-specific"]},
     )
     generic_metadata_path = generic.root / "account.json"
     generic_metadata = json.loads(generic_metadata_path.read_text())
@@ -1324,14 +1807,14 @@ async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
     generic_metadata_path.write_text(json.dumps(generic_metadata))
     (generic.root / "codex" / "models_cache.json").write_text(json.dumps({
         "models": [{
-            "slug": "gpt-5.4",
+            "slug": "gpt-provider-specific",
             "service_tiers": [{"id": "priority"}],
         }],
     }))
     legacy_generic = generic_store.reload()[0]
     assert legacy_generic.service_tiers_explicit is False
     assert not legacy_generic.supports_service_tier(
-        "codex", "gpt-5.4", "priority"
+        "codex", "gpt-provider-specific", "priority"
     )
 
 
@@ -1375,16 +1858,55 @@ async def test_legacy_apex_models_cache_symlink_fails_closed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "models": [{
+                "slug": "gpt-5.4",
+                "service_tiers": [{"id": "priority tier"}],
+            }],
+        },
+        {
+            "data": [{
+                "id": "gpt-5.4",
+                "service_tiers": [{"id": "priority tier"}],
+            }],
+        },
+    ],
+)
 async def test_apex_probe_rejects_malformed_service_tiers(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, payload,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value=payload),
+    )
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_models_response",
+    ):
+        await store.probe_models(
+            "lck-test-secret",
+            api_provider="apex",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_provider", ["cloudrouter", "apibest"])
+async def test_generic_probe_rejects_malformed_service_tiers(
+    tmp_path, monkeypatch, api_provider,
 ):
     store = CloudRouterAccountStore(tmp_path / "accounts")
     monkeypatch.setattr(
         store,
         "_request_json",
         AsyncMock(return_value={
-            "models": [{
-                "slug": "gpt-5.4",
+            "data": [{
+                "id": "gpt-5.4",
                 "service_tiers": [{"id": "priority tier"}],
             }],
         }),
@@ -1395,8 +1917,8 @@ async def test_apex_probe_rejects_malformed_service_tiers(
         match="invalid_models_response",
     ):
         await store.probe_models(
-            "lck-test-secret",
-            api_provider="apex",
+            "sk-test-secret",
+            api_provider=api_provider,
         )
 
 
@@ -1922,6 +2444,13 @@ def test_unsafe_storage_error_is_not_reported_as_staged_busy_cleanup():
     )
 
     assert busy.status_code == 409
+    assert busy.detail == {
+        "message": "active turn",
+        "error": "active turn",
+        "code": "cleanup_blocked",
+        "reason": "active turn",
+        "cleanup_pending": True,
+    }
     assert unsafe.status_code == 500
     assert unsafe.detail == "API account storage is unsafe"
 
@@ -2130,17 +2659,39 @@ async def test_delete_endpoint_stages_busy_account_and_retry_finishes_cleanup(
     with pytest.raises(HTTPException) as blocked:
         await cloudrouter_api.retire_account(_admin_request(), account.id)
     assert blocked.value.status_code == 409
-    assert blocked.value.detail == "active turn"
+    assert blocked.value.detail == {
+        "message": "active turn",
+        "error": "active turn",
+        "code": "cleanup_blocked",
+        "reason": "active turn",
+        "cleanup_pending": True,
+    }
     pending = store.account(account.id)
     assert pending is not None
     assert pending.retired is True
     assert pending.cleanup_pending is True
+    assert pending.cleanup_code == "cleanup_blocked"
+    assert pending.cleanup_reason == "active turn"
+    assert pending.cleanup_last_attempt_at is not None
+    assert pending.cleanup_last_error_at is not None
     assert (account.root / "api.key").is_file()
     assert store.visible_accounts() == [pending]
+
+    restarted = CloudRouterAccountStore(store.root)
+    restored = restarted.account(account.id)
+    assert restored is not None
+    assert restored.cleanup_code == pending.cleanup_code
+    assert restored.cleanup_reason == pending.cleanup_reason
+    assert restored.cleanup_last_attempt_at == pending.cleanup_last_attempt_at
+    assert restored.cleanup_last_error_at == pending.cleanup_last_error_at
 
     listed = await cloudrouter_api.list_accounts(_admin_request())
     assert listed[0]["id"] == account.id
     assert listed[0]["cleanup_pending"] is True
+    assert listed[0]["cleanup_code"] == "cleanup_blocked"
+    assert listed[0]["cleanup_reason"] == "active turn"
+    assert listed[0]["cleanup_last_attempt_at"] is not None
+    assert listed[0]["cleanup_last_error_at"] is not None
     assert listed[0]["api_quota"] is None
 
     @asynccontextmanager
@@ -2156,10 +2707,48 @@ async def test_delete_endpoint_stages_busy_account_and_retry_finishes_cleanup(
     assert result["ok"] is True
     assert result["retired"] is True
     assert result["cleanup_pending"] is False
+    assert result["cleanup_code"] is None
+    assert result["cleanup_reason"] is None
+    assert result["cleanup_last_attempt_at"] is None
+    assert result["cleanup_last_error_at"] is None
     assert result["key_hint"] == ""
     assert not (account.root / "api.key").exists()
     assert store.visible_accounts() == []
+    completed_metadata = json.loads(
+        (account.root / "account.json").read_text()
+    )
+    assert completed_metadata["cleanup_code"] is None
+    assert completed_metadata["cleanup_reason"] is None
+    assert completed_metadata["cleanup_last_attempt_at"] is None
+    assert completed_metadata["cleanup_last_error_at"] is None
     assert reload_pools.call_count >= 4
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_record_diagnostics_after_storage_failure(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    monkeypatch.setattr(cloudrouter_api, "_get_store", lambda: store)
+    monkeypatch.setattr(cloudrouter_api, "_reload_runtime_pools", Mock())
+    record_failure = AsyncMock()
+    monkeypatch.setattr(store, "record_cleanup_failure", record_failure)
+
+    @asynccontextmanager
+    async def unsafe_fence(_account, _store):
+        raise CloudRouterUnsafePathError("account root changed")
+        yield
+
+    monkeypatch.setattr(
+        cloudrouter_api, "_runtime_retirement_fence", unsafe_fence,
+    )
+
+    with pytest.raises(HTTPException) as failed:
+        await cloudrouter_api.retire_account(_admin_request(), account.id)
+
+    assert failed.value.status_code == 500
+    assert failed.value.detail == "API account storage is unsafe"
+    record_failure.assert_not_awaited()
 
 
 def _install_retirement_runtime(
@@ -2182,6 +2771,64 @@ def _install_retirement_runtime(
     import backend
     monkeypatch.setattr(backend, "main", runtime, raising=False)
     return runtime
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_redacts_migration_failure(
+    tmp_path, monkeypatch,
+):
+    from backend.services.task_migrator import MigrationError
+
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace()
+    runtime = _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    class BusyMigrator:
+        @asynccontextmanager
+        async def api_account_retirement_guard(self):
+            raise MigrationError("active migration sk-secret-value")
+            yield
+
+    runtime.task_migrator = BusyMigrator()
+
+    with pytest.raises(CloudRouterAccountBusyError) as blocked:
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
+
+    assert blocked.value.code == "migration_busy"
+    assert blocked.value.reason == (
+        "API account cleanup is blocked by an active task migration; "
+        "retry after it finishes"
+    )
+    assert "sk-secret-value" not in blocked.value.reason
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_preserves_storage_integrity_failure(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(
+            side_effect=CloudRouterUnsafePathError("account root changed"),
+        ),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="account root changed",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
 
 
 @pytest.mark.asyncio
@@ -2212,13 +2859,14 @@ async def test_cloudrouter_retirement_blocks_persisted_codex_monitor_owner(
     with pytest.raises(
         CloudRouterAccountBusyError,
         match="monitor 17",
-    ):
+    ) as blocked:
         async with cloudrouter_api._runtime_retirement_fence(
             account,
             store,
         ):
             pass
 
+    assert blocked.value.code == "runtime_busy"
     manager.begin_codex_app_server_home_maintenance.assert_not_awaited()
 
 
@@ -2272,7 +2920,7 @@ async def test_cloudrouter_retirement_rechecks_monitor_after_home_fence(
 
 
 @pytest.mark.asyncio
-async def test_apex_retirement_skips_impossible_claude_container_scan(
+async def test_apex_without_claude_models_skips_claude_container_scan(
     tmp_path, monkeypatch,
 ):
     store = CloudRouterAccountStore(tmp_path / "accounts")
@@ -2291,7 +2939,7 @@ async def test_apex_retirement_skips_impossible_claude_container_scan(
         begin_codex_app_server_home_maintenance=AsyncMock(return_value=False),
         end_codex_app_server_home_maintenance=AsyncMock(),
         detach_api_account_containers=AsyncMock(
-            side_effect=AssertionError("Apex cannot have a Claude mount"),
+            side_effect=AssertionError("Account has no Claude models"),
         ),
     )
     _install_retirement_runtime(
@@ -2336,10 +2984,11 @@ async def test_cloudrouter_retirement_container_failure_is_busy_and_releases_hom
     with pytest.raises(
         CloudRouterAccountBusyError,
         match="could not be verified",
-    ):
+    ) as blocked:
         async with cloudrouter_api._runtime_retirement_fence(account, store):
             pass
 
+    assert blocked.value.code == "runtime_verification_failed"
     manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
         account.codex_home
     )

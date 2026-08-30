@@ -4,8 +4,13 @@ import {
   AlertCircle, Loader2, Plus, Trash2, Server, HardDrive, Download, Upload,
   GitBranch, RefreshCw,
 } from '../components/icons';
-import { api, getToken } from '../api/client';
-import type { Project } from '../api/client';
+import { api, getToken, isApiRequestError } from '../api/client';
+import type {
+  Project,
+  SSHProfile as ManagedSSHProfile,
+  SSHProfileInput,
+  TaskSSHCapability,
+} from '../api/client';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,7 +23,7 @@ interface DirEntry {
   size: number | null;
 }
 
-interface SSHProfile {
+interface LegacySSHProfile {
   id: string;
   label: string;
   host: string;
@@ -27,6 +32,10 @@ interface SSHProfile {
   password: string;
   key_path: string;
 }
+
+type SSHConnection =
+  | { kind: 'managed'; profile: ManagedSSHProfile }
+  | { kind: 'legacy'; profile: LegacySSHProfile };
 
 type Mode = 'local' | 'ssh' | 'git';
 
@@ -43,7 +52,7 @@ const SSH_PROFILES_KEY = 'cc_ssh_profiles';
 // SSH profile storage helpers
 // ---------------------------------------------------------------------------
 
-function loadProfiles(): SSHProfile[] {
+function loadProfiles(): LegacySSHProfile[] {
   try {
     return JSON.parse(localStorage.getItem(SSH_PROFILES_KEY) || '[]');
   } catch {
@@ -51,20 +60,16 @@ function loadProfiles(): SSHProfile[] {
   }
 }
 
-function saveProfiles(profiles: SSHProfile[]) {
+function saveProfiles(profiles: LegacySSHProfile[]) {
   localStorage.setItem(SSH_PROFILES_KEY, JSON.stringify(profiles));
-}
-
-function newProfile(): SSHProfile {
-  return { id: crypto.randomUUID(), label: '', host: '', port: 22, username: '', password: '', key_path: '' };
 }
 
 // ---------------------------------------------------------------------------
 // Auto-inject Worker SSH profiles
 // ---------------------------------------------------------------------------
 
-function useWorkerProfiles(): SSHProfile[] {
-  const [wps, setWps] = useState<SSHProfile[]>([]);
+function useWorkerProfiles(): LegacySSHProfile[] {
+  const [wps, setWps] = useState<LegacySSHProfile[]>([]);
   useEffect(() => {
     api.listWorkers()
       .then((workers) => {
@@ -173,93 +178,502 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)}M`;
 }
 
-// ---------------------------------------------------------------------------
-// SSH profile editor panel
-// ---------------------------------------------------------------------------
-
-interface SSHPanelProps {
-  profiles: SSHProfile[];
-  active: SSHProfile | null;
-  onActivate: (p: SSHProfile) => void;
-  onSave: (profiles: SSHProfile[]) => void;
+interface ManagedSSHPanelProps {
+  profiles: ManagedSSHProfile[];
+  legacyProfiles: LegacySSHProfile[];
+  activeId: number | null;
+  activeLegacyId: string | null;
+  onActivate: (profile: ManagedSSHProfile) => void;
+  onActivateLegacy: (profile: LegacySSHProfile) => void;
+  onRefresh: (preferredId?: number) => Promise<void>;
+  onLegacyMigrated: (legacyId: string) => void;
+  onDeleteLegacy: (legacyId: string) => void;
+  isAdmin: boolean;
 }
 
-function SSHPanel({ profiles, active, onActivate, onSave, isAdmin = true }: SSHPanelProps & { isAdmin?: boolean }) {
-  const [editing, setEditing] = useState<SSHProfile | null>(null);
+interface ManagedProfileDraft {
+  id: number | null;
+  revision: number | null;
+  legacyId: string | null;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  keyUploadToken: string;
+  keyUploadFilename: string;
+  keyUploadFingerprint: string;
+  hostKeyValue: string;
+  hostKeyFingerprint: string;
+  hostKeyConfirmed: boolean;
+  enabled: boolean;
+  allowedRootsText: string;
+  taskAccessEnabled: boolean;
+  taskCapabilities: TaskSSHCapability[];
+}
 
-  const startNew = () => setEditing(newProfile());
-  const startEdit = (p: SSHProfile) => setEditing({ ...p });
+function emptyManagedDraft(): ManagedProfileDraft {
+  return {
+    id: null,
+    revision: null,
+    legacyId: null,
+    name: '',
+    host: '',
+    port: 22,
+    username: '',
+    keyUploadToken: '',
+    keyUploadFilename: '',
+    keyUploadFingerprint: '',
+    hostKeyValue: '',
+    hostKeyFingerprint: '',
+    hostKeyConfirmed: false,
+    enabled: true,
+    allowedRootsText: '/',
+    taskAccessEnabled: false,
+    taskCapabilities: [],
+  };
+}
 
-  const handleSave = () => {
-    if (!editing) return;
-    const exists = profiles.find((p) => p.id === editing.id);
-    const next = exists ? profiles.map((p) => (p.id === editing.id ? editing : p)) : [...profiles, editing];
-    onSave(next);
-    setEditing(null);
+const TASK_CAPABILITY_OPTIONS: Array<{
+  key: TaskSSHCapability;
+  label: string;
+  detail: string;
+}> = [
+  { key: 'read', label: 'Read files', detail: 'List directories and read files' },
+  { key: 'exec', label: 'Run commands', detail: 'Execute non-interactive shell commands' },
+  { key: 'write', label: 'Write files', detail: 'Create or replace remote files' },
+];
+
+function ManagedSSHPanel({
+  profiles,
+  legacyProfiles,
+  activeId,
+  activeLegacyId,
+  onActivate,
+  onActivateLegacy,
+  onRefresh,
+  onLegacyMigrated,
+  onDeleteLegacy,
+  isAdmin,
+}: ManagedSSHPanelProps) {
+  const [editing, setEditing] = useState<ManagedProfileDraft | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const keyUploadInputRef = useRef<HTMLInputElement>(null);
+
+  const abandonUploadedKey = (draft: ManagedProfileDraft | null) => {
+    if (draft?.keyUploadToken) {
+      void api.cancelSSHPrivateKeyUpload(draft.keyUploadToken).catch(() => undefined);
+    }
   };
 
-  const handleDelete = (id: string) => {
-    onSave(profiles.filter((p) => p.id !== id));
+  const beginEditing = (draft: ManagedProfileDraft) => {
+    abandonUploadedKey(editing);
+    setMessage(null);
+    setEditing(draft);
+  };
+
+  const startEdit = (profile: ManagedSSHProfile) => {
+    beginEditing({
+      id: profile.id,
+      revision: profile.revision,
+      legacyId: null,
+      name: profile.name,
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
+      keyUploadToken: '',
+      keyUploadFilename: '',
+      keyUploadFingerprint: '',
+      hostKeyValue: '',
+      hostKeyFingerprint: profile.host_key_fingerprint,
+      hostKeyConfirmed: true,
+      enabled: profile.enabled,
+      allowedRootsText: profile.allowed_roots.join('\n'),
+      taskAccessEnabled: profile.task_access_enabled,
+      taskCapabilities: profile.task_capabilities,
+    });
+  };
+
+  const startLegacyMigration = (profile: LegacySSHProfile) => {
+    beginEditing({
+      ...emptyManagedDraft(),
+      legacyId: profile.id,
+      name: profile.label || `${profile.username}@${profile.host}`,
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
+    });
+    setMessage(
+      'Legacy credentials are not copied. Upload a PEM/private key, verify the host fingerprint, and save to finish migration.',
+    );
+  };
+
+  const uploadPrivateKey = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !editing) return;
+    if (file.size > 1024 * 1024) {
+      setMessage('Private keys must be no larger than 1 MB.');
+      return;
+    }
+    const previousToken = editing.keyUploadToken;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const uploaded = await api.uploadSSHPrivateKey(file);
+      if (previousToken) {
+        void api.cancelSSHPrivateKeyUpload(previousToken).catch(() => undefined);
+      }
+      setEditing((current) => current ? {
+        ...current,
+        keyUploadToken: uploaded.upload_token,
+        keyUploadFilename: uploaded.filename,
+        keyUploadFingerprint: uploaded.public_key_fingerprint,
+      } : current);
+      setMessage('Private key uploaded securely. Save the profile to finish.');
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeUploadedKey = () => {
+    if (!editing?.keyUploadToken) return;
+    void api.cancelSSHPrivateKeyUpload(editing.keyUploadToken).catch(() => undefined);
+    setEditing({
+      ...editing,
+      keyUploadToken: '',
+      keyUploadFilename: '',
+      keyUploadFingerprint: '',
+    });
+  };
+
+  const probeHostKey = async () => {
+    if (!editing?.host.trim()) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api.probeSSHHostKey({ host: editing.host, port: editing.port });
+      setEditing({
+        ...editing,
+        hostKeyValue: result.host_key_value,
+        hostKeyFingerprint: result.fingerprint,
+        hostKeyConfirmed: false,
+      });
+      setMessage('Host identity captured. Verify the fingerprint before saving.');
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveManagedProfile = async () => {
+    if (!editing) return;
+    if (!editing.name.trim() || !editing.host.trim() || !editing.username.trim()) {
+      setMessage('Name, host, and username are required.');
+      return;
+    }
+    if (editing.id === null && (!editing.keyUploadToken || !editing.hostKeyValue)) {
+      setMessage('Upload a private key, then verify the host fingerprint.');
+      return;
+    }
+    if (editing.hostKeyValue && !editing.hostKeyConfirmed) {
+      setMessage('Confirm that you verified the probed host fingerprint.');
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      const allowedRoots = editing.allowedRootsText
+        .split(/\r?\n/)
+        .map((root) => root.trim())
+        .filter(Boolean);
+      if (!allowedRoots.length || allowedRoots.some((root) => !root.startsWith('/'))) {
+        setMessage('Enter at least one absolute POSIX allowed root.');
+        return;
+      }
+      const common = {
+        name: editing.name.trim(),
+        host: editing.host.trim(),
+        port: editing.port,
+        username: editing.username.trim(),
+        enabled: editing.enabled,
+        allowed_roots: allowedRoots,
+        task_access_enabled: editing.taskAccessEnabled,
+        task_capabilities: editing.taskAccessEnabled
+          ? editing.taskCapabilities
+          : [],
+      };
+      let saved: ManagedSSHProfile;
+      if (editing.id === null) {
+        const input: SSHProfileInput = {
+          ...common,
+          key_upload_token: editing.keyUploadToken,
+          host_key_value: editing.hostKeyValue,
+        };
+        saved = await api.createSSHProfile(input);
+      } else {
+        if (editing.revision === null) {
+          throw new Error('SSH profile revision is unavailable; refresh and retry.');
+        }
+        saved = await api.updateSSHProfile(editing.id, {
+          expected_revision: editing.revision,
+          ...common,
+          ...(editing.keyUploadToken
+            ? { key_upload_token: editing.keyUploadToken }
+            : {}),
+          ...(editing.hostKeyValue ? { host_key_value: editing.hostKeyValue } : {}),
+        });
+      }
+      const migratedLegacyId = editing.legacyId;
+      setEditing(null);
+      await onRefresh(saved.id);
+      if (migratedLegacyId) onLegacyMigrated(migratedLegacyId);
+    } catch (error) {
+      if (isApiRequestError(error) && error.status === 409) {
+        abandonUploadedKey(editing);
+        setEditing(null);
+        await onRefresh();
+        setMessage('SSH profile changed elsewhere. Refreshed; reopen it and retry.');
+      } else {
+        setMessage((error as Error).message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testManagedProfile = async (profile: ManagedSSHProfile) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result = await api.testSSHProfile(profile.id);
+      setMessage(result.ok ? `Connected to ${profile.name}.` : (result.detail || 'Connection test failed.'));
+      await onRefresh(profile.id);
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteManagedProfile = async (profile: ManagedSSHProfile) => {
+    if (!window.confirm(`Delete SSH profile “${profile.name}”?`)) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      await api.deleteSSHProfile(profile.id, profile.revision);
+      if (editing?.id === profile.id) {
+        abandonUploadedKey(editing);
+        setEditing(null);
+      }
+      await onRefresh();
+    } catch (error) {
+      if (isApiRequestError(error) && error.status === 409) {
+        await onRefresh();
+        setMessage('SSH profile changed elsewhere. Refreshed; retry the delete.');
+      } else {
+        setMessage((error as Error).message);
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="space-y-3">
-      {/* Saved profiles */}
-      <div className="space-y-1">
-        {profiles.map((p) => (
-          <div
-            key={p.id}
-            className={`flex items-center gap-2 px-3 py-2 rounded cursor-pointer text-sm ${
-              active?.id === p.id ? 'bg-indigo-700 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-            }`}
-          >
-            <Server size={14} className="flex-shrink-0" />
-            <span className="flex-1 truncate" onClick={() => onActivate(p)}>
-              {p.label || `${p.username}@${p.host}`}
-            </span>
-            {isAdmin && <button onClick={() => startEdit(p)} className="text-gray-400 hover:text-gray-200 text-xs px-1">edit</button>}
-            {isAdmin && <button onClick={() => handleDelete(p.id)} className="text-red-400 hover:text-red-300"><Trash2 size={12} /></button>}
-          </div>
-        ))}
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium text-gray-200">SSH connections</div>
+          <div className="text-xs text-gray-500">Every managed connection can browse files. You decide whether Tasks may use it.</div>
+        </div>
+        {isAdmin && <button
+          disabled={busy}
+          onClick={() => beginEditing(emptyManagedDraft())}
+          className="flex items-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50"
+        >
+          <Plus size={12} /> Add SSH connection
+        </button>}
       </div>
 
-      {isAdmin && (
-        <button
-          onClick={startNew}
-          className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300"
-        >
-          <Plus size={12} /> Add server
-        </button>
-      )}
-
-      {/* Inline editor */}
-      {editing && (
-        <div className="bg-gray-700 rounded p-3 space-y-2 text-sm">
-          {[
-            { label: 'Label', key: 'label', placeholder: 'My Server' },
-            { label: 'Host', key: 'host', placeholder: '192.168.1.1' },
-            { label: 'Port', key: 'port', placeholder: '22' },
-            { label: 'Username', key: 'username', placeholder: 'ubuntu' },
-            { label: 'Password', key: 'password', placeholder: '(optional if key is set)', type: 'password' },
-            { label: 'Key File', key: 'key_path', placeholder: '~/.ssh/id_rsa  (optional, leave empty to use password)' },
-          ].map(({ label, key, placeholder, type }) => (
-            <div key={key} className="flex items-center gap-2">
-              <span className="w-20 text-gray-400 flex-shrink-0">{label}</span>
-              <input
-                type={type || 'text'}
-                value={String((editing as unknown as Record<string, unknown>)[key] ?? '')}
-                onChange={(e) => setEditing({ ...editing, [key]: key === 'port' ? Number(e.target.value) : e.target.value })}
-                placeholder={placeholder}
-                className="flex-1 bg-gray-600 text-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {profiles.map((profile) => (
+          <div
+            key={profile.id}
+            className={`rounded border p-3 ${activeId === profile.id ? 'border-indigo-500 bg-indigo-500/10' : 'border-gray-700 bg-gray-800/70'}`}
+          >
+            <button onClick={() => onActivate(profile)} className="w-full text-left">
+              <div className="flex items-center gap-2 text-sm text-gray-200">
+                <Server size={14} className="text-indigo-400" />
+                <span className="truncate font-medium">{profile.name}</span>
+                {!profile.enabled && <span className="ml-auto text-[10px] text-amber-400">disabled</span>}
+              </div>
+              <div className="mt-1 truncate text-xs text-gray-500">{profile.username}@{profile.host}:{profile.port}</div>
+              <div className="mt-1 truncate font-mono text-[10px] text-gray-600" title={profile.host_key_fingerprint}>
+                host {profile.host_key_fingerprint}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] text-indigo-300">Files</span>
+                {profile.allowed_roots.map((root) => (
+                  <span key={root} className="max-w-full truncate rounded bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] text-violet-300" title={root}>root: {root}</span>
+                ))}
+                {profile.task_access_enabled ? (
+                  profile.task_capabilities.map((capability) => (
+                    <span key={capability} className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] text-cyan-300">Task: {capability}</span>
+                  ))
+                ) : (
+                  <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">Not exposed to Tasks</span>
+                )}
+              </div>
+            </button>
+            <div className="mt-2 flex gap-2 text-xs">
+              <button disabled={busy} onClick={() => testManagedProfile(profile)} className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50">test</button>
+              {isAdmin && <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>}
+              {isAdmin && <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
             </div>
-          ))}
-          <div className="flex gap-2 pt-1">
-            <button onClick={handleSave} className="px-3 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700">Save</button>
-            <button onClick={() => setEditing(null)} className="px-3 py-1 bg-gray-600 text-gray-300 rounded text-xs hover:bg-gray-500">Cancel</button>
+          </div>
+        ))}
+        {legacyProfiles.map((profile) => (
+          <div
+            key={`legacy-${profile.id}`}
+            className={`rounded border p-3 ${activeLegacyId === profile.id ? 'border-amber-500 bg-amber-500/10' : 'border-gray-700 bg-gray-800/70'}`}
+          >
+            <button onClick={() => onActivateLegacy(profile)} className="w-full text-left">
+              <div className="flex items-center gap-2 text-sm text-gray-200">
+                <Server size={14} className="text-amber-400" />
+                <span className="truncate font-medium">{profile.label || `${profile.username}@${profile.host}`}</span>
+              </div>
+              <div className="mt-1 truncate text-xs text-gray-500">{profile.username}@{profile.host}:{profile.port}</div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] text-indigo-300">Files</span>
+                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">Legacy · migrate to expose to Tasks</span>
+              </div>
+            </button>
+            {isAdmin && !profile.id.startsWith('worker-') && (
+              <div className="mt-2 flex gap-2 text-xs">
+                <button disabled={busy} onClick={() => startLegacyMigration(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">migrate</button>
+                <button disabled={busy} onClick={() => onDeleteLegacy(profile.id)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>
+              </div>
+            )}
+          </div>
+        ))}
+        {profiles.length === 0 && legacyProfiles.length === 0 && (
+          <div className="rounded border border-dashed border-gray-700 p-4 text-xs text-gray-500">No SSH connections yet.</div>
+        )}
+      </div>
+
+      {editing && (
+        <div className="rounded border border-gray-700 bg-gray-800 p-3 space-y-3">
+          <div className="text-sm font-medium text-gray-200">{editing.legacyId ? 'Migrate SSH connection' : editing.id === null ? 'New SSH connection' : 'Edit SSH connection'}</div>
+          <div className="grid gap-2 md:grid-cols-2">
+            <label className="text-xs text-gray-400">Name<input value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
+            <label className="text-xs text-gray-400">Username<input value={editing.username} onChange={(e) => setEditing({ ...editing, username: e.target.value })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
+            <label className="text-xs text-gray-400">Host<input value={editing.host} onChange={(e) => setEditing({ ...editing, host: e.target.value, hostKeyValue: '', hostKeyFingerprint: '', hostKeyConfirmed: false })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
+            <label className="text-xs text-gray-400">Port<input type="number" min={1} max={65535} value={editing.port} onChange={(e) => setEditing({ ...editing, port: Number(e.target.value), hostKeyValue: '', hostKeyFingerprint: '', hostKeyConfirmed: false })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
+            <div className="text-xs text-gray-400 md:col-span-2">
+              <div className="flex items-center justify-between gap-2">
+                <span>Private key</span>
+                <button disabled={busy} onClick={() => keyUploadInputRef.current?.click()} className="flex items-center gap-1 rounded bg-gray-700 px-2 py-1 text-indigo-300 hover:bg-gray-600 disabled:opacity-50">
+                  <Upload size={12} /> Upload PEM or private key
+                </button>
+                <input ref={keyUploadInputRef} aria-label="Upload SSH private key" type="file" className="hidden" onChange={uploadPrivateKey} />
+              </div>
+              {editing.keyUploadToken ? (
+                <div className="mt-1 flex flex-wrap items-center gap-2 rounded border border-emerald-800 bg-emerald-950/30 px-2 py-1.5">
+                  <span className="text-emerald-300">Uploaded: {editing.keyUploadFilename}</span>
+                  <span className="min-w-0 truncate font-mono text-[10px] text-gray-500">{editing.keyUploadFingerprint}</span>
+                  <button disabled={busy} onClick={removeUploadedKey} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50">remove</button>
+                </div>
+              ) : (
+                <div className="mt-1 rounded border border-gray-700 bg-gray-900/40 px-2 py-1.5 text-gray-400">
+                  {editing.id === null
+                    ? 'Upload is required for every new or migrated connection.'
+                    : `Current key (${profiles.find((profile) => profile.id === editing.id)?.key_path_hint || 'stored on Manager'}) will be kept. Upload only to rotate it.`}
+                </div>
+              )}
+              <div className="mt-1 text-[10px] text-gray-500">Uploaded keys are validated and stored only on the CCM server with mode 0600.</div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 rounded bg-gray-900/70 p-2">
+            <button disabled={busy || !editing.host.trim()} onClick={probeHostKey} className="px-2 py-1 rounded bg-amber-600 text-white text-xs hover:bg-amber-700 disabled:opacity-50">Probe host identity</button>
+            <span className="min-w-0 truncate font-mono text-[10px] text-gray-400">{editing.hostKeyFingerprint || 'No newly verified fingerprint'}</span>
+            {editing.hostKeyValue && (
+              <label className="flex items-center gap-1.5 text-xs text-amber-300">
+                <input type="checkbox" checked={editing.hostKeyConfirmed} onChange={(e) => setEditing({ ...editing, hostKeyConfirmed: e.target.checked })} />
+                I verified this host fingerprint
+              </label>
+            )}
+          </div>
+          <label className="block text-xs text-gray-400">
+            Allowed remote roots
+            <textarea
+              aria-label="Allowed remote roots"
+              rows={3}
+              value={editing.allowedRootsText}
+              onChange={(event) => setEditing({ ...editing, allowedRootsText: event.target.value })}
+              placeholder="/srv/app\n/var/log/my-app"
+              className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 font-mono text-gray-200"
+            />
+            <span className="mt-1 block text-[10px] text-gray-500">
+              One absolute POSIX path per line. This limits Files and Task file operations; command execution is not path-scoped. Changing roots requires existing Task grants to be re-authorized.
+            </span>
+          </label>
+          <div className="rounded border border-gray-700 bg-gray-900/50 p-3">
+            <label className="flex items-start gap-2 text-xs text-gray-300">
+              <input
+                aria-label="Allow Tasks to use this connection"
+                type="checkbox"
+                checked={editing.taskAccessEnabled}
+                onChange={(event) => setEditing({
+                  ...editing,
+                  taskAccessEnabled: event.target.checked,
+                  taskCapabilities: event.target.checked
+                    ? (editing.taskCapabilities.length ? editing.taskCapabilities : ['read'])
+                    : [],
+                })}
+                className="mt-0.5 accent-cyan-500"
+              />
+              <span>
+                <span className="block font-medium">Allow Tasks to use this connection</span>
+                <span className="block text-[10px] text-gray-500">Off means this connection is available only in Files.</span>
+              </span>
+            </label>
+            {editing.taskAccessEnabled && (
+              <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                {TASK_CAPABILITY_OPTIONS.map((capability) => (
+                  <label key={capability.key} className="rounded bg-gray-800 p-2 text-xs text-gray-300" title={capability.detail}>
+                    <span className="flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        aria-label={`Task capability: ${capability.label}`}
+                        checked={editing.taskCapabilities.includes(capability.key)}
+                        onChange={(event) => {
+                          const next = event.target.checked
+                            ? [...editing.taskCapabilities, capability.key]
+                            : editing.taskCapabilities.filter((item) => item !== capability.key);
+                          if (next.length) setEditing({ ...editing, taskCapabilities: next });
+                        }}
+                        className="accent-cyan-500"
+                      />
+                      {capability.label}
+                    </span>
+                    <span className="mt-1 block text-[10px] text-gray-500">{capability.detail}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+          <label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} />Enabled</label>
+          <div className="flex gap-2">
+            <button disabled={busy} onClick={saveManagedProfile} className="px-3 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50">{busy ? 'Working…' : 'Save'}</button>
+            <button disabled={busy} onClick={() => { abandonUploadedKey(editing); setEditing(null); }} className="px-3 py-1 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600 disabled:opacity-50">Cancel</button>
           </div>
         </div>
       )}
+
+      {message && <div className="rounded border border-gray-700 bg-gray-900/60 px-3 py-2 text-xs text-gray-300">{message}</div>}
     </div>
   );
 }
@@ -335,10 +749,11 @@ export function FilesPage() {
   const [rootError, setRootError] = useState<string | null>(null);
 
   // SSH state
-  const [profiles, setProfiles] = useState<SSHProfile[]>(loadProfiles);
+  const [profiles, setProfiles] = useState<LegacySSHProfile[]>(loadProfiles);
   const workerProfiles = useWorkerProfiles();
   const allProfiles = [...workerProfiles, ...profiles];
-  const [activeProfile, setActiveProfile] = useState<SSHProfile | null>(null);
+  const [managedProfiles, setManagedProfiles] = useState<ManagedSSHProfile[]>([]);
+  const [activeConnection, setActiveConnection] = useState<SSHConnection | null>(null);
   const [sshPath, setSshPath] = useState('/');
   const [sshEntries, setSshEntries] = useState<DirEntry[] | null>(null);
   const [sshLoading, setSshLoading] = useState(false);
@@ -368,6 +783,18 @@ export function FilesPage() {
 
   useEffect(() => {
     api.listProjects().then(setProjects).catch(() => {});
+    api.listSSHProfiles().then(setManagedProfiles).catch(() => {});
+  }, []);
+
+  const refreshManagedProfiles = useCallback(async (preferredId?: number) => {
+    const next = await api.listSSHProfiles();
+    setManagedProfiles(next);
+    setActiveConnection((current) => {
+      const targetId = preferredId ?? (current?.kind === 'managed' ? current.profile.id : null);
+      if (targetId === null) return current;
+      const refreshed = next.find((profile) => profile.id === targetId);
+      return refreshed ? { kind: 'managed', profile: refreshed } : null;
+    });
   }, []);
 
   // --- git helpers ---
@@ -440,20 +867,22 @@ export function FilesPage() {
 
   const handleLocalSelect = async (path: string, isDir: boolean) => {
     if (isDir) return;
-    openFile(path, false, null);
+    openFile(path);
   };
 
   // --- SSH helpers ---
 
-  const loadSshRoot = async (profile: SSHProfile, path: string) => {
+  const loadSshRoot = async (connection: SSHConnection, path: string) => {
     setSshLoading(true);
     setSshError(null);
     setSshEntries(null);
     setSelectedFile(null);
     setFileContent(null);
     try {
-      const creds = profileToCreds(profile);
-      const res = await api.sshListDir(creds, path);
+      const res = connection.kind === 'managed'
+        ? await api.managedSSHListDir(connection.profile.id, path)
+        : await api.sshListDir(profileToCreds(connection.profile), path);
+      setSshPath(res.path);
       setSshEntries(res.entries);
     } catch (e) {
       setSshError((e as Error).message);
@@ -463,35 +892,43 @@ export function FilesPage() {
   };
 
   const sshFetchChildren = async (path: string): Promise<DirEntry[]> => {
-    if (!activeProfile) return [];
-    const res = await api.sshListDir(profileToCreds(activeProfile), path);
+    if (!activeConnection) return [];
+    const res = activeConnection.kind === 'managed'
+      ? await api.managedSSHListDir(activeConnection.profile.id, path)
+      : await api.sshListDir(profileToCreds(activeConnection.profile), path);
     return res.entries;
   };
 
   const handleSshSelect = async (path: string, isDir: boolean) => {
     if (isDir) return;
-    openFile(path, true, activeProfile);
+    openFile(path, activeConnection);
   };
 
-  const handleActivateProfile = (p: SSHProfile) => {
-    setActiveProfile(p);
+  const activateSSHConnection = (connection: SSHConnection) => {
+    const initialPath = connection.kind === 'managed'
+      ? (connection.profile.allowed_roots[0] || '/')
+      : sshPath;
+    setActiveConnection(connection);
+    setSshPath(initialPath);
     setSshEntries(null);
     setSelectedFile(null);
     setFileContent(null);
-    loadSshRoot(p, sshPath);
+    loadSshRoot(connection, initialPath);
   };
 
   // --- shared file opener ---
 
-  const openFile = async (path: string, isSSH: boolean, profile: SSHProfile | null) => {
+  const openFile = async (path: string, connection: SSHConnection | null = null) => {
     setSelectedFile(path);
     setFileContent(null);
     setFileError(null);
     setFileLoading(true);
     try {
-      const res = isSSH && profile
-        ? await api.sshReadFile(profileToCreds(profile), path)
-        : await api.readFile(path);
+      const res = connection?.kind === 'managed'
+        ? await api.managedSSHReadFile(connection.profile.id, path)
+        : connection?.kind === 'legacy'
+          ? await api.sshReadFile(profileToCreds(connection.profile), path)
+          : await api.readFile(path);
       setFileContent(res.content);
     } catch (e) {
       setFileError((e as Error).message);
@@ -502,9 +939,20 @@ export function FilesPage() {
 
   // --- profile persistence ---
 
-  const handleSaveProfiles = (next: SSHProfile[]) => {
+  const handleSaveProfiles = (next: LegacySSHProfile[]) => {
     setProfiles(next);
     saveProfiles(next);
+  };
+
+  const removeLegacyProfile = (legacyId: string) => {
+    const next = profiles.filter((profile) => profile.id !== legacyId);
+    handleSaveProfiles(next);
+    if (activeConnection?.kind === 'legacy' && activeConnection.profile.id === legacyId) {
+      setActiveConnection(null);
+      setSshEntries(null);
+      setSelectedFile(null);
+      setFileContent(null);
+    }
   };
 
   const handleDownload = async () => {
@@ -519,9 +967,11 @@ export function FilesPage() {
       iframe.src = url;
       document.body.appendChild(iframe);
       setTimeout(() => document.body.removeChild(iframe), 10000);
-    } else if (activeProfile) {
+    } else if (activeConnection) {
       try {
-        const res = await api.sshDownloadFile(profileToCreds(activeProfile), selectedFile);
+        const res = activeConnection.kind === 'managed'
+          ? await api.managedSSHDownloadFile(activeConnection.profile.id, selectedFile)
+          : await api.sshDownloadFile(profileToCreds(activeConnection.profile), selectedFile);
         if (!res.ok) { setFileError('Download failed'); return; }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -555,14 +1005,18 @@ export function FilesPage() {
   };
 
   const currentEntries = mode === 'local' ? rootEntries : sshEntries;
-  const currentRootLabel = mode === 'local' ? rootPath : (activeProfile ? `${activeProfile.username}@${activeProfile.host}:${sshPath}` : '');
+  const currentRootLabel = mode === 'local'
+    ? rootPath
+    : activeConnection
+      ? `${activeConnection.profile.username}@${activeConnection.profile.host}:${sshPath}`
+      : '';
 
   return (
     <div className="space-y-4">
       {/* Mode toggle + path bar */}
       <div className="bg-gray-800 rounded-lg p-4 space-y-3">
         <div className="flex items-center gap-3 flex-wrap">
-          <h2 className="text-sm font-semibold text-foreground">File Browser</h2>
+          <h2 className="text-sm font-semibold text-foreground">Files</h2>
           <div className="flex rounded overflow-hidden border border-gray-600 text-xs">
             <button
               onClick={() => setMode('local')}
@@ -574,7 +1028,7 @@ export function FilesPage() {
               onClick={() => setMode('ssh')}
               className={`flex items-center gap-1 px-3 py-1.5 ${mode === 'ssh' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
             >
-              <Server size={12} /> SSH
+              <Server size={12} /> SSH workspace
             </button>
             <button
               onClick={() => setMode('git')}
@@ -640,25 +1094,31 @@ export function FilesPage() {
 
         {mode === 'ssh' && (
           <div className="space-y-3">
-            <SSHPanel
-              profiles={allProfiles}
-              active={activeProfile}
-              onActivate={handleActivateProfile}
-              onSave={handleSaveProfiles}
+            <ManagedSSHPanel
+              profiles={managedProfiles}
+              legacyProfiles={allProfiles}
+              activeId={activeConnection?.kind === 'managed' ? activeConnection.profile.id : null}
+              activeLegacyId={activeConnection?.kind === 'legacy' ? activeConnection.profile.id : null}
+              onActivate={(profile) => activateSSHConnection({ kind: 'managed', profile })}
+              onActivateLegacy={(profile) => activateSSHConnection({ kind: 'legacy', profile })}
+              onRefresh={refreshManagedProfiles}
+              onLegacyMigrated={removeLegacyProfile}
+              onDeleteLegacy={removeLegacyProfile}
               isAdmin={isAdmin}
             />
-            {activeProfile && (
+
+            {activeConnection && (
               <div className="flex gap-2">
                 <input
                   type="text"
                   value={sshPath}
                   onChange={(e) => setSshPath(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && loadSshRoot(activeProfile, sshPath)}
+                  onKeyDown={(e) => e.key === 'Enter' && loadSshRoot(activeConnection, sshPath)}
                   placeholder="/home/user"
                   className="flex-1 bg-gray-700 text-gray-300 text-sm rounded px-3 py-1.5 border border-gray-600 focus:outline-none focus:border-indigo-500"
                 />
                 <button
-                  onClick={() => loadSshRoot(activeProfile, sshPath)}
+                  onClick={() => loadSshRoot(activeConnection, sshPath)}
                   disabled={sshLoading}
                   className="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700 disabled:opacity-50"
                 >
@@ -878,7 +1338,7 @@ export function FilesPage() {
 // Helper
 // ---------------------------------------------------------------------------
 
-function profileToCreds(p: SSHProfile) {
+function profileToCreds(p: LegacySSHProfile) {
   return {
     host: p.host,
     port: p.port,

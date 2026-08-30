@@ -170,7 +170,29 @@ def _fake_tools(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
         "fi\n"
         f"exec {real_python} \"$@\"\n"
     )
-    for executable in (systemctl, sudo, uv, python_wrapper):
+    bwrap = bin_dir / "bwrap"
+    bwrap.write_text("#!/bin/sh\nexit 0\n")
+    socat = bin_dir / "socat"
+    socat.write_text("#!/bin/sh\nexit 0\n")
+    npm_root = tmp_path / "npm-root"
+    apply_seccomp = (
+        npm_root
+        / "@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp"
+    )
+    apply_seccomp.parent.mkdir(parents=True)
+    apply_seccomp.write_text("#!/bin/sh\nexit 0\n")
+    apply_seccomp.chmod(apply_seccomp.stat().st_mode | stat.S_IEXEC)
+    npm = bin_dir / "npm"
+    npm.write_text('#!/bin/sh\nprintf "%s\\n" "$FAKE_NPM_ROOT"\n')
+    for executable in (
+        systemctl,
+        sudo,
+        uv,
+        python_wrapper,
+        bwrap,
+        socat,
+        npm,
+    ):
         executable.chmod(executable.stat().st_mode | stat.S_IEXEC)
 
     env = {
@@ -186,6 +208,7 @@ def _fake_tools(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
         "FAKE_SERVICE_LOG": str(service_log),
         "FAKE_ACTIVE_STATE": str(active_state),
         "FAKE_UV_LOG": str(uv_log),
+        "FAKE_NPM_ROOT": str(npm_root),
     }
     return env, service_log, uv_log, python_wrapper
 
@@ -281,6 +304,41 @@ def test_systemd_user_manager_deserialize_is_narrowly_allowed() -> None:
     assert not classifier("python systemd --user")
 
 
+def test_server_side_sshd_session_allowlist_requires_root_parent() -> None:
+    content = SCRIPT.read_text()
+    start = content.index("def fixed_server_side_sshd_session")
+    end = content.index("\n\nunsafe_uninspectable", start)
+    namespace = {"re": re}
+    exec(content[start:end], namespace)
+    classifier = namespace["fixed_server_side_sshd_session"]
+    valid = {
+        "process_name": "sshd-session",
+        "command": "sshd-session: ubuntu@pts/0",
+        "cgroup": "0::/user.slice/user-1000.slice/session-799.scope",
+        "parent_name": "sshd-session",
+        "parent_uids": (0, 0, 0, 0),
+        "parent_command": "sshd-session: ubuntu [priv]",
+        "parent_cgroup": "0::/user.slice/user-1000.slice/session-799.scope",
+        "own_uid": 1000,
+        "account_name": "ubuntu",
+    }
+
+    assert classifier(**valid)
+    assert classifier(**{**valid, "command": "sshd-session: ubuntu@notty"})
+    assert not classifier(**{**valid, "process_name": "python"})
+    assert not classifier(**{**valid, "command": "sshd-session: ubuntu@pts/0 extra"})
+    assert not classifier(**{**valid, "cgroup": "0::/user.slice/user-1000.slice/app.slice"})
+    assert not classifier(**{**valid, "parent_name": "python"})
+    assert not classifier(**{**valid, "parent_uids": (1000, 1000, 1000, 1000)})
+    assert not classifier(**{**valid, "parent_command": "python [priv]"})
+    assert not classifier(
+        **{
+            **valid,
+            "parent_cgroup": "0::/user.slice/user-1000.slice/session-800.scope",
+        }
+    )
+
+
 def test_root_bootstrap_uses_isolated_system_python_before_setuid() -> None:
     content = SCRIPT.read_text()
     bootstrap_start = content.index('if [ "$(id -u)" = "0" ]; then')
@@ -296,14 +354,98 @@ def test_root_bootstrap_uses_isolated_system_python_before_setuid() -> None:
     assert "os.setuid(uid)" in bootstrap
 
 
+def test_linux_prerequisite_gate_fails_before_service_stop(
+    tmp_path: Path,
+    update_port: int,
+) -> None:
+    project, old_commit, _ = _git_project(tmp_path)
+    database = tmp_path / "live.db"
+    backup = tmp_path / "backup.db"
+    _write_sqlite(database, "unchanged")
+    _write_sqlite(backup, "unchanged")
+    env, service_log, uv_log, python_wrapper = _fake_tools(tmp_path)
+    (Path(env["PATH"].split(":", 1)[0]) / "socat").unlink()
+    lookup_mask = tmp_path / "mask-socat-command.bash"
+    lookup_mask.write_text(
+        "command() {\n"
+        "  if [ \"${1:-}\" = \"-v\" ] && "
+        "[ \"${2:-}\" = \"socat\" ]; then return 1; fi\n"
+        "  builtin command \"$@\"\n"
+        "}\n"
+    )
+    # Keep the prerequisite probe hermetic even when the test host itself has
+    # /usr/bin/socat installed later in PATH.
+    env["BASH_ENV"] = str(lookup_mask)
+
+    result = _run(
+        project=project,
+        old_commit=old_commit,
+        backup=backup,
+        port=update_port,
+        database=database,
+        mode="migrate",
+        env=env,
+        python_wrapper=python_wrapper,
+    )
+
+    assert result.returncode != 0
+    status = _status(update_port)
+    assert status["status"] == "failed"
+    assert status["step"] == "deployment_prerequisites"
+    assert "bubblewrap/socat" in status["message"]
+    assert "apt-get install -y bubblewrap socat" in Path(
+        status["log_file"]
+    ).read_text()
+    assert not service_log.exists() or "stop" not in service_log.read_text()
+    assert not uv_log.exists() or not uv_log.read_text()
+
+
+def test_linux_prerequisite_gate_requires_matching_apply_seccomp(
+    tmp_path: Path,
+    update_port: int,
+) -> None:
+    project, old_commit, _ = _git_project(tmp_path)
+    database = tmp_path / "live.db"
+    backup = tmp_path / "backup.db"
+    _write_sqlite(database, "unchanged")
+    _write_sqlite(backup, "unchanged")
+    env, service_log, uv_log, python_wrapper = _fake_tools(tmp_path)
+    helper = (
+        Path(env["FAKE_NPM_ROOT"])
+        / "@anthropic-ai/sandbox-runtime/vendor/seccomp/x64/apply-seccomp"
+    )
+    helper.unlink()
+
+    result = _run(
+        project=project,
+        old_commit=old_commit,
+        backup=backup,
+        port=update_port,
+        database=database,
+        mode="migrate",
+        env=env,
+        python_wrapper=python_wrapper,
+    )
+
+    assert result.returncode != 0
+    status = _status(update_port)
+    assert status["status"] == "failed"
+    assert status["step"] == "deployment_prerequisites"
+    assert "apply-seccomp" in status["message"]
+    log = Path(status["log_file"]).read_text()
+    assert "matching apply-seccomp" in log
+    assert "@anthropic-ai/sandbox-runtime@0.0.71" in log
+    assert not service_log.exists() or "stop" not in service_log.read_text()
+    assert not uv_log.exists() or not uv_log.read_text()
+
+
 def test_success_refreshes_stopped_snapshot_and_requires_target_commit(
     tmp_path: Path, update_port: int
 ) -> None:
     project, old_commit, new_commit = _git_project(tmp_path)
     database = tmp_path / "live.db"
-    backup = tmp_path / "stale-online.db"
+    backup = tmp_path / "reserved-final.db"
     _write_sqlite(database, "latest-before-stop")
-    _write_sqlite(backup, "stale")
     env, service_log, uv_log, python_wrapper = _fake_tools(tmp_path)
     env.update(
         {
@@ -342,9 +484,8 @@ def test_migration_failure_restores_final_snapshot_and_old_code(
 ) -> None:
     project, old_commit, _ = _git_project(tmp_path)
     database = tmp_path / "live.db"
-    backup = tmp_path / "stale-online.db"
+    backup = tmp_path / "reserved-final.db"
     _write_sqlite(database, "latest-before-stop")
-    _write_sqlite(backup, "stale")
     env, _, _, python_wrapper = _fake_tools(tmp_path)
     env.update(
         {

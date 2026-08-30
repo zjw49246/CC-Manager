@@ -10,16 +10,39 @@ import logging
 import os
 import signal
 import tempfile
+import time
 import weakref
 from dataclasses import dataclass
 
 from backend.config import settings
+from backend.services.cancellation import (
+    await_task_completion,
+    finish_awaitable,
+    settle_awaitable,
+)
 from backend.services.codex_app_server import (
-    CODEX_SERVICE_TIER_PRIORITY,
-    codex_untrusted_project_override,
     normalize_codex_service_tier,
 )
+from backend.services.claude_auth_projection import (
+    ClaudeAuthProjectionError,
+    apply_claude_auth_projection,
+    environment_has_direct_claude_auth,
+    inject_cloudrouter_claude_direct_auth,
+    prepare_claude_auth_projection,
+    remove_claude_auth_projection,
+)
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.task_agent_isolation import (
+    TaskAgentIsolationError,
+    generate_claude_zero_tool_isolation_settings,
+    require_task_security_boundary_configured,
+    scrub_task_model_environment,
+    validate_claude_zero_tool_isolation_settings,
+)
+from backend.services.task_ssh_access import (
+    TaskSSHAccessError,
+    manager_secret_protected_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -346,19 +369,9 @@ async def _settle_process_spawn(
 ) -> tuple[asyncio.subprocess.Process, asyncio.CancelledError | None]:
     """Return the exact spawned process even across caller cancellation."""
 
-    spawn_task = asyncio.create_task(
+    spawn_task, delayed_cancellation = await settle_awaitable(
         asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
     )
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not spawn_task.done():
-        try:
-            await asyncio.shield(spawn_task)
-        except asyncio.CancelledError as exc:
-            if spawn_task.done():
-                break
-            delayed_cancellation = exc
-        except Exception:
-            break
 
     try:
         process = spawn_task.result()
@@ -490,17 +503,8 @@ async def _terminate_process_shielded(
             )
 
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            # Multiple cancellations must not strand the evaluator.  Preserve
-            # the latest one and keep waiting for the shielded cleanup task.
-            cancellation = exc
-        except Exception:
-            # Inspect and classify the settled cleanup failure below, where the
-            # exact process handle is retained before propagating it.
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
 
     try:
         try:
@@ -628,10 +632,20 @@ class GoalEvaluator:
         task_id: int | None = None,
         config_dir: str | None = None,
         cloudrouter_store=None,
+        claude_pool=None,
         codex_service_tier: str = "default",
         codex_app_server_registry=None,
     ) -> GoalEvalResult:
         provider = (provider or "claude").lower()
+        try:
+            require_task_security_boundary_configured()
+            protected_paths = manager_secret_protected_paths()
+        except (TaskAgentIsolationError, TaskSSHAccessError) as exc:
+            raise GoalEvaluationError(
+                "Goal evaluation security admission failed",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
         if provider == "codex":
             eval_model = model or settings.default_codex_goal_evaluator_model
             codex_service_tier = normalize_codex_service_tier(
@@ -642,11 +656,7 @@ class GoalEvaluator:
 
         prompt = self._build_eval_prompt(condition, conversation_summary)
 
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
-        }
+        env = scrub_task_model_environment(os.environ, provider=provider)
         # ``codex_home`` is retained as a compatibility name because the
         # dispatcher historically passes the active provider's config_dir
         # through that argument for both providers.
@@ -664,7 +674,20 @@ class GoalEvaluator:
                 cloudrouter_store, provider, provider_home,
             )
         )
-        if cloudrouter_api:
+        if cloudrouter_api and provider == "claude":
+            try:
+                inject_cloudrouter_claude_direct_auth(
+                    env,
+                    cloudrouter_store,
+                    provider_home,
+                )
+            except ClaudeAuthProjectionError as exc:
+                raise GoalEvaluationError(
+                    "Goal evaluation security admission failed",
+                    provider=provider,
+                    stderr=str(exc),
+                ) from exc
+        elif cloudrouter_api:
             auth_keys = (
                 _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
                 if provider == "codex"
@@ -673,13 +696,10 @@ class GoalEvaluator:
             for key in auth_keys:
                 env.pop(key, None)
 
-        if (
-            provider == "codex"
-            and codex_service_tier == CODEX_SERVICE_TIER_PRIORITY
-        ):
+        if provider == "codex":
             if codex_app_server_registry is None or not provider_home:
                 raise GoalEvaluationError(
-                    "Codex Fast goal evaluation requires an exact app-server "
+                    "Codex goal evaluation requires an exact app-server "
                     "account route before execution",
                     provider=provider,
                 )
@@ -689,21 +709,83 @@ class GoalEvaluator:
                 codex_home=provider_home,
                 task_id=task_id,
                 registry=codex_app_server_registry,
-                disable_project_config=cloudrouter_api,
+                codex_service_tier=codex_service_tier,
             )
 
-        cmd = self._build_eval_command(provider, prompt, eval_model)
-        evaluator_cwd = tempfile.gettempdir()
-        if provider == "codex" and cloudrouter_api:
-            # Loading the managed API provider/auth configuration is required,
-            # but trusting the evaluator cwd would also enable project-local
-            # Codex configuration.  Replace the whole projects map for this
-            # process so neither a persisted entry nor a project file can
-            # launch project-local MCP servers or hooks beside that credential.
-            cmd[-1:-1] = [
-                "-c",
-                codex_untrusted_project_override(evaluator_cwd),
-            ]
+        projection_identifier = (
+            task_id
+            if isinstance(task_id, int) and task_id > 0
+            else max(1, os.getpid())
+        )
+        projection_binding = (
+            f"goal-evaluator:{projection_identifier}:{time.monotonic_ns()}"
+        )
+        try:
+            if (
+                not cloudrouter_api
+                and not environment_has_direct_claude_auth(env)
+                and claude_pool is not None
+            ):
+                refreshed = await claude_pool.ensure_oauth_access_token(
+                    provider_home,
+                    minimum_remaining_seconds=300.0,
+                )
+                if not refreshed:
+                    raise ClaudeAuthProjectionError(
+                        "Selected Goal evaluator Claude account cannot refresh "
+                        "a bounded access token"
+                    )
+            auth_projection = prepare_claude_auth_projection(
+                provider_home,
+                namespace="goal-evaluator",
+                identifier=projection_identifier,
+                binding=projection_binding,
+                environment=env,
+            )
+            apply_claude_auth_projection(env, auth_projection)
+        except ClaudeAuthProjectionError as exc:
+            raise GoalEvaluationError(
+                "Goal evaluation security admission failed",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
+        evaluator_cwd = os.path.abspath(os.sep)
+        try:
+            isolation_settings = generate_claude_zero_tool_isolation_settings(
+                "goal-evaluator",
+                (
+                    task_id
+                    if isinstance(task_id, int) and task_id > 0
+                    else max(1, os.getpid())
+                ),
+                protected_paths,
+            )
+            validate_claude_zero_tool_isolation_settings(
+                isolation_settings,
+                claude_binary=settings.claude_binary,
+            )
+        except TaskAgentIsolationError as exc:
+            try:
+                remove_claude_auth_projection(
+                    namespace="goal-evaluator",
+                    identifier=projection_identifier,
+                    binding=projection_binding,
+                )
+            except ClaudeAuthProjectionError:
+                logger.exception(
+                    "Could not roll back Goal evaluator auth projection"
+                )
+            raise GoalEvaluationError(
+                "Goal evaluation security admission failed",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
+        cmd = self._build_eval_command(
+            provider,
+            prompt,
+            eval_model,
+            isolation_settings_path=isolation_settings,
+        )
 
         process: asyncio.subprocess.Process | None = None
         process_was_registered = False
@@ -713,9 +795,8 @@ class GoalEvaluator:
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "env": env,
+            "cwd": evaluator_cwd,
         }
-        if provider == "codex" and cloudrouter_api:
-            spawn_kwargs["cwd"] = evaluator_cwd
         if managed_process_group:
             spawn_kwargs["start_new_session"] = True
         try:
@@ -808,6 +889,18 @@ class GoalEvaluator:
                 returncode=returncode,
                 stderr=str(exc),
             ) from exc
+        finally:
+            if process is None or not _goal_evaluator_process_is_retained(process):
+                try:
+                    remove_claude_auth_projection(
+                        namespace="goal-evaluator",
+                        identifier=projection_identifier,
+                        binding=projection_binding,
+                    )
+                except ClaudeAuthProjectionError:
+                    logger.exception(
+                        "Could not clean Goal evaluator auth projection"
+                    )
 
         raw = stdout.decode("utf-8", errors="replace") if stdout else ""
         stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
@@ -837,7 +930,7 @@ class GoalEvaluator:
         codex_home: str,
         task_id: int | None,
         registry,
-        disable_project_config: bool,
+        codex_service_tier: str,
     ) -> GoalEvalResult:
         """Run a Fast evaluator through the same verified app-server path."""
 
@@ -848,18 +941,7 @@ class GoalEvaluator:
         transport_removed = False
 
         async def settle_cleanup(awaitable) -> None:
-            cleanup = asyncio.ensure_future(awaitable)
-            delayed_cancellation: asyncio.CancelledError | None = None
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError as exc:
-                    delayed_cancellation = exc
-                except BaseException:
-                    break
-            cleanup.result()
-            if delayed_cancellation is not None:
-                raise delayed_cancellation
+            await finish_awaitable(awaitable)
 
         async def abort_turn(reason: str) -> None:
             nonlocal transport_removed
@@ -911,8 +993,12 @@ class GoalEvaluator:
                 resume_session_id=None,
                 git_env=None,
                 task_id=task_id,
-                disable_project_config=disable_project_config,
-                codex_service_tier=CODEX_SERVICE_TIER_PRIORITY,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                disable_autonomous_features=True,
+                sandbox_mode="read-only",
+                tools_disabled=True,
+                codex_service_tier=codex_service_tier,
             )
             turn_token = id(process)
             _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS[turn_token] = (
@@ -925,11 +1011,12 @@ class GoalEvaluator:
                 )
             )
             logger.info(
-                "Codex Fast goal evaluator priority request admitted "
-                "task=%s thread=%s model=%s",
+                "Codex tool-free goal evaluator admitted "
+                "task=%s thread=%s model=%s tier=%s",
                 task_id,
                 thread_id,
                 model,
+                codex_service_tier,
             )
             collect_task = asyncio.create_task(collect_output())
             try:
@@ -1104,24 +1191,33 @@ class GoalEvaluator:
             )
             return False
 
-    def _build_eval_command(self, provider: str, prompt: str, model: str) -> list[str]:
-        if provider == "codex":
-            return [
-                settings.codex_binary,
-                "exec",
-                "--json",
-                "--skip-git-repo-check",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral",
-                "-c", 'service_tier="default"',
-                "--model", model,
-                prompt,
-            ]
+    def _build_eval_command(
+        self,
+        provider: str,
+        prompt: str,
+        model: str,
+        *,
+        isolation_settings_path=None,
+    ) -> list[str]:
+        if provider != "claude":
+            raise ValueError(
+                "Codex goal evaluation requires the audited app-server transport"
+            )
         return [
             settings.claude_binary,
             "-p", prompt,
-            "--dangerously-skip-permissions",
             "--output-format", "json",
+            "--permission-mode", "acceptEdits",
+            "--settings", str(isolation_settings_path),
+            "--setting-sources", "",
+            "--strict-mcp-config",
+            "--mcp-config", '{"mcpServers":{}}',
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--tools", "",
+            "--allowedTools", "",
+            "--no-session-persistence",
+            "--exclude-dynamic-system-prompt-sections",
             "--model", model,
             "--max-turns", "1",
         ]

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from weakref import WeakValueDictionary
 from datetime import datetime, timedelta
 
@@ -8,7 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.api.deps import (
+    internal_task_incarnation_id,
+    lock_task_effect_access,
     require_internal_service,
+    require_internal_task_incarnation,
     require_task_access,
     require_task_control,
 )
@@ -22,10 +26,17 @@ from backend.schemas.monitor_session import (
     MonitorCompleteRequest,
 )
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.cancellation import await_task_completion
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
+from backend.services.worker_node_control import fence_worker_node_mutation
 
 router = APIRouter(prefix="/api/tasks/{task_id}/monitor-sessions", tags=["monitor"])
 
 MAX_CONCURRENT_MONITORS = 5
+_WORKER_MIRROR_META_KEY = "ccm_worker_mirror"
 _monitor_admission_locks: WeakValueDictionary[int, asyncio.Lock] = (
     WeakValueDictionary()
 )
@@ -41,18 +52,74 @@ def _monitor_admission_lock(task_id: int) -> asyncio.Lock:
     return lock
 
 
+def _task_relay_generation(task: Task) -> dict[str, int]:
+    """Freeze the Task generation carried by one monitor relay event."""
+
+    return {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+
+
+def _parse_worker_mirror_identity(
+    meta: object,
+) -> tuple[int, str, int] | None:
+    """Parse the exact Worker/incarnation/remote identity of one mirror."""
+
+    if not isinstance(meta, str):
+        return None
+    try:
+        payload = json.loads(meta)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {_WORKER_MIRROR_META_KEY}:
+        return None
+    identity = payload.get(_WORKER_MIRROR_META_KEY)
+    if not isinstance(identity, dict) or set(identity) != {
+        "worker_id",
+        "task_incarnation_id",
+        "remote_id",
+    }:
+        return None
+    worker_id = identity.get("worker_id")
+    incarnation_id = identity.get("task_incarnation_id")
+    remote_id = identity.get("remote_id")
+    if (
+        type(worker_id) is not int
+        or worker_id <= 0
+        or not isinstance(incarnation_id, str)
+        or len(incarnation_id) != 32
+        or any(char not in "0123456789abcdef" for char in incarnation_id)
+        or type(remote_id) is not int
+        or remote_id <= 0
+    ):
+        return None
+    return worker_id, incarnation_id, remote_id
+
+
+async def _read_task_relay_generation(
+    db: AsyncSession,
+    task_id: int,
+) -> dict[str, int]:
+    row = (
+        await db.execute(
+            select(Task.retry_count, Task.turn_generation).where(
+                Task.id == task_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(404, "Task not found")
+    return {
+        "task_retry_count": row.retry_count,
+        "task_turn_generation": row.turn_generation,
+    }
+
+
 async def _settle_shielded(operation: asyncio.Task) -> asyncio.CancelledError | None:
     """Delay caller cancellation until a lifecycle-critical operation settles."""
 
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            delayed_cancellation = exc
-        except BaseException:
-            break
-    return delayed_cancellation
+    return await await_task_completion(operation)
 
 
 async def _mark_monitor_admission_failed(
@@ -121,8 +188,15 @@ async def _monitor_session_or_error(
     session_id: int,
 ) -> MonitorSession:
     db.expire_all()
-    session = await db.get(MonitorSession, session_id)
-    if session is None or session.task_id != task_id:
+    session = await db.scalar(
+        select(MonitorSession).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
+    )
+    if session is None:
         raise HTTPException(404, "Monitor session not found")
     raise HTTPException(400, "Monitor session is not running")
 
@@ -153,8 +227,15 @@ async def _monitor_callback_error(
     session_id: int,
 ) -> None:
     db.expire_all()
-    session = await db.get(MonitorSession, session_id)
-    if session is None or session.task_id != task_id:
+    session = await db.scalar(
+        select(MonitorSession).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
+    )
+    if session is None:
         raise HTTPException(404, "Monitor session not found")
     if session.status != "running":
         raise HTTPException(400, "Monitor session is not running")
@@ -199,22 +280,56 @@ async def create_monitor_session(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_control(request, task, db)
+    expected_incarnation_id = task.incarnation_id
     # Codex Worker and shared Tasks must fail before a proxy/network side
     # effect. Claude Worker routing remains unchanged.
     _require_monitor_capability(task)
     if task.worker_id is not None:
+        if internal_task_incarnation_id(request, task_id) is not None:
+            raise HTTPException(
+                409,
+                "Scoped Monitor tools must execute on the Task's owning Worker",
+            )
         # Worker task：monitor 子进程依赖 task 所在机器的文件系统（ps/tail/signal
         # file），必须在 worker 上跑。本地镜像行由 relay 的 monitor_session_created
         # 事件落库（带 remote_id），这里直接透传 worker 响应。
         from backend.main import worker_proxy
         if worker_proxy is None:
             raise HTTPException(503, "Worker 功能未启用")
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=False,
+            fence_worker_node=True,
+        )
+        if task.status == "migrating":
+            raise HTTPException(
+                409,
+                "Task migration is active; retry Monitor creation after it settles",
+            )
+        if (
+            task.incarnation_id != expected_incarnation_id
+            or task.worker_id is None
+        ):
+            raise HTTPException(409, "Task Worker assignment changed")
         db.expunge(task)
-        await db.rollback()
+        # This commit is the Manager-side linearization point for the remote
+        # effect.  A revocation that won first is rejected by the canonical
+        # ACL fence; one that starts afterwards is ordered after admission.
+        await db.commit()
         return await worker_proxy.proxy_to_worker(
             task, "POST", f"/api/tasks/{task_id}/monitor-sessions",
             body=body.model_dump(),
+            require_task_incarnation_fence=True,
         )
 
     async with _monitor_admission_lock(task_id):
@@ -223,45 +338,100 @@ async def create_monitor_session(
             # ``FOR UPDATE`` alone is ignored by SQLite. The keyed lock keeps
             # same-process cap checks ordered, while this no-op Task UPDATE
             # also serializes cancellation and other backend processes.
-            await db.rollback()
+            task = await lock_task_effect_access(
+                request,
+                task,
+                db,
+                allow_chat_share=False,
+                fence_worker_node=True,
+            )
+            if task.incarnation_id != expected_incarnation_id:
+                raise HTTPException(409, "Task incarnation changed")
             guarded = await db.execute(
                 update(Task)
                 .where(
                     Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(status=Task.status)
             )
             if not guarded.rowcount:
                 await db.rollback()
                 db.expire_all()
-                task = await db.get(Task, task_id)
+                await require_internal_task_incarnation(request, task_id, db)
+                task = await db.scalar(
+                    select(Task).where(
+                        Task.id == task_id,
+                        Task.incarnation_id == expected_incarnation_id,
+                    )
+                )
                 if task is None:
-                    raise HTTPException(404, "Task not found")
+                    raise HTTPException(409, "Task incarnation changed")
+                if await active_worker_task_termination_receipt(db, task_id):
+                    raise HTTPException(
+                        409,
+                        "Task has an active Worker termination receipt",
+                    )
                 _require_monitor_capability(task)
                 if task.worker_id is not None:
+                    if internal_task_incarnation_id(request, task_id) is not None:
+                        raise HTTPException(
+                            409,
+                            "Scoped Monitor tools must execute on the Task's "
+                            "owning Worker",
+                        )
                     from backend.main import worker_proxy
                     if worker_proxy is None:
                         raise HTTPException(503, "Worker 功能未启用")
+                    task = await lock_task_effect_access(
+                        request,
+                        task,
+                        db,
+                        allow_chat_share=False,
+                        fence_worker_node=True,
+                    )
+                    if task.status == "migrating":
+                        raise HTTPException(
+                            409,
+                            "Task migration is active; retry Monitor creation "
+                            "after it settles",
+                        )
+                    if (
+                        task.incarnation_id != expected_incarnation_id
+                        or task.worker_id is None
+                    ):
+                        raise HTTPException(
+                            409,
+                            "Task Worker assignment changed",
+                        )
                     db.expunge(task)
-                    await db.rollback()
+                    await db.commit()
                     return await worker_proxy.proxy_to_worker(
                         task,
                         "POST",
                         f"/api/tasks/{task_id}/monitor-sessions",
                         body=body.model_dump(),
+                        require_task_incarnation_fence=True,
                     )
                 raise HTTPException(
                     400,
                     "Cannot create monitor for inactive task",
                 )
             db.expire_all()
-            task = await db.get(Task, task_id)
+            task = await db.scalar(
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
+                )
+            )
             if task is None:
-                raise HTTPException(404, "Task not found")
+                raise HTTPException(409, "Task incarnation changed")
             _require_monitor_capability(task)
+            relay_generation = _task_relay_generation(task)
             skills = task.enabled_skills or {}
             if not skills.get("monitor"):
                 raise HTTPException(
@@ -316,7 +486,12 @@ async def create_monitor_session(
 
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
-        {"event": "monitor_session_created", "monitor_session_id": ms.id, "description": ms.description},
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": ms.id,
+            "description": ms.description,
+            **relay_generation,
+        },
     )
 
     return ms
@@ -331,10 +506,21 @@ async def list_monitor_sessions(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
     result = await db.execute(
         select(MonitorSession)
-        .where(MonitorSession.task_id == task_id)
+        .where(
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
         .order_by(MonitorSession.created_at.desc())
     )
     return list(result.scalars().all())
@@ -350,9 +536,23 @@ async def get_monitor_session(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
-    ms = await db.get(MonitorSession, session_id)
-    if not ms or ms.task_id != task_id:
+    ms = await db.scalar(
+        select(MonitorSession).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
+    )
+    if ms is None:
         raise HTTPException(404, "Monitor session not found")
     return ms
 
@@ -364,29 +564,90 @@ async def delete_monitor_session(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    ms = await db.get(MonitorSession, session_id)
-    if not ms or ms.task_id != task_id:
-        raise HTTPException(404, "Monitor session not found")
-
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_control(request, task, db)
-    if task is not None and task.worker_id is not None:
+    expected_incarnation_id = task.incarnation_id
+
+    # This is the final authorization/ownership boundary for both the local
+    # runtime cleanup and a Worker DELETE.  It deliberately takes the Worker
+    # node fence before the Task writer fence, then the termination receipt,
+    # and re-reads the exact child row only after those locks are held.
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
+    if task.incarnation_id != expected_incarnation_id:
+        raise HTTPException(409, "Task incarnation changed")
+    if await active_worker_task_termination_receipt(
+        db,
+        task_id,
+        for_update=True,
+    ):
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    ms = await db.scalar(
+        select(MonitorSession)
+        .where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
+        .with_for_update()
+    )
+    if ms is None:
+        raise HTTPException(404, "Monitor session not found")
+    relay_generation = _task_relay_generation(task)
+    if task.worker_id is not None:
         # 本地行是镜像（id 是 Manager 自增），worker 端要用 remote_id
+        identity = _parse_worker_mirror_identity(ms.meta)
+        if (
+            identity is None
+            or identity
+            != (task.worker_id, task.incarnation_id, ms.remote_id)
+            or type(ms.remote_id) is not int
+            or ms.remote_id <= 0
+        ):
+            raise HTTPException(
+                409,
+                "Monitor Worker mirror identity is missing or stale",
+            )
         from backend.main import worker_proxy
         if worker_proxy is None:
             raise HTTPException(503, "Worker 功能未启用")
-        if ms.remote_id is None:
-            raise HTTPException(409, "该 monitor 缺少 worker 侧 id（remote_id），无法远程删除")
+        remote_id = ms.remote_id
+        mirror_meta = ms.meta
+        db.expunge(task)
+        # Release every DB writer lock before the network call.  The committed
+        # ACL fence is the Manager-side linearization point for this effect.
+        await db.commit()
         result = await worker_proxy.proxy_to_worker(
-            task, "DELETE", f"/api/tasks/{task_id}/monitor-sessions/{ms.remote_id}",
+            task, "DELETE", f"/api/tasks/{task_id}/monitor-sessions/{remote_id}",
+            require_task_incarnation_fence=True,
         )
         await db.execute(
             update(MonitorSession)
             .where(
                 MonitorSession.id == session_id,
                 MonitorSession.task_id == task_id,
+                MonitorSession.agent_type == "monitor",
+                MonitorSession.source == "ccm",
+                MonitorSession.remote_id == remote_id,
+                MonitorSession.meta == mirror_meta,
                 MonitorSession.status == "running",
             )
             .values(
@@ -399,6 +660,12 @@ async def delete_monitor_session(
         )
         await db.commit()
         return result
+
+    if ms.remote_id is not None:
+        raise HTTPException(
+            409,
+            "Monitor Worker mirror no longer matches Task assignment",
+        )
 
     transitioned = await db.execute(
         update(MonitorSession)
@@ -446,6 +713,7 @@ async def delete_monitor_session(
                 "event": "monitor_session_status",
                 "monitor_session_id": session_id,
                 "status": "cancelled",
+                **relay_generation,
             },
         )
 
@@ -463,8 +731,15 @@ async def get_monitor_checks(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
-    ms = await db.get(MonitorSession, session_id)
-    if not ms or ms.task_id != task_id:
+    ms = await db.scalar(
+        select(MonitorSession).where(
+            MonitorSession.id == session_id,
+            MonitorSession.task_id == task_id,
+            MonitorSession.agent_type == "monitor",
+            MonitorSession.source == "ccm",
+        )
+    )
+    if ms is None:
         raise HTTPException(404, "Monitor session not found")
     result = await db.execute(
         select(MonitorCheck)
@@ -484,9 +759,19 @@ async def create_monitor_check(
 ):
     """Sub-agent reports a status check via MCP tool."""
     require_internal_service(request)
+    await fence_worker_node_mutation(db)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     import json as _json
     from backend.main import dispatcher
     from backend.models.log_entry import LogEntry
+
+    relay_generation = await _read_task_relay_generation(db, task_id)
+    queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
 
     next_check = MonitorSession.checks_done + 1
     reaches_limit = next_check >= MonitorSession.max_checks
@@ -615,15 +900,16 @@ async def create_monitor_check(
             f"[Monitor #{session_id} 汇报] {body.summary}\n\n"
             "请向用户简要转达这个监控结果。"
         )
-        await dispatcher.enqueue_message(
+        admitted = await dispatcher.enqueue_message(
             task_id=task_id,
             prompt=report_prompt,
             priority=PRIORITY_MONITOR_IMPORTANT,
             source="monitor:report",
             user_message_text=f"[Monitor #{session_id}] {body.summary}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
-        chat_injected = True
+        chat_injected = admitted is not False
 
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
@@ -636,6 +922,7 @@ async def create_monitor_check(
             "is_important": body.is_important,
             "chat_injected": chat_injected,
             "source": "monitor",
+            **relay_generation,
         },
     )
 
@@ -646,6 +933,7 @@ async def create_monitor_check(
                 "event": "monitor_session_status",
                 "monitor_session_id": session_id,
                 "status": "completed",
+                **relay_generation,
             },
         )
         from backend.services.dispatcher import PRIORITY_MONITOR_COMPLETE
@@ -662,6 +950,7 @@ async def create_monitor_check(
             source="monitor:complete",
             user_message_text=f"[Monitor #{session_id}] 监控完成: {body.summary}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
     return check
 
@@ -676,6 +965,17 @@ async def complete_monitor_session(
 ):
     """Sub-agent marks itself as complete."""
     require_internal_service(request)
+    await fence_worker_node_mutation(db)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
+    from backend.main import dispatcher
+
+    relay_generation = await _read_task_relay_generation(db, task_id)
+    queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
     completed = await db.execute(
         update(MonitorSession)
         .where(
@@ -720,7 +1020,6 @@ async def complete_monitor_session(
     db.add(check)
     await db.commit()
 
-    from backend.main import dispatcher
     import json as _json
 
     chat_injected = False
@@ -736,11 +1035,17 @@ async def complete_monitor_session(
             "is_important": False,
             "chat_injected": False,
             "source": "monitor",
+            **relay_generation,
         },
     )
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
-        {"event": "monitor_session_status", "monitor_session_id": session_id, "status": "completed"},
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": session_id,
+            "status": "completed",
+            **relay_generation,
+        },
     )
 
     # Check if the last report_status already notified the main agent
@@ -789,6 +1094,7 @@ async def complete_monitor_session(
             source="monitor:complete",
             user_message_text=f"[Monitor #{session_id}] 监控完成: {body.reason}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
 
     return {"ok": True, "message": "Session completed. Your task is done — stop all activity now."}

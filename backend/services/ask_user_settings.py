@@ -1,11 +1,9 @@
-"""把 AskUserQuestion 的 PreToolUse hook 合并进 {config_dir}/settings.json。
+"""Build exact Task hooks and maintain the legacy account-level AskUser hook.
 
-为什么走 settings.json 而不是 CLI flag：claude-pty 的命令构建是固定字段、不接受
-`--settings`，且本仓库对 PTY 仓库只有 READ 权限无法 bump 依赖。好在 `-p` 和 PTY 两条
-链路都用 CLAUDE_CONFIG_DIR，Claude Code 在 --dangerously-skip-permissions 下会自动
-加载 {CLAUDE_CONFIG_DIR}/settings.json 的 hook（无审批弹窗，已实测）。
-
-在 instance_manager.launch()（两路统一入口）每次启动前调用，幂等：
+Normal Tasks receive ``ask_user_hook_entry()`` in a private exact ``--settings``
+file; ambient account/project settings are disabled. ``ensure_ask_user_hook``
+remains only for prompt-only Claude processes that have no Task-scoped file.
+It is idempotent:
   enabled  → 确保我们的 hook 项存在且参数最新；
   disabled → 移除我们的 hook 项（保持文件干净）。
 靠 command 里包含 "ask_user_hook.py" 识别"我们的"项，避免重复追加。
@@ -19,32 +17,47 @@ import shlex
 import tempfile
 from pathlib import Path
 
+from backend.services.trusted_runtime import RUNNING_PYTHON
+
 logger = logging.getLogger(__name__)
 
 _CCM_ROOT = Path(__file__).resolve().parent.parent.parent
-_VENV_PYTHON = _CCM_ROOT / ".venv" / "bin" / "python3"
 _HOOK_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "ask_user_hook.py"
+_SSH_GUARD_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "task_ssh_guard_hook.py"
 _MATCHER = "AskUserQuestion"
 _MARKER = "ask_user_hook.py"  # 识别"我们的"hook 项
+_SSH_GUARD_MATCHER = "Bash|Read|Write|Edit|MultiEdit|Glob|Grep"
+_SSH_GUARD_MARKER = "task_ssh_guard_hook.py"
 
 
-def _hook_command() -> str:
+def _hook_command(*, script_path: str | Path | None = None) -> str:
     from backend.config import settings
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-    api_base = f"http://{host}:{settings.port}"
-    python = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else "python3"
+    api_base = resolve_internal_api_base()
     timeout = int(getattr(settings, "ask_user_timeout", 1800)) + 60
 
     parts = [
-        python, str(_HOOK_SCRIPT),
+        RUNNING_PYTHON, str(script_path or _HOOK_SCRIPT),
         "--api-base", api_base,
         "--timeout", str(timeout),
     ]
-    token = getattr(settings, "auth_token", "") or ""
-    if token:
-        parts.extend(["--auth-token", token])
     return " ".join(shlex.quote(p) for p in parts)
+
+
+def ask_user_hook_entry(*, script_path: str | Path | None = None) -> dict:
+    """Return CCM's secret-free AskUser hook entry for exact settings."""
+
+    from backend.config import settings
+
+    return {
+        "matcher": _MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": _hook_command(script_path=script_path),
+            "timeout": int(getattr(settings, "ask_user_timeout", 1800)) + 60,
+        }],
+    }
 
 
 def _is_our_pretool_entry(entry: dict) -> bool:
@@ -58,8 +71,59 @@ def _is_our_pretool_entry(entry: dict) -> bool:
     return False
 
 
-def ensure_ask_user_hook(config_dir: str) -> None:
-    """幂等地把（或从）{config_dir}/settings.json 加入/移除 AskUserQuestion hook。"""
+def _is_our_ssh_guard_entry(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks") or []:
+        if isinstance(hook, dict) and _SSH_GUARD_MARKER in (
+            hook.get("command") or ""
+        ):
+            return True
+    return False
+
+
+def _ssh_guard_command(
+    protected_paths: tuple[str, ...],
+    *,
+    script_path: str | Path | None = None,
+) -> str:
+    parts = [RUNNING_PYTHON, str(script_path or _SSH_GUARD_SCRIPT)]
+    for path in protected_paths:
+        parts.extend(["--protected-path", path])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def task_ssh_guard_hook_entry(
+    protected_paths: tuple[str, ...],
+    *,
+    script_path: str | Path | None = None,
+) -> dict:
+    """Return the advisory SSH guard used inside the OS-enforced sandbox."""
+
+    return {
+        "matcher": _SSH_GUARD_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": _ssh_guard_command(
+                protected_paths,
+                script_path=script_path,
+            ),
+            "timeout": 5,
+        }],
+    }
+
+
+def ensure_ask_user_hook(
+    config_dir: str,
+    *,
+    ssh_guard: bool = False,
+    ssh_protected_paths: tuple[str, ...] = (),
+) -> bool:
+    """Merge CCM's Claude hooks into ``settings.json``.
+
+    This compatibility path is not the enforcement boundary for normal Tasks;
+    they use an exact private settings file plus the provider OS sandbox.
+    """
     from backend.config import settings
 
     enabled = bool(getattr(settings, "ask_user_enabled", True))
@@ -85,21 +149,24 @@ def ensure_ask_user_hook(config_dir: str) -> None:
             pretool = []
 
         # 去掉旧的"我们的"项
-        new_pretool = [e for e in pretool if not _is_our_pretool_entry(e)]
+        new_pretool = [
+            entry
+            for entry in pretool
+            if not _is_our_pretool_entry(entry)
+            and not (ssh_guard and _is_our_ssh_guard_entry(entry))
+        ]
         changed = len(new_pretool) != len(pretool)
 
         if enabled:
-            new_pretool.append({
-                "matcher": _MATCHER,
-                "hooks": [{
-                    "type": "command",
-                    "command": _hook_command(),
-                    # CLI 对 hook 命令默认 600s 就杀；必须显式抬到服务端等待窗口
-                    # 之上，否则 hook 在 /wait 阻塞中途被杀 → 放行原生
-                    # AskUserQuestion → PTY 弹无人应答的交互框冻死整个 turn。
-                    "timeout": int(getattr(settings, "ask_user_timeout", 1800)) + 60,
-                }],
-            })
+            # CLI 对 hook 命令默认 600s 就杀；这里的 entry 抬高到服务端
+            # 等待窗口之上，避免 PTY 回退为无人应答的原生交互框。
+            new_pretool.append(ask_user_hook_entry())
+            changed = True
+
+        if ssh_guard:
+            new_pretool.append(
+                task_ssh_guard_hook_entry(ssh_protected_paths)
+            )
             changed = True
 
         # Ensure thinking summaries are visible in stream output —
@@ -110,7 +177,7 @@ def ensure_ask_user_hook(config_dir: str) -> None:
 
         # 没变化（disabled 且本来就没有我们的项）→ 不写盘
         if not changed and not enabled:
-            return
+            return True
 
         if new_pretool:
             hooks["PreToolUse"] = new_pretool
@@ -122,8 +189,10 @@ def ensure_ask_user_hook(config_dir: str) -> None:
             data.pop("hooks", None)
 
         _atomic_write_json(settings_path, data)
-    except Exception:  # noqa: BLE001 — 注入失败绝不能阻断 launch
+        return True
+    except Exception:  # noqa: BLE001 — SSH caller decides whether to fail closed
         logger.exception("ensure_ask_user_hook failed for %s", config_dir)
+        return False
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

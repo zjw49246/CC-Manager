@@ -22,6 +22,7 @@ from pathlib import Path
 from backend.services.cloudrouter_accounts import (
     is_api_auth_kind as _is_api_auth_kind,
 )
+from backend.services.cancellation import await_task_completion
 
 logger = logging.getLogger(__name__)
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -254,6 +255,8 @@ def is_transient_overload(text: str) -> bool:
 
 _CODEX_USAGE_LIMIT_RE = re.compile(
     r"hit your usage limit"          # UsageLimitReached
+    r"|usage_limit_exceeded"          # structured Codex error code
+    r"|usage limit exceeded"          # structured/human error wording
     r"|quota exceeded"               # QuotaExceeded
     r"|out of credits"               # workspace credits depleted
     r"|spend cap"                    # workspace spend cap
@@ -702,12 +705,24 @@ class ClaudePool:
             logger.warning("Pool has no available accounts (exclude=%s)", exclude)
             return None
 
-        # Fresh launches prefer a compatible API account.  Keep
-        # the existing cooldown-expiry order within each account kind so the
-        # native pool remains the unchanged fallback when no API projection is
-        # usable for this model.
+        # Fresh launches prefer a compatible API account only after cached
+        # health has been proven.  At process startup an API account can still
+        # be unknown, so keep it behind a usable native account until the first
+        # probe settles.  Unknown API accounts remain a final fallback for
+        # API-only installations.
+        def automatic_rank(account: PoolAccount) -> int:
+            if not _is_api_auth_kind(account.auth_kind):
+                return 1
+            decision = self._api_quota_decision(account)
+            if (
+                bool(decision.get("known"))
+                and decision.get("available") is True
+            ):
+                return 0
+            return 2
+
         candidates.sort(key=lambda a: (
-            0 if _is_api_auth_kind(a.auth_kind) else 1,
+            automatic_rank(a),
             self._cooldowns.get(a.id, 0),
         ))
         # Manual switch: preferred account jumps the queue; if it fails the
@@ -1085,7 +1100,52 @@ class ClaudePool:
         self._usage_cache = None
         return True
 
-    async def _refresh_oauth(self, account: "PoolAccount", cred_path: Path) -> dict | None:
+    async def ensure_oauth_access_token(
+        self,
+        config_dir: str | os.PathLike[str],
+        *,
+        minimum_remaining_seconds: float = 300.0,
+    ) -> bool:
+        """Refresh a managed native account before access-token-only projection.
+
+        Auxiliary untrusted workloads receive only ``accessToken`` and cannot
+        rotate a refresh token themselves.  Resolve the exact pool account and
+        refresh under the same per-account lock used by the pool before such a
+        workload snapshots its bounded access token.
+        """
+
+        if minimum_remaining_seconds < 0:
+            raise ValueError("minimum_remaining_seconds must be non-negative")
+        canonical = os.path.realpath(os.path.expanduser(os.fspath(config_dir)))
+        account = next(
+            (
+                candidate
+                for candidate in self._accounts
+                if os.path.realpath(candidate.config_dir) == canonical
+            ),
+            None,
+        )
+        if (
+            account is None
+            or not account.enabled
+            or account.retired
+            or _is_api_auth_kind(account.auth_kind)
+        ):
+            return False
+        creds = await self._refresh_oauth(
+            account,
+            Path(account.config_dir) / ".credentials.json",
+            minimum_remaining_seconds=minimum_remaining_seconds,
+        )
+        return creds is not None
+
+    async def _refresh_oauth(
+        self,
+        account: "PoolAccount",
+        cred_path: Path,
+        *,
+        minimum_remaining_seconds: float = 60.0,
+    ) -> dict | None:
         """accessToken 过期时用 refreshToken 换新（与 Claude CLI 自动刷新行为一致）。
 
         过期 ≠ 需要重新登录：CLI 平时跑着就会自己刷，闲置账号才会看到过期。
@@ -1105,7 +1165,10 @@ class ClaudePool:
             except (OSError, ValueError, KeyError):
                 return None
             # 等锁期间可能已被并发请求（或 CLI 进程自己）刷新过
-            if creds.get("expiresAt", 0) / 1000 > time.time() + 60:
+            if (
+                creds.get("expiresAt", 0) / 1000
+                > time.time() + minimum_remaining_seconds
+            ):
                 return creds
             refresh_token = creds.get("refreshToken")
             if not refresh_token:
@@ -1797,15 +1860,7 @@ async def migrate_session_async(
             session_id=session_id,
         )
     )
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(operation)
     try:
         migrated = operation.result()
     except BaseException as exc:

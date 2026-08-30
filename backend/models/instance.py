@@ -13,11 +13,27 @@ class Instance(Base):
             "NOT (current_task_id IS NOT NULL AND current_plan_run_id IS NOT NULL)",
             name="ck_instances_task_xor_plan_run_owner",
         ),
+        CheckConstraint(
+            "process_identity IS NULL OR pid IS NOT NULL",
+            name="ck_instances_process_identity_requires_pid",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Opaque kernel identity ("v1:<pid>:<start_ticks>:<boot_id>") for the
+    # process in `pid`. A PID number alone cannot distinguish "this exact
+    # process is still alive" from "an unrelated process reused this number",
+    # so recovery probes compare the start time and boot session too.
+    # The PID is embedded in the value, so a writer that sets `pid` without
+    # refreshing this column produces a mismatch that reads as "unusable"
+    # rather than as proof of death. NULL means the row predates identity
+    # capture or the platform could not supply it; both stay fail-closed.
+    # Always write and clear this together with `pid`.
+    process_identity: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="idle")
     current_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_plan_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)

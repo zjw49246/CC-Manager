@@ -20,9 +20,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     with op.batch_alter_table('tasks', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('enable_workflows', sa.Boolean(), server_default='0', nullable=False))
+        batch_op.add_column(sa.Column(
+            'enable_workflows',
+            sa.Boolean(),
+            server_default=sa.false(),
+            nullable=False,
+        ))
 
-    op.execute("UPDATE tasks SET enable_workflows = CASE WHEN disable_workflows THEN 0 ELSE 1 END")
+    # Boolean columns are integers on SQLite but native BOOLEAN on PostgreSQL.
+    # ``NOT`` preserves the inversion semantics on all supported dialects.
+    op.execute("UPDATE tasks SET enable_workflows = NOT disable_workflows")
 
     with op.batch_alter_table('tasks', schema=None) as batch_op:
         batch_op.drop_column('disable_workflows')
@@ -30,9 +37,14 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     with op.batch_alter_table('tasks', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('disable_workflows', sa.Boolean(), server_default='1', nullable=False))
+        batch_op.add_column(sa.Column(
+            'disable_workflows',
+            sa.Boolean(),
+            server_default=sa.true(),
+            nullable=False,
+        ))
 
-    op.execute("UPDATE tasks SET disable_workflows = CASE WHEN enable_workflows THEN 0 ELSE 1 END")
+    op.execute("UPDATE tasks SET disable_workflows = NOT enable_workflows")
 
     with op.batch_alter_table('tasks', schema=None) as batch_op:
         batch_op.drop_column('enable_workflows')

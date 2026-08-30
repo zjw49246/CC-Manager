@@ -82,7 +82,10 @@ describe('API account compatibility routing', () => {
       headers: { get: () => null },
       json: async () => ({
         detail: {
+          message: 'API account is still in use',
           error: 'API account is still in use',
+          code: 'runtime_busy',
+          reason: 'Task #42 is still using this API account',
           cleanup_pending: true,
         },
       }),
@@ -92,7 +95,10 @@ describe('API account compatibility routing', () => {
       message: 'API account is still in use',
       status: 409,
       detail: {
+        message: 'API account is still in use',
         error: 'API account is still in use',
+        code: 'runtime_busy',
+        reason: 'Task #42 is still using this API account',
         cleanup_pending: true,
       },
     });

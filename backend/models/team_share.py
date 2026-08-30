@@ -25,7 +25,7 @@ class TeamProjectShare(Base):
 
 
 class TeamTaskShare(Base):
-    """Grant a user or group access to a specific Task (requires Project access)."""
+    """Grant chat access to one Task independently of Project membership."""
     __tablename__ = "team_task_shares"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

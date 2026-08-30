@@ -19,8 +19,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    dialect = op.get_bind().dialect
+    mysql_family = dialect.name in {"mysql", "mariadb"} or bool(
+        getattr(dialect, "is_mariadb", False)
+    )
+    env_files_default = (
+        sa.text("(JSON_ARRAY())") if mysql_family else sa.text("'[]'")
+    )
     with op.batch_alter_table('projects', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('env_files', sa.JSON(), server_default='[]', nullable=False))
+        batch_op.add_column(sa.Column(
+            'env_files',
+            sa.JSON(),
+            server_default=env_files_default,
+            nullable=False,
+        ))
 
 
 def downgrade() -> None:

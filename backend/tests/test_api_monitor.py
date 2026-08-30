@@ -1,5 +1,6 @@
 """Tests for Monitor API endpoints."""
 import asyncio
+import json
 from datetime import datetime
 
 import pytest
@@ -10,7 +11,16 @@ from sqlalchemy import func, select, update
 
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
+from backend.models.project import Project
 from backend.models.sub_agent import SubAgentReport
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 
 
 def _admin_request() -> Request:
@@ -90,6 +100,215 @@ async def test_create_monitor_session(client, session_factory):
     assert data["max_checks"] == 10
     assert data["task_id"] == task_id
     mock_dispatcher.start_monitor_session.assert_called_once()
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": data["id"],
+            "description": "watch build",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "worker"])
+@pytest.mark.parametrize(
+    ("agent_type", "path", "payload", "skill", "starter_name"),
+    [
+        (
+            "monitor",
+            "monitor-sessions",
+            {"description": "must not start"},
+            "monitor",
+            "start_monitor_session",
+        ),
+        (
+            "sub_agent",
+            "sub-agent-sessions",
+            {"name": "denied", "prompt": "must not start"},
+            "sub-agent",
+            "start_sub_agent_session",
+        ),
+    ],
+)
+async def test_auxiliary_create_rejects_group_revoked_at_effect_fence(
+    secured_client,
+    monkeypatch,
+    remote,
+    agent_type,
+    path,
+    payload,
+    skill,
+    starter_name,
+):
+    """Local rows and Worker POSTs share the final membership boundary."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"{agent_type}-{remote}-effect@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"{agent_type}-{remote}-effect-project",
+            status="ready",
+        )
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title=f"{agent_type} effect fence",
+            description="group authority is revoked before admission",
+            project_id=project.id,
+            created_by=999,
+            status="in_progress",
+            provider="claude",
+            worker_id=77 if remote else None,
+            enabled_skills={skill: True},
+        )
+        db.add(task)
+        await db.commit()
+        project_id = project.id
+        task_id = task.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"proxied": True})
+    dispatcher = MagicMock()
+    setattr(dispatcher, starter_name, MagicMock())
+    dispatcher.broadcaster.broadcast = AsyncMock()
+
+    with (
+        patch("backend.main.worker_proxy", proxy),
+        patch("backend.main.dispatcher", dispatcher),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/{path}",
+            headers={"Authorization": f"Bearer {member_token}"},
+            json=payload,
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    proxy.proxy_to_worker.assert_not_awaited()
+    getattr(dispatcher, starter_name).assert_not_called()
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(MonitorSession.id)).where(
+                MonitorSession.task_id == task_id,
+                MonitorSession.agent_type == agent_type,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "worker"])
+@pytest.mark.parametrize(
+    ("agent_type", "path", "stopper"),
+    [
+        ("monitor", "monitor-sessions", "stop_monitor_session_process"),
+        (
+            "sub_agent",
+            "sub-agent-sessions",
+            "stop_sub_agent_session_process",
+        ),
+    ],
+)
+async def test_auxiliary_delete_rejects_group_revoked_at_effect_fence(
+    secured_client,
+    monkeypatch,
+    remote,
+    agent_type,
+    path,
+    stopper,
+):
+    """Revocation that wins the final Task fence prevents every stop effect."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"delete-{agent_type}-{remote}-effect@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"delete-{agent_type}-{remote}-project",
+            status="ready",
+        )
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title="delete effect fence",
+            description="revocation must win before child stop",
+            project_id=project.id,
+            created_by=999,
+            status="in_progress",
+            provider="claude",
+            worker_id=88 if remote else None,
+        )
+        db.add(task)
+        await db.flush()
+        remote_id = 9031 if remote else None
+        meta = None
+        if remote and agent_type == "sub_agent":
+            meta = json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": task.worker_id,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            })
+        session = MonitorSession(
+            task_id=task.id,
+            remote_id=remote_id,
+            agent_type=agent_type,
+            source="ccm",
+            description="must remain running",
+            status="running",
+            meta=meta,
+        )
+        db.add(session)
+        await db.commit()
+        project_id = project.id
+        task_id = task.id
+        session_id = session.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"ok": True})
+    dispatcher = MagicMock()
+    dispatcher.stop_monitor_session_process = AsyncMock()
+    dispatcher.stop_sub_agent_session_process = AsyncMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+
+    with (
+        patch("backend.main.worker_proxy", proxy),
+        patch("backend.main.dispatcher", dispatcher),
+    ):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/{path}/{session_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    proxy.proxy_to_worker.assert_not_awaited()
+    getattr(dispatcher, stopper).assert_not_awaited()
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(MonitorSession, session_id)
+    assert current.status == "running"
 
 
 @pytest.mark.asyncio
@@ -269,6 +488,77 @@ async def test_failed_auxiliary_admission_marks_committed_row_failed(
     assert row is not None
     assert row.status == "failed"
     assert row.completed_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "path", "payload", "starter_name"),
+    (
+        (
+            "monitor",
+            "monitor-sessions",
+            {"description": "late-worker-monitor"},
+            "start_monitor_session",
+        ),
+        (
+            "sub_agent",
+            "sub-agent-sessions",
+            {"name": "late-worker-child", "prompt": "work"},
+            "start_sub_agent_session",
+        ),
+    ),
+)
+async def test_worker_drain_refuses_new_auxiliary_admission(
+    client,
+    session_factory,
+    worker_control_plane_auth,
+    monkeypatch,
+    kind,
+    path,
+    payload,
+    starter_name,
+):
+    """The drain claim must win before the Task/session admission writer."""
+
+    from backend.config import settings
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    if kind == "monitor":
+        task_id = await _create_task_with_monitor(client, session_factory)
+    else:
+        task_id = await _create_task_with_sub_agent(client, session_factory)
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="d" * 64)
+        await db.commit()
+
+    dispatcher = MagicMock()
+    setattr(dispatcher, starter_name, MagicMock())
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.post(
+            f"/api/tasks/{task_id}/{path}",
+            json=payload,
+        )
+
+    assert response.status_code == 409
+    getattr(dispatcher, starter_name).assert_not_called()
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task_id,
+                        MonitorSession.agent_type == kind,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -462,6 +752,359 @@ async def test_worker_sub_agent_create_is_proxied_without_local_start(
     assert method == "POST"
     assert path == f"/api/tasks/{task_id}/sub-agent-sessions"
     dispatcher.start_sub_agent_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_sub_agent_manager_mirror_list_get_and_exact_delete(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_sub_agent(client, session_factory)
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.worker_id = 77
+        await db.flush()
+        remote_id = 9011
+        historical = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="historical remote child mirror",
+            status="completed",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": 76,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        mirror = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="remote child mirror",
+            status="running",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": task.worker_id,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        db.add_all([historical, mirror])
+        await db.commit()
+        historical_id = historical.id
+        local_id = mirror.id
+        incarnation_id = task.incarnation_id
+
+    listed = await client.get(f"/api/tasks/{task_id}/sub-agent-sessions")
+    historical_fetched = await client.get(
+        f"/api/tasks/{task_id}/sub-agent-sessions/{historical_id}"
+    )
+    fetched = await client.get(
+        f"/api/tasks/{task_id}/sub-agent-sessions/{local_id}"
+    )
+    assert listed.status_code == 200
+    assert {row["id"] for row in listed.json()} == {historical_id, local_id}
+    assert historical_fetched.status_code == 200
+    assert historical_fetched.json()["id"] == historical_id
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == local_id
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"ok": True})
+    with patch("backend.main.worker_proxy", proxy):
+        stale_deleted = await client.delete(
+            f"/api/tasks/{task_id}/sub-agent-sessions/{historical_id}"
+        )
+        deleted = await client.delete(
+            f"/api/tasks/{task_id}/sub-agent-sessions/{local_id}"
+        )
+
+    assert stale_deleted.status_code == 409
+    assert "mirror identity" in stale_deleted.json()["detail"]
+    assert deleted.status_code == 200, deleted.text
+    proxied_task, method, path = proxy.proxy_to_worker.call_args.args
+    assert proxied_task.id == task_id
+    assert proxied_task.worker_id == 77
+    assert proxied_task.incarnation_id == incarnation_id
+    assert method == "DELETE"
+    assert path == f"/api/tasks/{task_id}/sub-agent-sessions/{remote_id}"
+    assert proxy.proxy_to_worker.call_args.kwargs == {
+        "require_task_incarnation_fence": True,
+    }
+    async with session_factory() as db:
+        current = await db.get(MonitorSession, local_id)
+    assert current.status == "stopped"
+    assert current.completed_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["missing", "malformed", "worker", "incarnation", "remote"],
+)
+async def test_worker_sub_agent_delete_rejects_untrusted_mirror_identity(
+    client,
+    session_factory,
+    identity_kind,
+):
+    task_id = await _create_task_with_sub_agent(client, session_factory)
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.worker_id = 78
+        await db.flush()
+        remote_id = 9021
+        identity = {
+            "worker_id": task.worker_id,
+            "task_incarnation_id": task.incarnation_id,
+            "remote_id": remote_id,
+        }
+        if identity_kind == "missing":
+            meta = None
+        elif identity_kind == "malformed":
+            meta = "not-json"
+        else:
+            if identity_kind == "worker":
+                identity["worker_id"] += 1
+            elif identity_kind == "incarnation":
+                identity["task_incarnation_id"] = "f" * 32
+            else:
+                identity["remote_id"] += 1
+            meta = json.dumps({"ccm_worker_mirror": identity})
+        mirror = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="untrusted mirror",
+            status="running",
+            meta=meta,
+        )
+        db.add(mirror)
+        await db.commit()
+        local_id = mirror.id
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"ok": True})
+    with patch("backend.main.worker_proxy", proxy):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/sub-agent-sessions/{local_id}"
+        )
+
+    assert response.status_code == 409
+    assert "mirror identity" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(MonitorSession, local_id)
+    assert current.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_worker_monitor_history_uses_local_ids_and_only_current_deletes(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    remote_id = 9041
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.worker_id = 82
+        await db.flush()
+        historical = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="monitor",
+            source="ccm",
+            description="historical Worker monitor",
+            status="completed",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": 81,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        current = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="monitor",
+            source="ccm",
+            description="current Worker monitor",
+            status="running",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": task.worker_id,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        db.add_all([historical, current])
+        await db.commit()
+        historical_id = historical.id
+        current_id = current.id
+        incarnation_id = task.incarnation_id
+
+    listed = await client.get(f"/api/tasks/{task_id}/monitor-sessions")
+    historical_get = await client.get(
+        f"/api/tasks/{task_id}/monitor-sessions/{historical_id}"
+    )
+    current_get = await client.get(
+        f"/api/tasks/{task_id}/monitor-sessions/{current_id}"
+    )
+    assert listed.status_code == 200
+    assert {row["id"] for row in listed.json()} == {
+        historical_id,
+        current_id,
+    }
+    assert historical_get.status_code == 200
+    assert historical_get.json()["id"] == historical_id
+    assert current_get.status_code == 200
+    assert current_get.json()["id"] == current_id
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"ok": True})
+    with patch("backend.main.worker_proxy", proxy):
+        stale_delete = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{historical_id}"
+        )
+        current_delete = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{current_id}"
+        )
+
+    assert stale_delete.status_code == 409
+    assert "mirror identity" in stale_delete.json()["detail"]
+    assert current_delete.status_code == 200, current_delete.text
+    proxy.proxy_to_worker.assert_awaited_once()
+    proxied_task, method, path = proxy.proxy_to_worker.call_args.args
+    assert proxied_task.worker_id == 82
+    assert proxied_task.incarnation_id == incarnation_id
+    assert method == "DELETE"
+    assert path == f"/api/tasks/{task_id}/monitor-sessions/{remote_id}"
+    assert proxy.proxy_to_worker.call_args.kwargs == {
+        "require_task_incarnation_fence": True,
+    }
+    async with session_factory() as db:
+        historical = await db.get(MonitorSession, historical_id)
+        current = await db.get(MonitorSession, current_id)
+    assert historical.status == "completed"
+    assert current.status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["missing", "malformed", "worker", "incarnation", "remote"],
+)
+async def test_worker_monitor_delete_rejects_untrusted_mirror_identity(
+    client,
+    session_factory,
+    identity_kind,
+):
+    task_id = await _create_task_with_monitor(client, session_factory)
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.worker_id = 83
+        await db.flush()
+        remote_id = 9042
+        identity = {
+            "worker_id": task.worker_id,
+            "task_incarnation_id": task.incarnation_id,
+            "remote_id": remote_id,
+        }
+        if identity_kind == "missing":
+            meta = None
+        elif identity_kind == "malformed":
+            meta = "not-json"
+        else:
+            if identity_kind == "worker":
+                identity["worker_id"] += 1
+            elif identity_kind == "incarnation":
+                identity["task_incarnation_id"] = "f" * 32
+            else:
+                identity["remote_id"] += 1
+            meta = json.dumps({"ccm_worker_mirror": identity})
+        mirror = MonitorSession(
+            task_id=task_id,
+            remote_id=remote_id,
+            agent_type="monitor",
+            source="ccm",
+            description="untrusted monitor mirror",
+            status="running",
+            meta=meta,
+        )
+        db.add(mirror)
+        await db.commit()
+        local_id = mirror.id
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"ok": True})
+    with patch("backend.main.worker_proxy", proxy):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/monitor-sessions/{local_id}"
+        )
+
+    assert response.status_code == 409
+    assert "mirror identity" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(MonitorSession, local_id)
+    assert current.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "path", "payload"),
+    [
+        (
+            "monitor",
+            "monitor-sessions",
+            {"description": "must wait for migration"},
+        ),
+        (
+            "sub_agent",
+            "sub-agent-sessions",
+            {"name": "blocked", "prompt": "must wait for migration"},
+        ),
+    ],
+)
+async def test_worker_auxiliary_create_rejects_active_migration_before_proxy(
+    client,
+    session_factory,
+    agent_type,
+    path,
+    payload,
+):
+    task_id = await (
+        _create_task_with_monitor(client, session_factory)
+        if agent_type == "monitor"
+        else _create_task_with_sub_agent(client, session_factory)
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(worker_id=84, status="migrating")
+        )
+        await db.commit()
+
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock(return_value={"unexpected": True})
+    with patch("backend.main.worker_proxy", proxy):
+        response = await client.post(
+            f"/api/tasks/{task_id}/{path}",
+            json=payload,
+        )
+
+    assert response.status_code == 409, response.text
+    assert "migration is active" in response.json()["detail"]
+    proxy.proxy_to_worker.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -693,6 +1336,46 @@ async def test_list_monitor_sessions(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_monitor_and_sub_agent_routes_do_not_cross_categories(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_sub_agent(client, session_factory)
+    async with session_factory() as db:
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="monitor-only",
+        )
+        sub_agent = MonitorSession(
+            task_id=task_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="sub-agent-only",
+        )
+        db.add_all([monitor, sub_agent])
+        await db.commit()
+        monitor_id = monitor.id
+        sub_agent_id = sub_agent.id
+
+    monitors = await client.get(f"/api/tasks/{task_id}/monitor-sessions")
+    sub_agents = await client.get(f"/api/tasks/{task_id}/sub-agent-sessions")
+    assert [row["id"] for row in monitors.json()] == [monitor_id]
+    assert [row["id"] for row in sub_agents.json()] == [sub_agent_id]
+    assert (
+        await client.get(
+            f"/api/tasks/{task_id}/monitor-sessions/{sub_agent_id}"
+        )
+    ).status_code == 404
+    assert (
+        await client.get(
+            f"/api/tasks/{task_id}/sub-agent-sessions/{monitor_id}"
+        )
+    ).status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_monitor_session(client, session_factory):
     task_id = await _create_task_with_monitor(client, session_factory)
 
@@ -742,11 +1425,79 @@ async def test_delete_monitor_session(client, session_factory):
         ms_id,
         terminal=True,
     )
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": ms_id,
+            "status": "cancelled",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
 
     async with session_factory() as db:
         ms = await db.get(MonitorSession, ms_id)
         assert ms.status == "cancelled"
         assert ms.completed_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_type", "path", "stopper"),
+    [
+        ("monitor", "monitor-sessions", "stop_monitor_session_process"),
+        (
+            "sub_agent",
+            "sub-agent-sessions",
+            "stop_sub_agent_session_process",
+        ),
+    ],
+)
+async def test_auxiliary_delete_yields_to_active_worker_termination_receipt(
+    client,
+    session_factory,
+    agent_type,
+    path,
+    stopper,
+):
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    task_id = (
+        await _create_task_with_monitor(client, session_factory)
+        if agent_type == "monitor"
+        else await _create_task_with_sub_agent(client, session_factory)
+    )
+    async with session_factory() as db:
+        session = MonitorSession(
+            task_id=task_id,
+            agent_type=agent_type,
+            source="ccm",
+            description="receipt-owned child",
+            status="running",
+        )
+        db.add(session)
+        await db.commit()
+        session_id = session.id
+    await persist_active_worker_receipt(session_factory, task_id)
+
+    dispatcher = MagicMock()
+    dispatcher.stop_monitor_session_process = AsyncMock()
+    dispatcher.stop_sub_agent_session_process = AsyncMock()
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        response = await client.delete(
+            f"/api/tasks/{task_id}/{path}/{session_id}"
+        )
+
+    assert response.status_code == 409
+    assert "active Worker termination receipt" in response.json()["detail"]
+    getattr(dispatcher, stopper).assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(MonitorSession, session_id)
+    assert current.status == "running"
 
 
 @pytest.mark.asyncio
@@ -867,6 +1618,7 @@ async def test_monitor_complete_loses_cas_to_concurrent_cancel(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
 
@@ -959,6 +1711,7 @@ async def test_sub_agent_result_loses_cas_to_concurrent_stop(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()
@@ -1055,6 +1808,7 @@ async def test_late_progress_callbacks_do_not_write_after_terminal_state(
         sub_agent_id = sub_agent.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1085,6 +1839,115 @@ async def test_late_progress_callbacks_do_not_write_after_terminal_state(
         )
     assert monitor_reports == 0
     assert sub_reports == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_refuses_late_auxiliary_callbacks(
+    client,
+    session_factory,
+    worker_control_plane_auth,
+    monkeypatch,
+):
+    """A callback cannot publish reports after node drain admission closes."""
+
+    from backend import database
+    from backend.config import settings
+    from backend.services.internal_service_auth import (
+        issue_internal_service_token,
+    )
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    task_id = await _create_task_with_monitor(client, session_factory)
+    sub_task_id = await _create_task_with_sub_agent(client, session_factory)
+    async with session_factory() as db:
+        monitor = MonitorSession(
+            task_id=task_id,
+            agent_type="monitor",
+            source="ccm",
+            description="late-worker-check",
+            status="running",
+            next_check_at=None,
+        )
+        sub_agent = MonitorSession(
+            task_id=sub_task_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="late-worker-progress",
+            status="running",
+        )
+        db.add_all([monitor, sub_agent])
+        await db.commit()
+        monitor_id = monitor.id
+        sub_agent_id = sub_agent.id
+        monitor_task = await db.get(Task, task_id)
+        sub_agent_task = await db.get(Task, sub_task_id)
+
+    monkeypatch.setattr(database, "async_session", session_factory)
+    monitor_token = issue_internal_service_token(
+        audience="ccm_monitor_agent",
+        task_id=task_id,
+        task_incarnation_id=monitor_task.incarnation_id,
+        monitor_session_id=monitor_id,
+        owner_kind="monitor-turn",
+        owner_id=f"{monitor_id}:drain-test",
+    )
+    sub_agent_token = issue_internal_service_token(
+        audience="ccm_sub_agent",
+        task_id=sub_task_id,
+        task_incarnation_id=sub_agent_task.incarnation_id,
+        sub_agent_session_id=sub_agent_id,
+        owner_kind="sub-agent-session",
+        owner_id=sub_agent_id,
+    )
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="e" * 64)
+        await db.commit()
+
+    dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
+    dispatcher.broadcaster.broadcast = AsyncMock()
+    dispatcher.enqueue_message = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher):
+        deployment_monitor_response = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{monitor_id}/checks",
+            json={"summary": "deployment token must not enter callback"},
+        )
+        deployment_sub_agent_response = await client.post(
+            f"/api/tasks/{sub_task_id}/sub-agent-sessions/"
+            f"{sub_agent_id}/progress",
+            json={"summary": "deployment token must not enter callback"},
+        )
+        monitor_response = await client.post(
+            f"/api/tasks/{task_id}/monitor-sessions/{monitor_id}/checks",
+            json={"summary": "too late", "is_important": True},
+            headers={"Authorization": f"Bearer {monitor_token}"},
+        )
+        sub_agent_response = await client.post(
+            f"/api/tasks/{sub_task_id}/sub-agent-sessions/"
+            f"{sub_agent_id}/progress",
+            json={"summary": "too late"},
+            headers={"Authorization": f"Bearer {sub_agent_token}"},
+        )
+
+    assert deployment_monitor_response.status_code == 403
+    assert deployment_sub_agent_response.status_code == 403
+    assert monitor_response.status_code == 409
+    assert sub_agent_response.status_code == 409
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(MonitorCheck.id)).where(
+                MonitorCheck.monitor_session_id == monitor_id
+            )
+        ) == 0
+        assert await db.scalar(
+            select(func.count(SubAgentReport.id)).where(
+                SubAgentReport.session_id == sub_agent_id
+            )
+        ) == 0
 
 
 @pytest.mark.asyncio
@@ -1184,6 +2047,7 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_monitor_session_process = AsyncMock()
@@ -1254,6 +2118,7 @@ async def test_monitor_callback_requires_exact_active_turn_generation(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1352,6 +2217,7 @@ async def test_sub_agent_progress_then_result_uses_unique_report_numbers(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()
@@ -1387,6 +2253,22 @@ async def test_sub_agent_progress_then_result_uses_unique_report_numbers(
     dispatcher.enqueue_message.assert_awaited_once()
     dispatcher.stop_sub_agent_session_process.assert_awaited_once_with(
         session_id
+    )
+    dispatcher.broadcaster.broadcast.assert_any_await(
+        f"task:{task_id}",
+        {
+            "event": "sub_agent_session_status",
+            "sub_agent_session_id": session_id,
+            "description": "progress-result",
+            "agent_type": "sub_agent",
+            "source": "ccm",
+            "monitor_context": None,
+            "status": "completed",
+            "checks_done": 2,
+            "last_summary": "done",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
     )
 
 
@@ -1553,6 +2435,22 @@ async def test_create_sub_agent_accepts_codex_task(client, session_factory):
     assert resp.status_code == 201
     assert resp.json()["description"] == "review"
     mock_dispatcher.start_sub_agent_session.assert_called_once()
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "sub_agent_session_created",
+            "sub_agent_session_id": resp.json()["id"],
+            "description": "review",
+            "agent_type": "sub_agent",
+            "source": "ccm",
+            "monitor_context": None,
+            "status": "running",
+            "checks_done": 0,
+            "last_summary": "review the code",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
 
 
 @pytest.mark.asyncio

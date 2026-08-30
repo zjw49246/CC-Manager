@@ -16,6 +16,12 @@ type InstanceLogItem = LogEntry & {
   provisional?: boolean;
 };
 
+type LogTaskTurnIdentity = {
+  taskId: number;
+  retryCount: number;
+  turnGeneration: number;
+};
+
 type HistoryState = {
   instanceId: number;
   cursor: number;
@@ -28,6 +34,81 @@ const MAX_VISIBLE_LOGS = 2000;
 const BACKFILL_PAGE_SIZE = 200;
 const AUTO_FOLLOW_THRESHOLD_PX = 80;
 const SCROLL_THROTTLE_MS = 50;
+
+function logTaskTurnIdentity(
+  value: Pick<LogEntry, 'task_id' | 'task_retry_count' | 'task_turn_generation'>,
+): LogTaskTurnIdentity | null {
+  if (
+    value.task_id == null
+    || !Number.isInteger(value.task_retry_count)
+    || (value.task_retry_count as number) < 0
+    || !Number.isInteger(value.task_turn_generation)
+    || (value.task_turn_generation as number) < 0
+  ) {
+    return null;
+  }
+  return {
+    taskId: value.task_id,
+    retryCount: value.task_retry_count as number,
+    turnGeneration: value.task_turn_generation as number,
+  };
+}
+
+function sameLogTaskTurn(
+  left: LogTaskTurnIdentity,
+  right: LogTaskTurnIdentity,
+): boolean {
+  return (
+    left.taskId === right.taskId
+    && left.retryCount === right.retryCount
+    && left.turnGeneration === right.turnGeneration
+  );
+}
+
+function compareLogTaskTurn(
+  left: LogTaskTurnIdentity,
+  right: LogTaskTurnIdentity,
+): number {
+  if (left.taskId !== right.taskId) return 0;
+  if (left.turnGeneration !== right.turnGeneration) {
+    return left.turnGeneration - right.turnGeneration;
+  }
+  return left.retryCount - right.retryCount;
+}
+
+function streamClientKey(
+  identity: LogTaskTurnIdentity,
+  itemId: string,
+): string {
+  return `delta:${identity.taskId}:${identity.retryCount}:${identity.turnGeneration}:${itemId}`;
+}
+
+function rememberLatestTaskTurns(
+  latestByTask: Map<number, LogTaskTurnIdentity>,
+  entries: LogEntry[],
+): void {
+  for (const entry of entries) {
+    const identity = logTaskTurnIdentity(entry);
+    if (!identity) continue;
+    const current = latestByTask.get(identity.taskId);
+    if (!current || compareLogTaskTurn(identity, current) > 0) {
+      latestByTask.set(identity.taskId, identity);
+    }
+  }
+}
+
+function removeSupersededProvisionals(
+  items: InstanceLogItem[],
+  latestByTask: Map<number, LogTaskTurnIdentity>,
+): InstanceLogItem[] {
+  return items.filter((item) => {
+    if (!item.provisional) return true;
+    const identity = logTaskTurnIdentity(item);
+    if (!identity) return false;
+    const latest = latestByTask.get(identity.taskId);
+    return !latest || sameLogTaskTurn(identity, latest);
+  });
+}
 
 function historyItem(entry: LogEntry): InstanceLogItem {
   return {
@@ -90,6 +171,15 @@ function matchesProvisional(
     !candidate.provisional
     || !candidate.streamItemId
     || candidate.streamItemId !== entry.streamItemId
+  ) {
+    return false;
+  }
+  const candidateIdentity = logTaskTurnIdentity(candidate);
+  const entryIdentity = logTaskTurnIdentity(entry);
+  if (
+    !candidateIdentity
+    || !entryIdentity
+    || !sameLogTaskTurn(candidateIdentity, entryIdentity)
   ) {
     return false;
   }
@@ -159,6 +249,7 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
   const scrollTimerRef = useRef<number | null>(null);
   const shouldAutoFollowRef = useRef(true);
   const liveSequence = useRef(0);
+  const latestTaskTurnsRef = useRef(new Map<number, LogTaskTurnIdentity>());
   const activeInstanceRef = useRef(instanceId);
   const backfillTailRef = useRef<Promise<void>>(Promise.resolve());
   const historyStateRef = useRef<HistoryState | null>(null);
@@ -222,8 +313,9 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
           recovered.length > 0
           && activeInstanceRef.current === requestedInstanceId
         ) {
+          rememberLatestTaskTurns(latestTaskTurnsRef.current, recovered);
           setLogs((current) => mergeHistoryItems(
-            current,
+            removeSupersededProvisionals(current, latestTaskTurnsRef.current),
             recovered.map(historyItem),
           ));
         }
@@ -275,6 +367,15 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
       streamItemId,
       instance_id: typeof data.instance_id === 'number' ? data.instance_id : instanceId,
       task_id: typeof data.task_id === 'number' ? data.task_id : null,
+      task_retry_count: typeof data.task_retry_count === 'number'
+        ? data.task_retry_count
+        : null,
+      task_turn_generation: typeof data.task_turn_generation === 'number'
+        ? data.task_turn_generation
+        : null,
+      native_turn_id: typeof data.native_turn_id === 'string'
+        ? data.native_turn_id
+        : null,
       event_type: eventType,
       role: typeof data.role === 'string' ? data.role : null,
       content: displayValue(data.content)
@@ -287,20 +388,32 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
       timestamp: typeof data.timestamp === 'string' ? data.timestamp : new Date().toISOString(),
     };
 
-    if (
-      (eventType === 'message_delta' || eventType === 'thinking_delta')
-      && streamItemId
-    ) {
-      if (!entry.content) return;
-      entry.clientKey = `delta:${streamItemId}`;
+    if (eventType === 'message_delta' || eventType === 'thinking_delta') {
+      const identity = logTaskTurnIdentity(entry);
+      if (!entry.content || !streamItemId || !identity) return;
+      const latest = latestTaskTurnsRef.current.get(identity.taskId);
+      const comparison = latest ? compareLogTaskTurn(identity, latest) : 1;
+      if (comparison < 0) return;
+      if (comparison > 0) {
+        latestTaskTurnsRef.current.set(identity.taskId, identity);
+      }
+      entry.clientKey = streamClientKey(identity, streamItemId);
       entry.provisional = true;
       setLogs((current) => {
-        const index = current.findIndex(
-          (candidate) => candidate.provisional
-            && candidate.streamItemId === streamItemId,
-        );
-        if (index < 0) return appendItem(current, entry);
-        const next = [...current];
+        const generationCurrent = comparison > 0
+          ? removeSupersededProvisionals(current, latestTaskTurnsRef.current)
+          : current;
+        const finalShape = {
+          ...entry,
+          event_type: eventType === 'message_delta' ? 'message' : 'thinking',
+        };
+        const index = generationCurrent.findIndex((candidate) => (
+          candidate.provisional === true
+          && candidate.streamItemId === streamItemId
+          && matchesProvisional(candidate, finalShape)
+        ));
+        if (index < 0) return appendItem(generationCurrent, entry);
+        const next = [...generationCurrent];
         next[index] = {
           ...next[index],
           content: `${next[index].content || ''}${entry.content}`,
@@ -311,10 +424,24 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
     }
 
     if (persistedId != null) {
+      const identity = logTaskTurnIdentity(entry);
+      let comparison = 0;
+      if (identity) {
+        const latest = latestTaskTurnsRef.current.get(identity.taskId);
+        comparison = latest ? compareLogTaskTurn(identity, latest) : 1;
+        if (comparison > 0) {
+          latestTaskTurnsRef.current.set(identity.taskId, identity);
+        }
+      }
       // A live row proves only that this one id was delivered. It must not
       // advance the contiguous HTTP cursor because rows immediately before it
       // may have fallen into the subscribe/reconnect window.
-      setLogs((current) => applyAuthoritativeItem(current, entry));
+      setLogs((current) => {
+        const generationCurrent = comparison > 0 && identity
+          ? removeSupersededProvisionals(current, latestTaskTurnsRef.current)
+          : current;
+        return applyAuthoritativeItem(generationCurrent, entry);
+      });
       return;
     }
     setLogs((current) => appendItem(current, entry));
@@ -330,6 +457,7 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
   useEffect(() => {
     activeInstanceRef.current = instanceId;
     liveSequence.current = 0;
+    latestTaskTurnsRef.current.clear();
     shouldAutoFollowRef.current = true;
     setLogs([]);
     setLoadError(null);
@@ -338,13 +466,14 @@ export function InstanceLog({ instanceId, onClose }: InstanceLogProps) {
     api.getInstanceLogs(instanceId, BACKFILL_PAGE_SIZE)
       .then((entries) => {
         if (!active || activeInstanceRef.current !== instanceId) return;
+        rememberLatestTaskTurns(latestTaskTurnsRef.current, entries);
         historyState.cursor = entries.reduce(
           (highest, entry) => Math.max(highest, entry.id),
           historyState.cursor,
         );
         historyState.snapshotEstablished = true;
         setLogs((current) => mergeHistoryItems(
-          current,
+          removeSupersededProvisionals(current, latestTaskTurnsRef.current),
           entries.slice().reverse().map(historyItem),
         ));
         setLoadError(null);

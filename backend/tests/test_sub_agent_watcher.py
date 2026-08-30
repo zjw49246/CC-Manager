@@ -18,6 +18,42 @@ from backend.services.sub_agent_watcher import (
 
 
 @pytest.mark.asyncio
+async def test_codex_native_agent_is_not_polled_as_claude_transcript(
+    db_factory,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="codex-native",
+            status="executing",
+            session_id="thread-root",
+        )
+        db.add(task)
+        await db.flush()
+        sub_agent = SubAgentSession(
+            task_id=task.id,
+            agent_type="native-agent",
+            source="native",
+            provider="codex",
+            description="Codex child",
+            status="running",
+            codex_thread_id="thread-child",
+            meta=json.dumps({"tool_use_id": "codex:thread-child"}),
+        )
+        db.add(sub_agent)
+        await db.commit()
+
+    watcher = SubAgentWatcher(db_factory, AsyncMock())
+    watcher._resolve_paths = AsyncMock(
+        side_effect=AssertionError("Codex child has no Claude transcript"),
+    )
+
+    await watcher._tick()
+
+    watcher._resolve_paths.assert_not_called()
+    assert watcher._tracked == {}
+
+
+@pytest.mark.asyncio
 async def test_silent_live_agent_is_not_inferred_complete(
     db_factory,
     tmp_path,
@@ -139,6 +175,76 @@ async def test_explicit_end_turn_marks_idle_native_agent_complete(
         current = await db.get(SubAgentSession, sid)
         assert current.status == "completed"
         assert current.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_refuses_native_agent_completion_writer(
+    db_factory,
+    tmp_path,
+    monkeypatch,
+):
+    """A stale transcript watcher cannot mutate or publish after node drain."""
+
+    from backend.config import settings
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    transcript = tmp_path / "agent-late-done.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "late done"}],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    async with db_factory() as db:
+        task = Task(
+            title="native-late-done",
+            status="executing",
+            session_id="session-late-done",
+        )
+        db.add(task)
+        await db.flush()
+        sub_agent = SubAgentSession(
+            task_id=task.id,
+            agent_type="native-agent",
+            source="native",
+            description="late done",
+            status="running",
+            meta=json.dumps({"tool_use_id": "toolu_late_done"}),
+        )
+        db.add(sub_agent)
+        await db.commit()
+        task_id = task.id
+        sid = sub_agent.id
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with db_factory() as db:
+        await begin_worker_node_drain(db, claim="f" * 64)
+        await db.commit()
+
+    broadcaster = AsyncMock()
+    watcher = SubAgentWatcher(db_factory, broadcaster)
+    watcher._tracked[sid] = {
+        "task_id": task_id,
+        "agent_id": "late-done",
+        "jsonl_path": str(transcript),
+        "last_size": transcript.stat().st_size,
+        "idle_since": datetime.utcnow()
+        - timedelta(seconds=IDLE_THRESHOLD + 1),
+        "description": "late done",
+    }
+
+    await watcher._tick()
+
+    async with db_factory() as db:
+        current = await db.get(SubAgentSession, sid)
+    assert current.status == "running"
+    assert current.completed_at is None
+    broadcaster.broadcast.assert_not_awaited()
 
 
 def test_resolve_paths_searches_default_and_pool_configured_homes(

@@ -3,7 +3,7 @@ import { act, render, screen, fireEvent, waitFor, createEvent } from '@testing-l
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { TaskList } from './TaskList';
-import type { Task, Project } from '../../api/client';
+import type { PRReviewResult, Task, Project } from '../../api/client';
 
 // Mock the api module
 vi.mock('../../api/client', () => ({
@@ -15,12 +15,34 @@ vi.mock('../../api/client', () => ({
     starTask: vi.fn().mockResolvedValue({}),
     archiveTask: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
+    getDeliveryRun: vi.fn().mockResolvedValue({
+      id: 17,
+      phase: 'monitoring',
+      activity: 'waiting',
+      outcome: null,
+      cycle_count: 1,
+      max_cycles: 10,
+      turn_count: 1,
+      delivery_branch: 'ccm/delivery/17-controlled-delivery',
+      wait_reason: 'pr_monitor',
+      pause_reason: null,
+      error_code: null,
+      error_message: null,
+      pr_number: null,
+      pr_url: null,
+      allowed_actions: [],
+    }),
+    pauseDeliveryRun: vi.fn(),
+    resumeDeliveryRun: vi.fn(),
+    cancelDeliveryRun: vi.fn(),
   },
 }));
 
 import { api } from '../../api/client';
 
-function makeTask(overrides: Partial<Task> = {}): Task {
+type LegacyTaskFixture = Task & { session_id?: string | null };
+
+function makeTask(overrides: Partial<LegacyTaskFixture> = {}): LegacyTaskFixture {
   return {
     id: 1,
     title: '',
@@ -34,6 +56,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     merge_status: 'pending',
     instance_id: null,
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 3,
     mode: 'auto',
     todo_file_path: null,
@@ -46,6 +69,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     archived: false,
     has_unread: false,
     session_id: null,
+    has_session: false,
+    access_scope: 'control',
+    is_worker_managed: false,
     error_message: null,
     provider: 'claude',
     model: null,
@@ -66,6 +92,7 @@ describe('TaskList', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
   });
 
   it('renders task description when no title', () => {
@@ -79,6 +106,106 @@ describe('TaskList', () => {
     render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('Custom Title')).toBeInTheDocument();
     expect(screen.getByText('The prompt')).toBeInTheDocument();
+  });
+
+  it('renders a PR Monitor display Task as read-only aggregate evidence', async () => {
+    const result: PRReviewResult = {
+      result_key: 'run:14',
+      run_id: 14,
+      display_task_id: 42,
+      repo_id: 3,
+      repo_full_name: 'acme/widget',
+      pr_number: 133,
+      pr_title: 'Keep exact-head review evidence',
+      pr_url: 'https://github.com/acme/widget/pull/133',
+      review_id: 113,
+      base_ref: 'main',
+      base_sha: 'b'.repeat(40),
+      head_sha: 'a'.repeat(40),
+      verdict_state: 'complete',
+      aggregate_verdict: 'changes_required',
+      publication_state: 'not_applicable',
+      lifecycle_state: 'reviewing',
+      failure_stage: null,
+      error_category: null,
+      error_measured: null,
+      error_limit: null,
+      error_unit: null,
+      display_status: 'Changes required',
+      display_summary: 'The exact head needs changes.',
+      published_actor: null,
+      published_at: null,
+      github_review_id: null,
+      github_review_url: null,
+      github_state: null,
+      github_event: null,
+      created_at: '2026-08-16T00:00:00Z',
+      updated_at: '2026-08-16T00:02:00Z',
+      completed_at: '2026-08-16T00:02:00Z',
+      can_rerun: false,
+    };
+    const task = makeTask({
+      id: 42,
+      mode: 'pr_monitor',
+      title: 'PR Monitor · acme/widget #133',
+      description: null,
+      status: 'completed',
+      metadata_: { pr_monitor_display: true },
+    });
+
+    render(
+      <TaskList
+        tasks={[task]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+        prResults={new Map([[42, result]])}
+      />,
+    );
+
+    expect(screen.getByText('acme/widget #133 · Keep exact-head review evidence')).toBeInTheDocument();
+    expect(screen.getAllByText('Changes required')).toHaveLength(2);
+    expect(screen.getByTitle('View PR review result')).toBeInTheDocument();
+    expect(screen.queryByTitle('Copy prompt')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTitle('View PR review result'));
+    expect(onOpenChat).toHaveBeenCalledWith(task);
+  });
+
+  it('renders a Delivery-owned scheduler shell with Run controls but no Task mutations', async () => {
+    const tasks = [makeTask({
+      mode: 'delivery_loop',
+      status: 'failed',
+      title: 'Controlled delivery',
+      session_id: 'delivery-session',
+      has_session: true,
+      delivery_run_id: 17,
+      delivery_phase: 'monitoring',
+      delivery_activity: 'waiting',
+      attention_tag: 'operator note',
+    })];
+
+    render(
+      <TaskList
+        tasks={tasks}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+      />,
+    );
+
+    const runButton = screen.getByRole('button', { name: 'DLV-17' });
+    expect(runButton).toBeInTheDocument();
+    expect(screen.getByText('operator note')).toBeInTheDocument();
+    expect(screen.getByTitle('Chat')).toBeInTheDocument();
+    expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('按住拖动排序')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit attention tag')).not.toBeInTheDocument();
+    await userEvent.click(runButton);
+    expect(await screen.findByRole('region', { name: 'Delivery Run #17' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(screen.getByText(/observation-only/)).toBeInTheDocument();
   });
 
   it.each([
@@ -300,6 +427,14 @@ describe('TaskList', () => {
       expect(screen.getByText('Cancel')).toBeInTheDocument();
     });
 
+    it('shows Cancel while a Task is waiting on an Auto capability', async () => {
+      const tasks = [makeTask({ status: 'waiting_capability' })];
+      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+
+      await userEvent.click(screen.getByTitle('More actions'));
+      expect(screen.getByText('Cancel')).toBeInTheDocument();
+    });
+
     it('shows stop action and hides Delete while detached background work is active', async () => {
       const tasks = [makeTask({ status: 'completed', background_active: true })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
@@ -314,24 +449,46 @@ describe('TaskList', () => {
       await waitFor(() => expect(onRefresh).toHaveBeenCalled());
     });
 
-    it('shows Retry in overflow menu for failed tasks', async () => {
-      const tasks = [makeTask({
-        status: 'failed',
-        provider: 'codex',
-        model: 'gpt-5.6-sol',
-        codex_service_tier: 'priority',
-      })];
-      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+    it.each(['failed', 'cancelled', 'conflict', 'completed'])(
+      'shows Retry in overflow menu for %s tasks',
+      async (status) => {
+        const tasks = [makeTask({
+          status,
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+          codex_service_tier: 'priority',
+        })];
+        render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+
+        await userEvent.click(screen.getByTitle('More actions'));
+        await userEvent.click(screen.getByText('Retry'));
+
+        expect(api.retryTask).toHaveBeenCalledWith(1, {
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+          codex_service_tier: 'priority',
+        });
+        await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+      },
+    );
+
+    it.each([
+      { mode: 'plan', status: 'failed' },
+      { mode: 'auto', status: 'pending' },
+      { mode: 'auto', status: 'completed', background_active: true },
+      { mode: 'auto', status: 'failed', delivery_run_id: 17 },
+    ])('hides Retry when the Task lifecycle does not allow it: %o', async (overrides) => {
+      render(
+        <TaskList
+          tasks={[makeTask(overrides)]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
 
       await userEvent.click(screen.getByTitle('More actions'));
-      await userEvent.click(screen.getByText('Retry'));
-
-      expect(api.retryTask).toHaveBeenCalledWith(1, {
-        provider: 'codex',
-        model: 'gpt-5.6-sol',
-        codex_service_tier: 'priority',
-      });
-      await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+      expect(screen.queryByText('Retry')).not.toBeInTheDocument();
     });
 
     it('closes overflow menu on outside click', async () => {
@@ -488,7 +645,7 @@ describe('TaskList', () => {
 
   describe('Chat button', () => {
     it('shows Chat button when session_id exists', () => {
-      const tasks = [makeTask({ session_id: 'abc-123' })];
+      const tasks = [makeTask({ session_id: 'abc-123', has_session: true })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
       expect(screen.getByTitle('Chat')).toBeInTheDocument();
     });
@@ -497,6 +654,159 @@ describe('TaskList', () => {
       const tasks = [makeTask({ session_id: null })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
       expect(screen.queryByTitle('Chat')).not.toBeInTheDocument();
+    });
+
+    it('uses has_session without requiring the native provider session id', () => {
+      const tasks = [makeTask({ session_id: undefined, has_session: true })];
+      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+      expect(screen.getByTitle('Chat')).toBeInTheDocument();
+    });
+  });
+
+  describe('chat-only access projection', () => {
+    it('keeps Chat and read-only data but hides every Task mutation control', () => {
+      const tasks = [makeTask({
+        access_scope: 'chat',
+        session_id: undefined,
+        has_session: true,
+        title: 'Shared conversation',
+        attention_tag: 'owner note',
+        starred: true,
+        has_unread: true,
+      })];
+
+      render(
+        <TaskList
+          tasks={tasks}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.getByTitle('Chat')).toBeInTheDocument();
+      expect(screen.getByText('Shared · Chat')).toBeInTheDocument();
+      expect(screen.getByText('owner note')).toBeInTheDocument();
+      expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Unstar')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Mark as read')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('按住拖动排序')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Plugins')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Task Config')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Edit attention tag')).not.toBeInTheDocument();
+    });
+
+    it('does not let a chat-only row initiate a sort update', () => {
+      vi.useFakeTimers();
+      try {
+        const tasks = [
+          makeTask({ id: 11, access_scope: 'chat', sort_order: 200 }),
+          makeTask({ id: 12, access_scope: 'control', sort_order: 100 }),
+        ];
+        const { container } = render(
+          <TaskList
+            tasks={tasks}
+            projects={projects}
+            onRefresh={onRefresh}
+            onOpenChat={onOpenChat}
+          />,
+        );
+        const rows = container.querySelectorAll('[data-reorder-idx]');
+        expect(rows).toHaveLength(2);
+
+        fireEvent.touchStart(rows[0]);
+        act(() => { vi.advanceTimersByTime(500); });
+        const dataTransfer = { effectAllowed: '', setData: vi.fn(), getData: vi.fn() };
+        fireEvent.dragOver(rows[1], { dataTransfer });
+        fireEvent.drop(rows[1], { dataTransfer });
+
+        expect(api.updateTask).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not mount Delivery controls for a chat-only Delivery row', () => {
+      render(
+        <TaskList
+          tasks={[makeTask({
+            access_scope: 'chat',
+            mode: 'delivery_loop',
+            delivery_run_id: 17,
+          })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.queryByRole('button', { name: 'DLV-17' })).not.toBeInTheDocument();
+      expect(api.getDeliveryRun).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Team Share visibility', () => {
+    it('shows Team Share to the Task creator', async () => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 42 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.getByText('Team Share')).toBeInTheDocument();
+    });
+
+    it('hides Team Share from a member who does not own the Task', async () => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.queryByText('Team Share')).not.toBeInTheDocument();
+    });
+
+    it('hides Team Share when no authoritative user identity is cached', async () => {
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.queryByText('Team Share')).not.toBeInTheDocument();
+    });
+
+    it.each(['admin', 'super_admin'])('shows Team Share to a %s', async (role) => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.getByText('Team Share')).toBeInTheDocument();
     });
   });
 });

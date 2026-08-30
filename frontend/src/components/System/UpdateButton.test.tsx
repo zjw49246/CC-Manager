@@ -40,6 +40,11 @@ function findModalOverlay(): HTMLElement | null {
   return document.body.querySelector('[class*="fixed"][class*="z-[70]"]');
 }
 
+async function openAndCheck(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByTitle('更新并重启'));
+  await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+}
+
 describe('UpdateButton', () => {
   beforeEach(() => {
     sessionStorage.clear();
@@ -75,12 +80,57 @@ describe('UpdateButton', () => {
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
   });
 
+  it('shows both update channels before checking and does not auto-fallback', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.startUpdate).mockRejectedValue(new Error('仓库没有可用的正式版本 tag'));
+    render(<UpdateButton />);
+
+    await user.click(screen.getByTitle('更新并重启'));
+
+    expect(screen.getByRole('radio', { name: /Stable 正式版/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /Main 测试版/ })).not.toBeChecked();
+    expect(api.startUpdate).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+    expect(await screen.findByText('仓库没有可用的正式版本 tag')).toBeInTheDocument();
+    expect(api.startUpdate).toHaveBeenCalledWith({
+      dry_run: true,
+      force: true,
+      channel: 'stable',
+      branch: undefined,
+    });
+    expect(api.startUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks Main only after the user explicitly selects it', async () => {
+    const user = userEvent.setup();
+    render(<UpdateButton />);
+
+    await user.click(screen.getByTitle('更新并重启'));
+    await user.click(screen.getByRole('radio', { name: /Main 测试版/ }));
+
+    expect(screen.getByText('切换到测试版前请注意')).toBeInTheDocument();
+    expect(screen.getByText(/如果 Main 包含正式版没有的数据库迁移/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+    await waitFor(() => {
+      expect(api.startUpdate).toHaveBeenCalledWith({
+        dry_run: true,
+        force: true,
+        channel: 'main',
+        branch: undefined,
+      });
+    });
+  });
+
   describe('modal portal rendering', () => {
     it('renders modal via portal on document.body when opened', async () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -94,7 +144,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       const { container } = render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -107,7 +157,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -122,7 +172,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -147,7 +197,7 @@ describe('UpdateButton', () => {
 
       render(<UpdateButton />, { container: innerDiv });
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -164,7 +214,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -184,7 +234,7 @@ describe('UpdateButton', () => {
 
       expect(findModalOverlay()).toBeNull();
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -195,7 +245,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -212,7 +262,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         const portals = document.body.querySelectorAll('[class*="z-[70]"]');
@@ -236,7 +286,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('已是最新版本，无需更新。')).toBeInTheDocument();
@@ -247,12 +297,13 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(api.startUpdate).toHaveBeenCalledWith({
           dry_run: true,
           force: true,
+          channel: 'stable',
           branch: undefined,
         });
       });
@@ -270,7 +321,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/磁盘代码尚未完整部署/)).toBeInTheDocument();
@@ -282,11 +333,46 @@ describe('UpdateButton', () => {
   });
 
   describe('modal content rendering', () => {
+    it('repeats the Stable rollback warning when Main contains migrations', async () => {
+      vi.mocked(api.startUpdate).mockResolvedValue({
+        ...mockDryRun,
+        channel: 'main',
+        has_new_migrations: true,
+        migration_count: 1,
+      } as never);
+
+      const user = userEvent.setup();
+      render(<UpdateButton />);
+      await user.click(screen.getByTitle('更新并重启'));
+      await user.click(screen.getByRole('radio', { name: /Main 测试版/ }));
+      await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+      expect(await screen.findByText(/更新后可能无法一键切回 Stable/)).toBeInTheDocument();
+    });
+
+    it('labels a Main-to-Stable change as a channel switch', async () => {
+      vi.mocked(api.startUpdate).mockResolvedValue({
+        ...mockDryRun,
+        channel: 'stable',
+        latest_version: 'v1.0.0',
+        update_kind: 'stable_switch',
+        is_stable_downgrade: true,
+        commits_behind: 0,
+      } as never);
+
+      const user = userEvent.setup();
+      render(<UpdateButton />);
+      await openAndCheck(user);
+
+      expect(await screen.findByText(/将从测试版切换回正式版/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '切换到正式版' })).toBeEnabled();
+    });
+
     it('displays commit count when updates available', async () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('3')).toBeInTheDocument();
@@ -297,7 +383,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/abc1234/)).toBeInTheDocument();
@@ -309,7 +395,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('fix: bug')).toBeInTheDocument();
@@ -321,7 +407,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('前端变更')).toBeInTheDocument();
@@ -338,7 +424,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/当前有 1 个任务正在执行/)).toBeInTheDocument();
@@ -362,7 +448,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       await waitFor(() => {
@@ -372,6 +458,7 @@ describe('UpdateButton', () => {
       expect(api.startUpdate).toHaveBeenLastCalledWith({
         dry_run: true,
         force: true,
+        channel: 'stable',
         branch: undefined,
       });
       expect(vi.mocked(api.reconcileUpdateState).mock.invocationCallOrder[0])
@@ -405,7 +492,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText(/#77 真实运行任务/)).toBeInTheDocument();
@@ -431,7 +518,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText(/当前有 1 个运行阻断项/)).toBeInTheDocument();
       expect(screen.getByText(/实例 worker-13（仍有未解除运行证据）/)).toBeInTheDocument();
@@ -453,7 +540,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText(/当前有 1 个运行阻断项/)).toBeInTheDocument();
       expect(screen.getByText(/监控子 Agent #7（running_auxiliary）/)).toBeInTheDocument();
@@ -473,7 +560,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText(
@@ -496,7 +583,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText('重新核对运行状态失败：维护锁正忙')).toBeInTheDocument();
@@ -520,7 +607,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('运行版本')).toBeInTheDocument();
@@ -541,7 +628,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       const repairButton = await screen.findByRole('button', { name: '修复并重新部署' });
       await user.click(repairButton);
@@ -564,7 +651,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await user.click(await screen.findByRole('button', { name: '重启服务' }));
 
@@ -585,7 +672,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       const restartButton = await screen.findByRole('button', { name: '手动重启' });
       await user.click(restartButton);
@@ -609,7 +696,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText('数据库版本落后于代码')).toBeInTheDocument();
       expect(screen.getByText('待迁移')).toBeInTheDocument();
@@ -763,7 +850,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText('无法拉取 origin/main')).toBeInTheDocument();
       expect(screen.getByText('更新失败')).toBeInTheDocument();
@@ -879,147 +966,19 @@ describe('UpdateButton', () => {
     });
   });
 
-  describe('automatic update reminder', () => {
-    it('performs a dry-run and shows a non-blocking top notice after the initial delay', async () => {
-      vi.useFakeTimers();
-      render(<UpdateButton />);
-
-      expect(findModalOverlay()).toBeNull();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.getUpdateStatus).toHaveBeenCalledTimes(1);
-      expect(api.startUpdate).toHaveBeenCalledTimes(1);
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      const notice = screen.getByTestId('update-available-notice');
-      expect(notice.className).toContain('pointer-events-none');
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-      expect(findModalOverlay()).toBeNull();
-    });
-
-    it('opens the existing update modal only after the user clicks view details', async () => {
+  describe('update checks', () => {
+    it('does not check for or prompt about updates automatically', async () => {
       vi.useFakeTimers();
       render(<UpdateButton />);
 
       await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
+        await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
       });
+
+      expect(api.getUpdateStatus).not.toHaveBeenCalled();
+      expect(api.startUpdate).not.toHaveBeenCalled();
       expect(findModalOverlay()).toBeNull();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '查看详情' }).click();
-      });
-
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(findModalOverlay()).toBeTruthy();
-      expect(screen.getByRole('button', { name: '确认更新' })).toBeInTheDocument();
-    });
-
-    it('silently ignores automatic check failures', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockRejectedValue(new Error('offline'));
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.queryByText('更新失败')).not.toBeInTheDocument();
-    });
-
-    it('stays silent when the automatic check finds the latest version', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockResolvedValue({
-        has_updates: false,
-        needs_restart: false,
-      } as never);
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.queryByTestId('update-available-dot')).not.toBeInTheDocument();
-    });
-
-    it('still reminds about a manual pull when the remote fetch failed', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockResolvedValue({
-        has_updates: false,
-        needs_restart: true,
-        manual_update_detected: true,
-        current_commit: 'def5678',
-        running_commit: 'abc1234',
-        error: 'network unavailable',
-      } as never);
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(screen.getByText('检测到待完成的本地更新')).toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-      expect(findModalOverlay()).toBeNull();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '查看详情' }).click();
-      });
-      expect(screen.getByText(/磁盘代码尚未完整部署/)).toBeInTheDocument();
-      expect(screen.getByText(/远端更新检查失败/)).toBeInTheDocument();
-    });
-
-    it('does not repeat the same reminder fingerprint during one page lifetime', async () => {
-      vi.useFakeTimers();
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '关闭更新提醒' }).click();
-      });
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(60 * 60_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledTimes(2);
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-    });
-
-    it('reminds again when the page is opened again', async () => {
-      vi.useFakeTimers();
-      const firstPage = render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-      expect(screen.getByTestId('update-available-notice')).toBeInTheDocument();
-
-      firstPage.unmount();
-      render(<UpdateButton />);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledTimes(2);
-      expect(screen.getByTestId('update-available-notice')).toBeInTheDocument();
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
+      expect(screen.queryByText('发现可用更新')).not.toBeInTheDocument();
     });
   });
 
@@ -1049,7 +1008,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1085,7 +1044,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       simulateVisibilityChange('hidden');
@@ -1109,7 +1068,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1139,7 +1098,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
       await user.click(confirmBtn!);
@@ -1162,7 +1121,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1186,7 +1145,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');

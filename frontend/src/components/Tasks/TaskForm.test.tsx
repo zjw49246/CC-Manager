@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskForm } from './TaskForm';
 
@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
     ]),
     listTags: vi.fn().mockResolvedValue([]),
     listSecrets: vi.fn().mockResolvedValue([]),
+    listSSHProfiles: vi.fn().mockResolvedValue([]),
     listTasks: vi.fn().mockResolvedValue([]),
     config: vi.fn().mockResolvedValue({
       default_provider: 'claude',
@@ -35,6 +36,9 @@ vi.mock('../../api/client', () => ({
       },
     }),
     createTask: vi.fn().mockResolvedValue({ id: 1 }),
+    createDeliveryRun: vi.fn().mockResolvedValue({ id: 11, developer_task_id: 12 }),
+    uploadImages: vi.fn().mockResolvedValue([]),
+    getMonitoredRepos: vi.fn().mockResolvedValue([]),
     createProject: vi.fn().mockResolvedValue({ id: 2 }),
     listWorkers: vi.fn().mockResolvedValue([]),
     listSkillsCached: vi.fn().mockResolvedValue([
@@ -456,14 +460,12 @@ describe('Codex provider UI gating', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument();
   });
 
-  it('shows Monitor with ordinary/User Skills for local Codex', async () => {
+  it('keeps the local Monitor status quiet while exposing Monitor in Plugins', async () => {
     const cliSelect = await renderAndOpenConfig();
     expect(screen.queryByText(/本地 Codex Monitor 已启用/)).not.toBeInTheDocument();
 
     await userEvent.selectOptions(cliSelect, 'codex');
-    expect(
-      screen.getByText('本地 Codex Monitor 已启用'),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/本地 Codex Monitor 已启用/)).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/Plugins/)).toBeInTheDocument());
     expect(screen.getByText('Skills')).toBeInTheDocument();
     await userEvent.click(screen.getByText(/Plugins/));
@@ -524,6 +526,7 @@ describe('Codex Fast speed configuration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    sessionStorage.clear();
     vi.mocked(api.config).mockResolvedValue({
       default_provider: 'claude',
       provider_options: ['claude', 'codex'],
@@ -687,5 +690,605 @@ describe('TaskForm persisted defaults', () => {
       expect(screen.getByDisplayValue('Goal')).toBeInTheDocument();
       expect(screen.getByDisplayValue('2 hours')).toBeInTheDocument();
     });
+  });
+});
+
+describe('TaskForm result follow-up prefill', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('loads an explicit PR result draft into the ordinary Task form', async () => {
+    const { rerender } = render(<TaskForm onCreated={vi.fn()} />);
+    const prompt = screen.getByPlaceholderText(/Prompt \/ Description/);
+    expect(prompt).toHaveValue('');
+
+    rerender(
+      <TaskForm
+        onCreated={vi.fn()}
+        prefill={{ key: 'run-41', description: 'Follow up acme/widget#133\nPR: https://github.com/acme/widget/pull/133' }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(prompt).toHaveValue('Follow up acme/widget#133\nPR: https://github.com/acme/widget/pull/133');
+    });
+    expect(prompt).toHaveFocus();
+  });
+
+  it('does not overwrite an unsaved draft unless the user confirms replacement', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const user = userEvent.setup();
+    const { rerender } = render(<TaskForm onCreated={vi.fn()} />);
+    const prompt = screen.getByPlaceholderText(/Prompt \/ Description/);
+    await user.type(prompt, 'Keep my unsaved draft');
+
+    rerender(
+      <TaskForm
+        onCreated={vi.fn()}
+        prefill={{ key: 'run-42', description: 'Replace with PR follow-up' }}
+      />,
+    );
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith(
+      'Replace your unsaved Task draft with this PR follow-up?',
+    ));
+    expect(prompt).toHaveValue('Keep my unsaved draft');
+    confirm.mockRestore();
+  });
+});
+
+describe('TaskForm frontend review entry location', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('does not show the looping frontend review control on Task creation', () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: '选择前端审查模式' }))
+      .not.toBeInTheDocument();
+  });
+});
+
+describe('TaskForm Auto capabilities', () => {
+  const enabledConfig = {
+    default_provider: 'claude',
+    provider_options: ['claude', 'codex'],
+    default_model: 'claude-opus-4-6',
+    model_options: ['claude-opus-4-6'],
+    default_codex_model: 'gpt-5.6-sol',
+    codex_model_options: ['gpt-5.6-sol'],
+    default_effort: 'medium',
+    effort_options: ['low', 'medium', 'high'],
+    codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+    codex_model_efforts: {},
+    codex_model_service_tiers: {},
+    capability_core_enabled: true,
+    auto_capability_enabled: true,
+    delivery_loop_enabled: false,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.config).mockResolvedValue(enabledConfig as never);
+    vi.mocked(api.listProjects).mockResolvedValue([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+    ] as never);
+  });
+
+  it.each([
+    ['Capability Core', { capability_core_enabled: false }],
+    ['Auto Capability', { auto_capability_enabled: false }],
+  ])('keeps controls hidden when the %s rollout gate is disabled', async (_name, override) => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...enabledConfig,
+      ...override,
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Allow automatic Code Review')).not.toBeInTheDocument();
+  });
+
+  it('fails closed when the server capability config cannot be loaded', async () => {
+    vi.mocked(api.config).mockRejectedValueOnce(new Error('config unavailable'));
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Create without unconfirmed capability support',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls[0][0]).not.toHaveProperty(
+      'capability_policy',
+    );
+  });
+
+  it('submits an explicit allowlist with total and per-capability budgets', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Plan budget'),
+      '2',
+    );
+    await userEvent.click(screen.getByLabelText('Allow automatic Code Review'));
+    await waitFor(() => {
+      expect(screen.getByLabelText('Automatic capability total limit')).toHaveValue('2');
+    });
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic capability total limit'),
+      '3',
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Implement with advisory help',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capability_policy: {
+          version: 1,
+          max_invocations: 3,
+          capabilities: { plan: 2, code_review: 1 },
+        },
+      }),
+    ));
+  });
+
+  it('keeps the maximum edge policy within every backend budget bound', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Plan budget'),
+      '8',
+    );
+    await userEvent.click(screen.getByLabelText('Allow automatic Code Review'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Code Review budget'),
+      '8',
+    );
+    expect(screen.getByLabelText('Automatic capability total limit')).toHaveValue('8');
+
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Use bounded advisory help',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capability_policy: {
+          version: 1,
+          max_invocations: 8,
+          capabilities: { plan: 8, code_review: 8 },
+        },
+      }),
+    ));
+  });
+
+  it('clears a local opt-in and omits policy after switching to a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+      { id: 2, name: 'worker-project', git_url: '', has_remote: false, local_path: '/tmp/worker', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: 9 },
+    ] as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.click(screen.getByText('test-project'));
+    await userEvent.click(await screen.findByText('worker-project'));
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Allow automatic Code Review')).not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Run only on the Worker',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls[0][0]).not.toHaveProperty(
+      'capability_policy',
+    );
+  });
+});
+
+describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
+  const config = {
+    default_provider: 'codex',
+    provider_options: ['claude', 'codex'],
+    default_model: 'claude-opus-4-6',
+    model_options: ['claude-opus-4-6'],
+    default_codex_model: 'gpt-5.6-sol',
+    codex_model_options: ['gpt-5.6-sol'],
+    default_effort: 'medium',
+    effort_options: ['low', 'medium', 'high'],
+    claude_model_efforts: {},
+    claude_model_context_windows: {},
+    codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+    codex_model_efforts: {},
+    codex_model_service_tiers: { 'gpt-5.6-sol': ['default', 'priority'] },
+    capability_core_enabled: true,
+    delivery_loop_enabled: true,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.config).mockResolvedValue(config as never);
+    vi.mocked(api.listProjects).mockResolvedValue([{
+      id: 1,
+      name: 'test-project',
+      git_url: 'git@github.com:owner/repo.git',
+      has_remote: true,
+      local_path: '/srv/repo',
+      default_branch: 'main',
+      worker_id: null,
+      status: 'ready',
+      error_message: null,
+      show_in_selector: true,
+      sort_order: 0,
+      tags: [],
+      env_files: [],
+      git_author_name: null,
+      git_author_email: null,
+      git_credential_type: null,
+      git_ssh_key_path: null,
+      git_https_username: null,
+      git_https_token: null,
+      badge_color: null,
+      created_at: '2026-08-05T00:00:00Z',
+    }]);
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([{
+      id: 9,
+      repo_full_name: 'owner/repo',
+      project_id: 1,
+      worker_id: null,
+      enabled: true,
+      auto_merge: true,
+      auto_repair: true,
+      max_repair_attempts: 3,
+      provider: 'claude',
+      review_model: null,
+      review_effort: null,
+      review_mode: 'panel',
+      wait_for_ci: true,
+      required_checks: [{ kind: 'check_run', name: 'test', app_slug: 'github-actions' }],
+      merge_queue_mode: 'manual',
+      default_branch: 'main',
+      allowed_authors: [],
+      status: 'active',
+      error_message: null,
+      created_at: '2026-08-05T00:00:00Z',
+      updated_at: '2026-08-05T00:00:00Z',
+    }]);
+  });
+
+  it('keeps global Delivery permission state out of the Task composer', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      agent_sandbox_unrestricted_enabled: true,
+    } as never);
+
+    render(<TaskForm onCreated={vi.fn()} />);
+
+    await screen.findByPlaceholderText(/Prompt \/ Description/);
+    expect(screen.queryByText('All Delivery permissions are ON', { exact: false })).not.toBeInTheDocument();
+  });
+
+  async function fillDeliveryForm(requirements: string) {
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: requirements } },
+    );
+  }
+
+  it('keeps the mode hidden when the server feature gate is off', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      delivery_loop_enabled: false,
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.queryByRole('option', { name: 'Delivery Loop' })).not.toBeInTheDocument();
+  });
+
+  it.skip('creates an atomic DeliveryRun instead of an ordinary Task', async () => {
+    const onCreated = vi.fn();
+    render(<TaskForm onCreated={onCreated} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('codex');
+    expect(providerSelect).not.toBeDisabled();
+    expect(within(providerSelect).getByRole('option', { name: 'Claude' })).toBeInTheDocument();
+    expect(within(providerSelect).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
+
+    expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Priority')).not.toBeInTheDocument();
+    expect(screen.queryByText('System Prompt')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Plugins/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Skills/)).not.toBeInTheDocument();
+
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    expect(screen.getByText(/Merge behavior is inherited from the selected PR Monitor/)).toBeInTheDocument();
+    expect(screen.getByText(/PR Monitor Auto Merge is ON/)).toHaveTextContent(
+      'CCM will finish only after GitHub confirms the merge',
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      'Fix exact-head loop\nwith complete regression tests',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith({
+      idempotency_key: expect.any(String),
+      project_id: 1,
+      monitored_repo_id: 9,
+      title: 'Fix exact-head loop',
+      requirements: 'Fix exact-head loop\nwith complete regression tests',
+      base_branch: 'main',
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      codex_service_tier: 'default',
+    }));
+    expect(api.createTask).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledOnce();
+  });
+
+  it.skip('creates a Claude Delivery Run when Claude is the only configured provider', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      default_provider: 'claude',
+      provider_options: ['claude'],
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('claude');
+    expect(within(providerSelect).getAllByRole('option')).toHaveLength(1);
+    expect(within(providerSelect).queryByRole('option', { name: 'Codex' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    await userEvent.type(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      'Ship with Claude only',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    const payload = vi.mocked(api.createDeliveryRun).mock.calls[0][0];
+    expect(payload).toEqual(expect.objectContaining({
+      project_id: 1,
+      monitored_repo_id: 9,
+      title: 'Ship with Claude only',
+      requirements: 'Ship with Claude only',
+      base_branch: 'main',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+    }));
+    expect(payload).not.toHaveProperty('codex_service_tier');
+  });
+
+  it.skip('keeps a failed admission key across remount and acknowledges it only after success', async () => {
+    vi.mocked(api.createDeliveryRun)
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValue({ id: 11, developer_task_id: 12 } as never);
+    const firstRender = render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await screen.findByText('response lost');
+    const firstKey = vi.mocked(api.createDeliveryRun).mock.calls[0][0].idempotency_key;
+    firstRender.unmount();
+
+    const replayRender = render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(api.createDeliveryRun).mock.calls[1][0].idempotency_key;
+    expect(firstKey).toBeTruthy();
+    expect(secondKey).toBe(firstKey);
+    replayRender.unmount();
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('Retry the exact same admission');
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.createDeliveryRun).mock.calls[2][0].idempotency_key).not.toBe(firstKey);
+  });
+
+  it.skip('trims Delivery requirements and derives a capped title from the first non-empty line', async () => {
+    const longTitle = 'T'.repeat(205);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm(`\n  \n${longTitle}\nRegression details\n`);
+
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'T'.repeat(200),
+        requirements: `${longTitle}\nRegression details`,
+      }),
+    ));
+  });
+
+  it.skip('rejects whitespace-only Delivery requirements', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await fillDeliveryForm('  \n\t  ');
+
+    expect(screen.getByRole('button', { name: /create/i })).toBeDisabled();
+    expect(api.createDeliveryRun).not.toHaveBeenCalled();
+  });
+
+  it.skip('ignores dropped and pasted files while Delivery Loop mode is active', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+
+    const prompt = screen.getByPlaceholderText(
+      'Delivery requirements (Plan → Code → Review → PR Monitor)',
+    );
+    const form = prompt.closest('form');
+    expect(form).not.toBeNull();
+
+    const dropped = new File(['drop'], 'dropped.txt', { type: 'text/plain' });
+    fireEvent.drop(form!, {
+      dataTransfer: { files: [dropped] },
+    });
+
+    const pasted = new File(['paste'], 'pasted.txt', { type: 'text/plain' });
+    fireEvent.paste(form!, {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => pasted }],
+      },
+    });
+
+    expect(api.uploadImages).not.toHaveBeenCalled();
+  });
+
+  it.skip('drops a previously selected SSH grant before Delivery admission', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      enabled: true,
+      revision: 1,
+      task_access_enabled: true,
+      task_capabilities: ['read'],
+      allowed_roots: ['/srv/app'],
+      has_key: true,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await userEvent.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await userEvent.click(await screen.findByLabelText('Grant production-box'));
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: 'Keep Delivery isolated from SSH grants' } },
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/does not accept.*SSH grants/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('TaskForm SSH grants', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.listSSHProfiles).mockResolvedValue([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      key_path_hint: '…/id_ed25519',
+      public_key_fingerprint: 'SHA256:client-key',
+      host_key_type: 'ssh-ed25519',
+      host_key_fingerprint: 'SHA256:server-key',
+      revision: 1,
+      enabled: true,
+      task_access_enabled: true,
+      task_capabilities: ['read', 'exec', 'write'],
+      allowed_roots: ['/'],
+      created_by: 1,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+  });
+
+  it('submits the selected profile and least-privilege capabilities atomically', async () => {
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'inspect production logs',
+    );
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ssh_grants: [{ profile_id: 41, capabilities: ['read'] }],
+      }),
+    ));
+  });
+
+  it('clears Manager-local SSH grants when switching to a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValueOnce([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+      { id: 2, name: 'worker-project', worker_id: 9, git_url: '', has_remote: false, local_path: '/workspace/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [] },
+    ] as Awaited<ReturnType<typeof api.listProjects>>);
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+
+    await user.click(screen.getByText('test-project'));
+    await user.click(await screen.findByText('worker-project'));
+    expect(screen.getByRole('button', { name: /^SSH access/ })).toBeDisabled();
+    await user.type(screen.getByPlaceholderText(/Prompt \/ Description/), 'remote task');
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls.at(-1)?.[0]).not.toHaveProperty('ssh_grants');
   });
 });

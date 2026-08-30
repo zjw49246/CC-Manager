@@ -1,7 +1,10 @@
 import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -12,9 +15,13 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from backend.api.deps import (
     get_current_user_id,
+    get_current_user_role,
+    lock_task_effect_access,
     require_internal_service,
     require_task_access,
     require_task_control,
+    require_worker_task_incarnation_header,
+    task_execution_principal_from_request,
 )
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, not_, select, update as sa_update
@@ -24,29 +31,58 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.models.user_skill import UserSkill
 from backend.api.uploads import (
     UploadAttachmentValidationError,
     ValidatedUploadAttachment,
     validate_upload_attachments,
 )
+from backend.api.task_projection import task_response
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_creation import stage_task_record
+from backend.services.cancellation import await_task_completion
 from backend.services.chat_event_identity import persisted_chat_event
-from backend.services.task_queue import task_is_pr_review_superseded
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
+from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
 )
-from backend.services.worker_proxy import get_task_operation_lock
+from backend.services.worker_proxy import (
+    get_task_operation_lock,
+    worker_managed_upload_paths,
+)
 from backend.services.worker_relay import (
+    acknowledge_worker_turn_handoff,
+    has_worker_execution_quarantine,
+    reserve_worker_turn_handoff,
+    worker_turn_handoff_request_identity,
     worker_task_generation,
     worker_task_generation_predicates,
+)
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
+from backend.services.test_harness_owner_fence import (
+    has_active_test_harness_owner_graph,
+    no_active_test_harness_owner_graph_predicate,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+
+@asynccontextmanager
+async def _task_operation_locks(task_ids: list[int]):
+    """Hold a deterministic set of Task operation locks without inversion."""
+
+    async with AsyncExitStack() as stack:
+        for task_id in sorted(set(task_ids)):
+            await stack.enter_async_context(get_task_operation_lock(task_id))
+        yield
 
 
 def _plan_delivery_digest(payload: dict) -> str:
@@ -56,6 +92,7 @@ def _plan_delivery_digest(payload: dict) -> str:
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
+            allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
 
@@ -101,8 +138,28 @@ async def _sender_display_name(
     return None
 
 
+def _client_message_id_field():
+    """Build the input-only optimistic-message correlation field."""
+
+    return Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+        exclude=True,
+    )
+
+
 class ChatMessage(BaseModel):
     message: str
+    # UI-only correlation key for reconciling the optimistic user bubble with
+    # the committed LogEntry delivered by history or WebSocket.  Excluding it
+    # from model dumps keeps it out of Worker replay/handoff identities and all
+    # routing, authorization, and idempotency decisions.
+    client_message_id: str | None = _client_message_id_field()
     image_paths: list[str] | None = None  # kept for backwards compatibility
     file_paths: list[str] | None = None
     secret_ids: list[int] | None = None
@@ -123,12 +180,319 @@ class ChatMessage(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
+    # Manager -> Worker only.  This is the durable identity of one ordinary
+    # follow-up while the two databases move from logical turn G to G+1.  The
+    # Worker stores it with the exact user row/queue envelope and does not
+    # report it as launched until that row is bound to G+1.
+    worker_turn_handoff_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
+    worker_turn_handoff_retry_count: int | None = Field(default=None, ge=0)
+    worker_turn_handoff_from_generation: int | None = Field(default=None, ge=0)
+    worker_turn_handoff_incarnation_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
+    # Manager -> Worker only.  The Worker authenticates the internal-service
+    # request and freezes this origin principal into its own durable outbox.
+    execution_user_id: int | None = None
+    execution_user_role: str | None = None
+    execution_mode: str | None = None
+    execution_principal_kind: str | None = None
 
     @model_validator(mode="after")
     def validate_plan_attachment_generation(self):
         if self.plan_task_ids and self.plan_version_ids:
             raise ValueError("Use plan_version_ids or legacy plan_task_ids, not both")
+        handoff = (
+            self.worker_turn_handoff_id,
+            self.worker_turn_handoff_retry_count,
+            self.worker_turn_handoff_from_generation,
+            self.worker_turn_handoff_incarnation_id,
+        )
+        if any(value is not None for value in handoff) and not all(
+            value is not None for value in handoff
+        ):
+            raise ValueError("Worker turn handoff fields must be provided together")
+        principal = (
+            self.execution_user_id,
+            self.execution_user_role,
+            self.execution_mode,
+            self.execution_principal_kind,
+        )
+        if any(value is not None for value in principal):
+            if self.worker_turn_handoff_id is None:
+                raise ValueError(
+                    "Execution principal is valid only for a Worker handoff"
+                )
+            required = (
+                self.execution_user_role,
+                self.execution_mode,
+                self.execution_principal_kind,
+            )
+            if not all(required):
+                raise ValueError(
+                    "Worker execution principal fields must be provided together"
+                )
+            from backend.services.task_creation import (
+                TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+                task_execution_principal_values,
+            )
+
+            if (
+                self.execution_principal_kind
+                not in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
+            ):
+                raise ValueError(
+                    "Worker execution principal must be delegated or system"
+                )
+            try:
+                canonical = task_execution_principal_values(
+                    user_id=self.execution_user_id,
+                    role=self.execution_user_role,
+                    principal_kind=self.execution_principal_kind,
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            supplied = {
+                "execution_user_id": self.execution_user_id,
+                "execution_user_role": self.execution_user_role,
+                "execution_mode": self.execution_mode,
+                "execution_principal_kind": self.execution_principal_kind,
+            }
+            if supplied != canonical:
+                raise ValueError("Worker execution principal role/mode mismatch")
         return self
+
+
+def _chat_payload_allows_chat_share(body: ChatMessage) -> bool:
+    """Return whether this request is only the narrow shared-chat effect.
+
+    A ``TeamTaskShare(permission="chat")`` lets its recipient contribute text
+    and CCM-managed uploads to an existing conversation.  It is deliberately
+    not authority to select execution routing, apply a Plan, inject secrets,
+    or invoke a command/Skill.  Keep this predicate value-based so normal
+    clients may continue omitting optional fields or serializing them as
+    ``null`` without accidentally widening an effect.
+    """
+
+    return not (
+        body.model is not None
+        or body.expected_routing is not None
+        or bool(body.secret_ids)
+        or bool(body.plan_task_ids)
+        or bool(body.confirmed_stale_plan_task_ids)
+        or bool(body.plan_version_ids)
+        or bool(body.confirmed_stale_plan_version_ids)
+        or body.plan_application_receipt_key is not None
+        or body.worker_turn_handoff_id is not None
+        or body.message.lstrip().startswith("$")
+    )
+
+
+def _validate_and_normalize_chat_attachments(
+    body: ChatMessage,
+) -> list[ValidatedUploadAttachment]:
+    """Replace browser upload references with canonical managed paths.
+
+    Public callers may send either the absolute path returned by the upload
+    endpoint or its opaque ``/api/uploads/<id>`` URL.  Neither is trusted
+    until the upload boundary has reopened the file no-follow and proved it
+    is a direct, owned regular file below this node's upload root.  A Worker
+    handoff runs this same check only after the Manager has copied the exact
+    managed file to the Worker's corresponding upload root.
+    """
+
+    raw_file_paths = list(body.file_paths or [])
+    raw_image_paths = list(body.image_paths or [])
+    try:
+        uploads = validate_upload_attachments(
+            file_paths=body.file_paths,
+            image_paths=body.image_paths,
+        )
+    except UploadAttachmentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    raw_paths = raw_file_paths or raw_image_paths
+    canonical_by_reference = {
+        reference: upload.path
+        for reference, upload in zip(raw_paths, uploads, strict=True)
+    }
+    if body.file_paths is not None:
+        body.file_paths = [upload.path for upload in uploads]
+    if body.image_paths is not None:
+        body.image_paths = [
+            canonical_by_reference[reference]
+            for reference in raw_image_paths
+        ]
+    return uploads
+
+
+def _public_chat_response(
+    payload: dict[str, Any],
+    *,
+    has_session: bool,
+) -> dict[str, Any]:
+    """Remove node-local execution identities from a human chat receipt."""
+
+    projected = dict(payload)
+    has_session = bool(projected.get("session_id")) or has_session
+    projected.pop("session_id", None)
+    projected.pop("instance_id", None)
+    projected["has_session"] = has_session
+    return projected
+
+
+class FrontendReviewGoalMessage(BaseModel):
+    """Start a repeatable frontend review from an existing Task chat."""
+
+    message: str = Field(min_length=1)
+    client_message_id: str | None = _client_message_id_field()
+    image_paths: list[str] | None = None
+    file_paths: list[str] | None = None
+    secret_ids: list[int] | None = None
+    profile: Literal["standard", "exhaustive"] = "standard"
+    max_iterations: int = Field(default=5, ge=1, le=10)
+    expected_routing: TaskRoutingExpectation | None = None
+
+    @model_validator(mode="after")
+    def normalize_message(self):
+        self.message = self.message.strip()
+        if not self.message:
+            raise ValueError("message is required")
+        return self
+
+
+class FrontendReviewGoalCapabilities(BaseModel):
+    """Whether an existing Task can safely edit a local Git worktree."""
+
+    available: bool
+    reason: str | None = None
+    repo_path: str | None = None
+
+
+def _worker_turn_handoff_request_identity(
+    body: ChatMessage,
+    admitted_routing: tuple[str, str | None, str],
+) -> dict:
+    """Canonical immutable Manager -> Worker request, excluding its receipt."""
+
+    return worker_turn_handoff_request_identity(
+        body.model_dump(mode="json"),
+        admitted_routing,
+    )
+
+
+def _worker_turn_handoff_request_digest(
+    body: ChatMessage,
+    admitted_routing: tuple[str, str | None, str],
+) -> str:
+    return _plan_delivery_digest(
+        _worker_turn_handoff_request_identity(body, admitted_routing)
+    )
+
+
+def _remote_worker_turn_handoff_matches(
+    receipt: object,
+    *,
+    handoff_id: str,
+    task_id: int,
+    incarnation_id: str,
+    retry_count: int,
+    from_generation: int,
+    request_digest: str,
+    principal_digest: str,
+) -> bool:
+    """Validate one Worker's durable ACK without trusting its HTTP outcome."""
+
+    if not isinstance(receipt, dict):
+        return False
+    status = receipt.get("status")
+    remote_task_id = receipt.get("task_id")
+    remote_retry_count = receipt.get("retry_count")
+    remote_from_generation = receipt.get("from_generation")
+    remote_turn_generation = receipt.get("turn_generation")
+    if status in {"claimed", "launching", "launched"}:
+        valid_generation = bool(
+            type(remote_turn_generation) is int
+            and remote_turn_generation == from_generation + 1
+        )
+    else:
+        valid_generation = remote_turn_generation is None
+    return bool(
+        receipt.get("handoff_id") == handoff_id
+        and type(remote_task_id) is int
+        and remote_task_id == task_id
+        and receipt.get("incarnation_id") == incarnation_id
+        and type(remote_retry_count) is int
+        and remote_retry_count == retry_count
+        and type(remote_from_generation) is int
+        and remote_from_generation == from_generation
+        and status
+        in {"accepted", "claimed", "launching", "launched", "cancelled"}
+        and valid_generation
+        and receipt.get("request_digest") == request_digest
+        and receipt.get("principal_digest") == principal_digest
+        and isinstance(receipt.get("response"), dict)
+    )
+
+
+def _worker_execution_principal_identity(payload: dict) -> dict[str, object]:
+    """Return the exact delegated principal covered by a Worker receipt."""
+
+    return {
+        field: payload.get(field)
+        for field in (
+            "execution_user_id",
+            "execution_user_role",
+            "execution_mode",
+            "execution_principal_kind",
+        )
+    }
+
+
+async def _find_worker_turn_handoff_receipt(
+    db: AsyncSession,
+    *,
+    task_id: int,
+    handoff_id: str,
+) -> tuple[WorkerTurnHandoffReceipt, LogEntry] | None:
+    """Resolve one Worker-local receipt through its unique structured key."""
+
+    receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    if (
+        receipt is None
+        or receipt.side != "worker"
+        or receipt.task_id != task_id
+    ):
+        return None
+    try:
+        request_digest = (
+            _plan_delivery_digest(receipt.request_payload)
+            if isinstance(receipt.request_payload, dict)
+            else None
+        )
+        queue_digest = (
+            _plan_delivery_digest(receipt.queue_payload)
+            if isinstance(receipt.queue_payload, dict)
+            else None
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if (
+        request_digest != receipt.request_digest
+        or queue_digest != receipt.queue_payload_digest
+    ):
+        return None
+    row = await db.get(LogEntry, receipt.source_log_id)
+    if (
+        row is None
+        or row.task_id != task_id
+        or row.event_type != "user_message"
+    ):
+        return None
+    return receipt, row
 
 
 class ForkAnchor(BaseModel):
@@ -142,6 +506,39 @@ class ForkAnchor(BaseModel):
         if self.type in {"initial", "latest"} and self.id is not None:
             raise ValueError(f"{self.type} fork anchors cannot include an id")
         return self
+
+
+@dataclass(frozen=True, slots=True)
+class _ForkLogSnapshot:
+    """Detached log evidence retained after fork admission commits."""
+
+    id: int
+    event_type: str | None
+    role: str | None
+    content: str | None
+    tool_name: str | None
+    tool_input: str | None
+    tool_output: str | None
+    raw_json: str | None
+    is_error: bool
+    loop_iteration: int | None
+    timestamp: datetime | None
+
+    @classmethod
+    def capture(cls, row: LogEntry) -> "_ForkLogSnapshot":
+        return cls(
+            id=row.id,
+            event_type=row.event_type,
+            role=row.role,
+            content=row.content,
+            tool_name=row.tool_name,
+            tool_input=row.tool_input,
+            tool_output=row.tool_output,
+            raw_json=row.raw_json,
+            is_error=row.is_error,
+            loop_iteration=row.loop_iteration,
+            timestamp=row.timestamp,
+        )
 
 
 class CodexForkRequest(BaseModel):
@@ -283,7 +680,7 @@ def _turn_item_ids(item: object) -> set[str]:
     return found
 
 
-def _raw_log_metadata(row: LogEntry) -> dict:
+def _raw_log_metadata(row: LogEntry | _ForkLogSnapshot) -> dict:
     if not row.raw_json:
         return {}
     try:
@@ -297,6 +694,7 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
     """Rebuild composer-ready upload records without trusting client paths."""
 
     from backend.api.uploads import UPLOAD_DIR
+    from backend.services.upload_references import managed_upload_url_basename
 
     attachments = metadata.get("attachments") or []
     explicit_paths = (
@@ -309,7 +707,8 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
             continue
         url = attachment.get("url")
         name = attachment.get("name")
-        if not isinstance(url, str) or not isinstance(name, str):
+        managed_basename = managed_upload_url_basename(url)
+        if managed_basename is None or not isinstance(name, str):
             continue
 
         path: str | None = None
@@ -323,9 +722,8 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
                     path = candidate
             except ValueError:
                 pass
-        if path is None and url.startswith("/api/uploads/"):
-            filename = url.removeprefix("/api/uploads/")
-            candidate_path = (upload_root / filename).resolve()
+        if path is None:
+            candidate_path = (upload_root / managed_basename).resolve()
             try:
                 candidate_path.relative_to(upload_root)
             except ValueError:
@@ -344,7 +742,7 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
     return uploads
 
 
-def _is_forkable_user_message(row: LogEntry) -> bool:
+def _is_forkable_user_message(row: LogEntry | _ForkLogSnapshot) -> bool:
     """Only ordinary human follow-up messages are precise fork boundaries."""
 
     if row.event_type != "user_message" or row.role != "user":
@@ -357,7 +755,7 @@ def _is_forkable_user_message(row: LogEntry) -> bool:
 def _resolve_fork_turn(
     *,
     anchor: ForkAnchor,
-    rows: list[LogEntry],
+    rows: list[LogEntry | _ForkLogSnapshot],
     turns: list[dict],
 ) -> tuple[str, int]:
     """Resolve the completed native turn immediately before a user message."""
@@ -436,7 +834,7 @@ def _resolve_fork_turn(
 
 def _resolve_latest_fork_turn(
     turns: list[dict],
-    rows: list[LogEntry],
+    rows: list[LogEntry | _ForkLogSnapshot],
 ) -> tuple[str, int]:
     """Resolve an exact full-context copy through the latest completed turn."""
 
@@ -511,15 +909,102 @@ async def send_chat_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a follow-up message on a task, resuming its previous session."""
-    if body.plan_application_receipt_key:
-        from backend.api.deps import require_internal_service
-
+    forwarded_worker_task = None
+    if (
+        getattr(request.state, "auth_type", None) == "worker_control_plane"
+        and body.worker_turn_handoff_id is None
+    ):
+        # The deployment token authenticates the Manager node, not a model
+        # turn.  Every Manager→Worker chat mutation must therefore carry the
+        # exact durable handoff and delegated principal envelope; otherwise a
+        # direct control-plane POST could overwrite the Worker mirror with the
+        # fallback system principal before final launch admission rejects it.
+        raise HTTPException(
+            403,
+            "Worker control-plane chat requires an exact turn handoff",
+        )
+    if body.plan_application_receipt_key or body.worker_turn_handoff_id:
         require_internal_service(request)
-    task = await db.get(Task, task_id)
+    if body.worker_turn_handoff_id is not None:
+        forwarded_worker_task = await require_worker_task_incarnation_header(
+            request,
+            task_id,
+            db,
+        )
+    task = forwarded_worker_task or await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
-    from backend.api.tasks import _require_expected_task_routing
+    allow_chat_share = _chat_payload_allows_chat_share(body)
+    if allow_chat_share:
+        await require_task_access(request, task, db)
+    else:
+        await require_task_control(request, task, db)
+    _validate_and_normalize_chat_attachments(body)
+    # Resolve authority once from the authenticated request.  Every durable
+    # projection below (source log, outbox and in-memory queue envelope) must
+    # carry this exact snapshot; unknown/internal identities fail closed in
+    # the shared helper instead of being mistaken for a deployment token.
+    if body.worker_turn_handoff_id is not None:
+        if body.worker_turn_handoff_incarnation_id != task.incarnation_id:
+            raise HTTPException(
+                409,
+                "Worker turn handoff Task incarnation changed",
+            )
+        from backend.services.task_creation import (
+            task_execution_principal_values,
+        )
+
+        try:
+            principal_values = task_execution_principal_values(
+                user_id=body.execution_user_id,
+                role=body.execution_user_role,
+                principal_kind=body.execution_principal_kind,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if principal_values["execution_mode"] != body.execution_mode:
+            raise HTTPException(
+                422,
+                "Worker execution principal role/mode mismatch",
+            )
+    else:
+        principal_values = task_execution_principal_from_request(request)
+    initiating_user_id = principal_values["execution_user_id"]
+    initiating_user_role = principal_values["execution_user_role"]
+    execution_mode = principal_values["execution_mode"]
+    execution_principal_kind = principal_values[
+        "execution_principal_kind"
+    ]
+    originating_user_id = initiating_user_id
+    if task.status == "waiting_capability":
+        raise HTTPException(
+            409,
+            "Task is waiting for its requested capability and cannot accept "
+            "another chat turn",
+        )
+    if await active_worker_task_termination_receipt(db, task_id):
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    from backend.api.tasks import (
+        _require_expected_task_routing,
+        _require_not_isolated_browser_child,
+        _require_not_delivery_owned_task,
+    )
+
+    _require_not_delivery_owned_task(task, action="sent direct chat messages")
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="sent direct chat messages",
+    )
+    if task.mode == "plan":
+        raise HTTPException(
+            409,
+            "Plan Tasks do not accept direct chat messages; revise the Plan "
+            "or create an execution Task instead",
+        )
 
     _require_expected_task_routing(
         task,
@@ -534,25 +1019,30 @@ async def send_chat_message(
         )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
-        if body.plan_task_ids or body.plan_version_ids:
-            raise HTTPException(
-                400,
-                "Shared shadow tasks do not support Plan attachments",
-            )
-        return await _send_shared_chat(
-            task,
-            body,
-            db,
-            command=command,
+        # ``shared_from_id`` belongs to the retired cross-CCM share-token
+        # protocol.  It has no authenticated CCM User principal to freeze for
+        # a provider turn.  Keep legacy rows readable for migration/support,
+        # but never proxy a mutation that would become system/member/sandbox.
+        raise HTTPException(
+            410,
+            "Legacy cross-CCM shared tasks are read-only; share the Task "
+            "with a CCM user instead",
         )
     if task.worker_id is not None:
-        return await _send_worker_chat(
+        public_has_session = bool(task.session_id)
+        result = await _send_worker_chat(
             task,
             body,
             db,
             request,
             command=command,
         )
+        if body.worker_turn_handoff_id is None:
+            return _public_chat_response(
+                result,
+                has_session=public_has_session,
+            )
+        return result
     if body.secret_ids:
         from backend.api.deps import require_admin
 
@@ -561,42 +1051,214 @@ async def send_chat_message(
     approved_plans: list[Task] = []
     approved_versions = []
 
+    # A terminal operation keeps the Task operation lock while it waits for
+    # the exact launch barrier.  Plan admission must observe the queue
+    # cancellation lease before waiting for that lock; otherwise the terminal
+    # caller can wait for a launch barrier which the blocked chat caller is
+    # expected to reject and release.  This is only an early deadlock breaker.
+    # The lock-local receipt check and final Task UPDATE below remain the
+    # authoritative cross-process admission fences.
+    if body.plan_task_ids or body.plan_version_ids:
+        from backend.main import dispatcher
+        from backend.services.dispatcher import TaskStartPausedError
+
+        try:
+            await dispatcher.snapshot_plan_queue_admission(task_id)
+        except (TaskStartPausedError, RuntimeError) as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Task queue is stopping; the Plan Version was not applied"
+                ),
+            ) from exc
+
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
     # that wins after this check is still caught by the queued turn's final DB
     # launch barrier.
     await db.rollback()
-    async with get_task_operation_lock(task_id):
+    async with _task_operation_locks(
+        [task_id, *(body.plan_task_ids or [])]
+    ):
         db.expire_all()
         task = await db.get(Task, task_id)
         if task is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, task, db)
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=allow_chat_share,
+        )
+        if task.status == "waiting_capability":
+            raise HTTPException(
+                409,
+                "Task is waiting for its requested capability and cannot "
+                "accept another chat turn",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         if task.worker_id is not None or task.shared_from_id is not None:
             raise HTTPException(
                 409,
                 "Task routing changed while chat admission was in progress",
             )
+        if task.mode == "plan":
+            raise HTTPException(
+                409,
+                "Plan Tasks do not accept direct chat messages; revise the "
+                "Plan or create an execution Task instead",
+            )
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="sent direct chat messages",
+        )
         from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
             _require_pr_review_chat_allowed,
         )
 
         _require_no_pending_worker_routing(task)
-        await _require_pr_review_chat_allowed(
+        terminal_pr_review_chat = await _require_pr_review_chat_allowed(
             db,
             task_id,
             trusted_unlinked_terminal=_trusted_terminal_pr_review_chat(
                 request
             ),
         )
+        if terminal_pr_review_chat:
+            principal_values = task_execution_principal_from_request(
+                request,
+                force_sandbox=True,
+            )
+            initiating_user_id = principal_values["execution_user_id"]
+            initiating_user_role = principal_values[
+                "execution_user_role"
+            ]
+            execution_mode = principal_values["execution_mode"]
+            execution_principal_kind = principal_values[
+                "execution_principal_kind"
+            ]
+        if task.status in _MANUAL_RETRYABLE_STATUSES:
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            restore_updates = frontend_review_goal_terminal_updates(task)
+            if restore_updates:
+                for field, value in restore_updates.items():
+                    setattr(task, field, value)
+                await db.commit()
+                await db.refresh(task)
         admitted_routing = _require_expected_task_routing(
             task,
             body.expected_routing,
             effective_model=body.model or task.model,
         )
         _validate_chat_service_tier(task, body.model)
+        handoff_log = None
+        handoff_receipt = None
+        handoff_request_identity = None
+        handoff_digest = None
+        if body.worker_turn_handoff_id is not None:
+            handoff_request_identity = _worker_turn_handoff_request_identity(
+                body,
+                admitted_routing,
+            )
+            handoff_digest = _plan_delivery_digest(handoff_request_identity)
+            existing_handoff = await _find_worker_turn_handoff_receipt(
+                db,
+                task_id=task_id,
+                handoff_id=body.worker_turn_handoff_id,
+            )
+            if (
+                existing_handoff is None
+                and await db.get(
+                    WorkerTurnHandoffReceipt,
+                    body.worker_turn_handoff_id,
+                )
+                is not None
+            ):
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff durable receipt is invalid",
+                )
+            if existing_handoff is not None:
+                handoff_receipt, handoff_log = existing_handoff
+                if (
+                    handoff_receipt.retry_count
+                    != body.worker_turn_handoff_retry_count
+                    or handoff_receipt.from_generation
+                    != body.worker_turn_handoff_from_generation
+                    or handoff_receipt.request_digest != handoff_digest
+                    or handoff_receipt.request_payload
+                    != handoff_request_identity
+                ):
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff identity or request changed",
+                    )
+                if handoff_receipt.status in {"launching", "launched"}:
+                    return handoff_receipt.response
+                if handoff_receipt.status == "cancelled":
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff was cancelled before launch",
+                    )
+                accepted_replay = bool(
+                    handoff_receipt.status == "accepted"
+                    and handoff_receipt.claimed_turn_generation is None
+                    and handoff_log.task_retry_count is None
+                    and handoff_log.task_turn_generation is None
+                    and task.retry_count == handoff_receipt.retry_count
+                    and task.turn_generation == handoff_receipt.from_generation
+                )
+                claimed_replay = bool(
+                    handoff_receipt.status == "claimed"
+                    and handoff_receipt.claimed_turn_generation
+                    == handoff_receipt.from_generation + 1
+                    and handoff_log.task_retry_count
+                    == handoff_receipt.retry_count
+                    and handoff_log.task_turn_generation
+                    == handoff_receipt.claimed_turn_generation
+                    and task.retry_count == handoff_receipt.retry_count
+                    and task.turn_generation
+                    == handoff_receipt.claimed_turn_generation
+                )
+                if not (accepted_replay or claimed_replay):
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff launch outcome is uncertain",
+                    )
+                from backend.main import dispatcher
+
+                admitted = await dispatcher.enqueue_worker_turn_handoff(
+                    task_id=task_id,
+                    source_log_id=handoff_log.id,
+                    handoff_id=body.worker_turn_handoff_id,
+                )
+                if not admitted:
+                    raise HTTPException(
+                        409,
+                        "Worker turn handoff is no longer admissible",
+                    )
+                return handoff_receipt.response
+            if (
+                task.retry_count != body.worker_turn_handoff_retry_count
+                or task.turn_generation
+                != body.worker_turn_handoff_from_generation
+            ):
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff baseline changed before admission",
+                )
         application_receipt = None
         if body.plan_application_receipt_key:
             from backend.models.plan import PlanApplicationReceipt
@@ -709,6 +1371,15 @@ async def send_chat_message(
                         body.confirmed_stale_plan_task_ids
                     ),
                 )
+                for plan in approved_plans:
+                    if await active_worker_task_termination_receipt(
+                        db, plan.id
+                    ):
+                        raise HTTPException(
+                            409,
+                            f"Plan Task #{plan.id} has an active Worker "
+                            "termination receipt",
+                        )
         except ValueError as exc:
             staleness = getattr(exc, "staleness", None)
             if staleness is not None:
@@ -725,6 +1396,24 @@ async def send_chat_message(
                 ) from exc
             raise HTTPException(400, str(exc)) from exc
 
+        # Prompt/attachment preparation below intentionally runs without the
+        # Task operation lock.  Freeze the exact aggregate admitted here, then
+        # re-lock Project -> Task and compare every value immediately before
+        # the durable user-log/outbox transaction.  This closes revocation,
+        # migration and retry windows without holding an in-process lock while
+        # building presentation-only prompt data.
+        admitted_task_identity = {
+            "incarnation_id": task.incarnation_id,
+            "project_id": task.project_id,
+            "session_id": task.session_id,
+            "status": task.status,
+            "retry_count": task.retry_count,
+            "turn_generation": task.turn_generation,
+            "worker_id": task.worker_id,
+            "shared_from_id": task.shared_from_id,
+            "mode": task.mode,
+        }
+
     command_skills: dict | None = None
 
     # Keep sender identity presentation-only.  The raw text is what the model
@@ -739,6 +1428,17 @@ async def send_chat_message(
     # enabled skills are advertised by the launch-time skill directory; merely
     # enabling one must not be represented as a fresh user invocation.
     prompt_parts = [model_message]
+    review_routing_prompt: str | None = None
+    if not command:
+        from backend.services.workspace_review_intent import (
+            workspace_browser_review_routing_prompt,
+        )
+
+        review_routing_prompt = workspace_browser_review_routing_prompt(
+            model_message,
+        )
+        if review_routing_prompt:
+            prompt_parts.append(review_routing_prompt)
     if command:
         # $command detected: inject command prompt and set temporary skills
         prompt_parts.append(command.prompt_template)
@@ -756,6 +1456,20 @@ async def send_chat_message(
         file_list = "\n".join(f"- {p}" for p in all_paths)
         prompt_parts.append(f"请用 Read 工具查看以下文件：\n{file_list}")
     prompt = "\n\n".join(prompt_parts)
+    workspace_review_baseline_run_id: str | None = None
+    if review_routing_prompt is not None:
+        from backend.models.test_harness import TestHarnessRun
+
+        baseline = await db.execute(
+            select(TestHarnessRun.id)
+            .where(TestHarnessRun.task_id == task_id)
+            .order_by(
+                TestHarnessRun.created_at.desc(),
+                TestHarnessRun.id.desc(),
+            )
+            .limit(1)
+        )
+        workspace_review_baseline_run_id = baseline.scalar_one_or_none()
     if approved_plans:
         from backend.services.plan_tasks import build_approved_plan_prompt
 
@@ -764,6 +1478,13 @@ async def send_chat_message(
         from backend.services.plan_service import build_versioned_plan_prompt
 
         prompt = build_versioned_plan_prompt(approved_versions, prompt)
+    from backend.services.auto_capability_policy import (
+        build_auto_capability_instructions,
+    )
+
+    capability_instructions = build_auto_capability_instructions(task)
+    if capability_instructions:
+        prompt = f"{prompt}\n\n{capability_instructions}"
 
     # Build file attachment metadata for storage and display
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -787,35 +1508,10 @@ async def send_chat_message(
 
         applied_plan_data = versioned_plan_snapshots(approved_versions)
 
-    # Store user message as a log entry (use instance_id=1 as placeholder)
-    log_metadata: dict = {"raw_content": model_message}
-    if attachments:
-        log_metadata["attachments"] = attachments
-        log_metadata["file_paths"] = all_paths
-    if sender_display_name:
-        # Model-facing history rebuilds must use this exact original text,
-        # never guess by regex (the user's real message may start with [BUG]).
-        log_metadata["sender_name"] = sender_display_name
-    if applied_plan_data:
-        # Persist the exact approved version that was prepended to this turn.
-        # The Plan row may later be revised or deleted, but chat history must
-        # still explain what context the model actually received.
-        log_metadata["applied_plans"] = applied_plan_data
-    user_log = LogEntry(
-        instance_id=1,
-        task_id=task_id,
-        event_type="user_message",
-        role="user",
-        content=display_content,
-        raw_json=json.dumps(log_metadata) if log_metadata else None,
-        is_error=False,
-    )
-    db.add(user_log)
-    await db.flush()
-    # Persist an epoch timestamp in the durable outbox. Unlike a monotonic
-    # process clock, this remains comparable with messages admitted after a
-    # process or host restart.
-    queue_timestamp = time.time()
+    # Snapshot queue admission before this transaction performs its first
+    # write.  Queue launch holds the admission lock while committing its Task
+    # claim; taking that lock after flushing the user row would invert
+    # lock-order on SQLite (DB writer -> admission vs admission -> DB writer).
     plan_queue_admission_fence = None
     if approved_versions:
         from backend.main import dispatcher
@@ -831,6 +1527,250 @@ async def send_chat_message(
                 status_code=409,
                 detail="Task queue is stopping; the Plan Version was not applied",
             ) from exc
+
+    # Store user message as a log entry (use instance_id=1 as placeholder)
+    log_metadata: dict = {"raw_content": model_message}
+    if body.client_message_id is not None:
+        log_metadata["client_message_id"] = body.client_message_id
+    log_metadata["execution_principal"] = {
+        "user_id": initiating_user_id,
+        "role": initiating_user_role,
+        "mode": execution_mode,
+        "kind": execution_principal_kind,
+    }
+    if originating_user_id != initiating_user_id:
+        # A purpose-built route may intentionally force the model principal to
+        # system/sandbox while retaining a human actor for audit/presentation.
+        # Never mix that actor id into the canonical execution principal.
+        log_metadata["actor_user_id"] = originating_user_id
+    if attachments:
+        log_metadata["attachments"] = attachments
+        log_metadata["file_paths"] = all_paths
+    if sender_display_name:
+        # Model-facing history rebuilds must use this exact original text,
+        # never guess by regex (the user's real message may start with [BUG]).
+        log_metadata["sender_name"] = sender_display_name
+    if applied_plan_data:
+        # Persist the exact approved version that was prepended to this turn.
+        # The Plan row may later be revised or deleted, but chat history must
+        # still explain what context the model actually received.
+        log_metadata["applied_plans"] = applied_plan_data
+
+    # Plan lookups, frontend-goal restoration and prompt preparation may have
+    # committed or released the first ACL transaction.  Re-establish the
+    # Worker node -> Project -> Task writer order in the *same* transaction that
+    # persists the user log and durable outbox.  The Project row is only an
+    # ordering fence; the same payload-sensitive Task authorization used at
+    # the route boundary is repeated here after every fallible preparation.
+    expected_applied_plan_data = applied_plan_data
+    await db.rollback()
+    db.expire_all()
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=allow_chat_share,
+        fence_worker_node=True,
+    )
+    current_task_identity = {
+        "incarnation_id": task.incarnation_id,
+        "project_id": task.project_id,
+        "session_id": task.session_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "worker_id": task.worker_id,
+        "shared_from_id": task.shared_from_id,
+        "mode": task.mode,
+    }
+    if current_task_identity != admitted_task_identity:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task routing, session, or execution generation changed while "
+            "chat admission was in progress",
+        )
+    if task.status == "waiting_capability":
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task is waiting for its requested capability and cannot accept "
+            "another chat turn",
+        )
+    if task.worker_id is not None or task.shared_from_id is not None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task routing changed while chat admission was in progress",
+        )
+    if task.mode == "plan":
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Plan Tasks do not accept direct chat messages; revise the Plan "
+            "or create an execution Task instead",
+        )
+    if await active_worker_task_termination_receipt(db, task_id):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="sent direct chat messages",
+    )
+    _require_no_pending_worker_routing(task)
+    current_terminal_pr_review_chat = await _require_pr_review_chat_allowed(
+        db,
+        task_id,
+        trusted_unlinked_terminal=_trusted_terminal_pr_review_chat(request),
+    )
+    if current_terminal_pr_review_chat != terminal_pr_review_chat:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "PR Review chat admission changed while the message was prepared",
+        )
+    current_routing = _require_expected_task_routing(
+        task,
+        body.expected_routing,
+        effective_model=body.model or task.model,
+    )
+    _validate_chat_service_tier(task, body.model)
+    if tuple(current_routing) != tuple(admitted_routing):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task provider routing changed while the message was prepared",
+        )
+    await _validate_chat_command_admission(task, command, db)
+
+    # The prompt must name the same immutable Plan evidence that is committed
+    # below.  Re-read it after the ACL rollback; never access expired ORM
+    # objects from the first admission transaction.
+    try:
+        if body.plan_version_ids:
+            from backend.services.plan_service import (
+                approved_versions_for_message,
+                versioned_plan_snapshots,
+            )
+
+            approved_versions = await approved_versions_for_message(
+                db,
+                target=task,
+                version_ids=body.plan_version_ids,
+                confirmed_stale_version_ids=(
+                    body.confirmed_stale_plan_version_ids
+                ),
+            )
+            refreshed_applied_plan_data = versioned_plan_snapshots(
+                approved_versions
+            )
+            approved_plans = []
+        else:
+            from backend.services.plan_tasks import (
+                applied_plan_snapshots,
+                approved_plans_for_message,
+            )
+
+            approved_plans = await approved_plans_for_message(
+                db,
+                task,
+                body.plan_task_ids,
+                confirmed_stale_plan_task_ids=(
+                    body.confirmed_stale_plan_task_ids
+                ),
+            )
+            for plan in approved_plans:
+                if await active_worker_task_termination_receipt(db, plan.id):
+                    raise HTTPException(
+                        409,
+                        f"Plan Task #{plan.id} has an active Worker "
+                        "termination receipt",
+                    )
+            refreshed_applied_plan_data = applied_plan_snapshots(
+                approved_plans
+            )
+            approved_versions = []
+    except ValueError as exc:
+        await db.rollback()
+        staleness = getattr(exc, "staleness", None)
+        if staleness is not None:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": str(exc),
+                    "plan_task_id": getattr(exc, "plan_task_id", None),
+                    "plan_version_id": getattr(exc, "plan_version_id", None),
+                    "staleness": staleness,
+                },
+            ) from exc
+        raise HTTPException(400, str(exc)) from exc
+    if refreshed_applied_plan_data != expected_applied_plan_data:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Approved Plan evidence changed while the message was prepared",
+        )
+    applied_plan_data = refreshed_applied_plan_data
+
+    user_log = LogEntry(
+        instance_id=1,
+        task_id=task_id,
+        event_type="user_message",
+        role="user",
+        content=display_content,
+        raw_json=json.dumps(log_metadata) if log_metadata else None,
+        is_error=False,
+    )
+    # This no-op write is the final cross-process admission barrier.  Manager
+    # and Worker termination receipt staging plus local Harness admission all
+    # lock the same Task row. Whichever transaction wins is therefore observed
+    # here; neither boundary can be crossed by a newly durable message/receipt.
+    message_gate = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            Task.incarnation_id == admitted_task_identity["incarnation_id"],
+            (
+                Task.project_id.is_(None)
+                if admitted_task_identity["project_id"] is None
+                else Task.project_id == admitted_task_identity["project_id"]
+            ),
+            Task.session_id == admitted_task_identity["session_id"],
+            Task.status == admitted_task_identity["status"],
+            Task.retry_count == admitted_task_identity["retry_count"],
+            Task.turn_generation == admitted_task_identity["turn_generation"],
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+            no_active_test_harness_owner_graph_predicate(),
+        )
+        .values(status=Task.status)
+    )
+    if message_gate.rowcount != 1:
+        await db.rollback()
+        if await has_active_test_harness_owner_graph(db, task_id):
+            raise HTTPException(
+                409,
+                "Task owns an active Test Harness, Workspace Review, or "
+                "Browser Agent graph",
+            )
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    db.add(user_log)
+    await db.flush()
+    # Persist an epoch timestamp in the durable outbox. Unlike a monotonic
+    # process clock, this remains comparable with messages admitted after a
+    # process or host restart.
+    queue_timestamp = time.time()
     application_receipt_key = (
         body.plan_application_receipt_key or str(uuid.uuid4())
         if approved_versions
@@ -839,34 +1779,90 @@ async def send_chat_message(
     response = {
         "ok": True,
         "queued": True,
-        "session_id": task.session_id,
+        "has_session": bool(task.session_id),
         "applied_plan_task_ids": [plan.id for plan in approved_plans],
         "applied_plan_version_ids": [
             version.id for _plan, version in approved_versions
         ],
+        "workspace_review_expected": review_routing_prompt is not None,
+        "workspace_review_baseline_run_id": (
+            workspace_review_baseline_run_id
+        ),
     }
+    if body.worker_turn_handoff_id is not None:
+        # Manager→Worker reconciliation needs the node-local native session;
+        # human callers receive only ``has_session`` above.
+        response["session_id"] = task.session_id
     if application_receipt_key is not None:
         response["plan_application_receipt_key"] = application_receipt_key
+    worker_queue_payload = {
+        "prompt": prompt,
+        "priority": 0,
+        "source": "user",
+        "command_skills": command_skills,
+        "model_override": body.model,
+        "expected_task_routing": list(admitted_routing),
+        "source_log_id": user_log.id,
+        "user_message_text": model_message,
+        "current_message": prompt,
+        "attachment_paths": all_paths,
+        "queue_timestamp": queue_timestamp,
+        "allow_new_session": False,
+        "delivery_key": application_receipt_key,
+        "initiating_user_id": initiating_user_id,
+        "initiating_user_role": initiating_user_role,
+        "execution_mode": execution_mode,
+        "execution_principal_kind": execution_principal_kind,
+    }
+    if body.worker_turn_handoff_id is not None:
+        worker_queue_payload.update({
+            "worker_turn_handoff_id": body.worker_turn_handoff_id,
+            "worker_turn_handoff_retry_count": (
+                body.worker_turn_handoff_retry_count
+            ),
+            "worker_turn_handoff_from_generation": (
+                body.worker_turn_handoff_from_generation
+            ),
+            "worker_turn_handoff_incarnation_id": (
+                body.worker_turn_handoff_incarnation_id
+            ),
+        })
+        log_metadata["worker_turn_handoff"] = {
+            "id": body.worker_turn_handoff_id,
+            "retry_count": body.worker_turn_handoff_retry_count,
+            "from_generation": body.worker_turn_handoff_from_generation,
+            "incarnation_id": body.worker_turn_handoff_incarnation_id,
+            "request_digest": handoff_digest,
+            "queue_payload": worker_queue_payload,
+            "response": response,
+        }
+        user_log.raw_json = json.dumps(log_metadata, ensure_ascii=False)
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=body.worker_turn_handoff_id,
+                task_id=task_id,
+                source_log_id=user_log.id,
+                side="worker",
+                worker_id=None,
+                retry_count=body.worker_turn_handoff_retry_count,
+                from_generation=body.worker_turn_handoff_from_generation,
+                status="accepted",
+                request_payload=handoff_request_identity,
+                request_digest=handoff_digest,
+                queue_payload=worker_queue_payload,
+                queue_payload_digest=_plan_delivery_digest(worker_queue_payload),
+                response=response,
+                terminal_pr_review_chat=terminal_pr_review_chat,
+            )
+        )
     if application_receipt_key and approved_versions:
         from backend.models.plan import PlanApplicationReceipt
 
-        outbox_payload = {
-            "prompt": prompt,
-            "priority": 0,
-            "source": "user",
-            "command_skills": command_skills,
-            "model_override": body.model,
-            "expected_task_routing": list(admitted_routing),
-            "source_log_id": user_log.id,
-            "user_message_text": model_message,
-            # Keep the full immutable model request (including the approved
-            # Plan) for compaction/session-recovery rebuilds. The raw user
-            # text above is the separate HTTP replay identity.
-            "current_message": prompt,
-            "attachment_paths": all_paths,
-            "queue_timestamp": queue_timestamp,
-            "queue_admission_fence": plan_queue_admission_fence,
-        }
+        outbox_payload = dict(worker_queue_payload)
+        # Keep the full immutable model request (including the approved Plan)
+        # for compaction/session-recovery rebuilds.  The raw user text above is
+        # the separate HTTP replay identity.
+        outbox_payload["queue_admission_fence"] = plan_queue_admission_fence
         application_receipt = PlanApplicationReceipt(
             receipt_key=application_receipt_key,
             target_task_id=task_id,
@@ -881,19 +1877,19 @@ async def send_chat_message(
         db.add(application_receipt)
         await db.flush()
     if approved_plans:
-        from sqlalchemy import update as sa_update
-
         applied_at = datetime.utcnow()
         for plan in approved_plans:
+            plan_id = plan.id
             applied = await db.execute(
                 sa_update(Task)
                 .where(
-                    Task.id == plan.id,
+                    Task.id == plan_id,
                     Task.mode == "plan",
                     Task.plan_target_task_id == task_id,
                     Task.plan_approved.is_(True),
                     Task.status == "completed",
                     Task.plan_applied_at.is_(None),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(
                     plan_applied_at=applied_at,
@@ -905,7 +1901,7 @@ async def send_chat_message(
                 await db.rollback()
                 raise HTTPException(
                     409,
-                    f"Plan Task #{plan.id} was applied concurrently",
+                    f"Plan Task #{plan_id} was applied concurrently",
                 )
     elif approved_versions:
         from backend.models.plan import PlanApplication
@@ -931,7 +1927,16 @@ async def send_chat_message(
                 409,
                 "A selected Plan Version was applied concurrently",
             ) from exc
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if body.worker_turn_handoff_id is not None:
+            raise HTTPException(
+                409,
+                "Worker turn handoff was admitted concurrently",
+            ) from exc
+        raise
 
     # Broadcast user message to task channel
     from backend.main import broadcaster
@@ -947,6 +1952,8 @@ async def send_chat_message(
     })
     if sender_display_name:
         broadcast_data["sender_name"] = sender_display_name
+    if body.client_message_id is not None:
+        broadcast_data["client_message_id"] = body.client_message_id
     await broadcaster.broadcast(f"task:{task_id}", broadcast_data)
 
     # Enqueue for serial processing (replaces direct launch)
@@ -962,6 +1969,17 @@ async def send_chat_message(
                     409,
                     "Plan application was cancelled before queue admission",
                 )
+        elif body.worker_turn_handoff_id is not None:
+            admitted = await dispatcher.enqueue_worker_turn_handoff(
+                task_id=task_id,
+                source_log_id=user_log.id,
+                handoff_id=body.worker_turn_handoff_id,
+            )
+            if not admitted:
+                raise HTTPException(
+                    409,
+                    "Worker turn handoff was cancelled before queue admission",
+                )
         else:
             await dispatcher.enqueue_message(
                 task_id=task_id,
@@ -973,6 +1991,11 @@ async def send_chat_message(
                 expected_task_routing=admitted_routing,
                 source_log_id=user_log.id,
                 queue_timestamp=queue_timestamp,
+                initiating_user_id=initiating_user_id,
+                initiating_user_role=initiating_user_role,
+                execution_mode=execution_mode,
+                execution_principal_kind=execution_principal_kind,
+                attachment_paths=tuple(all_paths),
             )
     except (TaskStartPausedError, RuntimeError) as exc:
         if application_receipt is None:
@@ -981,13 +2004,17 @@ async def send_chat_message(
                 # admission failures are therefore known pre-delivery and
                 # must restore their one-shot application markers exactly as
                 # before the first-class Version path was introduced.
-                async with get_task_operation_lock(task_id):
-                    for plan in approved_plans:
-                        await db.execute(
+                approved_plan_ids = [plan.id for plan in approved_plans]
+                async with _task_operation_locks(
+                    [task_id, *approved_plan_ids]
+                ):
+                    for plan_id in approved_plan_ids:
+                        restored = await db.execute(
                             sa_update(Task)
                             .where(
-                                Task.id == plan.id,
+                                Task.id == plan_id,
                                 Task.plan_applied_log_id == user_log.id,
+                                no_active_worker_task_termination_predicate(),
                             )
                             .values(
                                 plan_applied_at=None,
@@ -995,6 +2022,13 @@ async def send_chat_message(
                                 plan_applied_log_id=None,
                             )
                         )
+                        if restored.rowcount != 1:
+                            await db.rollback()
+                            raise HTTPException(
+                                409,
+                                f"Plan Task #{plan_id} could not be restored "
+                                "because its termination state changed",
+                            ) from exc
                     log_metadata.pop("applied_plans", None)
                     user_log.raw_json = json.dumps(log_metadata)
                     await db.commit()
@@ -1056,6 +2090,418 @@ async def send_chat_message(
     return response
 
 
+@router.get(
+    "/{task_id}/frontend-review-goal/capabilities",
+    response_model=FrontendReviewGoalCapabilities,
+)
+async def get_frontend_review_goal_capabilities(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Inspect the Task's real resume cwd without mutating the repository."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+
+    from backend.services.frontend_review_goal import (
+        inspect_frontend_review_local_repository,
+    )
+
+    return await inspect_frontend_review_local_repository(task, db)
+
+
+@router.post(
+    "/{task_id}/frontend-review-goal",
+    response_model=TaskResponse,
+)
+async def start_frontend_review_goal(
+    task_id: int,
+    body: FrontendReviewGoalMessage,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn an idle existing Task into a repeatable Browser Review Goal."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    _validate_and_normalize_chat_attachments(body)
+    if body.secret_ids:
+        from backend.api.deps import require_admin
+
+        require_admin(request)
+
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+
+        from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
+            _require_expected_task_routing,
+            _require_no_pending_worker_routing,
+            _retry_local_task_safely,
+        )
+        from backend.services.task_creation import (
+            validate_task_service_tier_configuration,
+        )
+
+        admitted_routing = _require_expected_task_routing(
+            current,
+            body.expected_routing,
+            effective_model=current.model,
+        )
+        if task_is_pr_review_superseded(current):
+            raise HTTPException(
+                409,
+                "This PR review task was superseded by a newer push",
+            )
+        if current.worker_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal currently requires a Manager-local Task",
+            )
+        if current.shared_from_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal cannot start from a shared Task",
+            )
+        _require_no_pending_worker_routing(current)
+        if not current.session_id:
+            raise HTTPException(
+                400,
+                "Run the task once before starting a Frontend Review Goal",
+            )
+        if current.status not in _MANUAL_RETRYABLE_STATUSES:
+            raise HTTPException(
+                409,
+                f"Task status {current.status} is not idle; wait for it to finish",
+            )
+        if current.pty_background_generation is not None:
+            raise HTTPException(
+                409,
+                "Task still has active Claude PTY background output",
+            )
+        if int(current.active_sub_agents or 0) > 0:
+            raise HTTPException(
+                409,
+                "Task still has active Monitor or Sub-Agent sessions",
+            )
+        from backend.services.frontend_review_goal import (
+            inspect_frontend_review_local_repository,
+        )
+
+        repository_capability = await inspect_frontend_review_local_repository(
+            current,
+            db,
+        )
+        if not repository_capability["available"]:
+            raise HTTPException(
+                409,
+                repository_capability["reason"]
+                or "无法确认可修改的本地 Git 仓库",
+            )
+        from backend.models.project import Project
+
+        project = await db.get(Project, current.project_id) if current.project_id else None
+        from backend.services.workspace_review import workspace_review_capability
+
+        review_capability = workspace_review_capability(current, project)
+        if not review_capability["available"]:
+            raise HTTPException(
+                409,
+                review_capability["reason"]
+                or "Project 尚未确认可信 Preview 配置",
+            )
+        try:
+            validate_task_service_tier_configuration(
+                provider=current.provider,
+                model=current.model,
+                codex_service_tier=current.codex_service_tier,
+                mode="goal",
+                goal_evaluator_model=current.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_ACTIVATION_METADATA_KEY,
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+            frontend_review_goal_restore_snapshot,
+        )
+
+        review_config = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: {
+                "mode": "goal",
+                "profile": body.profile,
+                "max_iterations": body.max_iterations,
+            },
+        })
+        if review_config is None:  # Pydantic already validates; fail closed.
+            raise HTTPException(422, "Invalid Frontend Review Goal configuration")
+        all_paths = body.file_paths or body.image_paths or []
+        metadata = deepcopy(current.metadata_ or {})
+        metadata[FRONTEND_REVIEW_METADATA_KEY] = review_config
+        metadata[FRONTEND_REVIEW_ACTIVATION_METADATA_KEY] = {
+            "message": body.message,
+            "file_paths": list(all_paths),
+            "secret_ids": list(body.secret_ids or []),
+            "restore": frontend_review_goal_restore_snapshot(current),
+        }
+        task_updates = {
+            "mode": "goal",
+            "goal_condition": build_frontend_review_goal_condition(body.message),
+            "goal_max_turns": review_config["max_iterations"],
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+            "retry_count": 0,
+            "metadata_": metadata,
+        }
+        task_updates.update(task_execution_principal_from_request(request))
+
+        display_content = body.message
+        sender_display_name = await _sender_display_name(request, db)
+        if sender_display_name:
+            display_content = f"[{sender_display_name}] {body.message}"
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        attachments = [{
+            "url": f"/api/uploads/{os.path.basename(path)}",
+            "name": os.path.basename(path),
+            "is_image": os.path.splitext(path)[1].lower() in image_exts,
+        } for path in all_paths]
+
+        from backend.main import dispatcher
+        from backend.services.dispatcher import (
+            TaskStartConflictError,
+            TaskStartPausedError,
+        )
+
+        if dispatcher is None:
+            raise HTTPException(503, "Dispatcher is unavailable")
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        expected_harness_owner = test_harness_owner_identity(current)
+        try:
+            async with dispatcher.task_start_guard(
+                require_idle_task_id=task_id,
+            ):
+                queue = TaskQueue(db)
+                activated = await _retry_local_task_safely(
+                    task_id,
+                    queue,
+                    db,
+                    expected_identity=expected_harness_owner,
+                    task_updates=task_updates,
+                    commit=False,
+                    effect_request=request,
+                )
+                if activated is None:
+                    raise HTTPException(409, "Task disappeared during Goal activation")
+                log_metadata: dict[str, Any] = {
+                    "source": "frontend-review-goal",
+                    "raw_content": body.message,
+                    "execution_principal": {
+                        "user_id": task_updates["execution_user_id"],
+                        "role": task_updates["execution_user_role"],
+                        "mode": task_updates["execution_mode"],
+                        "kind": task_updates["execution_principal_kind"],
+                    },
+                }
+                if body.client_message_id is not None:
+                    log_metadata["client_message_id"] = body.client_message_id
+                if attachments:
+                    log_metadata.update({
+                        "attachments": attachments,
+                        "file_paths": list(all_paths),
+                    })
+                if sender_display_name:
+                    log_metadata["sender_name"] = sender_display_name
+                user_log = LogEntry(
+                    instance_id=None,
+                    task_id=task_id,
+                    event_type="user_message",
+                    role="user",
+                    content=display_content,
+                    raw_json=json.dumps(log_metadata, ensure_ascii=False),
+                    is_error=False,
+                )
+                db.add(user_log)
+                await db.commit()
+                await db.refresh(user_log)
+                await db.refresh(activated)
+        except TaskStartPausedError as exc:
+            raise HTTPException(
+                409,
+                "服务即将重启，暂时不能启动循环审查，请稍后重试",
+            ) from exc
+        except TaskStartConflictError as exc:
+            raise HTTPException(
+                409,
+                "Task 已有一条消息等待执行，请等待完成后再启动循环审查",
+            ) from exc
+
+    from backend.main import broadcaster
+
+    image_urls = [
+        attachment["url"]
+        for attachment in attachments
+        if attachment["is_image"]
+    ]
+    event = persisted_chat_event(user_log, {
+        "event_type": "user_message",
+        "role": "user",
+        "content": display_content,
+        "source": "frontend-review-goal",
+        "raw_content": body.message,
+        "image_urls": image_urls,
+        "attachments": attachments,
+    })
+    if sender_display_name:
+        event["sender_name"] = sender_display_name
+    if body.client_message_id is not None:
+        event["client_message_id"] = body.client_message_id
+    await broadcaster.broadcast(f"task:{task_id}", event)
+    from backend.services.task_events import broadcast_status_change
+
+    await broadcast_status_change(task_id, "pending")
+    dispatcher.wake()
+    return await task_response(request, activated, db)
+
+
+@router.get("/{task_id}/worker-turn-handoffs/{handoff_id}")
+async def get_worker_turn_handoff_receipt(
+    task_id: int,
+    handoff_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Worker-local durable proof for one Manager follow-up.
+
+    ``accepted`` and ``claimed`` are replayable; claimed already owns G+1.
+    ``launching`` crossed the first possible provider side effect and, like
+    ``launched``, is never replayed automatically.
+    """
+
+    require_internal_service(request)
+    if (
+        len(handoff_id) != 32
+        or any(char not in "0123456789abcdef" for char in handoff_id)
+    ):
+        raise HTTPException(404, "Worker turn handoff not found")
+    task = await require_worker_task_incarnation_header(
+        request,
+        task_id,
+        db,
+    )
+    await require_task_access(request, task, db)
+    found = await _find_worker_turn_handoff_receipt(
+        db,
+        task_id=task_id,
+        handoff_id=handoff_id,
+    )
+    if found is None:
+        if await db.get(WorkerTurnHandoffReceipt, handoff_id) is not None:
+            raise HTTPException(
+                409,
+                "Worker turn handoff durable receipt is invalid",
+            )
+        raise HTTPException(404, "Worker turn handoff not found")
+    receipt, row = found
+    request_payload = receipt.request_payload
+    if (
+        not isinstance(request_payload, dict)
+        or request_payload.get("worker_turn_handoff_incarnation_id")
+        != task.incarnation_id
+    ):
+        raise HTTPException(
+            409,
+            "Worker turn handoff incarnation is invalid",
+        )
+    return {
+        "handoff_id": handoff_id,
+        "task_id": task_id,
+        "incarnation_id": task.incarnation_id,
+        "status": receipt.status,
+        "retry_count": receipt.retry_count,
+        "from_generation": receipt.from_generation,
+        "turn_generation": receipt.claimed_turn_generation,
+        "source_log_id": row.id,
+        "cancel_reason": receipt.cancel_reason,
+        "request_digest": receipt.request_digest,
+        "principal_digest": _plan_delivery_digest(
+            _worker_execution_principal_identity(receipt.request_payload)
+        ),
+        # The acknowledgement contains no model prompt or attachment content;
+        # it is safe for the Manager to reconstruct the lost POST response.
+        "response": receipt.response,
+    }
+
+
+@router.post("/{task_id}/worker-turn-handoffs/{handoff_id}/resume")
+async def resume_worker_turn_handoff(
+    task_id: int,
+    handoff_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-admit a pre-boundary receipt after the memory queue was lost."""
+
+    receipt = await get_worker_turn_handoff_receipt(
+        task_id,
+        handoff_id,
+        request,
+        db,
+    )
+    if receipt["status"] in {"launching", "launched"}:
+        return {**receipt, "resumed": False}
+    if receipt["status"] == "cancelled":
+        raise HTTPException(
+            409,
+            "Worker turn handoff was cancelled before launch",
+        )
+    if receipt["status"] not in {"accepted", "claimed"}:
+        raise HTTPException(
+            409,
+            "Worker turn handoff launch outcome is uncertain",
+        )
+    task = await db.get(Task, task_id, populate_existing=True)
+    expected_generation = (
+        receipt["from_generation"]
+        if receipt["status"] == "accepted"
+        else receipt["turn_generation"]
+    )
+    if (
+        task is None
+        or task.retry_count != receipt["retry_count"]
+        or task.turn_generation != expected_generation
+    ):
+        raise HTTPException(
+            409,
+            "Worker turn handoff baseline changed before resume",
+        )
+    from backend.main import dispatcher
+
+    admitted = await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=receipt["source_log_id"],
+        handoff_id=handoff_id,
+    )
+    if not admitted:
+        raise HTTPException(409, "Worker turn handoff is no longer admissible")
+    return {**receipt, "resumed": True}
+
+
 @router.get("/{task_id}/fork-anchors")
 async def list_codex_fork_anchors(
     task_id: int,
@@ -1068,6 +2514,13 @@ async def list_codex_fork_anchors(
     if not source:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, source, db)
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
+
+    _require_not_delivery_owned_task(source, action="forked")
+    await _require_not_isolated_browser_child(db, source, action="forked")
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if not source.session_id:
@@ -1127,7 +2580,32 @@ async def fork_codex_task(
     source = await db.get(Task, task_id)
     if not source:
         raise HTTPException(404, "Task not found")
-    await require_task_control(request, source, db)
+    # Forking crosses an external native-thread boundary.  Serialize the final
+    # Project/Task/membership/User decision first, freeze every input needed by
+    # the RPC and outcome, then commit that no-op writer transaction as the
+    # admission linearization point.  Never hold SQLite's database-wide writer
+    # reservation while waiting for Codex.
+    source = await lock_task_effect_access(
+        request,
+        source,
+        db,
+        allow_chat_share=False,
+    )
+    fork_principal = task_execution_principal_from_request(request)
+    fork_created_by = get_current_user_id(request)
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
+
+    _require_not_delivery_owned_task(source, action="forked")
+    await _require_not_isolated_browser_child(db, source, action="forked")
+    if source.mode == "plan" or source.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            "Plan Tasks and migrated Plan carriers cannot fork into ordinary "
+            "Tasks; use the canonical Plan execution flow",
+        )
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if source.shared_from_id is not None:
@@ -1136,7 +2614,12 @@ async def fork_codex_task(
         raise HTTPException(409, "Remote Worker task forks are not supported yet")
     if not source.session_id:
         raise HTTPException(400, "This task has no Codex session to fork")
-    if source.status in {"in_progress", "executing", "migrating"}:
+    if source.status in {
+        "in_progress",
+        "executing",
+        "migrating",
+        "waiting_capability",
+    }:
         raise HTTPException(409, "Wait for the current Codex turn to finish")
 
     rows = list((await db.execute(
@@ -1151,7 +2634,7 @@ async def fork_codex_task(
         if not source.description:
             raise HTTPException(404, "Initial prompt not found")
         seed_message = source.description
-        selected_metadata = source.metadata_ or {}
+        selected_metadata = deepcopy(source.metadata_ or {})
     elif body.anchor.type == "user_message":
         selected = next(
             (row for row in rows if row.id == body.anchor.id),
@@ -1170,6 +2653,36 @@ async def fork_codex_task(
         )
 
     codex_home, account_id = _codex_fork_home(source)
+    source_snapshot = {
+        "id": source.id,
+        "metadata_": deepcopy(source.metadata_ or {}),
+        "title": source.title,
+        "description": source.description,
+        "priority": source.priority,
+        "project_id": source.project_id,
+        "target_repo": source.target_repo,
+        "target_branch": source.target_branch,
+        "max_retries": source.max_retries,
+        "session_id": source.session_id,
+        "last_cwd": source.last_cwd,
+        "model": source.model,
+        "codex_service_tier": source.codex_service_tier,
+        "effort_level": source.effort_level,
+        "thinking_budget": source.thinking_budget,
+        "system_prompt_mode": source.system_prompt_mode,
+        "timeout_hours": source.timeout_hours,
+        "enable_workflows": source.enable_workflows,
+        "enabled_skills": deepcopy(source.enabled_skills),
+        "selected_user_skills": deepcopy(source.selected_user_skills),
+        "tags": deepcopy(source.tags),
+        "attention_tag": source.attention_tag,
+    }
+    row_snapshots = [_ForkLogSnapshot.capture(row) for row in rows]
+    # The admission commit orders this effect against concurrent ACL removal
+    # and user disable/demotion.  A change committed afterwards may proceed
+    # immediately; this already-admitted request finishes from detached data.
+    await db.commit()
+
     from backend.main import instance_manager
     from backend.services.codex_app_server import (
         CodexAppServerBusyError,
@@ -1182,29 +2695,36 @@ async def fork_codex_task(
             cutoff = -1
             forked_thread = await instance_manager.create_codex_thread(
                 codex_home,
-                cwd=source.last_cwd or source.target_repo or os.getcwd(),
-                model=source.model,
+                cwd=(
+                    source_snapshot["last_cwd"]
+                    or source_snapshot["target_repo"]
+                    or os.getcwd()
+                ),
+                model=source_snapshot["model"],
             )
         else:
             native_thread = await instance_manager.read_codex_thread(
                 codex_home,
-                source.session_id,
+                source_snapshot["session_id"],
             )
             turns = [
                 turn for turn in (native_thread.get("turns") or [])
                 if isinstance(turn, dict)
             ]
             if body.anchor.type == "latest":
-                last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
+                last_turn_id, cutoff = _resolve_latest_fork_turn(
+                    turns,
+                    row_snapshots,
+                )
             else:
                 last_turn_id, cutoff = _resolve_fork_turn(
                     anchor=body.anchor,
-                    rows=rows,
+                    rows=row_snapshots,
                     turns=turns,
                 )
             forked_thread = await instance_manager.fork_codex_thread(
                 codex_home,
-                source.session_id,
+                source_snapshot["session_id"],
                 last_turn_id=last_turn_id,
             )
     except CodexAppServerBusyError as exc:
@@ -1215,10 +2735,10 @@ async def fork_codex_task(
     forked_thread_id = str(forked_thread["id"])
     committed = False
     try:
-        metadata = deepcopy(source.metadata_ or {})
+        metadata = deepcopy(source_snapshot["metadata_"])
         if account_id:
             metadata["codex_account_id"] = account_id
-        metadata["forked_from_task_id"] = source.id
+        metadata["forked_from_task_id"] = source_snapshot["id"]
         metadata["forked_from_log_id"] = (
             body.anchor.id if body.anchor.type == "user_message" else None
         )
@@ -1243,48 +2763,51 @@ async def fork_codex_task(
             metadata.pop("image_paths", None)
 
         default_title = (
-            f"Fork of #{source.id}: {source.title}"
-            if source.title
-            else f"Fork of #{source.id}"
+            f"Fork of #{source_snapshot['id']}: {source_snapshot['title']}"
+            if source_snapshot["title"]
+            else f"Fork of #{source_snapshot['id']}"
         )
         now = datetime.utcnow()
         forked_task = await stage_task_record(
             db,
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
             description=(
-                source.description
+                source_snapshot["description"]
                 if body.anchor.type in {"user_message", "latest"}
                 else None
             ),
             status="completed",
-            priority=source.priority,
-            project_id=source.project_id,
-            target_repo=source.target_repo,
-            target_branch=source.target_branch,
+            priority=source_snapshot["priority"],
+            project_id=source_snapshot["project_id"],
+            target_repo=source_snapshot["target_repo"],
+            target_branch=source_snapshot["target_branch"],
             merge_status="pending",
             worker_id=None,
-            created_by=get_current_user_id(request),
-            max_retries=source.max_retries,
+            created_by=fork_created_by,
+            **fork_principal,
+            max_retries=source_snapshot["max_retries"],
             mode="auto",
             session_id=forked_thread_id,
-            last_cwd=source.last_cwd,
+            last_cwd=source_snapshot["last_cwd"],
             provider="codex",
-            model=source.model,
-            codex_service_tier=source.codex_service_tier,
-            effort_level=source.effort_level,
-            thinking_budget=source.thinking_budget,
-            system_prompt_mode=source.system_prompt_mode,
-            timeout_hours=source.timeout_hours,
-            enable_workflows=source.enable_workflows,
-            enabled_skills=deepcopy(source.enabled_skills),
-            selected_user_skills=deepcopy(source.selected_user_skills),
-            tags=deepcopy(source.tags),
-            attention_tag=source.attention_tag,
+            model=source_snapshot["model"],
+            codex_service_tier=source_snapshot["codex_service_tier"],
+            effort_level=source_snapshot["effort_level"],
+            thinking_budget=source_snapshot["thinking_budget"],
+            system_prompt_mode=source_snapshot["system_prompt_mode"],
+            timeout_hours=source_snapshot["timeout_hours"],
+            enable_workflows=source_snapshot["enable_workflows"],
+            enabled_skills=deepcopy(source_snapshot["enabled_skills"]),
+            selected_user_skills=deepcopy(
+                source_snapshot["selected_user_skills"]
+            ),
+            tags=deepcopy(source_snapshot["tags"]),
+            attention_tag=source_snapshot["attention_tag"],
             metadata_=metadata,
             started_at=now,
             completed_at=now,
         )
-        for row in rows:
+        for row in row_snapshots:
             if row.id > cutoff:
                 break
             db.add(LogEntry(
@@ -1306,9 +2829,9 @@ async def fork_codex_task(
             task_id=forked_task.id,
             event_type="system_event",
             role="system",
-            content=f"Forked from Task #{source.id}",
+            content=f"Forked from Task #{source_snapshot['id']}",
             raw_json=json.dumps({
-                "forked_from_task_id": source.id,
+                "forked_from_task_id": source_snapshot["id"],
                 "forked_from_log_id": metadata["forked_from_log_id"],
                 "forked_from_turn_id": last_turn_id,
             }),
@@ -1318,12 +2841,7 @@ async def fork_codex_task(
         # cancellation. Settle the commit before deciding whether compensation
         # is still allowed.
         commit_task = asyncio.create_task(db.commit())
-        cancellation: asyncio.CancelledError | None = None
-        while not commit_task.done():
-            try:
-                await asyncio.shield(commit_task)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
+        cancellation = await await_task_completion(commit_task)
         commit_task.result()
         committed = True
         if cancellation is not None:
@@ -1338,28 +2856,16 @@ async def fork_codex_task(
                     forked_thread_id,
                 )
             )
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
         raise
 
-    if forked_task.project_id:
-        try:
-            from backend.services.task_sharing import auto_share_new_task
-            await auto_share_new_task(
-                db,
-                forked_task.id,
-                forked_task.project_id,
-            )
-        except Exception:
-            logger.exception(
-                "Could not auto-share forked task %s",
-                forked_task.id,
-            )
-    return forked_task
+    return await task_response(
+        request,
+        forked_task,
+        db,
+        status_code=201,
+    )
 
 
 async def _send_shared_chat(
@@ -1377,15 +2883,29 @@ async def _send_shared_chat(
     if command is None:
         command, _command_args = _parse_chat_command(body.message)
     await db.refresh(task)
-    await _validate_chat_command_admission(task, command, db)
 
-    # Find the shared record
+    # Prove both sides of the receiver mapping before any remote side effect.
+    # ``shared_from_id`` alone is unsafe: a revoked SharedTaskReceived id could
+    # historically be recycled while its cancelled shadow Task remained.
     result = await db.execute(
-        select(SharedTaskReceived).where(SharedTaskReceived.id == task.shared_from_id)
+        select(SharedTaskReceived)
+        .where(
+            SharedTaskReceived.id == task.shared_from_id,
+            SharedTaskReceived.local_task_id == task.id,
+            SharedTaskReceived.status == "active",
+        )
+        .with_for_update()
     )
     shared = result.scalar_one_or_none()
     if not shared:
         raise HTTPException(400, "Shared task record not found")
+    from backend.services.shared_shadow import lock_owned_shadow
+
+    owned = await lock_owned_shadow(db, shared)
+    if owned is None or owned[1].id != task.id:
+        raise HTTPException(400, "Shared task ownership changed")
+    _, task = owned
+    await _validate_chat_command_admission(task, command, db)
     owner_ccm_url = shared.owner_ccm_url
     remote_task_id = shared.remote_task_id
     share_token = shared.share_token
@@ -1457,14 +2977,32 @@ async def _send_shared_chat(
 async def _preserve_remote_uncertain_plan_receipt(
     db: AsyncSession,
     *,
-    receipt,
+    receipt_key: str,
+    target_task_id: int,
+    expected_worker_id: int,
     remote_receipt: dict,
     request: Request | None,
 ) -> None:
     """Mirror a Worker's ambiguous launch as a consumed, visible Version."""
 
     from backend.services.plan_events import broadcast_plan_event
-    from backend.services.plan_service import preserve_uncertain_plan_application
+    from backend.services.plan_service import (
+        fence_worker_plan_application_receipt,
+        preserve_uncertain_plan_application,
+    )
+
+    receipt = await fence_worker_plan_application_receipt(
+        db,
+        receipt_key=receipt_key,
+        target_task_id=target_task_id,
+        expected_worker_id=expected_worker_id,
+    )
+    if receipt is None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Worker Plan receipt changed before uncertain delivery was preserved",
+        )
 
     error = str(
         remote_receipt.get("delivery_error")
@@ -1485,8 +3023,8 @@ async def _preserve_remote_uncertain_plan_receipt(
         await broadcast_plan_event(
             event="plan_application_delivery_uncertain",
             plan_id=plan_id,
-            target_task_id=receipt.target_task_id,
-            receipt_key=receipt.receipt_key,
+            target_task_id=target_task_id,
+            receipt_key=receipt_key,
             delivery_status="uncertain",
         )
 
@@ -1501,6 +3039,8 @@ async def _send_worker_chat(
 ):
     """Worker task 的 chat 代理。"""
     from backend.main import broadcaster, worker_proxy
+
+    allow_chat_share = _chat_payload_allows_chat_share(body)
     if worker_proxy is None:
         raise HTTPException(503, "Worker 功能未启用")
     if body.secret_ids:
@@ -1510,9 +3050,18 @@ async def _send_worker_chat(
     # TaskMigrator holds the same lock for its complete copy/rebind workflow.
     task_id = task.id
     await db.rollback()
-    async with get_task_operation_lock(task_id):
+    async with _task_operation_locks(
+        [task_id, *(body.plan_task_ids or [])]
+    ):
         db.expire_all()
         current = await db.get(Task, task_id)
+        if current is not None and request is not None:
+            current = await lock_task_effect_access(
+                request,
+                current,
+                db,
+                allow_chat_share=allow_chat_share,
+            )
         observed = (
             worker_task_generation(current)
             if current is not None
@@ -1522,6 +3071,30 @@ async def _send_worker_chat(
             raise HTTPException(
                 409,
                 "Task moved away from its Worker before chat could be sent",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        for plan_id in body.plan_task_ids or []:
+            if await active_worker_task_termination_receipt(db, plan_id):
+                raise HTTPException(
+                    409,
+                    f"Plan Task #{plan_id} has an active Worker termination "
+                    "receipt",
+                )
+        if has_worker_execution_quarantine(current.metadata_):
+            raise HTTPException(
+                409,
+                "Task Worker execution is quarantined pending explicit "
+                "authoritative reconciliation",
+            )
+        if observed.worker_turn_handoff_id is not None:
+            raise HTTPException(
+                409,
+                "A previous Worker follow-up is still waiting for its exact "
+                "remote turn generation",
             )
         if task_is_pr_review_superseded(current):
             raise HTTPException(
@@ -1536,7 +3109,7 @@ async def _send_worker_chat(
             _require_pr_review_chat_allowed,
         )
 
-        _require_expected_task_routing(
+        admitted_worker_routing = _require_expected_task_routing(
             current,
             body.expected_routing,
             effective_model=body.model or current.model,
@@ -1599,6 +3172,12 @@ async def _send_worker_chat(
                 display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
+        # Older Workers may silently ignore the delegated principal fields and
+        # enqueue this turn under their deployment token.  Negotiate before any
+        # Plan materialization, attachment upload, durable user Log, or /chat
+        # mutation so a mixed-version rollout remains side-effect free.
+        await worker_proxy.require_worker_delegated_principal_support(worker)
+        await worker_proxy.require_worker_task_incarnation_support(worker)
         if terminal_pr_review_chat:
             # Old Workers permanently freeze pr-review chat. Confirm the
             # matching endpoint contract before the Manager stores a user
@@ -1649,8 +3228,15 @@ async def _send_worker_chat(
                         "A previous Worker Plan application is bound to a "
                         "different message or attachment set",
                     )
+                prepared_receipt_key = prepared.receipt_key
+                prepared_log_id = prior_log.id
+                # Remote receipt lookup is read-only and may take an arbitrary
+                # amount of time. End the discovery snapshot first; every
+                # branch that mutates Manager audit state reacquires the exact
+                # Task writer fence in a new transaction below.
+                await db.commit()
                 remote_receipt = await worker_proxy.get_plan_application_receipt(
-                    worker, prepared.receipt_key
+                    worker, prepared_receipt_key
                 )
                 remote_delivery_status = (
                     remote_receipt.get("delivery_status")
@@ -1659,12 +3245,25 @@ async def _send_worker_chat(
                 )
                 if remote_delivery_status in {"failed", "cancelled"}:
                     from backend.services.plan_service import (
+                        fence_worker_plan_application_receipt,
                         release_unstarted_plan_application,
                     )
 
+                    locked_receipt = await fence_worker_plan_application_receipt(
+                        db,
+                        receipt_key=prepared_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
+                    )
+                    if locked_receipt is None:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Prepared Worker Plan receipt changed during reconciliation",
+                        )
                     await release_unstarted_plan_application(
                         db,
-                        receipt_key=prepared.receipt_key,
+                        receipt_key=prepared_receipt_key,
                         delivery_status=remote_delivery_status,
                         error=str(remote_receipt.get("delivery_error") or "")[:2000],
                         expected_worker_id=worker.id,
@@ -1677,7 +3276,9 @@ async def _send_worker_chat(
                 if remote_delivery_status == "uncertain":
                     await _preserve_remote_uncertain_plan_receipt(
                         db,
-                        receipt=prepared,
+                        receipt_key=prepared_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
                         remote_receipt=remote_receipt,
                         request=request,
                     )
@@ -1692,11 +3293,73 @@ async def _send_worker_chat(
                     and isinstance(remote_receipt.get("response"), dict)
                 ):
                     remote_result = dict(remote_receipt["response"])
+                    from backend.services.plan_service import (
+                        fence_plan_target_task,
+                    )
+
+                    await fence_plan_target_task(
+                        db,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
+                    )
+                    prior_log = await db.get(
+                        LogEntry,
+                        prepared_log_id,
+                        populate_existing=True,
+                    )
+                    if prior_log is None:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Prepared Plan application lost its user log",
+                        )
+                    for plan, version in approved_versions:
+                        db.add(PlanApplication(
+                            plan_id=plan.id,
+                            plan_version_id=version.id,
+                            application_type="chat_message",
+                            target_task_id=current.id,
+                            target_session_id=(
+                                remote_result.get("session_id") or current.session_id
+                            ),
+                            user_log_id=prior_log.id,
+                            applied_by=(
+                                get_current_user_id(request) if request else None
+                            ),
+                            application_receipt_key=prepared_receipt_key,
+                        ))
+                    metadata = _raw_log_metadata(prior_log)
+                    metadata["applied_plans"] = versioned_plan_snapshots(
+                        approved_versions
+                    )
+                    if body.client_message_id is not None:
+                        # The retry owns a new optimistic bubble even though
+                        # it is recovering the same durable Plan application.
+                        # Retarget only this UI correlation key so the history
+                        # refresh can consume that bubble; the handoff/replay
+                        # identity remains frozen in the receipt.
+                        metadata["client_message_id"] = body.client_message_id
+                    prior_log.raw_json = json.dumps(metadata)
+                    try:
+                        # Task -> Application -> Receipt is the shared deletion
+                        # order. If receipt reconciliation lost its CAS, this
+                        # flush is rolled back together with every audit row.
+                        await db.flush()
+                    except IntegrityError as exc:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "A selected Plan Version was applied concurrently",
+                        ) from exc
                     receipt_committed = await db.execute(
                         sa_update(PlanApplicationReceipt)
                         .where(
                             PlanApplicationReceipt.receipt_key
-                            == prepared.receipt_key,
+                            == prepared_receipt_key,
+                            PlanApplicationReceipt.target_task_id == current.id,
+                            PlanApplicationReceipt.worker_id == worker.id,
+                            PlanApplicationReceipt.manager_user_log_id
+                            == prepared_log_id,
                             PlanApplicationReceipt.status == "prepared",
                             PlanApplicationReceipt.delivery_status == "pending",
                         )
@@ -1717,20 +3380,6 @@ async def _send_worker_chat(
                             409,
                             "Worker Plan delivery changed during reconciliation",
                         )
-                    for plan, version in approved_versions:
-                        db.add(PlanApplication(
-                            plan_id=plan.id,
-                            plan_version_id=version.id,
-                            application_type="chat_message",
-                            target_task_id=current.id,
-                            target_session_id=remote_result.get("session_id") or current.session_id,
-                            user_log_id=prior_log.id,
-                            applied_by=get_current_user_id(request) if request else None,
-                            application_receipt_key=prepared.receipt_key,
-                        ))
-                    metadata = _raw_log_metadata(prior_log)
-                    metadata["applied_plans"] = versioned_plan_snapshots(approved_versions)
-                    prior_log.raw_json = json.dumps(metadata)
                     await db.commit()
                     from backend.services.plan_events import broadcast_plan_event
 
@@ -1772,6 +3421,20 @@ async def _send_worker_chat(
             remote_confirmed_version_ids.append(remote_version_id)
 
         all_paths = body.file_paths or body.image_paths or []
+        remote_all_paths = worker_managed_upload_paths(all_paths)
+        remote_path_by_local = dict(
+            zip(all_paths, remote_all_paths, strict=True)
+        )
+        worker_file_paths = (
+            [remote_path_by_local[path] for path in body.file_paths]
+            if body.file_paths is not None
+            else None
+        )
+        worker_image_paths = (
+            [remote_path_by_local[path] for path in body.image_paths]
+            if body.image_paths is not None
+            else None
+        )
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         attachments = [
             {
@@ -1783,11 +3446,166 @@ async def _send_worker_chat(
             for p in all_paths
         ]
 
-        # 1. Persist the display copy only if the exact pre-network Worker
-        # generation is still current.
+        # Finish every fallible remote preflight before publishing a user
+        # message.  The user Log, Task handoff marker, Manager receipt, and
+        # optional Plan receipt are the durable outbox and must become visible
+        # in one local transaction; otherwise a crash here would leave a
+        # visible message that no recovery path can ever deliver.
+        if all_paths:
+            try:
+                await worker_proxy.push_files(
+                    worker,
+                    all_paths,
+                    remote_paths=remote_all_paths,
+                )
+            except Exception as e:
+                raise HTTPException(503, f"附件同步到 Worker 失败: {e}")
+
+        await worker_proxy.relay.subscribe_task(worker, current.id)
+        if not terminal_pr_review_chat:
+            await worker_proxy.sync_task_skill_selection(worker, current)
+        # PR review mirrors stay permanently tool-free. Their Worker-side
+        # configuration is immutable and needs no Skill synchronization.
+
+        application_receipt_key = (
+            str(uuid.uuid4()) if approved_versions else None
+        )
+        handoff_id = uuid.uuid4().hex
+        from backend.services.task_creation import (
+            delegated_task_execution_principal_values,
+        )
+
+        request_principal = task_execution_principal_from_request(request)
+        manager_principal = (
+            task_execution_principal_from_request(
+                request,
+                force_sandbox=True,
+            )
+            if terminal_pr_review_chat
+            else request_principal
+        )
+        delegated_principal = delegated_task_execution_principal_values(
+            user_id=manager_principal["execution_user_id"],
+            role=manager_principal["execution_user_role"],
+            principal_kind=manager_principal["execution_principal_kind"],
+        )
+        worker_request_body = {
+            "message": model_message,
+            "image_paths": worker_image_paths,
+            "file_paths": worker_file_paths,
+            "model": body.model,
+            "plan_task_ids": body.plan_task_ids,
+            "plan_version_ids": remote_version_ids or None,
+            "confirmed_stale_plan_version_ids": (
+                remote_confirmed_version_ids or None
+            ),
+            "confirmed_stale_plan_task_ids": (
+                body.confirmed_stale_plan_task_ids
+            ),
+            "expected_routing": (
+                body.expected_routing.model_dump(mode="json")
+                if body.expected_routing is not None
+                else None
+            ),
+            "plan_application_receipt_key": application_receipt_key,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": observed.retry_count,
+            "worker_turn_handoff_from_generation": observed.turn_generation,
+            "worker_turn_handoff_incarnation_id": current.incarnation_id,
+            **delegated_principal,
+        }
+        # Normalize through the same Pydantic model used by the Worker before
+        # computing the cross-database digest.  This fills optional defaults
+        # (for example ``secret_ids=None``) identically on both sides.
+        worker_request_model = ChatMessage.model_validate(worker_request_body)
+        worker_request_body = worker_request_model.model_dump(mode="json")
+        worker_request_identity = _worker_turn_handoff_request_identity(
+            worker_request_model,
+            admitted_worker_routing,
+        )
+        worker_request_digest = _plan_delivery_digest(
+            worker_request_identity
+        )
+        # ``lock_task_effect_access`` deliberately rolls back the prior read
+        # transaction before taking Project -> Task writer fences.  Freeze the
+        # immutable identities now and rehydrate the ORM rows afterwards;
+        # retaining expired async ORM objects across that rollback would make
+        # later ``version.id`` access attempt implicit IO outside greenlet.
+        approved_version_keys = [
+            (plan.id, version.id)
+            for plan, version in approved_versions
+        ]
+
+        # Revalidate both ACL sources after all network preflight, then publish
+        # the complete durable outbox while the Project -> Task fences remain
+        # held. A concurrent TeamProjectShare or TeamTaskShare revoke either
+        # commits first and vetoes this turn, or waits for this admission.
+        if request is not None:
+            current = await lock_task_effect_access(
+                request,
+                current,
+                db,
+                allow_chat_share=allow_chat_share,
+            )
+            refreshed_observed = worker_task_generation(
+                current,
+                expected_worker_id=observed.worker_id,
+            )
+            if refreshed_observed != observed:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed before chat authorization",
+                )
+            if approved_version_keys:
+                from backend.models.plan import Plan, PlanVersion
+
+                rehydrated_versions = []
+                for plan_id, version_id in approved_version_keys:
+                    plan = await db.get(Plan, plan_id)
+                    version = await db.get(PlanVersion, version_id)
+                    if (
+                        plan is None
+                        or version is None
+                        or version.plan_id != plan.id
+                        or plan.target_task_id != current.id
+                    ):
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Approved Plan Version changed while Worker chat "
+                            "authorization was fenced",
+                        )
+                    rehydrated_versions.append((plan, version))
+                approved_versions = rehydrated_versions
+
+        # Revalidate the exact Worker generation after all network preflight,
+        # then publish the complete durable outbox atomically.
+        if manager_principal["execution_principal_kind"] == "user":
+            from backend.models.user import User
+
+            principal_gate = await db.execute(
+                sa_update(User)
+                .where(
+                    User.id == manager_principal["execution_user_id"],
+                    User.is_active.is_(True),
+                    User.role == manager_principal["execution_user_role"],
+                )
+                .values(role=User.role)
+            )
+            if principal_gate.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker follow-up principal is no longer active or its "
+                    "role changed",
+                )
         guarded = await db.execute(
             sa_update(Task)
-            .where(*worker_task_generation_predicates(observed))
+            .where(
+                *worker_task_generation_predicates(observed),
+                no_active_worker_task_termination_predicate(),
+            )
             .values(status=observed.status)
         )
         if guarded.rowcount != 1:
@@ -1796,7 +3614,32 @@ async def _send_worker_chat(
                 409,
                 "Task Worker generation changed before chat could be sent",
             )
-        log_metadata: dict = {"raw_content": model_message}
+        log_metadata: dict = {
+            "raw_content": model_message,
+            # The source Log is the durable audit boundary for this exact
+            # G -> G+1 handoff.  Freeze the native Manager principal here as
+            # well as in the delegated request/receipt so later recovery never
+            # has to infer who authorized the turn from mutable Task state.
+            "execution_principal": {
+                "user_id": manager_principal["execution_user_id"],
+                "role": manager_principal["execution_user_role"],
+                "mode": manager_principal["execution_mode"],
+                "kind": manager_principal["execution_principal_kind"],
+            },
+        }
+        if body.client_message_id is not None:
+            log_metadata["client_message_id"] = body.client_message_id
+        if (
+            request_principal["execution_user_id"]
+            != manager_principal["execution_user_id"]
+        ):
+            # Terminal PR discussions deliberately execute as the canonical
+            # sandboxed system principal.  Keep the authenticated human actor
+            # as separate audit evidence, matching the Manager-local path,
+            # without corrupting the runtime principal shape.
+            log_metadata["actor_user_id"] = request_principal[
+                "execution_user_id"
+            ]
         if attachments:
             log_metadata["attachments"] = attachments
             log_metadata["file_paths"] = all_paths
@@ -1812,40 +3655,9 @@ async def _send_worker_chat(
             is_error=False,
         )
         db.add(manager_user_log)
-        application_receipt_key = str(uuid.uuid4()) if approved_versions else None
+        await db.flush()
+
         manager_receipt = None
-        await db.commit()
-
-        # 2. Broadcast to the Manager frontend.
-        broadcast_data = persisted_chat_event(manager_user_log, {
-            "event_type": "user_message",
-            "role": "user",
-            "content": display_content,
-            "raw_content": model_message,
-            "image_paths": body.image_paths or [],
-        })
-        if sender_display_name:
-            broadcast_data["sender_name"] = sender_display_name
-        await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
-
-        # 3. Push attachments to the same Worker path.
-        if all_paths:
-            try:
-                await worker_proxy.push_files(worker, all_paths)
-            except Exception as e:
-                raise HTTPException(503, f"附件同步到 Worker 失败: {e}")
-
-        # 4. Ensure relay subscription before the remote turn can emit events.
-        await worker_proxy.relay.subscribe_task(worker, current.id)
-        if not terminal_pr_review_chat:
-            await worker_proxy.sync_task_skill_selection(worker, current)
-        # PR review mirrors stay permanently tool-free.  Their Worker-side
-        # configuration is intentionally immutable and therefore needs no
-        # Skill synchronization before a terminal discussion turn.
-
-        # Persist the handoff receipt only after every preflight step succeeds.
-        # From this commit onward the next network action is the idempotent
-        # Worker request carrying this exact key.
         if approved_versions:
             from backend.models.plan import PlanApplicationReceipt
 
@@ -1858,101 +3670,301 @@ async def _send_worker_chat(
                 status="prepared",
             )
             db.add(manager_receipt)
-            await db.commit()
 
-        # 5. The common operation lock is already held; asking WorkerProxy to
+        # The marker is the sole authority for this exact G -> G+1. Reserve it
+        # in the same transaction as the user Log and both receipts.
+        reserved = await reserve_worker_turn_handoff(
+            db,
+            observed,
+            handoff_id=handoff_id,
+            source_log_id=manager_user_log.id,
+            request_payload=worker_request_identity,
+            request_digest=worker_request_digest,
+            replay_payload=worker_request_body,
+            terminal_pr_review_chat=terminal_pr_review_chat,
+        )
+        if reserved is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task Worker generation changed before follow-up handoff",
+            )
+        manager_user_log.task_retry_count = observed.retry_count
+        manager_user_log.task_turn_generation = observed.turn_generation + 1
+        manager_log_metadata = _raw_log_metadata(manager_user_log)
+        manager_log_metadata["worker_turn_handoff"] = {
+            "id": handoff_id,
+            "retry_count": observed.retry_count,
+            "from_generation": observed.turn_generation,
+            # Needed only to replay the exact internal request after a Manager
+            # restart.  Worker tasks reject Secrets, so no secret material can
+            # enter this durable envelope.
+            "request_body": worker_request_body,
+            "request_digest": worker_request_digest,
+            "terminal_pr_review_chat": terminal_pr_review_chat,
+        }
+        manager_user_log.raw_json = json.dumps(
+            manager_log_metadata,
+            ensure_ascii=False,
+        )
+        # COMMIT and recovery ownership are one cancellation-safe handoff.  A
+        # database driver may finish COMMIT just as the HTTP task is cancelled;
+        # never re-raise that cancellation until the durable marker has a live
+        # recovery owner in this process.
+        commit_task = asyncio.create_task(db.commit())
+        handoff_cancellation = await await_task_completion(commit_task)
+        commit_task.result()
+
+        # Arm durable recovery immediately after the outbox/marker commit,
+        # before broadcasting or attempting the first HTTP POST.  If this
+        # request is cancelled or the process loses the initial ACK, the
+        # Manager must already have a live owner for the prepared handoff.
+        recovery_scheduler = getattr(
+            worker_proxy.relay,
+            "ensure_worker_turn_handoff_recovery",
+            None,
+        )
+        if callable(recovery_scheduler):
+            scheduled = recovery_scheduler(worker, reserved)
+            if inspect.isawaitable(scheduled):
+                recovery_task = asyncio.ensure_future(scheduled)
+                recovery_cancellation = await await_task_completion(
+                    recovery_task
+                )
+                if handoff_cancellation is None:
+                    handoff_cancellation = recovery_cancellation
+                recovery_task.result()
+        if handoff_cancellation is not None:
+            raise handoff_cancellation
+
+        broadcast_data = persisted_chat_event(manager_user_log, {
+            "event_type": "user_message",
+            "role": "user",
+            "content": display_content,
+            "raw_content": model_message,
+            "image_paths": body.image_paths or [],
+        })
+        if sender_display_name:
+            broadcast_data["sender_name"] = sender_display_name
+        if body.client_message_id is not None:
+            broadcast_data["client_message_id"] = body.client_message_id
+        await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
+
+        # The common operation lock is already held; asking WorkerProxy to
         # acquire it again would deadlock.
         try:
             result = await worker_proxy.proxy_to_worker(
                 current,
                 "POST",
                 f"/api/tasks/{current.id}/chat",
-                body={
-                    "message": model_message,
-                    "image_paths": body.image_paths,
-                    "file_paths": body.file_paths,
-                    "model": body.model,
-                    "plan_task_ids": body.plan_task_ids,
-                    "plan_version_ids": remote_version_ids or None,
-                    "confirmed_stale_plan_version_ids": (
-                        remote_confirmed_version_ids or None
-                    ),
-                    "confirmed_stale_plan_task_ids": (
-                        body.confirmed_stale_plan_task_ids
-                    ),
-                    "expected_routing": (
-                        body.expected_routing.model_dump(mode="json")
-                        if body.expected_routing is not None
-                        else None
-                    ),
-                    "plan_application_receipt_key": application_receipt_key,
-                },
+                body=worker_request_body,
                 operation_lock_held=True,
                 pr_review_terminal_chat=terminal_pr_review_chat,
+                require_task_incarnation_fence=True,
             )
-        except Exception:
-            remote_receipt = (
-                await worker_proxy.get_plan_application_receipt(
-                    worker, application_receipt_key
+        except Exception as proxy_error:
+            remote_handoff = None
+            try:
+                remote_handoff = (
+                    await worker_proxy.get_worker_turn_handoff_receipt(
+                        worker,
+                        current.id,
+                        handoff_id,
+                        current.incarnation_id,
+                    )
                 )
-                if application_receipt_key is not None
-                else None
-            )
+                if (
+                    remote_handoff is not None
+                    and not _remote_worker_turn_handoff_matches(
+                        remote_handoff,
+                        handoff_id=handoff_id,
+                        task_id=current.id,
+                        incarnation_id=current.incarnation_id,
+                        retry_count=reserved.worker_turn_handoff_retry_count,
+                        from_generation=(
+                            reserved.worker_turn_handoff_from_generation
+                        ),
+                        request_digest=worker_request_digest,
+                        principal_digest=_plan_delivery_digest(
+                            delegated_principal
+                        ),
+                    )
+                ):
+                    # An existing but mismatched receipt is durable conflict,
+                    # not evidence that the first POST never committed.  Keep
+                    # it non-None so the resend branch stays fail-closed.
+                    remote_handoff = {}
+                if (
+                    remote_handoff
+                    and remote_handoff.get("status") in {"accepted", "claimed"}
+                ):
+                    resumed_handoff = (
+                        await worker_proxy.resume_worker_turn_handoff(
+                            worker,
+                            current.id,
+                            handoff_id,
+                            current.incarnation_id,
+                        )
+                    )
+                    remote_handoff = (
+                        resumed_handoff
+                        if _remote_worker_turn_handoff_matches(
+                            resumed_handoff,
+                            handoff_id=handoff_id,
+                            task_id=current.id,
+                            incarnation_id=current.incarnation_id,
+                            retry_count=(
+                                reserved.worker_turn_handoff_retry_count
+                            ),
+                            from_generation=(
+                                reserved.worker_turn_handoff_from_generation
+                            ),
+                            request_digest=worker_request_digest,
+                            principal_digest=_plan_delivery_digest(
+                                delegated_principal
+                            ),
+                        )
+                        else {}
+                    )
+            except Exception:
+                logger.warning(
+                    "Worker turn handoff %s reconciliation failed",
+                    handoff_id,
+                    exc_info=True,
+                )
             if (
-                manager_receipt is not None
-                and isinstance(remote_receipt, dict)
-                and remote_receipt.get("delivery_status") == "uncertain"
+                remote_handoff is not None
+                and remote_handoff.get("status")
+                in {"accepted", "claimed", "launching", "launched"}
+                and isinstance(remote_handoff.get("response"), dict)
             ):
-                await _preserve_remote_uncertain_plan_receipt(
-                    db,
-                    receipt=manager_receipt,
-                    remote_receipt=remote_receipt,
-                    request=request,
+                result = dict(remote_handoff["response"])
+            elif remote_handoff is None and manager_receipt is None:
+                # The first request may have failed before its durable commit,
+                # or its response may still be crossing the network.  Re-send
+                # the exact idempotency key once; the Worker's operation lock
+                # serializes this with an in-flight first attempt.
+                try:
+                    result = await worker_proxy.proxy_to_worker(
+                        current,
+                        "POST",
+                        f"/api/tasks/{current.id}/chat",
+                        body=worker_request_body,
+                        operation_lock_held=True,
+                        pr_review_terminal_chat=terminal_pr_review_chat,
+                        require_task_incarnation_fence=True,
+                    )
+                except Exception:
+                    raise proxy_error
+            elif remote_handoff is not None:
+                raise proxy_error
+            if manager_receipt is not None:
+                remote_receipt = (
+                    await worker_proxy.get_plan_application_receipt(
+                        worker, application_receipt_key
+                    )
+                    if application_receipt_key is not None
+                    else None
                 )
-                raise HTTPException(
-                    409,
-                    "Worker Plan application launch outcome is uncertain; "
-                    "administrator reconciliation is required",
-                )
-            if (
-                remote_receipt is None
-                or remote_receipt.get("status") != "committed"
-                or not isinstance(remote_receipt.get("response"), dict)
-                or remote_receipt.get("delivery_status")
-                in {"failed", "cancelled", "uncertain"}
-            ):
-                raise
-            result = remote_receipt["response"]
+                if (
+                    isinstance(remote_receipt, dict)
+                    and remote_receipt.get("delivery_status") == "uncertain"
+                ):
+                    await _preserve_remote_uncertain_plan_receipt(
+                        db,
+                        receipt_key=application_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
+                        remote_receipt=remote_receipt,
+                        request=request,
+                    )
+                    raise HTTPException(
+                        409,
+                        "Worker Plan application launch outcome is uncertain; "
+                        "administrator reconciliation is required",
+                    )
+                if (
+                    remote_receipt is None
+                    or remote_receipt.get("status") != "committed"
+                    or not isinstance(remote_receipt.get("response"), dict)
+                    or remote_receipt.get("delivery_status")
+                    in {"failed", "cancelled", "uncertain"}
+                ):
+                    raise proxy_error
+                result = remote_receipt["response"]
 
-        # 6. A delayed response can only update the generation that issued the
-        # request.  Even responses without a session id perform a no-op CAS so
-        # reassignment/retry during the network await is reported as conflict.
-        values = {"status": observed.status}
-        if isinstance(result, dict) and result.get("session_id"):
-            values["session_id"] = result["session_id"]
-        changed = await db.execute(
-            sa_update(Task)
-            .where(*worker_task_generation_predicates(observed))
-            .values(**values)
+        # 6. ACK the exact durable handoff.  If relay already proved G+1 this
+        # clears the marker; otherwise it stays acknowledged until the first
+        # exact G+1 event/snapshot consumes it.  Retry, migration, another
+        # Worker, or any generation beyond that one transition all conflict.
+        acknowledged = await acknowledge_worker_turn_handoff(
+            db,
+            reserved,
+            session_id=(
+                result.get("session_id")
+                if isinstance(result, dict)
+                else None
+            ),
         )
-        if changed.rowcount != 1:
+        if acknowledged is None:
             await db.rollback()
             raise HTTPException(
                 409,
                 "Task Worker assignment or generation changed while chat was in flight",
+            )
+        # The remote acceptance is independent evidence from the Manager's
+        # subsequent Plan/application bookkeeping.  Persist it now so a later
+        # validation or local DB failure cannot roll the ACK back and strand a
+        # relay-proven G+1 behind an eternally unacknowledged handoff marker.
+        await db.commit()
+
+        if callable(recovery_scheduler):
+            scheduled = recovery_scheduler(worker, acknowledged)
+            if inspect.isawaitable(scheduled):
+                await scheduled
+        requested_plan_ids = list(body.plan_task_ids or [])
+        if approved_versions or requested_plan_ids:
+            # The ACK commit intentionally ends the original admission
+            # transaction.  Reacquire a cross-process Task writer fence after
+            # all external recovery scheduling and immediately before creating
+            # first-class PlanApplication rows or updating legacy mirrors.
+            # Otherwise another Manager process could delete the Task in the
+            # ACK -> audit window and this transaction would recreate
+            # references to a missing target.
+            from backend.services.plan_service import fence_plan_target_task
+
+            await fence_plan_target_task(
+                db,
+                target_task_id=current.id,
+                expected_worker_id=worker.id,
             )
         applied_plan_ids = (
             result.get("applied_plan_task_ids")
             if isinstance(result, dict)
             else None
         )
-        if isinstance(applied_plan_ids, list):
-            applied_at = datetime.utcnow()
+        if applied_plan_ids is None:
             normalized_applied_ids: list[int] = []
-            for plan_id in applied_plan_ids:
-                if isinstance(plan_id, bool) or not isinstance(plan_id, int):
-                    continue
-                normalized_applied_ids.append(plan_id)
+        elif isinstance(applied_plan_ids, list) and all(
+            not isinstance(plan_id, bool) and isinstance(plan_id, int)
+            for plan_id in applied_plan_ids
+        ):
+            normalized_applied_ids = applied_plan_ids
+        else:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Worker returned an invalid legacy Plan application identity",
+            )
+        if normalized_applied_ids != requested_plan_ids:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Worker did not confirm the exact selected legacy Plan Tasks",
+            )
+        if normalized_applied_ids:
+            applied_at = datetime.utcnow()
+            for plan_id in normalized_applied_ids:
                 local_applied = await db.execute(
                     sa_update(Task)
                     .where(
@@ -1961,6 +3973,7 @@ async def _send_worker_chat(
                         Task.plan_target_task_id == current.id,
                         Task.plan_approved.is_(True),
                         Task.plan_applied_at.is_(None),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(
                         plan_applied_at=applied_at,
@@ -1971,28 +3984,29 @@ async def _send_worker_chat(
                     )
                 )
                 if local_applied.rowcount != 1:
-                    logger.warning(
-                        "Worker applied Plan Task %s but Manager mirror could "
-                        "not claim its local application row",
-                        plan_id,
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        f"Worker applied Plan Task #{plan_id}, but its Manager "
+                        "termination state changed before the mirror commit",
                     )
-            if normalized_applied_ids:
-                from backend.services.plan_tasks import applied_plan_snapshots
 
-                rows = await db.execute(
-                    select(Task).where(Task.id.in_(normalized_applied_ids))
-                )
-                plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
-                snapshot_plans = [
-                    plans_by_id[plan_id]
-                    for plan_id in normalized_applied_ids
-                    if plan_id in plans_by_id
-                ]
-                manager_metadata = _raw_log_metadata(manager_user_log)
-                manager_metadata["applied_plans"] = applied_plan_snapshots(
-                    snapshot_plans
-                )
-                manager_user_log.raw_json = json.dumps(manager_metadata)
+            from backend.services.plan_tasks import applied_plan_snapshots
+
+            rows = await db.execute(
+                select(Task).where(Task.id.in_(normalized_applied_ids))
+            )
+            plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
+            snapshot_plans = [
+                plans_by_id[plan_id]
+                for plan_id in normalized_applied_ids
+                if plan_id in plans_by_id
+            ]
+            manager_metadata = _raw_log_metadata(manager_user_log)
+            manager_metadata["applied_plans"] = applied_plan_snapshots(
+                snapshot_plans
+            )
+            manager_user_log.raw_json = json.dumps(manager_metadata)
         applied_remote_version_ids = (
             result.get("applied_plan_version_ids")
             if isinstance(result, dict)
@@ -2007,29 +4021,6 @@ async def _send_worker_chat(
                 )
             from backend.models.plan import PlanApplication
             from backend.services.plan_service import versioned_plan_snapshots
-
-            if manager_receipt is not None:
-                receipt_committed = await db.execute(
-                    sa_update(PlanApplicationReceipt)
-                    .where(
-                        PlanApplicationReceipt.receipt_key
-                        == manager_receipt.receipt_key,
-                        PlanApplicationReceipt.status == "prepared",
-                        PlanApplicationReceipt.delivery_status == "pending",
-                    )
-                    .values(
-                        status="committed",
-                        delivery_status="queued",
-                        response=(result if isinstance(result, dict) else None),
-                        updated_at=datetime.utcnow(),
-                    )
-                )
-                if receipt_committed.rowcount != 1:
-                    await db.rollback()
-                    raise HTTPException(
-                        409,
-                        "Worker Plan delivery changed before Manager commit",
-                    )
 
             for plan, version in approved_versions:
                 db.add(
@@ -2063,6 +4054,32 @@ async def _send_worker_chat(
                     409,
                     "A selected Plan Version was applied concurrently",
                 ) from exc
+            if manager_receipt is not None:
+                receipt_committed = await db.execute(
+                    sa_update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key
+                        == application_receipt_key,
+                        PlanApplicationReceipt.target_task_id == current.id,
+                        PlanApplicationReceipt.worker_id == worker.id,
+                        PlanApplicationReceipt.manager_user_log_id
+                        == manager_user_log.id,
+                        PlanApplicationReceipt.status == "prepared",
+                        PlanApplicationReceipt.delivery_status == "pending",
+                    )
+                    .values(
+                        status="committed",
+                        delivery_status="queued",
+                        response=(result if isinstance(result, dict) else None),
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+                if receipt_committed.rowcount != 1:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Worker Plan delivery changed before Manager commit",
+                    )
         await db.commit()
 
         if approved_versions:
@@ -2136,12 +4153,27 @@ async def get_chat_history(
     if not task:
         raise HTTPException(404, "Task not found")
 
+    touch_allowed = False
     if touch:
+        try:
+            await require_task_control(request, task, db)
+            touch_allowed = True
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            # A chat-only recipient may read and participate in the
+            # conversation, but opening somebody else's shared Task must not
+            # reorder the owner's/project collaborators' Task list.
+    if touch_allowed:
         from datetime import datetime as _dt
         task.last_accessed_at = _dt.utcnow()
         await db.commit()
 
-    allowed = ["user_message", "message", "result", "tool_use", "tool_result", "system_init", "system_event", "thinking", "process_exit"]
+    allowed = [
+        "user_message", "message", "result", "tool_use", "tool_result",
+        "system_init", "system_event", "thinking", "process_exit",
+        "background_lifecycle", "pty_background_followup_boundary",
+    ]
     # Noisy telemetry must be excluded in SQL, before LIMIT applies. Filtering
     # after the query made pages come back short (< limit), which the client
     # reads as "history exhausted" — older messages became unreachable.
@@ -2151,6 +4183,9 @@ async def get_chat_history(
         LogEntry.tool_name, LogEntry.tool_input, LogEntry.tool_output,
         LogEntry.is_error, LogEntry.loop_iteration, LogEntry.timestamp,
         LogEntry.raw_json, LogEntry.task_retry_count,
+        LogEntry.task_turn_generation, LogEntry.native_turn_id,
+        LogEntry.turn_scope,
+        LogEntry.actual_transport,
     ]
     conditions = [
         LogEntry.task_id == task_id,
@@ -2265,9 +4300,14 @@ async def get_chat_history(
         raw_content = None
         applied_plans = None
         item_id = None
-        turn_id = None
+        turn_id = row.native_turn_id
         native_item_type = None
         native_item_status = None
+        background_lifecycle = None
+        followup_operation_id = None
+        pty_followup_state = None
+        pty_background_generation = None
+        client_message_id = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -2285,7 +4325,8 @@ async def get_chat_history(
                         or (turn.get("id") if isinstance(turn, dict) else None)
                     )
                     item_id = str(native_item) if native_item else None
-                    turn_id = str(native_turn) if native_turn else None
+                    if turn_id is None:
+                        turn_id = str(native_turn) if native_turn else None
                     if isinstance(item, dict):
                         item_type = item.get("type")
                         item_status = item.get("status")
@@ -2309,6 +4350,27 @@ async def get_chat_history(
                         raw_content = raw["raw_content"]
                     if isinstance(raw.get("applied_plans"), list):
                         applied_plans = raw["applied_plans"]
+                    if isinstance(raw.get("followup_operation_id"), str):
+                        followup_operation_id = raw[
+                            "followup_operation_id"
+                        ]
+                    if raw.get("state") in {"completed", "uncertain"}:
+                        pty_followup_state = raw["state"]
+                    if isinstance(raw.get("background_generation"), str):
+                        pty_background_generation = raw[
+                            "background_generation"
+                        ]
+                    if isinstance(raw.get("client_message_id"), str):
+                        client_message_id = raw["client_message_id"]
+                    if raw.get("type") == "background.lifecycle":
+                        background_lifecycle = {
+                            "state": raw.get("state"),
+                            "reason": raw.get("reason"),
+                            "active_count": raw.get("active_count"),
+                            "active_thread_ids": raw.get("active_thread_ids"),
+                            "started_at": raw.get("started_at"),
+                            "last_activity_at": raw.get("last_activity_at"),
+                        }
             except (json.JSONDecodeError, TypeError):
                 pass
         if applied_plans is None:
@@ -2337,6 +4399,10 @@ async def get_chat_history(
             "is_error": row.is_error,
             "loop_iteration": row.loop_iteration,
             "task_retry_count": row.task_retry_count,
+            "task_turn_generation": row.task_turn_generation,
+            "native_turn_id": row.native_turn_id,
+            "turn_scope": row.turn_scope,
+            "actual_transport": row.actual_transport,
             "timestamp": (row.timestamp.isoformat() + "Z") if row.timestamp else None,
             "image_urls": image_urls or None,
             "attachments": attachments,
@@ -2347,6 +4413,17 @@ async def get_chat_history(
             "turn_id": turn_id,
             "native_item_type": native_item_type,
             "native_item_status": native_item_status,
+            "background_lifecycle": background_lifecycle,
+            "followup_operation_id": followup_operation_id,
+            "pty_followup_state": pty_followup_state,
+            "pty_background_generation": pty_background_generation,
+            "client_message_id": client_message_id,
+            "protocol_anomaly": detect_assistant_protocol_anomaly(
+                row.event_type,
+                row.role,
+                row.content,
+                provider=task.provider,
+            ),
         })
 
     # Trim back to requested limit (we over-fetched to compensate for
@@ -2477,12 +4554,17 @@ async def _store_injected_message(
     *,
     db: AsyncSession,
     broadcaster,
-    task: Task,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
     raw_content: str,
     display_content: str,
     sender_display_name: str | None,
     uploads: list[ValidatedUploadAttachment],
     instance_id: int | None,
+    generation_audit_matched: bool,
+    execution_principal: dict[str, object],
+    followup_operation_id: str | None,
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -2492,7 +4574,20 @@ async def _store_injected_message(
     raw_metadata: dict[str, Any] = {
         "source": "inject",
         "raw_content": raw_content,
+        "generation_audit": (
+            "matched"
+            if generation_audit_matched
+            else "changed_after_transport"
+        ),
+        "execution_principal": {
+            "user_id": execution_principal["execution_user_id"],
+            "role": execution_principal["execution_user_role"],
+            "mode": execution_principal["execution_mode"],
+            "kind": execution_principal["execution_principal_kind"],
+        },
     }
+    if followup_operation_id:
+        raw_metadata["followup_operation_id"] = followup_operation_id
     if attachments:
         raw_metadata.update({
             "attachments": attachments,
@@ -2503,7 +4598,10 @@ async def _store_injected_message(
         raw_metadata["sender_name"] = sender_display_name
     entry = LogEntry(
         instance_id=instance_id,
-        task_id=task.id,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        turn_scope="foreground",
         event_type="user_message",
         role="user",
         content=display_content,
@@ -2526,9 +4624,111 @@ async def _store_injected_message(
             if attachment["is_image"]
         ],
     })
+    if followup_operation_id:
+        event["followup_operation_id"] = followup_operation_id
     if sender_display_name:
         event["sender_name"] = sender_display_name
-    await broadcaster.broadcast(f"task:{task.id}", event)
+    await broadcaster.broadcast(f"task:{task_id}", event)
+
+
+async def _audit_and_store_injected_message(
+    *,
+    db: AsyncSession,
+    broadcaster,
+    request: Request,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_session_id: str,
+    task_instance_id: int | None,
+    task_provider_db_value: str | None,
+    execution_principal: dict[str, object],
+    raw_content: str,
+    uploads: list[ValidatedUploadAttachment],
+    followup_operation_id: str | None,
+) -> None:
+    """Durably audit a transport side effect against its admitted generation.
+
+    The transport acknowledgement happens without a database transaction held.
+    Reacquire the Task row only after that acknowledgement and persist the user
+    message in the same short transaction.  A generation that changed in the
+    transport window is audit evidence, not a reason to erase an already
+    delivered message or return a retryable response.
+    """
+
+    generation_audit = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            Task.retry_count == task_retry_count,
+            Task.turn_generation == task_turn_generation,
+            (
+                Task.instance_id.is_(None)
+                if task_instance_id is None
+                else Task.instance_id == task_instance_id
+            ),
+            Task.session_id == task_session_id,
+            (
+                Task.provider.is_(None)
+                if task_provider_db_value is None
+                else Task.provider == task_provider_db_value
+            ),
+            (
+                Task.execution_user_id.is_(None)
+                if execution_principal["execution_user_id"] is None
+                else Task.execution_user_id
+                == execution_principal["execution_user_id"]
+            ),
+            Task.execution_user_role
+            == execution_principal["execution_user_role"],
+            Task.execution_mode == execution_principal["execution_mode"],
+            Task.execution_principal_kind
+            == execution_principal["execution_principal_kind"],
+        )
+        .values(status=Task.status)
+    )
+    generation_audit_matched = generation_audit.rowcount == 1
+    if not generation_audit_matched:
+        logger.warning(
+            "Task %s generation changed after its live injection transport "
+            "acknowledged retry=%s turn=%s session=%s; preserving the "
+            "delivered-message audit under the admitted generation",
+            task_id,
+            task_retry_count,
+            task_turn_generation,
+            task_session_id,
+        )
+
+    display_content, sender_display_name = await _inject_display_content(
+        request,
+        db,
+        raw_content,
+    )
+    await _store_injected_message(
+        db=db,
+        broadcaster=broadcaster,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        raw_content=raw_content,
+        display_content=display_content,
+        sender_display_name=sender_display_name,
+        uploads=uploads,
+        instance_id=task_instance_id,
+        generation_audit_matched=generation_audit_matched,
+        execution_principal=execution_principal,
+        followup_operation_id=followup_operation_id,
+    )
+
+
+async def _settle_injected_message_audit(operation) -> None:
+    """Finish the audit after transport success even if HTTP is cancelled."""
+
+    audit_task = asyncio.create_task(operation)
+    delayed_cancel = await await_task_completion(audit_task)
+    audit_task.result()
+    if delayed_cancel is not None:
+        raise delayed_cancel
 
 
 @router.get("/{task_id}/inject-capabilities")
@@ -2540,7 +4740,18 @@ async def inject_capabilities(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
+
+    _require_not_delivery_owned_task(task, action="received direct injection")
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="received direct injection",
+    )
     return {
         "attachment_protocol": 1,
         "codex_native_inputs": True,
@@ -2555,10 +4766,14 @@ async def inject_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Inject a message into the task's currently running turn."""
+    # Freeze the authenticated HTTP principal once.  Live injection steers an
+    # already-admitted provider turn and therefore must carry exactly the same
+    # authority as that turn; ordinary ACL access alone is insufficient.
+    request_principal = task_execution_principal_from_request(request)
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
 
     # Serialize with routing edits and migration.  Re-read after acquiring the
     # lock so the expected route and transport are one admission decision.
@@ -2568,7 +4783,72 @@ async def inject_message(
         task = await db.get(Task, task_id)
         if task is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, task, db)
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=False,
+        )
+        from backend.api.tasks import (
+            _require_not_delivery_owned_task,
+            _require_not_isolated_browser_child,
+            _require_pr_review_chat_allowed,
+        )
+
+        # Structural lifecycle ownership is checked before comparing the
+        # active execution principal.  An isolated child is never a public
+        # injection target, regardless of which caller principal happens to
+        # be frozen on its archived/internal row.
+        _require_not_delivery_owned_task(
+            task,
+            action="received direct injection",
+        )
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="received direct injection",
+        )
+        await _require_pr_review_chat_allowed(db, task_id)
+        if request_principal["execution_principal_kind"] == "user":
+            from backend.models.user import User
+
+            # Authentication populated request.state earlier in the request.
+            # Fence the durable User row in this admission transaction so a
+            # concurrent disable/demotion cannot race an old admin snapshot
+            # through the Task gate and into an unrestricted live turn.
+            current_user_gate = await db.execute(
+                sa_update(User)
+                .where(
+                    User.id == request_principal["execution_user_id"],
+                    User.is_active.is_(True),
+                    User.role == request_principal["execution_user_role"],
+                )
+                .values(role=User.role)
+            )
+            if current_user_gate.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Live injection principal is no longer active or its "
+                    "role changed; send a normal next-turn message instead",
+                )
+        task_principal = {
+            "execution_user_id": task.execution_user_id,
+            "execution_user_role": task.execution_user_role,
+            "execution_mode": task.execution_mode,
+            "execution_principal_kind": task.execution_principal_kind,
+        }
+        if task_principal != request_principal:
+            raise HTTPException(
+                409,
+                "Live injection requires the exact principal that started "
+                "the active turn; send a normal next-turn message instead",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         if task_is_pr_review_superseded(task):
             raise HTTPException(
                 409,
@@ -2578,7 +4858,6 @@ async def inject_message(
         from backend.api.tasks import (
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
-            _require_pr_review_chat_allowed,
         )
 
         if task.worker_id is not None:
@@ -2587,10 +4866,22 @@ async def inject_message(
                 "Worker task 暂不支持执行中注入",
             )
         _require_no_pending_worker_routing(task)
-        await _require_pr_review_chat_allowed(
-            db,
-            task_id,
+        retained_background_tail = (
+            (task.provider or "claude").lower() == "claude"
+            and task.status in {"in_progress", "executing", "completed"}
+            and task.pty_background_generation is not None
         )
+        if (
+            task.status not in {"in_progress", "executing"}
+            and not retained_background_tail
+        ):
+            detail = (
+                "Task is waiting for its requested capability and has no "
+                "active provider turn to inject"
+                if task.status == "waiting_capability"
+                else "Task has no active provider turn to inject"
+            )
+            raise HTTPException(409, detail)
 
         _require_expected_task_routing(
             task,
@@ -2607,42 +4898,138 @@ async def inject_message(
 
         uploads = _validated_inject_attachments(body)
 
+        # Capture the immutable admission generation before ending this DB
+        # transaction.  The in-process operation lock stays held across the
+        # transport and audit, while these scalar values keep both operations
+        # tied to the exact foreground generation admitted here.
+        admitted_task_id = task.id
+        admitted_status = task.status
+        admitted_background_generation = task.pty_background_generation
+        admitted_retry_count = task.retry_count
+        admitted_turn_generation = task.turn_generation
+        admitted_instance_id = task.instance_id
+        admitted_session_id = task.session_id
+        admitted_provider_db_value = task.provider
+        admitted_provider = (task.provider or "claude").lower()
+        admitted_execution_principal = dict(request_principal)
+        admitted_followup_operation_id = (
+            uuid.uuid4().hex
+            if admitted_provider == "claude" and retained_background_tail
+            else None
+        )
+        followup_transport_kwargs = (
+            {"followup_operation_id": admitted_followup_operation_id}
+            if admitted_followup_operation_id is not None
+            else {}
+        )
+
+        # Take a short exact-generation admission gate, then COMMIT it before
+        # awaiting the provider.  The PTY consumer may need to persist an
+        # assistant/tool event before it can read the later queue-operation
+        # acknowledgement; retaining this row lock across the await would make
+        # the API wait for the consumer while the consumer waits for this API.
+        injection_gate = await db.execute(
+            sa_update(Task)
+            .where(
+                Task.id == admitted_task_id,
+                Task.status == admitted_status,
+                (
+                    Task.pty_background_generation
+                    == admitted_background_generation
+                    if admitted_background_generation is not None
+                    else Task.status.in_(("in_progress", "executing"))
+                ),
+                Task.retry_count == admitted_retry_count,
+                Task.turn_generation == admitted_turn_generation,
+                (
+                    Task.instance_id.is_(None)
+                    if admitted_instance_id is None
+                    else Task.instance_id == admitted_instance_id
+                ),
+                Task.session_id == admitted_session_id,
+                (
+                    Task.provider.is_(None)
+                    if admitted_provider_db_value is None
+                    else Task.provider == admitted_provider_db_value
+                ),
+                (
+                    Task.execution_user_id.is_(None)
+                    if admitted_execution_principal["execution_user_id"] is None
+                    else Task.execution_user_id
+                    == admitted_execution_principal["execution_user_id"]
+                ),
+                Task.execution_user_role
+                == admitted_execution_principal["execution_user_role"],
+                Task.execution_mode
+                == admitted_execution_principal["execution_mode"],
+                Task.execution_principal_kind
+                == admitted_execution_principal[
+                    "execution_principal_kind"
+                ],
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(status=Task.status)
+        )
+        if injection_gate.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task state changed or it has an active Worker termination "
+                "receipt",
+            )
+        # This is the critical lock-release boundary.  Never move it below a
+        # provider transport await: enqueue -> assistant -> remove is a normal
+        # Claude JSONL sequence, and the assistant event uses the same Task row.
+        await db.commit()
+
         from backend.main import instance_manager, broadcaster
 
-        provider = (task.provider or "claude").lower()
         transport_content = _inject_transport_content(
             body.message,
             uploads,
         )
-        if provider == "codex":
+        if admitted_provider == "codex":
             from backend.config import settings
+            from backend.services.codex_app_server import (
+                CodexTurnAdmissionUncertainError,
+            )
 
             if not settings.codex_app_server_enabled:
                 raise HTTPException(
                     400,
                     "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
                 )
-            if uploads:
-                ok = await instance_manager.inject_codex_message(
-                    task.session_id,
-                    transport_content,
-                    input_items=_codex_inject_input_items(
+            try:
+                if uploads:
+                    ok = await instance_manager.inject_codex_message(
+                        admitted_session_id,
                         transport_content,
-                        uploads,
-                    ),
-                )
-            else:
-                ok = await instance_manager.inject_codex_message(
-                    task.session_id,
-                    transport_content,
-                )
+                        input_items=_codex_inject_input_items(
+                            transport_content,
+                            uploads,
+                        ),
+                    )
+                else:
+                    ok = await instance_manager.inject_codex_message(
+                        admitted_session_id,
+                        transport_content,
+                    )
+            except CodexTurnAdmissionUncertainError as exc:
+                raise HTTPException(
+                    503,
+                    "注入结果不确定：Codex follow-up 可能已被接收，但共享 "
+                    "transport 无法安全确认或回收。系统不会自动重试；请先"
+                    "查看聊天记录或运行日志，再决定是否手动重试",
+                ) from exc
             unavailable_detail = (
                 "注入失败：当前 Codex turn 已结束、暂不可 steer、附件输入被 "
                 "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
                 "模式直接发普通消息"
             )
-        elif provider == "claude":
-            if not instance_manager.has_pty_session(task.session_id):
+        elif admitted_provider == "claude":
+            if not instance_manager.has_pty_session(admitted_session_id):
                 raise HTTPException(
                     400,
                     (
@@ -2655,20 +5042,42 @@ async def inject_message(
             try:
                 if uploads:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
                         require_host_file_access=True,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
+                        **followup_transport_kwargs,
                     )
                 else:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
+                        **followup_transport_kwargs,
                     )
             except Exception as exc:
                 from backend.services.instance_manager import (
+                    ClaudeInjectionAdmissionUncertainError,
                     LiveAttachmentInjectionUnsupportedError,
                 )
 
+                if isinstance(
+                    exc,
+                    ClaudeInjectionAdmissionUncertainError,
+                ):
+                    raise HTTPException(
+                        503,
+                        "注入结果不确定：Claude 输入可能已完整写入，但本地 "
+                        "transport 未能确认模型是否接收。当前 Claude 任务会继续"
+                        "运行，系统不会自动重试；请先查看聊天记录或运行日志，再"
+                        "决定是否手动重试",
+                    ) from exc
                 if isinstance(
                     exc,
                     LiveAttachmentInjectionUnsupportedError,
@@ -2686,31 +5095,81 @@ async def inject_message(
         else:
             raise HTTPException(
                 400,
-                f"Provider {provider} 不支持执行中注入",
+                f"Provider {admitted_provider} 不支持执行中注入",
             )
 
         if not ok:
             raise HTTPException(409, unavailable_detail)
 
-        display_content, sender_display_name = await _inject_display_content(
-            request,
-            db,
-            body.message,
-        )
-        await _store_injected_message(
-            db=db,
-            broadcaster=broadcaster,
-            task=task,
-            raw_content=body.message,
-            display_content=display_content,
-            sender_display_name=sender_display_name,
-            uploads=uploads,
-            instance_id=task.instance_id,
+        # The durable Task marker is only a routing hint.  Between the short
+        # admission transaction and the PTY lifecycle lock, a new native
+        # foreground turn may have started.  InstanceManager records the
+        # route it actually selected: retained pumps return the operation id;
+        # ordinary foreground steering returns ``None`` because it emits no
+        # retained-boundary receipt.  Keep the provisional id as a compatibility
+        # fallback for older test doubles/managers that do not expose this
+        # handoff method.
+        if admitted_followup_operation_id:
+            consume_route = getattr(
+                instance_manager,
+                "consume_pty_followup_operation_route",
+                None,
+            )
+            manager_owns_route_handoff = (
+                inspect.getattr_static(
+                    type(instance_manager),
+                    "consume_pty_followup_operation_route",
+                    None,
+                )
+                is not None
+            )
+            route_result = (
+                consume_route(admitted_followup_operation_id)
+                if manager_owns_route_handoff and callable(consume_route)
+                else None
+            )
+            if manager_owns_route_handoff:
+                if (
+                    isinstance(route_result, tuple)
+                    and len(route_result) == 2
+                    and route_result[0] is True
+                    and isinstance(route_result[1], str)
+                    and route_result[1]
+                ):
+                    admitted_followup_operation_id = route_result[1]
+                else:
+                    # A live manager that cannot prove the route must fail
+                    # closed: returning the provisional id would recreate the
+                    # exact spinner-without-boundary bug this handoff avoids.
+                    admitted_followup_operation_id = None
+
+        # The provider transport has accepted the input. From this point on,
+        # cancellation must not leave an invisible side effect that a client
+        # will retry.
+        # Re-audit the exact generation and persist its user-message record in
+        # one short transaction, even when that generation changed meanwhile.
+        await _settle_injected_message_audit(
+            _audit_and_store_injected_message(
+                db=db,
+                broadcaster=broadcaster,
+                request=request,
+                task_id=admitted_task_id,
+                task_retry_count=admitted_retry_count,
+                task_turn_generation=admitted_turn_generation,
+                task_session_id=admitted_session_id,
+                task_instance_id=admitted_instance_id,
+                task_provider_db_value=admitted_provider_db_value,
+                execution_principal=admitted_execution_principal,
+                raw_content=body.message,
+                uploads=uploads,
+                followup_operation_id=admitted_followup_operation_id,
+            )
         )
         return {
             "ok": True,
             "injected": True,
             "attachment_count": len(uploads),
+            "operation_id": admitted_followup_operation_id,
         }
 
 
@@ -2730,13 +5189,29 @@ async def resolve_permission(
         raise HTTPException(400, "behavior must be 'allow' or 'deny'")
 
     task = await db.get(Task, task_id)
-    if task:
-        await require_task_access(request, task, db)
     if not task:
         raise HTTPException(404, "Task not found")
 
+    # A PTY permission response changes the executable authority of the
+    # active model turn.  A chat-only TeamTaskShare may send follow-up text,
+    # but must never approve or deny Bash/tool execution for somebody else's
+    # Task.  Hold the Project/Task share-revocation fence through the short
+    # in-memory bridge effect so a concurrent revocation has one exact winner.
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
+
     from backend.main import instance_manager
-    ok = await instance_manager.resolve_pty_permission(request_id, body.behavior)
+    ok = await instance_manager.resolve_pty_permission(
+        request_id,
+        body.behavior,
+        fenced_db=db,
+        authorized_task_id=task.id,
+    )
     if not ok:
         raise HTTPException(410, "权限请求已过期或不存在（CC 侧可能已超时默认拒绝）")
     return {"ok": True, "behavior": body.behavior}
@@ -2835,7 +5310,18 @@ async def distill_task(
         task = await db.get(Task, task_id)
         if not task:
             raise HTTPException(404, "Task not found")
-        await require_task_control(request, task, db)
+        # Distillation is a real provider effect.  Serialize and revalidate
+        # Project/Task/membership/User authority, then commit that writer
+        # transaction as the admission point before starting the model call.
+        # The in-process operation lock remains held for routing consistency,
+        # but SQLite must not retain a database-wide writer while the provider
+        # is running.
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=False,
+        )
         from backend.api.tasks import _require_expected_task_routing
 
         _require_expected_task_routing(
@@ -2858,6 +5344,19 @@ async def distill_task(
         if not conversation.strip():
             raise HTTPException(400, "No conversation history to distill")
 
+        title = (
+            task.title
+            or (task.description[:100] if task.description else "")
+            or "Untitled"
+        )
+        suggested_name = (
+            task.title or task.description or "untitled"
+        )[:50].strip()
+        provider = task.provider or "claude"
+        codex_account_id = (task.metadata_ or {}).get("codex_account_id")
+        admitted_task_id = task.id
+        await db.commit()
+
         from backend.main import (
             cloudrouter_store,
             codex_pool,
@@ -2870,22 +5369,16 @@ async def distill_task(
             TaskDistillTimeoutError,
             distill_task_conversation,
         )
-        title = (
-            task.title
-            or (task.description[:100] if task.description else "")
-            or "Untitled"
-        )
         try:
             result = await distill_task_conversation(
                 title=title,
                 conversation=conversation,
-                provider=task.provider or "claude",
+                provider=provider,
                 custom_instruction=body.custom_instruction,
                 claude_pool=dispatcher.pool,
                 codex_pool=codex_pool,
-                codex_account_id=(task.metadata_ or {}).get(
-                    "codex_account_id"
-                ),
+                codex_account_id=codex_account_id,
+                task_id=admitted_task_id,
                 instance_manager=instance_manager,
                 cloudrouter_store=cloudrouter_store,
             )
@@ -2906,10 +5399,6 @@ async def distill_task(
                 message = f"{message}: {detail}"
             raise HTTPException(502, message) from exc
 
-        suggested_name = (
-            task.title or task.description or "untitled"
-        )[:50].strip()
-
         return {
             "task_id": task_id,
             "suggested_name": suggested_name,
@@ -2929,7 +5418,12 @@ async def save_distilled_skill(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_control(request, task, db)
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+    )
 
     existing = await db.execute(
         select(UserSkill).where(UserSkill.name == body.name)

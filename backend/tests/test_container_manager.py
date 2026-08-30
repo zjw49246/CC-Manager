@@ -20,7 +20,10 @@ from backend.services.container_manager import (
     _TMP_LEASE_INIT,
     _TMP_PRESSURE_LIB,
 )
-from backend.services.instance_manager import InstanceManager
+from backend.services.instance_manager import (
+    InstanceManager,
+    SharedProjectAgentLaunchDisabledError,
+)
 from backend.services.process_safety import UnsafeProcessGroupError
 from backend.models.instance import Instance
 from backend.models.project import Project
@@ -422,7 +425,7 @@ async def test_running_legacy_container_is_not_recreated_just_for_init(
 
 
 @pytest.mark.asyncio
-async def test_shared_project_tmp_pressure_never_falls_back_to_host(
+async def test_shared_project_launch_is_rejected_before_container_effect(
     db_factory,
     tmp_path,
 ):
@@ -464,7 +467,7 @@ async def test_shared_project_tmp_pressure_never_falls_back_to_host(
         ),
         patch.object(
             ContainerManager, "is_docker_available", return_value=True
-        ),
+        ) as docker_available,
         patch(
             "backend.services.mcp_config.generate_mcp_config",
             return_value=None,
@@ -476,7 +479,10 @@ async def test_shared_project_tmp_pressure_never_falls_back_to_host(
             manager, "_launch_pty", new_callable=AsyncMock
         ) as launch_pty,
         patch.object(manager, "_build_command") as build_command,
-        pytest.raises(ContainerTmpPressureError, match="container /tmp busy"),
+        pytest.raises(
+            SharedProjectAgentLaunchDisabledError,
+            match="is shared",
+        ),
     ):
         await manager._launch_locked(
             instance.id,
@@ -486,6 +492,8 @@ async def test_shared_project_tmp_pressure_never_falls_back_to_host(
             provider="claude",
         )
 
+    docker_available.assert_not_called()
+    container_manager.ensure_container.assert_not_awaited()
     container_manager.create_pty_wrapper.assert_not_called()
     launch_pty.assert_not_awaited()
     build_command.assert_not_called()

@@ -1,8 +1,10 @@
 # Claude Code Manager
 
+**简体中文** | [English](README.en-US.md)
+
 Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊鸣的文章「我给 10 个 Claude Code 打工」。
 
-> **⚠️ 重要安全提示：** 本项目会以 `--dangerously-skip-permissions` 模式运行 Claude Code，这意味着 Claude Code 将拥有**不受限制的文件读写、命令执行和网络访问权限**，并且会自动执行 `git push` 等操作。**强烈建议在一台单独的、没有重要文件的电脑或虚拟机上部署**，避免对你的个人数据或工作环境造成意外影响。
+> **⚠️ 重要安全提示：** 管理员、超级管理员和单 Token 部署发起的普通 Task 会以 unrestricted 模式运行（Claude Code 使用 `--dangerously-skip-permissions`），能够不受限制地读写文件、执行命令、访问网络并自动执行 `git push` 等操作。Member 回合和 Browser/PR Review/Delivery/Planner 等专用任务使用各自的受限协议。仍强烈建议把 CCM 部署在没有重要个人数据的独立电脑或虚拟机上。
 
 ## 功能
 
@@ -10,7 +12,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **全局调度器** — 启动时自动创建 worker、自动分配任务，无需手动操作
 - **Claude Code 完全自主** — Claude Code 自主完成 worktree 创建、commit、fetch、merge、push、冲突解决和清理，Dispatcher 只负责分配任务和判断成败
 - **9 步任务生命周期** — 领取 → 创建工作区 → 实现 → 提交 → merge + 测试 → 合并到 main → 标记完成 → 清理 → 经验沉淀
-- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
+- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目。后台 clone 不会因等待凭据输入而挂起，认证失败给出明确提示；clone 失败的项目会拒绝新建任务（422），已排队任务保持等待并在 Re-clone 成功后自动开始
 - **项目 Todo 清单** — 每个项目维护一个可折叠的待办清单（prompt 模板），一键「▶ Run」直接创建 Task 并跳转 Chat；创建后 Todo 自动标记完成并记录派生的 task。支持归档/恢复/永久删除
 - **任务队列** — 按优先级自动调度（数字越小优先级越高）
 - **多实例并行** — 同时运行多个 Claude Code 实例，各自处理不同任务
@@ -36,14 +38,18 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
 - **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
 - **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件
+- **SSH 工作台与 Task 授权** — Files 页面可管理固定主机指纹的 SSH Profile、浏览/下载远程文件；新建、legacy 迁移与密钥轮换只接受上传到 CCM 托管目录，升级前的外部路径 Profile 仅可保持 Files-only。管理员可在新建 Task 或 Chat 中按 `exec/read/write` 最小权限授权，Claude/Codex 通过 task-scoped `ccm_ssh` MCP 使用，私钥始终留在 Manager。使用和安全边界见 [SSH access](docs/ssh-access.md)
 - **数学公式渲染** — 聊天和 Discussion 中的 Markdown 支持 KaTeX；兼容 Codex 常用的 `\\(...\\)` / 整段 `\\[...\\]` 以及 `$$...$$`，单美元符号内容按普通文本显示，链接、HTML、代码和货币内容保持不变
 - **交互式提问（ask_user）** — 模型调用内置 `AskUserQuestion` 时，聊天里弹出可选卡片（单选/多选/自定义文本），用户选完即把答案喂回模型继续。超时默认 1800s，支持跨页面全局通知（右下角弹窗 + 未读标记），可用 `ASK_USER_ENABLED=false` 关闭
 - **权限透传（PTY 模式）** — CC 请求工具权限时聊天里出现卡片（工具名/描述/输入预览），点允许/拒绝实时回包；120s 超时默认拒绝
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
 
 ### 可靠性
-- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Codex Fast 只选择真实广告 `priority` 的账号；ApexRouter 的模型目录能力也会参与选择。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
-- **API 账号安全删除** — CloudRouter/ApexRouter 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
+- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter、ApexRouter、APIBest API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Claude API Key 只投影给模型主进程，Bash、hooks 与 MCP 子进程仍会清除凭据。API 网关只有在自己的模型目录显式广告 Fast 时才参与选择；CCM 验证实际发出的 Responses 请求携带 `service_tier=priority`，但不会把响应中的信息性 `auto/default` 误判成失败。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
+- **API 账号安全删除** — CloudRouter/ApexRouter/APIBest 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
+- **APIBest 渠道** — 可在 API 账号中直接添加 APIBest Key，同时发现 Claude/Codex 模型。CCM 先经 `/v1/models` 验证 Key，空目录时再读公开 `/api/pricing`，兼容可选 `service_tiers`；Codex 使用 Responses API，该渠道当前不展示额度
+- **Claude API PTY 认证** — 受管网关 Key 以无交互 Bearer token 投影给 Claude 主进程，不受 CLI `.claude.json` 中 API-key 批准/拒绝状态影响；凭据仍不会进入 Bash、hooks 或 MCP 子进程
+- **Codex 日志库自维护** — app-server 启动前自动隔离超过 1 GiB 的本地诊断日志库，只有新运行时初始化成功后才回收旧库；账号配置、认证和 session/rollout 始终保留
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级
 - **瞬时 429/过载自动重试** — 基础设施侧的临时限流/过载（非账号额度用尽），指数退避+jitter 用同一账号自动 `--resume` 重试，最多 5 次；检测按 provider 分流（Claude / Codex 各自的 CLI 错误文案）
 - **`/tmp` 空间保护** — 服务启动时及后台每 3 小时检查容量和 inode；任一达到 80% 时，清理全部超过 6 小时的 CCM 白名单临时产物
@@ -54,8 +60,8 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **安全的一键更新重启** — 后台定时检查并弹窗提醒；更新时暂停领取新工作，运行中 task、无 Task 的手动实例或待续跑消息未清零则拒绝重启；支持识别手动拉取但尚未加载的代码，再完成依赖、迁移、前端构建和智能重启
 
 ### 项目与协作
-- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
-- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
+- **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目。后台 clone 不会因等待凭据输入而挂起，认证失败给出明确提示；clone 失败的项目会拒绝新建任务（422），已排队任务保持等待并在 Re-clone 成功后自动开始
+- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；内部 Reviewer/Fix/Rebuttal Task 始终隐藏，Tasks 页面改为展示一张按 `PRMonitorRun` 聚合的只读结果卡，可直接看到代码 verdict、GitHub 发布状态、PR 生命周期和后端发布身份，并进入完整 Review History。每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址
 - **主题切换** — v2 主题系统：现代深色（默认，Multica 风格）/ 现代浅色（tonal zinc 灰调分层）/ 飞书（官方色板 + 真实 App 截图取色实证：白底为主 + 经典飞书蓝 #3370FF + N 系中性色 + 低边框风，与浅色主题以「白 vs 灰」区分，飞书客户端式窄图标 rail + IconPark 双色图标集）/ 苹果（apple-design skill 驱动：iOS systemGray 中性色 + apple.com CTA 蓝 #0071E3 + 系统字体优先 + 毛玻璃顶栏 + 按压反馈 + macOS Settings 式侧栏与 Ionicons 图标集，尊重 reduced-motion/transparency），v1 的经典深色、海蓝、森林、莓红完整保留为 Legacy 组，偏好持久化
@@ -79,11 +85,21 @@ Dispatcher 只负责分配任务和判断成败，Claude Code 自主完成整个
 **状态流转：**
 ```
 pending → in_progress → executing → completed
+                           ├─ (显式 Auto Capability policy，可选)
                            ↓
-                        (fail)
+                    waiting_capability
+                           ↓  Plan / Code Review 完成并恢复同一会话 G+1
+                       executing
                            ↓
-                        pending (retry)
+                         (fail)
+                           ↓
+                     pending (retry)
 ```
+
+Auto Capability 的全局 admission 默认开启，但本地普通 Auto Task 默认不带
+`capability_policy`，仍需在创建时显式允许 Plan / Code Review 并设置总预算与
+分类预算；任务卡片和聊天页会展示 policy、剩余预算及 `waiting_capability`
+等待状态。Worker、Shared 和其他 Task mode 不接受该 policy。
 
 ## 技术栈
 
@@ -117,6 +133,8 @@ claude-manager/
 │   │   ├── monitor.py           # Monitor Session CRUD + 子 agent endpoints
 │   │   ├── pool.py              # Claude 账号池 status/usage/reload/clear-cooldown
 │   │   ├── pr_monitor.py        # PR Monitor CRUD + GitHub webhook
+│   │   ├── browser_reviews.py   # 浏览器审查任务/进度/产物 API
+│   │   ├── test_harness.py      # Task 统一测试 Run/重试/比较/证据 API
 │   │   ├── workers.py           # 分布式 Worker CRUD + stop/start/destroy/retry
 │   │   ├── sub_agents.py        # 子 Agent summary API
 │   │   ├── ask_user.py          # ask_user 拦截 + 答案回流
@@ -142,6 +160,8 @@ claude-manager/
 │   ├── schemas/                 # Pydantic 请求/响应模型
 │   ├── mcp/                     # MCP Servers
 │   │   ├── ccm_skills_server.py         # 主 Agent MCP: create_monitor / check_monitors / stop_monitor
+│   │   ├── ccm_browser_review_server.py # Task-scoped 隔离浏览器审查工具
+│   │   ├── ccm_workspace_review_server.py # 当前工作区/PR/ref 测试工具
 │   │   └── ccm_monitor_agent_server.py  # 子 Agent MCP: report_status / mark_complete / get_context
 │   └── services/                # 核心业务逻辑
 │       ├── dispatcher.py        # 全局调度器 (9 步任务生命周期 + goal + monitor)
@@ -164,6 +184,17 @@ claude-manager/
 │       ├── task_queue.py        # 优先级任务队列
 │       ├── worktree_manager.py  # Git worktree 管理 + rebase + push
 │       ├── pr_review_service.py # PR 审核 prompt 构建 + 状态回查
+│       ├── browser_review.py    # 隔离 Playwright 浏览器、安全动作与 CLI harness
+│       ├── browser_review_jobs.py # CCM Task-backed browser review job/证据管理
+│       ├── test_harness.py      # provider-neutral 测试门面与持久化生命周期
+│       ├── test_harness_artifacts.py # 私有证据、哈希归档与保留策略
+│       ├── test_harness_runtime.py # 每 Task 独立 Browser Agent 模型/强度配置
+│       ├── test_harness_children.py # Browser Agent 子 Task 持久所有权/停止恢复
+│       ├── test_harness_git_targets.py # 公共 GitHub 元数据与 exact SHA 冻结
+│       ├── test_harness_sandbox.py # PR/ref Docker Sandbox 与持久 Lease
+│       ├── test_harness_egress_proxy.py # Sandbox 依赖出口白名单代理
+│       ├── test_harness_preview_relay.py # 只读 loopback Preview relay
+│       ├── test_harness_targets.py # PR/ref 隔离目标编排门禁
 │       ├── ask_user.py          # ask_user 注册表 + Future 管理
 │       ├── ask_user_settings.py # ask_user hook 注入/移除
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
@@ -191,6 +222,7 @@ claude-manager/
 │       └── hooks/useWebSocket.ts
 ├── scripts/
 │   ├── dev.sh                   # 一键启动开发环境
+│   ├── browser_review_demo.py   # Playwright + OpenAI Computer Use 前端审查 demo
 │   ├── setup.sh                 # Worker SSH Key + 环境初始化
 │   ├── refresh_pty.sh           # 刷新 claude-pty 依赖
 │   ├── start_all.sh             # 生产环境启动脚本
@@ -210,12 +242,17 @@ claude-manager/
 - Node.js 18+
 - [uv](https://docs.astral.sh/uv/) — Python 包管理器
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 已安装并登录（`claude auth login`）
+- Linux 上运行本地 Claude Task 需要 `bubblewrap` 与 `socat`；缺少任一项时安全预检会在模型输入前 fail closed（Ubuntu 的 `scripts/setup.sh` 会自动安装）
+- 这条 Claude OS 隔离证明目前只支持 Linux；macOS Manager 请使用 Codex provider，或把 Claude Task 路由到已安装上述依赖的 Linux 环境
 - Google Chrome + Xvfb（号池自动登录需要，服务器部署时安装）
 
 ### 安装
 
 ```bash
 git clone https://github.com/zjw49246/Claude-Code-Manager.git && cd Claude-Code-Manager
+
+# Ubuntu/Debian：本地 Claude Task 的隔离预检依赖
+sudo apt-get install -y bubblewrap socat
 
 # 后端依赖（使用 uv）
 uv sync
@@ -233,7 +270,7 @@ cd frontend && npm install && cd ..
 cp .env.example .env
 # 编辑 .env，设置：
 #   AUTH_TOKEN=你的访问密码
-#   OPENAI_API_KEY=sk-...（语音功能需要）
+#   OPENAI_API_KEY=sk-...（仅 Whisper 语音和独立 Browser Review CLI 需要）
 #   WORKSPACE_DIR=~/Projects（项目工作区根目录）
 ```
 
@@ -252,6 +289,64 @@ cd frontend && npx vite --host &
 
 启动后 Dispatcher 会自动创建 worker 实例并开始调度。
 
+### 浏览器前端审查 Demo
+
+CCM 的 Web 浏览器测试现在统一由持久化 Test Harness 管理。普通对话、Task 输入区的
+一次性测试、Goal 复查、固定 URL、PR 号和 Git ref 都会创建同一种 Run，冻结测试
+目标、TestPlan、provider/model 和预算，并持续记录 Attempt、阶段事件、截图/报告、
+结构化 Finding 与最终 Verdict。右侧栏或浮窗会自动切到同一 Task 的最新 Run；终态
+Run 可以直接“重新测试”，也可以比较两轮 finding fingerprint。服务重启后历史记录
+仍在；截图/报告只有复制到私有内容寻址存储并重新通过 SHA-256 校验后才进入
+`complete`，缺失或中断会保留 staging 供恢复并让 Run fail closed，不会伪装成通过。
+
+Browser Agent 的 provider、模型、推理强度和 Codex Fast/Standard 可在右侧测试栏单独
+配置，默认才跟随父 Task。该选择按 Task 保存，并统一用于普通对话触发、一次性测试、
+Goal 复查、固定 URL 以及 PR/ref 审查；每个 Run 启动后会冻结实际路由，因此父 Task 与
+黑盒审查 Agent 可以使用不同模型，也不会在运行中因设置变化而漂移。
+
+当前工作区测试会先使用 Project 中管理员确认过的 Preview Profile 启动 loopback 隔离
+预览。一个 Project 可以登记多个受信任 Profile（例如 `web/**`、`admin/**`）；Delivery
+按最终提交相对 base 的 changed paths 自动选择全部匹配项并依次审查，无匹配时才使用
+管理员指定的 default profile。Profile 的 argv、cwd、环境和 URL 在 Run admission 时冻结，
+Agent 只能选择已登记 ID，不能从 PR 内容替换启动命令。旧版单 Preview 配置会自动映射为
+一个兼容 Profile。PR/ref 测试会解析精确 Git SHA，把源码 fetch、依赖安装、构建和 Preview 全部
+放进临时 Docker Sandbox，绝不在 Manager 宿主机执行不可信提交或切换当前开发工作树。
+独立 Browser Agent 只收到 URL、冻结后的测试计划和浏览器工具，
+不继承父 Task 的会话或仓库上下文，因此更接近黑盒验收。浏览器会收集截图、console、
+页面异常、失败请求和 HTTP 4xx/5xx，并阻止跨源导航、弹窗、下载、凭证输入和破坏性
+动作。Claude 与 Codex 复用同一套 Harness/MCP；这项能力不绑定某一个模型厂商。
+
+固定 URL 测试也从 Task 右侧测试栏配置和启动。轨迹只展示可公开的进度/决策摘要、
+Harness 生命周期和浏览器工具调用，不暴露隐藏推理。Web 页面不需要单独的
+`OPENAI_API_KEY`；远程 Worker 暂不执行本机浏览器测试。
+
+默认是只读模式，并限制跨域顶层导航、弹窗、下载和 Service Worker。网页文本、DOM
+和遥测始终作为不可信证据，不能改变 Agent 任务。独立 CLI 仍保留，可用于脱离 CCM
+Task 的浏览器链路诊断；其中完整模型审查才需要 `OPENAI_API_KEY`：
+
+```bash
+# 默认使用 Playwright 自带的 Chromium（也可用 --browser-channel chrome 复用系统 Chrome）
+uv run playwright install chromium
+
+# 先只验证浏览器、截图和遥测，不调用模型
+uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173 --capture-only
+
+# 完整模型审查；默认只允许截图、滚动、等待和移动鼠标
+OPENAI_API_KEY=sk-... uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173
+
+# 在无敏感数据的隔离预览环境中允许点击、输入、按键和拖拽
+OPENAI_API_KEY=sk-... uv run python scripts/browser_review_demo.py \
+  http://127.0.0.1:5173 --allow-actions
+```
+
+结果默认写入系统临时目录，包括 `report.md`、`final.png`、
+`telemetry.json`，模型发生操作时还会保存逐步截图和脱敏后的
+`actions.jsonl`。可用
+`--output-dir` 指定目录，`--headed` 显示浏览器窗口。顶层页面导航默认限制在
+目标同源，弹窗、下载和 Service Worker 均被禁用。
+
 ### Android App 打包
 
 ```bash
@@ -260,8 +355,13 @@ cd frontend
 # 安装 Capacitor（已在 package.json 中）
 npm install
 
-# 构建 + 同步 + 打包 APK
+# 构建 Web 资源
 npm run build
+
+# 首次 clone：生成未纳入 Git 的原生 Android 工程；后续打包跳过此步
+npx cap add android
+
+# 同步 Web 资源与原生依赖，然后打包 APK
 npx cap sync android
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   android/gradlew -p android assembleDebug
@@ -286,6 +386,8 @@ DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/claude_manager
 DATABASE_URL=mysql+aiomysql://user:pass@host:3306/claude_manager
 ```
 
+MySQL 要求 **8.0.16 或更高版本**；CCM 的完整性约束依赖该版本起正式执行的 `CHECK` 约束语义。
+
 ### Schema 迁移（Alembic）
 
 使用 Alembic 管理 schema 版本。**启动时自动执行 `alembic upgrade head`**，无需手动操作。
@@ -298,17 +400,7 @@ uv run alembic history         # 查看历史
 
 ### 数据迁移
 
-在数据库之间迁移全部数据（注意使用同步 URL）：
-
-```bash
-# 先在目标库初始化 schema
-DATABASE_URL=postgresql+asyncpg://... uv run alembic upgrade head
-
-# 再迁移数据
-uv run python scripts/transfer_db.py \
-    "sqlite:///./claude_manager.db" \
-    "postgresql://user:pass@host:5432/claude_manager"
-```
+本仓库不提供跨 SQLite、PostgreSQL 和 MySQL 的数据搬运脚本。跨数据库迁移时，请先停止写入并完整备份，再使用源数据库和目标数据库官方提供的导出、导入或复制工具（或经过独立验证的 ETL）。迁移后应运行 Alembic、核对行数与关键关联，并在切换 `DATABASE_URL` 前完成恢复演练。
 
 ## 更新已部署的实例
 
@@ -340,7 +432,7 @@ curl -X POST http://localhost:8000/api/system/restart \
   -H "Authorization: Bearer $AUTH_TOKEN"
 ```
 
-更新事务使用仓库内的持久 deployment lease 记录 token、worker PID 身份、期望 commit 和迁移结果。服务启动前会先检查该 lease；若上一次迁移或回滚没有完整结束，CCM 只启动一个不访问业务数据库的维护界面，Dispatcher、Worker 和普通 API 不会启动，管理员仍可查看状态并执行修复/回滚。迁移脚本会在服务完全停止后重新生成 SQLite 快照；数据库恢复、代码回退、依赖恢复或前端恢复任一步失败，服务保持停止，避免启动代码、依赖和 schema 混合的版本。
+更新事务使用仓库内的持久 deployment lease 记录 token、worker PID 身份、期望 commit 和迁移结果。服务启动前会先检查该 lease；若上一次迁移或回滚没有完整结束，CCM 只启动一个不访问业务数据库的维护界面，Dispatcher、Worker 和普通 API 不会启动，管理员仍可查看状态并执行修复/回滚。只有 Alembic revision 确认存在待迁移项时才生成数据库回滚快照；迁移脚本在服务完全停止后一次性生成并校验权威 SQLite 快照，不再先做一份会被覆盖的在线快照。数据库恢复、代码回退、依赖恢复或前端恢复任一步失败，服务保持停止，避免启动代码、依赖和 schema 混合的版本。数据库快照默认只保留当前和上一个恢复点。
 
 一键更新和自动修复仅支持文件型 SQLite，因为 CCM 必须能在停服后制作并验证快照，才能承诺自动回滚。PostgreSQL/MySQL 等外部数据库仍可在版本完全一致时使用「重启」，但更新和修复必须由管理员先完成数据库备份，再按数据库自己的迁移/恢复流程部署。迁移失败通常来自数据库 schema 漂移、迁移脚本本身报错、数据库文件被其他进程占用、权限/磁盘空间问题或新服务未在健康检查期限内启动；页面和 deployment status 会保留失败步骤与日志，不应通过反复点击更新绕过。
 
@@ -376,6 +468,7 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 3. 点击任务的 **Chat** 按钮，可以对已完成的任务继续追问
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
 5. 可在任务卡片菜单添加一个关注标签，或直接点击任务卡片/Chat 顶栏中的标签修改；清空并保存即可移除
+6. PR Monitor 接管的 PR 会在 Tasks 中显示独立的只读 **PR Review Result** 卡；Panel 只显示一张聚合卡，点击后进入 PR Monitor 详情或 GitHub。该卡不是可执行 Task，没有 Chat、Task Retry、中断、分享或内部 prompt/session 日志
 
 ### Interactive Plans
 
@@ -412,11 +505,63 @@ API key、access token 和 private key 等高置信凭据必须存入 Settings �
 
 ### PR Monitor 前置条件
 
-PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr review` / `gh pr merge`，使用前需满足：
+PR Monitor 的审核流程会由后端通过 `gh pr view` / `gh api` 读取 exact-head PR 状态、
+发布 `COMMENT` Review，并在显式开启自动合并时执行受保护的 exact-ref fast-forward，使用前需满足：
 
 1. **gh CLI 已认证**：运行后端的系统用户必须先执行 `gh auth login` 完成 GitHub 认证
 2. **账号权限**：该 GitHub 账号需要对被监控仓库有 push / review 权限（auto-merge 还需要 merge 权限）
 3. **PUBLIC_BASE_URL**：在 `.env` 中设置 `PUBLIC_BASE_URL`（如 `https://ccm.example.com`），PR Monitor 页面才能显示正确的 Webhook Payload URL
+
+不要求该 GitHub 账号是仓库创建者。只读分析需要仓库/PR 读取权限；发布审查、
+Delivery 推送分支和创建 PR 需要相应的 PR 与仓库写权限；只有启用自动合并时，
+才额外要求 CCM 登录账号可被证明为 `write`、`maintain` 或 `admin` collaborator，
+并满足目标分支保护门禁。
+
+这里的“GitHub 账号”专指**运行 CCM 后端的系统用户**在 `gh` 中登录的账号。浏览器中的 GitHub
+Connector、当前 Codex 会话或 Reviewer thread 的登录状态与它互相独立，也不会被拿来发布 Review。
+Reviewer 始终 tool-free；GitHub 写操作由后端执行并保存实际 actor、发布时间、GitHub Review 链接与
+`COMMENT` event 证据。内部 verdict 为 pass 不代表 GitHub `APPROVED`：CCM 新建的 GitHub Review 恒为
+head-pinned `COMMENT`。
+
+代码结论、发布状态和 PR 生命周期会分别显示。例如 Reviewer 已给出 Changes required，但 PR 在发布前
+被外部合并时，结果仍保留 Changes required，并显示“PR 已合并 · 结果未发布（不再适用）”，不会误报
+`Infrastructure error`。详情页可用 **重新审查** 对当前 exact head 创建新 attempt；head 已变化、PR 已关闭/
+合并或进入 draft 时会拒绝，旧 Review History 不会被覆盖。升级前没有可靠 Run 快照的历史 Single Review
+会以只读 `review:<id>` 结果保留，不能重新审查；只有绑定 current Run、并通过远端 open/non-draft/exact-head
+复验的 `run:<id>` 结果才允许该操作。`closed` Webhook 只负责按 GitHub 远端事实收口为 closed 或 merged，
+不会把已关闭 PR 重新送入审核；之后只有 GitHub 实际 `reopened`/`ready_for_review` 才会重新准入 current subject。
+若该 Run 已由 Delivery Loop 的 durable owner edge 接管，上述 reopen/ready 以及 `synchronize` 都会返回 409，
+不会替换 current Review、清除终态证据或把 Delivery 冻结策略降级成可变的普通 PR Monitor 配置。
+
+### Delivery Loop 快速启动
+
+1. 在 **Projects** 导入本机 GitHub 项目并等待状态变为 `ready`
+2. 打开 **Delivery**，选择项目，在需求框直接描述任务和验收条件；标题可留空
+3. 选择前端审查策略和是否自动合并，点击 **Start Delivery**；系统进入
+   Plan → Development → Code Review → Frontend Review → Publish PR → CI & PR Review
+
+导入完成后 CCM 会尽力自动创建并绑定该项目的内部 PR Monitor；第一次 Start 也会
+进行同一套幂等准备。Panel Review 始终启用；required CI 优先使用 GitHub 分支保护
+声明的精确 check，没有声明 required check 时只运行 Panel，不会根据可选、部署或
+push-only workflow 猜一个 CI Gate，也不要求用户填写 PR Monitor 表单。默认在全部
+门禁通过后保持 PR 打开；每次启动可显式开启“自动合并”，但只有已发现 app-bound
+exact CI、GitHub 写权限和严格分支保护同时满足时才允许执行。
+
+前端审查默认是 `Auto`：项目已确认至少一个可信 Preview Profile 且配置了 `AUTH_TOKEN`
+时，会在创建 PR 前由独立 Browser Agent 运行 Test Harness。最终 diff 同时命中多个
+Profile 时会串行运行全部审查，详情页显示当前项与逐项结果；能力不可用或没有匹配项且
+未配置 default 时会在进度中显示跳过原因。
+`Required` 会把同一条件变成强制门禁，`Off` 则明确关闭。运行详情按六个阶段展示公开
+进度、Agent 路由、报告和截图证据；当前 Round、总预算、开轮原因和耗时会置顶高亮，
+历史 Round 可横向切换，阶段内容与时间线只展示所选轮次，避免把新一轮误判为旧 Plan
+卡住。如果 Plan 需要选择或补充信息，页面会自动聚焦当前 Round、切回 Plan tab 并内嵌
+回答表单，侧栏同时显示待处理数量。
+
+Planner/Reviewer 路由因 stream stall、临时不可用等原因让一次 Plan Run 失败时，系统会
+先在同一个 Capability Invocation 内自动创建一次新的 Plan Run 重试。两次尝试都失败且
+尚未发布 PR 时，详情页会显示 **Retry from Plan**：它在原 Delivery Run 内保留失败记录并
+新建一个 Cycle 重新规划，不需要重新 Start Delivery；发布后的失败仍交给 PR Monitor 流程
+收敛，不允许回退重放。
 
 Panel 中的 Finding 操作是独立的审计流程：**Ignore** 和 **Human advice** 只保存决策或供下一次候选生成参考，不会把阻断项改成通过；**Generate AI fix** 会在与 Reviewer 相同的 tool-free 沙箱中读取后端冻结的 exact-head 单文件输入，只输出有界 unified diff，不会直接访问仓库或 GitHub。候选完成后必须从 CCM 后端下载 diff；后端签发并保存与当前用户、Action 和 SHA-256 绑定的下载回执，只有回传同一回执并再次确认 exact base/head/repo/ref 后才会创建 commit。push 以 captured head 为 expected-old 做原子 compare-and-swap，分支被删除、漂移或远端结果无法证明时会拒绝或进入可对账恢复，不覆盖他人提交。
 
@@ -455,13 +600,24 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `GET/PUT/DELETE /api/tasks/{id}` | 任务详情/更新/删除 |
 | | `POST /api/tasks/{id}/cancel` | 取消任务 |
 | | `POST /api/tasks/{id}/retry` | 重试任务 |
-| | `POST /api/tasks/{id}/plan/approve` | 批准计划 |
 | | `POST /api/tasks/{id}/chat` | 发送追问消息 |
 | | `GET /api/tasks/{id}/chat/history` | 获取对话历史 |
 | | `POST /api/tasks/{id}/permissions/{rid}` | 回复权限请求 |
 | | `POST /api/tasks/{id}/ask-user/{rid}` | 回复 ask_user 提问 |
 | | `GET /api/tasks/{id}/ask-user/pending` | 获取待回复提问 |
+| Plans | `GET/POST /api/plans` | Plan 目录/创建 |
+| | `GET/PATCH /api/plans/{id}` | 详情、重命名、归档或恢复 |
+| | `POST /api/plans/{id}/runs` | 创建 Revise/Refresh/Retry Run |
+| | `POST /api/plans/{id}/fork` | Fork 为新 Plan |
+| | `GET /api/plans/{id}/versions` | 获取不可变 Version 历史 |
+| | `GET /api/plan-versions/{id}` | 获取 exact Version |
+| | `GET /api/plan-versions/{id}/staleness` | 检查 Version 上下文是否过期 |
+| | `POST /api/plan-versions/{id}/approve` | 批准 exact Version |
+| | `POST /api/plan-versions/{id}/reject` | 拒绝 exact Version |
+| | `POST /api/plan-runs/{run_id}/input-requests/{request_id}/answer` | 回答必要输入并恢复同一 Run |
+| | `POST /api/plan-versions/{id}/create-execution-task` | 从 standalone Version 创建执行 Task |
 | Instances | `GET/POST /api/instances` | 实例列表/创建 |
+| Settings | `GET/PUT /api/settings/capacity` | 查看或热更新 Manager 本地并发容量；`null` 恢复环境默认值 |
 | | `DELETE /api/instances/{id}` | 删除实例 |
 | | `POST /api/instances/{id}/stop` | 停止实例 |
 | | `POST /api/instances/{id}/run` | 手动执行 |
@@ -472,6 +628,9 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `POST /api/tasks/{id}/monitor-sessions/{sid}/checks` | 子 agent 报告状态 |
 | | `POST /api/tasks/{id}/monitor-sessions/{sid}/complete` | 子 agent 标记完成 |
 | Sub-Agents | `GET /api/tasks/{id}/sub-agents/summary` | 子 agent 按类型汇总 |
+| PR Monitor | `GET /api/pr-monitor/results?page=&size=` | Tasks 使用的只读 Run 聚合结果 feed |
+| | `GET /api/pr-monitor/runs/{id}` | PR 生命周期、Review History 与公开 evidence 详情 |
+| | `POST /api/pr-monitor/reviews/{review_id}/rerun` | 携 `expected_head_sha` 与 `idempotency_key` 重审 current exact head |
 | Workers | `GET/POST /api/workers` | Worker 列表/创建 |
 | | `GET /api/workers/{id}` | Worker 详情 |
 | | `GET /api/workers/{id}/logs` | Bootstrap 日志 |
@@ -508,7 +667,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `AUTH_TOKEN` | (必填) | API 认证 Token |
 | `PORT` | `8000` | 主服务监听端口 |
 | `PUBLIC_BASE_URL` | （空） | 部署的公网地址（如 `https://ccm.example.com`） |
-| `OPENAI_API_KEY` | (可选) | 语音功能所需 |
+| `OPENAI_API_KEY` | (可选) | Whisper 语音及独立 Browser Review CLI 的 Responses 模式所需；Web Browser Review 复用 CCM 账号池，不读取该 Key |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./claude_manager.db` | 数据库连接（支持 SQLite/PostgreSQL/MySQL） |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | （空） | 飞书 OAuth 应用凭据 |
 | `FEISHU_OAUTH_STATE_SECRET` | （空） | 可选独立 OAuth state 签名密钥；留空时安全复用 `FEISHU_APP_SECRET` |
@@ -522,8 +681,11 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `VERIFICATION_CODE_RESEND_COOLDOWN_SECONDS` | `60` | 同一邮箱两次发送的最短间隔（秒） |
 | `VERIFICATION_CODE_SMTP_CONCURRENCY` | `4` | 单进程同时进行的 SMTP 投递上限 |
 | `WORKSPACE_DIR` | `~/Projects` | 项目 clone 目标目录 |
-| `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
+| `MAX_CONCURRENT_INSTANCES` | `8` | Manager 本地 Task/Plan 默认并发上限；管理员可在 Settings 热更新覆盖，无需重启 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
+| `CAPABILITY_CORE_ENABLED` | `true` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
+| `AUTO_CAPABILITY_ENABLED` | `true` | 允许带显式 `capability_policy` 的本地普通 Auto Task 通过 exact terminal action 请求 Plan/Code Review，并由 durable outbox 恢复下一轮；同时要求 Capability Core |
+| `DELIVERY_LOOP_ENABLED` | `true` | 允许新建 Delivery Loop；同时要求 Capability Core |
 | `TASK_TIMEOUT_SECONDS` | `1800` | 单个任务最长执行时间（秒） |
 | `SERVICE_NAME` | (自动检测) | systemd 服务名，一键更新重启时使用 |
 
@@ -534,6 +696,25 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 `AUTH_TOKEN` 进入，团队部署需配置 `SMTP_*` 后注册真实管理员。验证码服务会
 按邮箱和 `Request.client.host` 限速；多进程/多副本部署还应在反向代理或网关
 配置共享限流，因为应用内状态按进程隔离。
+
+Task 的运行权限按每一回合的实际发起账号决定：管理员和超级管理员发起的普通
+Task 回合使用 unrestricted 环境，单 Token 部署的 `AUTH_TOKEN` 也按
+`super_admin` 运行；Member 发起的回合进入 fail-closed sandbox。
+发起者身份会随消息持久化并在启动前复验，重试不会借后台 system 身份提权。
+同一 CCM 内的 Team Share 只分配 Project/Task ACL，不改变消息发起者的运行权限。
+Worker 是无前端的完整 CCM 计算节点：Manager 先校验 ACL 和角色，再把普通 Task
+回合转换成 delegated principal 交给 Worker；Worker Token 只认证控制面，不能
+自行变成超级管理员。legacy 跨 CCM Share 仍以 system sandbox 运行；Browser、
+PR Review、Delivery、Planner/Reviewer 等专用任务也始终保留各自的隔离协议。
+Task SSH Profile 和 grant 仅由管理员配置；Member sandbox 只映射当前消息已验证
+的附件和授权能力，不会开放其他 Task 或整个 uploads 目录。
+
+团队权限矩阵：
+
+- `super_admin/admin` 可创建、配置和分配 Project，并可管理所有 Project/Task。
+- `member` 默认看不到任何 Project/Task，也不能创建 Task；获得 Project ACL 后可查看该 Project，并在其中创建和操作 Task。
+- Task 的创建者或管理员可把该 Task 以 chat 权限分享给用户/用户组；Task Share 不等于 Project ACL，不能据此创建同 Project 的新 Task。
+- Worker 的所有者只管理计算节点，不会因此获得节点上 Project/Task 的数据权限；Worker 没有独立前端，任务、日志和权限仍以 Manager 为准。
 
 ### PTY 模式
 
@@ -592,6 +773,9 @@ Agent、未知 PID、权限不足或清后仍达到触发线都会阻止新容�
 | `POOL_ENABLED` | `true` | 启用 Claude 账号池 |
 | `POOL_CONFIG_PATH` | `~/.claude-pool/accounts.json` | 账号池配置文件路径 |
 | `POOL_COOLDOWN_SECONDS` | `300` | 撞限账号的冷却时长（秒） |
+| `CODEX_POOL_ENABLED` | `true` | Codex 原生号池部署级总开关 |
+| `CODEX_POOL_CONFIG_PATH` | `~/.codex-pool/accounts.json` | Codex 账号与运行策略的私有持久化路径 |
+| `CODEX_POOL_COOLDOWN_SECONDS` | `300` | 旧配置未保存在线策略时的 Codex 冷却默认值 |
 
 号池默认启用。首次启动时，如果 `accounts.json` 不存在但 `~/.claude/.credentials.json` 有有效凭证，系统会自动将默认账号加入号池。
 
@@ -600,6 +784,12 @@ Agent、未知 PID、权限不足或清后仍达到触发线都会阻止新容�
 - 点击 **+** 添加新账号（需要邮箱 + 接码 token）
 - 刷新 OAuth Token / 重新登录
 - 手动切换首选账号
+
+Codex 页签右上角的设置按钮可在线修改并立即生效：启用/暂停账号路由、撞限冷却时间、
+主动换号阈值，以及新会话使用 API 优先或 OAuth 优先。在线策略和首选账号保存在
+`CODEX_POOL_CONFIG_PATH` 指向的 `0600` 私有 JSON 中，重启后继续生效；配置文件路径和
+部署级总开关仍由环境变量管理。暂停只阻止后续 Codex 回合，不中断正在执行的进程，
+也不会绕过号池回落到默认 `CODEX_HOME`。
 
 多账号时，撞限或认证失败会自动换号，通过硬链接 session 目录实现无缝 `--resume`。
 
@@ -626,6 +816,7 @@ socket 才会被清理；未知或已被替换的 socket 继续 fail-closed。Ch
 | `WORKER_SSH_KEY_PATH` | (必填) | SSH 私钥 `.pem` 文件路径 |
 | `WORKER_SSH_USER` | `ubuntu` | Worker EC2 的 SSH 用户名 |
 | `WORKER_ENABLED` | `true` | 是否启用 Worker 功能 |
+| `CCM_NODE_ROLE` | `manager` | 数据库节点身份；Worker bootstrap 自动写 `worker`，绑定后不可原地切换 |
 | `WORKER_INSTANCE_TYPE` | (继承 Manager) | 覆盖 Worker 的 EC2 实例类型 |
 | `WORKER_IMAGE_ID` | (继承 Manager) | 覆盖 Worker 的 AMI ID |
 
@@ -775,8 +966,8 @@ cloudflared tunnel run <tunnel-name>
 - **Claude Code 集成**：默认 PTY 模式（常驻交互会话，多轮免冷启动）；可切换为 `claude -p` 一次性进程模式（`USE_PTY_MODE=false`）
 - **进程超时保护**：任务执行超过 `TASK_TIMEOUT_SECONDS`（默认 30 分钟）后自动 kill，防止进程挂死
 - **多轮对话**：session_id 绑定在 Task 上，follow-up 时使用 `--resume <session_id>` 续接会话
-- **Codex 共享传输停止**：`stop-session` 只停止目标 turn。若精确中断暂时无法确认，且同一账号 app-server 还在服务其他 turn 或已准入请求，API 返回 409 并保留原任务运行证据，可稍后重试；不会为停一个任务杀掉同账号的其他任务
-- **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过当前账号 `model/list` 能力检查、app-server 显式 priority 准入，以及 CCM loopback Responses 代理对上游 `response.created.response.service_tier=priority` 的实际响应验证。成功 SSE 在验证前不会释放；缺字段、不一致、非 2xx、未知 lineage 或代理不可用都会明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件会记录 `actual_service_tier_verified=true` 和上游 response id。Fast Goal evaluator 使用与任务相同的模型并走同一实际 tier 证明链路；当前 Distill 无法提供同等证明，因此 Fast Task 会在 Distill 执行前明确返回 409
+- **Codex 共享传输停止**：`stop-session` 会终止目标 Task 的全部存活 turn（包括续接期间尚未收敛的旧 turn 及其原生后代），再回收账号 transport 以确认 Task 私有 helper 已退出。不同 Task 的 live turn 或已准入请求会让 API 返回 409，并保留原任务运行证据和排队消息；不会误杀其他任务
+- **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过账号模型目录的显式能力、app-server priority 准入，以及 CCM loopback Responses 代理对 exact thread/turn 发出的 `service_tier=priority` 请求验证。成功 `response.created` 表示上游接受该请求；其响应 `service_tier` 仅作为遥测，即使为 `auto/default` 或缺失也继续执行。请求 tier 不一致、非 2xx、未知 lineage 或代理不可用仍明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件记录 `service_tier_request_verified=true`、上游报告值和 response id，不宣称实际 Fast 已获证明。Fast Goal evaluator 使用与任务相同的模型并走同一请求验证链路；当前 Distill 无法提供同等保证，因此 Fast Task 会在 Distill 执行前明确返回 409
 - **子 Agent 系统**：统一存 `sub_agent_sessions` 表，`agent_type` 区分类别（monitor / native-agent / native-monitor）。CCM 自有子 agent 拥有独立 MCP server，通过 HTTP API 与系统通信
 - **瞬时过载重试**：Anthropic 基础设施侧 429/overloaded 与账号额度用尽严格区分，前者退避重试同一账号，后者走号池轮换
 - **进程管理**：`asyncio.create_subprocess_exec` 启动，必须 unset `CLAUDECODE` 环境变量避免嵌套检测
@@ -789,6 +980,7 @@ CCM 支持将任务分发到远程 EC2 Worker 节点执行，突破单机并发�
 **核心能力：**
 - **一键创建** — Workers 页面点 +，自动创建 EC2、部署代码、安装依赖、启动服务（配置从 Manager 自身继承，无需手动填写 AMI/机型/子网）
 - **任务转发** — 创建任务或修改已有任务时选择执行 Worker，所有 Chat/Stop/Retry/Plan 操作自动代理，前端零感知
+- **角色委托** — Worker Token 只认证 Manager 控制面；普通 Task 每个回合都继承 Manager 验证后的用户角色（管理员/超级管理员 unrestricted，Member sandbox），Worker 不使用自己的 User 表解释 Manager User ID
 - **实时迁移** — 任务可随时在本机和 Worker 之间迁移，session 文件和工作目录自动同步，`--resume` 无缝衔接
 - **WebSocket 中继** — 每个 Worker 一条 WS 连接，日志实时中继到 Manager 并存储副本，断线自动重连+补全
 - **生命周期管理** — 支持关机（保留数据）/开机/销毁（自动迁回全部任务），健康检查每 30s 自动恢复降级 Worker

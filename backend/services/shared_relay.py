@@ -38,11 +38,25 @@ class SharedRelay:
 
     async def start_relay(self, shared: SharedTaskReceived):
         """Start relay for a shared task. Idempotent."""
-        if shared.id in self._connections or not shared.local_task_id:
+        if shared.id in self._connections or shared.id in self._loops:
             return
+        from backend.services.shared_shadow import lock_owned_shadow
+
+        async with self.db_factory() as db:
+            owned = await lock_owned_shadow(db, shared)
+            if owned is None:
+                return
+            _, shadow = owned
+            shared.local_task_id = shadow.id
         self._closing.discard(shared.id)
         loop_task = asyncio.create_task(self._connect_and_relay(shared))
         self._loops[shared.id] = loop_task
+
+        def _forget_finished(done: asyncio.Task, shared_id: int = shared.id):
+            if self._loops.get(shared_id) is done:
+                self._loops.pop(shared_id, None)
+
+        loop_task.add_done_callback(_forget_finished)
 
     async def stop_relay(self, shared_id: int):
         """Stop relay for a shared task."""
@@ -56,6 +70,8 @@ class SharedRelay:
                 pass
         if loop_task is not None:
             loop_task.cancel()
+            if loop_task is not asyncio.current_task():
+                await asyncio.gather(loop_task, return_exceptions=True)
 
     async def recover_all(self):
         """Restart relays for all active shared tasks (called on startup).
@@ -98,17 +114,31 @@ class SharedRelay:
     async def _create_shadow_task(self, shared: SharedTaskReceived):
         """Create a local shadow task for a shared record that doesn't have one."""
         from backend.models.task import Task
+        from backend.services.shared_shadow import lock_shared_record
+        from backend.services.task_creation import stage_task_record
+
         async with self.db_factory() as db:
-            shadow = Task(
-                title=shared.task_title or "",
-                description=shared.task_description,
-                status="pending",
-                shared_from_id=shared.id,
-            )
-            db.add(shadow)
-            await db.flush()
-            shared_record = await db.get(SharedTaskReceived, shared.id)
-            if shared_record:
+            shared_record = await lock_shared_record(db, shared)
+            if shared_record is None:
+                return
+            shadow = None
+            if shared_record.local_task_id is not None:
+                shadow = (
+                    await db.execute(
+                        select(Task).where(
+                            Task.id == shared_record.local_task_id,
+                            Task.shared_from_id == shared_record.id,
+                        )
+                    )
+                ).scalar_one_or_none()
+            if shadow is None:
+                shadow = await stage_task_record(
+                    db,
+                    title=shared_record.task_title or "",
+                    description=shared_record.task_description,
+                    status="pending",
+                    shared_from_id=shared_record.id,
+                )
                 shared_record.local_task_id = shadow.id
             await db.commit()
             shared.local_task_id = shadow.id
@@ -119,8 +149,11 @@ class SharedRelay:
             from backend.services.shared_proxy import proxy_config
             config = await proxy_config(shared.owner_ccm_url, shared.remote_task_id, shared.share_token)
             async with self.db_factory() as db:
-                shadow = await db.get(Task, shared.local_task_id)
-                if shadow and config:
+                from backend.services.shared_shadow import lock_owned_shadow
+
+                owned = await lock_owned_shadow(db, shared)
+                if owned is not None and config:
+                    _, shadow = owned
                     shadow.status = config.get("status", "pending")
                     shadow.title = config.get("title") or shadow.title
                     shadow.description = config.get("description") or shadow.description
@@ -148,6 +181,11 @@ class SharedRelay:
         for attempt in range(100):
             if shared.id in self._closing:
                 return
+            from backend.services.shared_shadow import lock_owned_shadow
+
+            async with self.db_factory() as db:
+                if await lock_owned_shadow(db, shared) is None:
+                    return
             try:
                 async with websockets.connect(ws_url, open_timeout=15) as ws:
                     self._connections[shared.id] = ws
@@ -198,10 +236,6 @@ class SharedRelay:
         if not event_type:
             return
 
-        local_task_id = shared.local_task_id
-        if not local_task_id:
-            return
-
         # user_message: skip self-sent (already stored locally with prefix by _send_shared_chat).
         # Relay messages from sharer or other shared users (different prefix or no prefix).
         if event_type == "user_message":
@@ -209,19 +243,30 @@ class SharedRelay:
             if self._my_name and content.startswith(f"[{self._my_name}]"):
                 return  # self-sent, already stored locally
 
-        # Write chat events to local log_entries
+        # Every mutation is fenced by both sides of the mapping.  In
+        # particular, never trust the detached relay object's local_task_id:
+        # the old shadow may have been deleted and its id explicitly reused.
+        from backend.services.shared_shadow import lock_owned_shadow
+
         persisted_data = None
-        if event_type in CHAT_EVENT_TYPES:
-            raw_json = data.get("raw_json")
-            metadata_keys = (
-                "attachments", "image_urls", "source", "raw_content", "sender_name",
-            )
-            if not raw_json and any(data.get(k) is not None for k in metadata_keys):
-                import json
-                raw_json = json.dumps({
-                    k: data[k] for k in metadata_keys if data.get(k) is not None
-                })
-            async with self.db_factory() as db:
+        async with self.db_factory() as db:
+            owned = await lock_owned_shadow(db, shared)
+            if owned is None:
+                return
+            _, shadow = owned
+            local_task_id = shadow.id
+
+            # Write chat events to local log_entries
+            entry = None
+            if event_type in CHAT_EVENT_TYPES:
+                raw_json = data.get("raw_json")
+                metadata_keys = (
+                    "attachments", "image_urls", "source", "raw_content", "sender_name",
+                )
+                if not raw_json and any(data.get(k) is not None for k in metadata_keys):
+                    raw_json = json.dumps({
+                        k: data[k] for k in metadata_keys if data.get(k) is not None
+                    })
                 entry = LogEntry(
                     instance_id=None,
                     task_id=local_task_id,
@@ -235,7 +280,19 @@ class SharedRelay:
                     is_error=data.get("is_error", False),
                 )
                 db.add(entry)
-                await db.commit()
+                if data.get("role") == "assistant" and event_type in ("message", "result"):
+                    shadow.has_unread = True
+
+            # Sync status changes under the same ownership proof.
+            if event_type == "status_change":
+                new_status = data.get("new_status")
+                if new_status:
+                    shadow.status = new_status
+                    if data.get("error_message"):
+                        shadow.error_message = data["error_message"]
+
+            await db.commit()
+            if entry is not None:
                 persisted_data = persisted_chat_event(
                     entry,
                     {
@@ -243,26 +300,8 @@ class SharedRelay:
                         for key, value in data.items()
                         if key != "raw_json"
                     },
+                    provider=shadow.provider,
                 )
-
-            if data.get("role") == "assistant" and event_type in ("message", "result"):
-                async with self.db_factory() as db:
-                    t = await db.get(Task, local_task_id)
-                    if t:
-                        t.has_unread = True
-                        await db.commit()
-
-        # Sync status changes
-        if event_type == "status_change":
-            new_status = data.get("new_status")
-            if new_status:
-                async with self.db_factory() as db:
-                    t = await db.get(Task, local_task_id)
-                    if t:
-                        t.status = new_status
-                        if data.get("error_message"):
-                            t.error_message = data["error_message"]
-                        await db.commit()
 
         # Broadcast to local frontend (mirror the event on local task channel)
         await self.broadcaster.broadcast(
@@ -284,9 +323,16 @@ class SharedRelay:
                 messages = resp.json()
 
             async with self.db_factory() as db:
+                from backend.services.shared_shadow import lock_owned_shadow
+
+                owned = await lock_owned_shadow(db, shared)
+                if owned is None:
+                    return
+                _, shadow = owned
+                local_task_id = shadow.id
                 # Check if we already have entries
                 existing = await db.execute(
-                    select(LogEntry.id).where(LogEntry.task_id == shared.local_task_id).limit(1)
+                    select(LogEntry.id).where(LogEntry.task_id == local_task_id).limit(1)
                 )
                 if existing.scalar_one_or_none():
                     return  # already backfilled
@@ -299,7 +345,7 @@ class SharedRelay:
                     }
                     db.add(LogEntry(
                         instance_id=None,
-                        task_id=shared.local_task_id,
+                        task_id=local_task_id,
                         event_type=msg.get("event_type", "message"),
                         role=msg.get("role"),
                         content=msg.get("content"),
@@ -310,6 +356,6 @@ class SharedRelay:
                         is_error=msg.get("is_error", False),
                     ))
                 await db.commit()
-                logger.info("backfilled %d entries for shared task %d", len(messages), shared.local_task_id)
+                logger.info("backfilled %d entries for shared task %d", len(messages), local_task_id)
         except Exception:
             logger.debug("backfill failed for shared %d", shared.id)

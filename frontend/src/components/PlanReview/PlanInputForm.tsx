@@ -5,8 +5,11 @@ import { useFileUpload } from '../../hooks/useFileUpload';
 import { Loader2, Paperclip, X } from '../icons';
 
 interface PlanInputFormProps {
-  run: PlanRun;
-  request: PlanInputRequest;
+  run: Pick<PlanRun, 'id' | 'generation'>;
+  request: Pick<
+    PlanInputRequest,
+    'id' | 'requested_by' | 'reason' | 'questions'
+  >;
   compact?: boolean;
   onAnswered: (answered?: PlanInputRequest) => void | Promise<void>;
 }

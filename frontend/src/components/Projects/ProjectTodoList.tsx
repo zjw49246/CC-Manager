@@ -15,10 +15,23 @@ import {
   X,
 } from '../icons';
 import { api } from '../../api/client';
-import type { ProjectTodo } from '../../api/client';
+import type {
+  DeliveryRunCreate,
+  MonitoredRepo,
+  Project,
+  ProjectTodo,
+} from '../../api/client';
+import {
+  acknowledgeDeliveryAdmission,
+  deliveryProviderOptions,
+  prepareDeliveryAdmission,
+  resolveDeliveryProvider,
+} from '../Tasks/deliveryAdmission';
+import { filterDeliveryRepos } from '../Tasks/deliveryCompatibility';
 
 interface ProjectTodoListProps {
   projectId: number;
+  project?: Project;
 }
 
 interface TodoDraft {
@@ -28,7 +41,11 @@ interface TodoDraft {
 
 const emptyDraft: TodoDraft = { title: '', prompt: '' };
 
-export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
+function deliveryAdmissionScope(projectId: number, todoId: number): string {
+  return `project-todo:${projectId}:${todoId}`;
+}
+
+export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
   const [expanded, setExpanded] = useState(false);
   const [todos, setTodos] = useState<ProjectTodo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -43,11 +60,36 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
   const [taskDraft, setTaskDraft] = useState<TodoDraft>(emptyDraft);
   const [taskProvider, setTaskProvider] = useState('codex');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
+  const [providerConfigLoaded, setProviderConfigLoaded] = useState(false);
+  const [taskMode, setTaskMode] = useState<'auto' | 'delivery_loop'>('auto');
+  const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
+  const [monitoredRepos, setMonitoredRepos] = useState<MonitoredRepo[]>([]);
+  const [deliveryRepoId, setDeliveryRepoId] = useState<number | ''>('');
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
   const [updatingIds, setUpdatingIds] = useState<Set<number>>(() => new Set());
 
   const openCount = useMemo(() => todos.filter((todo) => todo.status === 'open').length, [todos]);
+  const deliveryProviders = useMemo(
+    () => deliveryProviderOptions(providerOptions),
+    [providerOptions],
+  );
+  const compatibleDeliveryRepos = useMemo(
+    () => filterDeliveryRepos(
+      project?.id === projectId ? project : undefined,
+      monitoredRepos,
+      providerConfigLoaded ? deliveryProviders : [],
+    ),
+    [deliveryProviders, monitoredRepos, project, projectId, providerConfigLoaded],
+  );
+  const selectedDeliveryProvider = resolveDeliveryProvider(
+    taskProvider,
+    undefined,
+    deliveryProviders,
+  );
+  const selectedDeliveryRepo = compatibleDeliveryRepos.find(
+    (repo) => repo.id === deliveryRepoId,
+  );
 
   // Track in-flight mutations per row. A single scalar would let one row's
   // completion clear another row's busy flag mid-flight and allow double-submits.
@@ -151,6 +193,11 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
 
   const restoreTodo = (todo: ProjectTodo) => setStatus(todo, 'open');
 
+  const openCreatedTask = (todo: ProjectTodo) => {
+    if (todo.created_task_id == null) return;
+    window.location.hash = `#/tasks/chat/${todo.created_task_id}`;
+  };
+
   const deleteTodo = async (todo: ProjectTodo) => {
     if (!confirm('Permanently delete this todo? This cannot be undone.')) return;
     startBusy(todo.id);
@@ -166,13 +213,37 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
   };
 
   const openTaskModal = (todo: ProjectTodo) => {
+    if (todo.created_task_id != null) {
+      openCreatedTask(todo);
+      return;
+    }
     setError('');
     setTaskTodo(todo);
     setTaskDraft({ title: todo.title, prompt: todo.prompt });
+    setTaskMode('auto');
+    setDeliveryRepoId('');
+    setProviderConfigLoaded(false);
+    setDeliveryLoopEnabled(false);
+    setMonitoredRepos([]);
     api.config().then((c) => {
-      if (c.provider_options?.length) setProviderOptions(c.provider_options);
-      if (c.default_provider) setTaskProvider(c.default_provider);
-    }).catch(() => {});
+      const configuredProviders = c.provider_options?.length
+        ? c.provider_options
+        : ['claude', 'codex'];
+      setProviderOptions(configuredProviders);
+      setProviderConfigLoaded(true);
+      setTaskProvider((current) => (
+        resolveDeliveryProvider(c.default_provider, current, configuredProviders) ?? current
+      ));
+      const enabled = c.delivery_loop_enabled === true;
+      setDeliveryLoopEnabled(enabled);
+      if (enabled) {
+        api.getMonitoredRepos().then(setMonitoredRepos).catch(() => setMonitoredRepos([]));
+      } else {
+        setMonitoredRepos([]);
+      }
+    }).catch(() => {
+      setProviderConfigLoaded(true);
+    });
   };
 
   const createTask = async (event: FormEvent) => {
@@ -180,26 +251,67 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
     if (!taskTodo || running) return;
     setRunning(true);
     setError('');
+    let deliveryRequest: DeliveryRunCreate | null = null;
+    let admissionScope: string | null = null;
     try {
-      const task = await api.createTask({
-        title: taskDraft.title,
-        description: taskDraft.prompt,
-        project_id: projectId,
-        provider: taskProvider,
-      });
-      if (!task?.id) {
+      let taskId: number | null = null;
+      let todoClaimedAtomically = false;
+      if (taskMode === 'delivery_loop') {
+        const repo = compatibleDeliveryRepos.find((item) => item.id === deliveryRepoId);
+        if (!repo) throw new Error('Select a compatible PR Monitor repository.');
+        if (!selectedDeliveryProvider) {
+          throw new Error('Select a supported Delivery provider.');
+        }
+        admissionScope = deliveryAdmissionScope(projectId, taskTodo.id);
+        deliveryRequest = prepareDeliveryAdmission(admissionScope, {
+          project_id: projectId,
+          monitored_repo_id: repo.id,
+          source_todo_id: taskTodo.id,
+          title: taskDraft.title,
+          requirements: taskDraft.prompt,
+          provider: selectedDeliveryProvider,
+        });
+        const run = await api.createDeliveryRun(deliveryRequest);
+        taskId = run.developer_task_id;
+        todoClaimedAtomically = true;
+      } else {
+        const task = await api.createTaskFromProjectTodo(projectId, taskTodo.id, {
+          title: taskDraft.title,
+          prompt: taskDraft.prompt,
+          provider: taskProvider === 'claude' ? 'claude' : 'codex',
+        });
+        taskId = task?.id || null;
+        todoClaimedAtomically = true;
+      }
+      if (!taskId) {
         throw new Error('Task was created but returned no id');
       }
-      // Close the loop: mark the source todo done and record which task it spawned.
-      // Best-effort — a failure here must not block navigating to the new chat.
-      try {
-        await api.updateProjectTodo(projectId, taskTodo.id, { status: 'done', created_task_id: task.id });
-      } catch {
-        /* ignore — the task was created; provenance is a nice-to-have */
+      if (!todoClaimedAtomically) throw new Error('Todo admission was not atomic');
+      if (deliveryRequest && admissionScope) {
+        acknowledgeDeliveryAdmission(admissionScope, deliveryRequest);
       }
-      window.location.hash = `#/tasks/chat/${task.id}`;
-    } catch (e) {
-      setError(String(e));
+      window.location.hash = `#/tasks/chat/${taskId}`;
+    } catch (caught) {
+      // The create response may have been lost after the backend atomically
+      // claimed the Todo. Re-read before inviting a retry: a durable claim is
+      // authoritative and gives us the Task to navigate to without duplicating
+      // a Delivery Run.
+      try {
+        const refreshed = await api.listProjectTodos(projectId, showArchived);
+        setTodos(refreshed);
+        const claimed = refreshed.find((todo) => todo.id === taskTodo.id);
+        if (claimed?.created_task_id != null) {
+          if (deliveryRequest && admissionScope) {
+            acknowledgeDeliveryAdmission(admissionScope, deliveryRequest);
+          }
+          window.location.hash = `#/tasks/chat/${claimed.created_task_id}`;
+          return;
+        }
+      } catch {
+        // Preserve the original admission error and durable key when recovery
+        // cannot be confirmed.
+      }
+      setError(String(caught));
       setRunning(false);
     }
   };
@@ -254,7 +366,8 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
           ) : (
             <div className="space-y-1.5">
               {todos.map((todo) => {
-                const isEditing = editingId === todo.id;
+                const isClaimed = todo.created_task_id != null;
+                const isEditing = !isClaimed && editingId === todo.id;
                 const isBusy = updatingIds.has(todo.id);
 
                 if (todo.status === 'archived') {
@@ -267,24 +380,37 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
                       <span className="shrink-0 rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-500">
                         archived
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => restoreTodo(todo)}
-                        disabled={isBusy}
-                        className="h-7 w-7 rounded text-gray-500 hover:bg-gray-700 hover:text-blue-400 disabled:opacity-60"
-                        title="Restore todo"
-                      >
-                        <RotateCcw size={14} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => deleteTodo(todo)}
-                        disabled={isBusy}
-                        className="h-7 w-7 rounded text-gray-500 hover:bg-gray-700 hover:text-red-400 disabled:opacity-60"
-                        title="Delete permanently"
-                      >
-                        <Trash2 size={14} />
-                      </button>
+                      {isClaimed ? (
+                        <button
+                          type="button"
+                          onClick={() => openCreatedTask(todo)}
+                          className="h-7 w-7 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400"
+                          title={`Open created task #${todo.created_task_id}`}
+                        >
+                          <Play size={14} />
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => restoreTodo(todo)}
+                            disabled={isBusy}
+                            className="h-7 w-7 rounded text-gray-500 hover:bg-gray-700 hover:text-blue-400 disabled:opacity-60"
+                            title="Restore todo"
+                          >
+                            <RotateCcw size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteTodo(todo)}
+                            disabled={isBusy}
+                            className="h-7 w-7 rounded text-gray-500 hover:bg-gray-700 hover:text-red-400 disabled:opacity-60"
+                            title="Delete permanently"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   );
                 }
@@ -325,15 +451,21 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
                       </div>
                     ) : (
                       <div className="flex items-start gap-2">
-                        <button
-                          type="button"
-                          onClick={() => toggleDone(todo)}
-                          disabled={isBusy}
-                          className="mt-0.5 h-7 w-7 shrink-0 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400 disabled:opacity-60"
-                          title={todo.status === 'done' ? 'Mark open' : 'Mark done'}
-                        >
+                        {isClaimed ? (
+                          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center text-gray-600">
+                            {todo.status === 'done' ? <CheckCircle2 size={17} /> : <Circle size={17} />}
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => toggleDone(todo)}
+                            disabled={isBusy}
+                            className="mt-0.5 h-7 w-7 shrink-0 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400 disabled:opacity-60"
+                            title={todo.status === 'done' ? 'Mark open' : 'Mark done'}
+                          >
                           {todo.status === 'done' ? <CheckCircle2 size={17} /> : <Circle size={17} />}
-                        </button>
+                          </button>
+                        )}
                         <div className="min-w-0 flex-1">
                           <div className={`truncate text-sm font-medium ${todo.status === 'done' ? 'text-gray-500 line-through' : 'text-foreground'}`}>
                             {todo.title}
@@ -341,31 +473,44 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
                           <div className="mt-0.5 line-clamp-2 whitespace-pre-wrap text-xs text-gray-500">{todo.prompt}</div>
                         </div>
                         <div className="flex shrink-0 items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => openTaskModal(todo)}
-                            className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400"
-                            title={todo.created_task_id ? 'Run again (already spawned a task)' : 'Create task'}
-                          >
-                            <Play size={15} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => startEdit(todo)}
-                            className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-blue-400"
-                            title="Edit todo"
-                          >
-                            <Pencil size={15} />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => archiveTodo(todo)}
-                            disabled={isBusy}
-                            className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-yellow-400 disabled:opacity-60"
-                            title="Archive todo"
-                          >
-                            <Archive size={15} />
-                          </button>
+                          {isClaimed ? (
+                            <button
+                              type="button"
+                              onClick={() => openCreatedTask(todo)}
+                              className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400"
+                              title={`Open created task #${todo.created_task_id}`}
+                            >
+                              <Play size={15} />
+                            </button>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => openTaskModal(todo)}
+                                className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-green-400"
+                                title="Create task"
+                              >
+                                <Play size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => startEdit(todo)}
+                                className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-blue-400"
+                                title="Edit todo"
+                              >
+                                <Pencil size={15} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => archiveTodo(todo)}
+                                disabled={isBusy}
+                                className="h-8 w-8 rounded text-gray-500 hover:bg-gray-700 hover:text-yellow-400 disabled:opacity-60"
+                                title="Archive todo"
+                              >
+                                <Archive size={15} />
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
                     )}
@@ -401,18 +546,76 @@ export function ProjectTodoList({ projectId }: ProjectTodoListProps) {
           onClose={() => setTaskTodo(null)}
           onSubmit={createTask}
           extraFields={
-            <label className="block space-y-1.5">
-              <span className="text-sm text-gray-300">Provider</span>
-              <select
-                value={taskProvider}
-                onChange={(e) => setTaskProvider(e.target.value)}
-                className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
-              >
-                {providerOptions.map((p) => (
-                  <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>
-                ))}
-              </select>
-            </label>
+            <>
+              <label className="block space-y-1.5">
+                <span className="text-sm text-gray-300">Mode</span>
+                <select
+                  aria-label="Task mode"
+                  value={taskMode}
+                  onChange={(e) => {
+                    const nextMode = e.target.value === 'delivery_loop' ? 'delivery_loop' : 'auto';
+                    setTaskMode(nextMode);
+                    if (nextMode === 'delivery_loop') {
+                      const nextProvider = resolveDeliveryProvider(
+                        taskProvider,
+                        undefined,
+                        deliveryProviders,
+                      );
+                      if (nextProvider) setTaskProvider(nextProvider);
+                    }
+                    setDeliveryRepoId('');
+                  }}
+                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
+                >
+                  <option value="auto">Auto</option>
+                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
+                    <option value="delivery_loop">Delivery Loop</option>
+                  )}
+                </select>
+              </label>
+              <label className="block space-y-1.5">
+                <span className="text-sm text-gray-300">Provider</span>
+                <select
+                  aria-label="Task provider"
+                  value={taskProvider}
+                  onChange={(e) => setTaskProvider(e.target.value)}
+                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
+                >
+                  {(taskMode === 'delivery_loop' ? deliveryProviders : providerOptions).map((p) => (
+                    <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>
+                  ))}
+                </select>
+              </label>
+              {taskMode === 'delivery_loop' && (
+                <label className="block space-y-1.5">
+                  <span className="text-sm text-gray-300">PR Monitor repository</span>
+                  <select
+                    aria-label="Delivery PR Monitor repository"
+                    value={deliveryRepoId}
+                    onChange={(e) => setDeliveryRepoId(e.target.value ? Number(e.target.value) : '')}
+                    className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
+                    required
+                  >
+                    <option value="">Select a compatible repository…</option>
+                    {compatibleDeliveryRepos.map((repo) => (
+                      <option key={repo.id} value={repo.id}>
+                        {repo.repo_full_name} · {repo.auto_merge ? 'auto merge' : 'ready to merge only'}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedDeliveryRepo && (
+                    <span className="block text-xs text-gray-400">
+                      PR Monitor Auto Merge is {selectedDeliveryRepo.auto_merge ? 'ON; completion waits for GitHub to confirm the merge.' : 'OFF; completion stops when the PR is ready to merge.'}
+                    </span>
+                  )}
+                  {compatibleDeliveryRepos.length === 0 && (
+                    <span className="block text-xs text-amber-300">
+                      This project has no compatible panel-review PR Monitor with required CI checks.
+                    </span>
+                  )}
+                </label>
+              )}
+            </>
           }
         />
       )}

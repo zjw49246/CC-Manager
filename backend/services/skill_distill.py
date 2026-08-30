@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -21,8 +22,30 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
-from backend.services.codex_app_server import codex_untrusted_project_override
+from backend.services.cancellation import (
+    await_task_completion,
+    settle_awaitable,
+)
+from backend.services.claude_auth_projection import (
+    ClaudeAuthProjectionError,
+    apply_claude_auth_projection,
+    environment_has_direct_claude_auth,
+    inject_cloudrouter_claude_direct_auth,
+    prepare_claude_auth_projection,
+    remove_claude_auth_projection,
+)
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.task_agent_isolation import (
+    TaskAgentIsolationError,
+    generate_claude_zero_tool_isolation_settings,
+    require_task_security_boundary_configured,
+    scrub_task_model_environment,
+    validate_claude_zero_tool_isolation_settings,
+)
+from backend.services.task_ssh_access import (
+    TaskSSHAccessError,
+    manager_secret_protected_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +109,9 @@ class _TaskDistillProcess:
     provider_home: str | None
     process_group_id: int | None = None
     cleanup_task: asyncio.Task[None] | None = None
+    app_server_registry: object | None = None
+    thread_id: str | None = None
+    transport_removed: bool = False
 
 
 _TASK_DISTILL_PROCESSES: dict[int, _TaskDistillProcess] = {}
@@ -174,6 +200,11 @@ def _select_codex_distill_home(
     """Pick a healthy account for an ephemeral run without changing task binding."""
     if codex_pool is None:
         return None
+    if not codex_pool.enabled:
+        raise CodexDistillAccountUnavailableError(
+            "Codex pool is paused; distillation cannot use the default account",
+            provider="codex",
+        )
 
     bound_home = (
         codex_pool.home_for_account(bound_account_id)
@@ -201,34 +232,28 @@ def _build_task_distill_command(
     provider: str,
     model: str,
     *,
-    load_user_config: bool = False,
+    isolation_settings_path=None,
 ) -> list[str]:
     if provider == "codex":
-        cmd = [
-            settings.codex_binary,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--ignore-rules",
-            "--ephemeral",
-            "-c",
-            'service_tier="default"',
-        ]
-        if not load_user_config:
-            cmd.append("--ignore-user-config")
-        if model and model != "default":
-            cmd.extend(["--model", model])
-        # Keep the conversation out of argv/process listings.
-        cmd.append("-")
-        return cmd
+        raise ValueError(
+            "Codex distillation requires the audited app-server transport"
+        )
 
     return [
         settings.claude_binary,
         "-p", "-",
-        "--dangerously-skip-permissions",
         "--output-format", "json",
+        "--permission-mode", "acceptEdits",
+        "--settings", str(isolation_settings_path),
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--mcp-config", '{"mcpServers":{}}',
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--tools", "",
+        "--allowedTools", "",
+        "--no-session-persistence",
+        "--exclude-dynamic-system-prompt-sections",
         "--model", model,
         "--max-turns", "1",
     ]
@@ -278,19 +303,9 @@ async def _settle_task_distill_spawn(
 ) -> tuple[object, asyncio.CancelledError | None]:
     """Recover the exact child even when cancellation races process spawn."""
 
-    spawn_task = asyncio.create_task(
+    spawn_task, delayed_cancellation = await settle_awaitable(
         asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
     )
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not spawn_task.done():
-        try:
-            await asyncio.shield(spawn_task)
-        except asyncio.CancelledError as exc:
-            if spawn_task.done():
-                break
-            delayed_cancellation = exc
-        except Exception:
-            break
     try:
         process = spawn_task.result()
     except BaseException:
@@ -304,17 +319,27 @@ def _register_task_distill_process(
     process,
     provider: str,
     provider_home: str | os.PathLike[str] | None,
+    *,
+    app_server_registry=None,
+    thread_id: str | None = None,
 ) -> tuple[int, _TaskDistillProcess]:
     token = id(process)
     retained = _TaskDistillProcess(
         process=process,
         provider=provider,
         provider_home=_canonical_provider_home(provider_home),
+        app_server_registry=app_server_registry,
+        thread_id=thread_id,
     )
     # Publish before any caller cancellation can be delivered.
     _TASK_DISTILL_PROCESSES[token] = retained
     pid = getattr(process, "pid", None)
-    if os.name == "posix" and type(pid) is int and pid > 1:
+    if (
+        app_server_registry is None
+        and os.name == "posix"
+        and type(pid) is int
+        and pid > 1
+    ):
         retained.process_group_id = require_safe_process_group_id(
             pid,
             context="task distill",
@@ -351,6 +376,33 @@ async def _terminate_task_distill_process(
         return
 
     process = retained.process
+    if retained.app_server_registry is not None:
+        registry = retained.app_server_registry
+        if getattr(process, "returncode", None) is None:
+            retained.transport_removed = bool(
+                await registry.abort_unclaimed_turn(
+                    retained.provider_home,
+                    process,
+                    reason="Task distillation turn stopped",
+                )
+            )
+        if communicate_task is not None and not communicate_task.done():
+            await asyncio.wait_for(
+                asyncio.shield(communicate_task),
+                timeout=_TASK_DISTILL_CLEANUP_TIMEOUT_SECONDS,
+            )
+        if getattr(process, "returncode", None) is None:
+            raise RuntimeError(
+                "Codex distillation turn could not be proven terminal"
+            )
+        if retained.thread_id and not retained.transport_removed:
+            await registry.delete_thread(
+                retained.provider_home,
+                retained.thread_id,
+            )
+            retained.thread_id = None
+        return
+
     process_group_id = retained.process_group_id
     pid = getattr(process, "pid", None)
     unsafe_posix_group = (
@@ -443,13 +495,8 @@ async def _shielded_terminate_task_distill_process(
             _terminate_task_distill_process(None, communicate_task)
         )
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except Exception:
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
     try:
         cleanup.result()
     except Exception as exc:
@@ -521,6 +568,125 @@ def _is_cloudrouter_projection(
         return False
 
 
+async def _run_codex_distill_turn(
+    *,
+    instance_manager,
+    codex_home: str,
+    model: str,
+    prompt: str,
+    task_id: int | None,
+    codex_pool=None,
+) -> tuple[object, bytes, bytes]:
+    """Run text-only distillation through Codex's audited deny-all profile."""
+
+    process = None
+    process_token: int | None = None
+    retained: _TaskDistillProcess | None = None
+    collect_task: asyncio.Task[tuple[bytes, bytes]] | None = None
+
+    async def collect_output() -> tuple[bytes, bytes]:
+        stdout_task = asyncio.create_task(process.stdout.read())
+        stderr_task = asyncio.create_task(process.stderr.read())
+        wait_task = asyncio.create_task(process.wait())
+        try:
+            stdout, stderr, _returncode = await asyncio.gather(
+                stdout_task,
+                stderr_task,
+                wait_task,
+            )
+            return stdout, stderr
+        finally:
+            for task in (stdout_task, stderr_task, wait_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                stdout_task,
+                stderr_task,
+                wait_task,
+                return_exceptions=True,
+            )
+
+    try:
+        async with instance_manager.codex_home_app_server_guard(
+            codex_home
+        ) as admitted_home:
+            registry = instance_manager._ensure_codex_app_server_registry()
+            process, thread_id = await registry.start_turn(
+                codex_home=admitted_home,
+                prompt=prompt,
+                cwd=tempfile.gettempdir(),
+                model=model,
+                effort=None,
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                disable_autonomous_features=True,
+                sandbox_mode="read-only",
+                tools_disabled=True,
+                codex_service_tier="default",
+            )
+            process_token, retained = _register_task_distill_process(
+                process,
+                "codex",
+                admitted_home,
+                app_server_registry=registry,
+                thread_id=thread_id,
+            )
+            codex_home = admitted_home
+        if codex_pool is not None:
+            codex_pool.record_routed_account(codex_home)
+        collect_task = asyncio.create_task(collect_output())
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(collect_task),
+            timeout=TASK_DISTILL_TIMEOUT_SECONDS,
+        )
+        await _shielded_terminate_task_distill_process(
+            process_token,
+            retained,
+            collect_task,
+        )
+        return process, stdout, stderr
+    except asyncio.CancelledError as exc:
+        if (
+            process_token is not None
+            and retained is not None
+            and _TASK_DISTILL_PROCESSES.get(process_token) is not retained
+        ):
+            raise
+        await _shielded_terminate_task_distill_process(
+            process_token,
+            retained,
+            collect_task,
+            delayed_cancellation=exc,
+        )
+        raise
+    except asyncio.TimeoutError as exc:
+        await _shielded_terminate_task_distill_process(
+            process_token,
+            retained,
+            collect_task,
+        )
+        raise TaskDistillTimeoutError(
+            "Distillation timed out (5min)",
+            provider="codex",
+        ) from exc
+    except TaskDistillError:
+        raise
+    except Exception as exc:
+        await _shielded_terminate_task_distill_process(
+            process_token,
+            retained,
+            collect_task,
+        )
+        raise TaskDistillError(
+            f"Distillation app-server turn failed: {exc}",
+            provider="codex",
+            stderr=str(exc),
+        ) from exc
+
+
 async def distill_task_conversation(
     *,
     title: str,
@@ -530,6 +696,7 @@ async def distill_task_conversation(
     claude_pool=None,
     codex_pool=None,
     codex_account_id: str | None = None,
+    task_id: int | None = None,
     instance_manager=None,
     cloudrouter_store=None,
 ) -> dict:
@@ -540,6 +707,15 @@ async def distill_task_conversation(
             f"Unsupported distill provider: {provider}",
             provider=provider,
         )
+    try:
+        require_task_security_boundary_configured()
+        protected_paths = manager_secret_protected_paths()
+    except (TaskAgentIsolationError, TaskSSHAccessError) as exc:
+        raise TaskDistillError(
+            "Distillation security admission failed",
+            provider=provider,
+            stderr=str(exc),
+        ) from exc
 
     model = (
         settings.default_codex_model
@@ -551,11 +727,7 @@ async def distill_task_conversation(
         conversation=conversation,
         custom_instruction=custom_instruction,
     )
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
-    }
+    env = scrub_task_model_environment(os.environ, provider=provider)
     codex_home = None
     if provider == "codex":
         codex_home = _select_codex_distill_home(
@@ -593,7 +765,20 @@ async def distill_task_conversation(
         provider,
         provider_home,
     )
-    if cloudrouter_api:
+    if cloudrouter_api and provider == "claude":
+        try:
+            inject_cloudrouter_claude_direct_auth(
+                env,
+                cloudrouter_store,
+                provider_home,
+            )
+        except ClaudeAuthProjectionError as exc:
+            raise TaskDistillError(
+                "Distillation security admission failed",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
+    elif cloudrouter_api:
         auth_keys = (
             _CLOUDROUTER_CODEX_AUTH_ENV_KEYS
             if provider == "codex"
@@ -602,26 +787,84 @@ async def distill_task_conversation(
         for key in auth_keys:
             env.pop(key, None)
 
-    # CloudRouter's Codex provider/auth helper lives in CODEX_HOME/config.toml,
-    # so only API projections must load that file. Native distill runs retain
-    # the existing isolated --ignore-user-config behavior.
-    cmd = _build_task_distill_command(
-        provider,
-        model,
-        load_user_config=provider == "codex" and cloudrouter_api,
-    )
-    distill_cwd = tempfile.gettempdir()
-    if provider == "codex" and cloudrouter_api:
-        # The API projection must load its managed provider/auth config, but
-        # must never inherit project-local Codex configuration from /tmp or a
-        # persisted trust entry.  A read-only sandbox alone does not prevent
-        # MCP processes or hooks from starting during configuration loading.
-        cmd[-1:-1] = [
-            "-c",
-            codex_untrusted_project_override(distill_cwd),
-        ]
+    distill_cwd = os.path.abspath(os.sep)
+    cmd: list[str] | None = None
+    projection_identifier: int | None = None
+    projection_binding: str | None = None
+    if provider == "claude":
+        projection_identifier = (
+            task_id
+            if isinstance(task_id, int) and task_id > 0
+            else max(1, os.getpid())
+        )
+        projection_binding = (
+            f"task-distill:{projection_identifier}:{time.monotonic_ns()}"
+        )
+        try:
+            if (
+                not cloudrouter_api
+                and not environment_has_direct_claude_auth(env)
+                and claude_pool is not None
+            ):
+                refreshed = await claude_pool.ensure_oauth_access_token(
+                    provider_home,
+                    minimum_remaining_seconds=300.0,
+                )
+                if not refreshed:
+                    raise ClaudeAuthProjectionError(
+                        "Selected Distill Claude account cannot refresh a "
+                        "bounded access token"
+                    )
+            auth_projection = prepare_claude_auth_projection(
+                provider_home,
+                namespace="task-distill",
+                identifier=projection_identifier,
+                binding=projection_binding,
+                environment=env,
+            )
+            apply_claude_auth_projection(env, auth_projection)
+            isolation_settings = generate_claude_zero_tool_isolation_settings(
+                "task-distill",
+                (
+                    task_id
+                    if isinstance(task_id, int) and task_id > 0
+                    else max(1, os.getpid())
+                ),
+                protected_paths,
+            )
+            validate_claude_zero_tool_isolation_settings(
+                isolation_settings,
+                claude_binary=settings.claude_binary,
+            )
+        except (ClaudeAuthProjectionError, TaskAgentIsolationError) as exc:
+            if projection_identifier is not None and projection_binding is not None:
+                try:
+                    remove_claude_auth_projection(
+                        namespace="task-distill",
+                        identifier=projection_identifier,
+                        binding=projection_binding,
+                    )
+                except ClaudeAuthProjectionError:
+                    logger.exception(
+                        "Could not roll back Task Distill auth projection"
+                    )
+            raise TaskDistillError(
+                "Distillation security admission failed",
+                provider=provider,
+                stderr=str(exc),
+            ) from exc
+        cmd = _build_task_distill_command(
+            provider,
+            model,
+            isolation_settings_path=isolation_settings,
+        )
 
     async def run_process() -> tuple[object, bytes, bytes]:
+        if cmd is None:
+            raise TaskDistillError(
+                "Direct Codex distillation is disabled",
+                provider=provider,
+            )
         process = None
         process_token: int | None = None
         retained: _TaskDistillProcess | None = None
@@ -652,14 +895,12 @@ async def distill_task_conversation(
             # ``select()`` only proposes an account. Publish "recently used"
             # once the provider process really exists, including runs that
             # later return a model/auth error.
-            if provider == "codex" and codex_pool is not None and codex_home:
-                codex_pool.record_routed_account(codex_home)
-            elif (
+            if (
                 provider == "claude"
                 and claude_pool is not None
-                and env.get("CLAUDE_CONFIG_DIR")
+                and provider_home
             ):
-                claude_pool.record_routed_account(env["CLAUDE_CONFIG_DIR"])
+                claude_pool.record_routed_account(provider_home)
             communicate_task = asyncio.create_task(
                 process.communicate(input=prompt.encode("utf-8"))
             )
@@ -716,6 +957,27 @@ async def distill_task_conversation(
                 provider=provider,
                 stderr=str(exc),
             ) from exc
+        finally:
+            if (
+                projection_identifier is not None
+                and projection_binding is not None
+                and (
+                    process is None
+                    or process_token is None
+                    or retained is None
+                    or _TASK_DISTILL_PROCESSES.get(process_token) is not retained
+                )
+            ):
+                try:
+                    remove_claude_auth_projection(
+                        namespace="task-distill",
+                        identifier=projection_identifier,
+                        binding=projection_binding,
+                    )
+                except ClaudeAuthProjectionError:
+                    logger.exception(
+                        "Could not clean Task Distill auth projection"
+                    )
 
     if provider == "codex":
         if instance_manager is None:
@@ -726,11 +988,14 @@ async def distill_task_conversation(
         from backend.services.codex_app_server import CodexAppServerBusyError
 
         async def run_admitted_codex():
-            async with instance_manager.codex_home_exec_guard(
-                codex_home
-            ) as admitted_home:
-                env["CODEX_HOME"] = admitted_home
-                return await run_process()
+            return await _run_codex_distill_turn(
+                instance_manager=instance_manager,
+                codex_home=codex_home,
+                model=model,
+                prompt=prompt,
+                task_id=task_id,
+                codex_pool=codex_pool,
+            )
 
         try:
             if cloudrouter_api:

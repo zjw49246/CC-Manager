@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
 import type { Components } from 'react-markdown';
 import { api } from '../../api/client';
-import type { ChatMessage, Task } from '../../api/client';
+import type { BackgroundLifecycle, ChatMessage, Task } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ArrowLeft, ChevronDown, ChevronRight, Copy, Check, XCircle, ArrowDown } from '../icons';
 import {
@@ -25,9 +25,68 @@ interface IterationMeta {
   progress: string | null;
 }
 
+function messageMatchesTaskTurn(message: ChatMessage, task: Task): boolean {
+  return (
+    message.task_retry_count === task.retry_count
+    && message.task_turn_generation === task.turn_generation
+  );
+}
+
+function latestBackgroundLifecycle(
+  messages: ChatMessage[],
+  task: Task,
+): BackgroundLifecycle | null {
+  let lifecycleIndex = -1;
+  let lifecycleMessage: ChatMessage | null = null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!messageMatchesTaskTurn(message, task)) continue;
+    if (message.background_lifecycle) {
+      lifecycleIndex = index;
+      lifecycleMessage = message;
+      break;
+    }
+  }
+  const lifecycleEntry = lifecycleMessage;
+  if (!lifecycleEntry?.background_lifecycle) return null;
+  const lifecycle = lifecycleEntry.background_lifecycle;
+  // A running lifecycle remains authoritative even if descendant output is
+  // interleaved with foreground rows. A completed marker, however, belongs
+  // to the iteration that emitted it; a later foreground event or any higher
+  // loop iteration starts a new visible foreground epoch on the same Task
+  // retry/turn generation.
+  if (lifecycle.state === 'running') return lifecycle;
+  const lifecycleIteration = lifecycleEntry.loop_iteration;
+  const foregroundTypes = new Set([
+    'user_message',
+    'message',
+    'result',
+    'tool_use',
+    'tool_result',
+    'system_init',
+    'system_event',
+    'thinking',
+  ]);
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (
+      !messageMatchesTaskTurn(message, task)
+      || !foregroundTypes.has(message.event_type)
+    ) continue;
+    if (index > lifecycleIndex) return null;
+    if (
+      lifecycleIteration != null
+      && message.loop_iteration != null
+      && message.loop_iteration > lifecycleIteration
+    ) return null;
+  }
+  return lifecycle;
+}
+
 function groupByIteration(messages: ChatMessage[]): Map<number, ChatMessage[]> {
   const map = new Map<number, ChatMessage[]>();
   for (const msg of messages) {
+    if (msg.event_type === 'background_lifecycle') continue;
     const iter = msg.loop_iteration ?? 0;
     if (!map.has(iter)) map.set(iter, []);
     map.get(iter)!.push(msg);
@@ -383,16 +442,23 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
   const lastWsStatusAt = useRef(0);
   const lastWsBackgroundAt = useRef(0);
   const effectiveStatus = localStatus || task.status;
-  const backgroundActive = localBackgroundActive ?? task.background_active === true;
-  const isProcessing = (
-    backgroundActive
-    || ['executing', 'in_progress'].includes(effectiveStatus)
+  const backgroundLifecycle = useMemo(
+    () => latestBackgroundLifecycle(messages, task),
+    [messages, task.retry_count, task.turn_generation],
   );
+  const backgroundActive = (
+    backgroundLifecycle?.state === 'running'
+    || (localBackgroundActive ?? task.background_active === true)
+  );
+  const foregroundActive = (
+    !backgroundActive
+    && backgroundLifecycle === null
+    && ['executing', 'in_progress'].includes(effectiveStatus)
+  );
+  const hasActiveWork = foregroundActive || backgroundActive;
   const taskStatusRef = useRef(effectiveStatus);
-  const backgroundActiveRef = useRef(backgroundActive);
   currentTaskIdRef.current = task.id;
   taskStatusRef.current = effectiveStatus;
-  backgroundActiveRef.current = backgroundActive;
 
   useEffect(() => {
     const prev = document.title;
@@ -459,6 +525,61 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
 
     const eventType = msg.data.event_type as string;
 
+    if (eventType === 'background_lifecycle') {
+      const retryCount = Number(msg.data.task_retry_count);
+      const turnGeneration = Number(msg.data.task_turn_generation);
+      if (
+        !Number.isInteger(retryCount)
+        || !Number.isInteger(turnGeneration)
+        || retryCount !== task.retry_count
+        || turnGeneration !== task.turn_generation
+      ) return;
+      const lifecycle: BackgroundLifecycle = {
+        state: msg.data.background_state === 'completed' ? 'completed' : 'running',
+        reason: String(msg.data.background_reason || 'waiting_for_descendants'),
+        active_count: Math.max(0, Number(msg.data.background_active_count) || 0),
+        active_thread_ids: Array.isArray(msg.data.background_active_thread_ids)
+          ? msg.data.background_active_thread_ids.map(String)
+          : [],
+        started_at: String(msg.data.background_started_at || new Date().toISOString()),
+        last_activity_at: typeof msg.data.background_last_activity_at === 'string'
+          ? msg.data.background_last_activity_at
+          : null,
+      };
+      const persistedId = Number(msg.data.id);
+      const lifecycleIteration = Number(msg.data.loop_iteration);
+      const entry: ChatMessage = {
+        id: Number.isFinite(persistedId) && persistedId > 0
+          ? persistedId
+          : Date.now() + Math.random(),
+        role: 'system',
+        event_type: 'background_lifecycle',
+        content: null,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: Number.isInteger(lifecycleIteration)
+          ? lifecycleIteration
+          : null,
+        task_retry_count: retryCount,
+        task_turn_generation: turnGeneration,
+        timestamp: typeof msg.data.timestamp === 'string'
+          ? msg.data.timestamp
+          : new Date().toISOString(),
+        image_urls: null,
+        attachments: null,
+        background_lifecycle: lifecycle,
+        persisted: Number.isFinite(persistedId) && persistedId > 0,
+      };
+      if (!historyLoadedRef.current) {
+        pendingWsRef.current.push(entry);
+      } else {
+        setMessages((previous) => mergeChatHistory([entry], previous));
+      }
+      return;
+    }
+
     // Capture loop_iteration_end to update panel headers
     if (eventType === undefined && (msg.data as Record<string, unknown>).event === 'loop_iteration_end') {
       const d = msg.data as { iteration: number; action: string; reason: string; progress: string | null };
@@ -492,6 +613,14 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
     const persistedId = Number(msg.data.id);
     const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
     const itemId = (msg.data.item_id as string) || null;
+    const declaredRetryCount = Number(msg.data.task_retry_count);
+    const declaredTurnGeneration = Number(msg.data.task_turn_generation);
+    if (
+      (Number.isInteger(declaredRetryCount)
+        && declaredRetryCount !== task.retry_count)
+      || (Number.isInteger(declaredTurnGeneration)
+        && declaredTurnGeneration !== task.turn_generation)
+    ) return;
     const entry: ChatMessage = {
       id: isPersisted ? persistedId : Date.now() + Math.random(),
       role: (msg.data.role as string) || 'assistant',
@@ -502,6 +631,12 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       tool_output: (msg.data.tool_output as string) || null,
       is_error: (msg.data.is_error as boolean) || false,
       loop_iteration: (msg.data.loop_iteration as number) ?? 0,
+      task_retry_count: Number.isInteger(declaredRetryCount)
+        ? declaredRetryCount
+        : task.retry_count,
+      task_turn_generation: Number.isInteger(declaredTurnGeneration)
+        ? declaredTurnGeneration
+        : task.turn_generation,
       timestamp: (msg.data.timestamp as string) || new Date().toISOString(),
       image_urls: null,
       attachments: null,
@@ -517,7 +652,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       return;
     }
     setMessages((prev) => [...prev, entry]);
-  }, [task.id]);
+  }, [task.id, task.retry_count, task.turn_generation]);
 
   const refreshHistory = useCallback(() => {
     const requestedTaskId = task.id;
@@ -537,10 +672,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       pendingWsRef.current = [];
       historyLoadedRef.current = true;
       setMessages((current) => mergeChatHistory(filtered, [...current, ...buffered]));
-      if (
-        backgroundActiveRef.current
-        || ['executing', 'in_progress'].includes(taskStatusRef.current)
-      ) {
+      if (['executing', 'in_progress'].includes(taskStatusRef.current)) {
         const maxIter = [...filtered, ...buffered]
           .reduce((acc, m) => Math.max(acc, m.loop_iteration ?? 0), 0);
         setActiveIteration((current) => Math.max(current ?? 0, maxIter));
@@ -669,11 +801,11 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
   };
 
   useEffect(() => {
-    if (!isProcessing) {
+    if (!foregroundActive) {
       setActiveIteration(null);
       setCancelling(false);
     }
-  }, [isProcessing]);
+  }, [foregroundActive]);
 
   return (
     <div className={inline ? "flex flex-col h-full bg-gray-950" : "fixed inset-0 bg-gray-950 flex flex-col z-50"}>
@@ -708,7 +840,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
             iteration={iter}
             messages={msgs}
             meta={iterMeta.get(iter) ?? null}
-            isActive={isProcessing && iter === (activeIteration ?? maxIteration)}
+            isActive={foregroundActive && iter === (activeIteration ?? maxIteration)}
             defaultOpen={iter === maxIteration}
             taskId={task.id}
           />
@@ -726,8 +858,15 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
       )}
 
       {/* Footer */}
-      {isProcessing && (
+      {hasActiveWork && (
         <div className="border-t border-gray-800 bg-gray-900 p-3 flex flex-col items-center gap-2">
+          {backgroundActive && (
+            <p className="text-xs text-sky-300">
+              {foregroundActive
+                ? 'Background agents are still running'
+                : 'Main loop response finished; background agents are still running'}
+            </p>
+          )}
           {cancelError && (
             <p className="text-xs text-red-400">{cancelError}</p>
           )}

@@ -1,10 +1,10 @@
 import { memo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 
 import { copyToClipboard } from './clipboard';
 import { Check, Copy } from './icons';
+import { MarkdownRenderer } from './Markdown/MarkdownRenderer';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -24,8 +24,6 @@ function CopyButton({ text }: { text: string }) {
     </button>
   );
 }
-
-const remarkPlugins = [remarkGfm];
 
 const markdownComponents: Components = {
   pre({ children }) {
@@ -92,12 +90,10 @@ export const MarkdownContent = memo(function MarkdownContent({
 }: MarkdownContentProps) {
   return (
     <div className={`markdown-body min-w-0 max-w-full ${className || ''}`}>
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
+      <MarkdownRenderer
         components={markdownComponents}
-      >
-        {content}
-      </ReactMarkdown>
+        content={content}
+      />
     </div>
   );
 });

@@ -1,13 +1,81 @@
-# CCM Autonomous Delivery Loop — Todo 实现方案
+# CCM Autonomous Delivery Loop — 实现基线与后续 Backlog
 
-- 文档状态：待实施
-- 文档版本：v0.2
-- 更新日期：2026-08-02
-- 文档类型：可领取、可验收、可逐项勾选的实施 Backlog
-- 目标：让 CCM 用持久状态机驱动“开发 → PR → CI → Review → Merge → Deployment”的自动交付循环
-- 当前安全 MVP：本地执行、一个仓库、一个 Developer Task、一个 PR、GitHub Actions、CI 失败自动修复、人工合并
+- 文档状态：Delivery Loop 与 PR Monitor 控制的 direct auto-merge 已实现；部署、Worker 等后续范围仍是 Backlog
+- 文档版本：v0.7
+- 更新日期：2026-08-13
+- 文档类型：当前实现基线 + 可领取、可验收的长期 Backlog
+- 当前目标：用持久状态机驱动“Plan → Code → Pre-PR Review → Frontend Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge 或 merged”
+- 当前安全范围：admission 冻结的 Claude/Codex 本地执行、一个仓库、一个 Developer Task、一个 PR、必经 Reviewer Panel + 仓库声明的 exact-head CI；合并终点由每次 Run 的默认关闭开关冻结
 
-> 本文中的 `[ ]` 表示尚未实现。只有代码、测试、迁移、文档和回退验证全部完成后，才能改为 `[x]`，并在 Todo 的“证据”栏补充 commit、PR 或测试记录。
+> 第 0 节描述当前 V1 的权威实现。第 18 节起保留最初面向完整自动交付平台的长期 Todo；其中 `[ ]` 表示该 Todo 的完整远期范围尚未全部完成，不能据此否定第 0 节列出的 V1 子集。
+
+---
+
+## 0. V1 已实现基线（2026-08-05）
+
+### 0.1 模式与调用关系
+
+- 普通任务仍是 `mode=auto`；Delivery Loop 是独立的 `mode=delivery_loop`。
+- Delivery Run 只能通过 `POST /api/delivery-runs` 创建；第一方入口使用 `POST /api/delivery-runs/quick-start`，先按 Project GitHub identity 幂等准备内部 PR Monitor，再复用同一 admission。Run、Developer Task 和首个 Cycle 在同一事务提交，普通 Task API 无法伪造 Delivery ownership。
+- Plan 与 Pre-PR Code Review 都通过通用 `CapabilityInvocation/CapabilityExecution` 接口调用。Delivery Controller 使用 required-gate invocation；普通 Auto Task 可创建 human advisory invocation，也可在创建时显式冻结 `capability_policy`，由模型通过 exact terminal action 请求 Plan/Review。
+- Capability executor 与调用者解耦。Auto 请求严格绑定 exact source/output/terminal，并在 provider 提供时绑定 native turn；原子消费预算后进入 `waiting_capability`，完成结果经 durable resume outbox 推进同一 Task 的 G→G+1。`CAPABILITY_CORE_ENABLED` 与 `AUTO_CAPABILITY_ENABLED` 均默认开启，但普通 Task 仍须显式冻结 `capability_policy`；Worker/Shared 及非普通 Auto scope 继续 fail closed。
+
+### 0.2 当前闭环
+
+```text
+Create DeliveryRun
+  → Plan Capability（Planner + Reviewer pipeline）
+  → Plan Run 失败：同一 Invocation 最多自动创建一个独立 replacement Execution/Run
+  → Developer Agent 在固定 worktree 写代码、测试、自审，留下未提交 diff
+  → Controller 校验 exact Run/Turn/worktree 后创建带审计 trailer 的 commit
+  → Code Review Capability 对 exact base/head/tree/patch 做独立结构化审查
+  → changes_requested：携 finding 新建 Cycle，重新 Plan
+  → approved：按冻结策略运行 Test Harness Frontend Review；failed finding 新建 Cycle
+  → Frontend Review passed/off/auto-unavailable：Controller 以 Action fence 做 exact non-force push，query-before-create 绑定 PR
+  → PR Monitor 必跑 Reviewer Panel；仓库声明 required CI 时再等 exact-head CI
+  → blocked：携 PRReview/RepairWake evidence 新建 Cycle，重新 Plan/Code/Review
+  → auto_merge OFF：ready_to_merge，远程复验 exact workspace/branch/PR/Monitor 后成功终止
+  → auto_merge ON：冻结 base ref non-force fast-forward 到 exact head，确认 merge evidence 与 merged comment 后成功终止
+  → 发布前 failed：操作员可在原 Run 内创建 operator_retry Cycle，从 Plan 继续
+```
+
+等待 Capability、CI 或 PR Monitor 时不会占用 Developer Instance。Developer Task 会跨 Cycle 复用 session/cwd，但每次执行都有独立、持久的 `DeliveryTurn` generation。
+
+### 0.3 Developer 执行 Profile
+
+- V1 Developer 支持 `claude` 与 `codex`；provider/model/effort 及 provider-specific service tier 在 Run admission 时冻结，后续每次领取和 launch 都复验同一 policy hash 与路由 tuple，运行中不得静默切换 provider。
+- Claude Developer 可走 Claude CLI direct 或 PTY，但必须使用本 Turn 的 exact `--settings`、`--setting-sources ""` 与 `failIfUnavailable` 隔离配置；网络关闭，工具严格限于非自主的本地读写/测试工具，不生成或注入 MCP、Skills、AskUserQuestion/hook/token、Agent/Task/Workflow、web 或 Git/GitHub credential。
+- Claude profile 对 worktree 内 `.git` pointer、per-worktree Git dir 与 common Git dir 先做 broad deny，再只把已验证的 linked-worktree Git metadata 路径投影到 exact `allowRead`，因此可读 `git status/diff/log` 但不能写 refs、objects、config 或 hooks；真正 spawn 前必须重新发现并精确比对 Git dir/common dir、read paths 与 identity fingerprint，漂移即 fail closed。
+- Codex Developer 仍只允许走 app-server：使用 `workspace-write`、`sandboxPolicy.networkAccess=false`，且 `writableRoots` 只显式列出本 Run 的受管 worktree；user/project MCP、CCM 主 MCP、Sub-agent MCP、Apps、web 与 autonomous features 全部关闭，线程配置强制 `mcp_servers={}`。app-server 被关闭、启动失败、隔离无法确认或 `turn/start` 结果不确定时均 fail closed，绝不回退 `codex exec`。
+- 两种 provider 都不继承 Git/GitHub credential，且 Developer 只能产生未提交 diff；Controller 在任何 privileged Git effect 前仍重新验证 commondir/backlink、受管路径与 exact subject。
+
+### 0.4 权限、副作用 Fence 与安全终点
+
+- Developer Agent 只产生未提交的工作树 diff，不 commit、不 push、不创建或修改 PR、不 merge。
+- Developer terminal 后，Controller 先证明 exact Task/Instance/Turn generation 已释放，再校验 branch、旧 head 和 worktree control metadata；只有 Controller 能 stage/commit。commit 包含 `CCM-Delivery-Run` 与 `CCM-Delivery-Turn` trailer。
+- Controller 的 durable Action outbox 负责 exact non-force push、PR create-or-bind 和 Monitor bind。每次外部写入前复验 Run owner/generation/有效 lease、Action id/token/有效 lease、base/head/tree/patch 与 payload hash；heartbeat 同时续 Run 和当前 Action lease。
+- push 用远程 ref 做 query-before-write；PR 用同仓库 head/base 自然键做 query-before-create；响应丢失或进程崩溃时先对账，不盲目重复 effect。
+- Delivery-owned Task 是只读 scheduler shell；chat/inject/edit/retry/stop/delete/fork/migrate/share 和 ad-hoc Capability 均不能绕过 Run。
+- Plan Capability 所拥有的 Plan 除回答 `waiting_user` 输入外不可经普通 Plan API 修改；Pre-PR Reviewer Task 的 prompt 与结构化 verdict 不接受 chat/inject。
+- PR Monitor 的结果只有在 `delivery_id=delivery:{run_id}:{head_sha}`、current Review/Monitor state-version、base ref/base/head 与 GitHub 远端 PR 全部仍匹配时才可推进；旧 head 或旧目标分支的 CI/review 只能 stale，不能放行新 subject。
+- Run admission 从锁定的 PR Monitor 冻结合并策略：`auto_merge=false` 只接受远程 exact-head `ready_to_merge`；`auto_merge=true` 只接受 COMMENT-only Review publication、冻结 base ref 的 non-force fast-forward evidence 和 merged comment 均确认后的 `merged`。两种模式都不进入 legacy repair 或 Merge Queue。
+- `CAPABILITY_CORE_ENABLED` 与 `DELIVERY_LOOP_ENABLED` 只控制新 admission；已接纳工作在关闭开关并重启后仍继续恢复或安全收口。
+
+### 0.5 恢复与幂等边界
+
+- Run admission 以 `(principal scope, project, idempotency_key)` 唯一，另存 canonical request hash；同 key 不同 payload 返回冲突，Todo 也只能拥有一个 Run。
+- Run/Cycle/Turn、Capability Invocation/Execution 和 Delivery Action 都先落库再 wake；数据库唯一键、state-version CAS、active slot 与 lease 才是正确性来源，内存 event/queue 只负责降低延迟。
+- Controller 在每次 drive 前领取带 generation 的 Run lease；发生 takeover 或续租失败时，旧 Controller 不再开始新 effect。发布 Action 另有随机 token lease，Publisher 不接受只凭内存传入的授权。
+- Controller commit 后、数据库 finalize 前崩溃时，只接受“旧 head 的唯一直接子 commit + exact Run/Turn trailer”作为恢复证据；其他 head advance 一律视为 subject changed。
+- push、PR create 和 Monitor bind 都在 effect 前后重验 exact subject；未知远端结果走 query-before-retry。服务启动会恢复已接纳的 Capability 与 Delivery work，并继续收敛到 waiting/terminal，而不是重新创建一套 Run。
+- Auto Capability 完成后由 outbox 冻结原请求 generation、session、路由和结果 hash；provider boundary 前只可重放同一 G+1/source，boundary 后禁止自动重放。G+1 终态先 settle 旧 outbox，再允许同轮请求下一项 Capability；stop/cancel 会先静止 queue consumer 与 executor。
+
+### 0.6 当前非目标
+
+- Worker/Shared Delivery、多个仓库或多个 PR。
+- Merge Queue、部署、健康检查和回滚；direct auto-merge 已由 PR Monitor repo 开关控制。
+- 把已有普通 Task 原地转换为 Delivery Run。
+- 让 Agent 自己轮询 GitHub，或在等待外部状态时保持模型进程。
 
 ---
 
@@ -25,7 +93,7 @@
 
 - `P0`：不先完成就可能绕过 Gate、泄露凭据、重复执行副作用或破坏现有任务。
 - `P1`：安全 MVP 必需。
-- `P2`：Reviewer、Worker、自动合并等增强能力。
+- `P2`：Reviewer、Worker、Merge Queue 等增强能力。
 - `P3`：部署、自动回滚与规模化运维。
 
 ### 1.3 每个 Todo 的完成定义
@@ -47,8 +115,8 @@
 
 ### 2.1 控制权
 
-- Agent 负责分析、修改代码、运行本地测试、commit，并把交付分支 push 到远程。
-- CCM Delivery Controller 负责长期状态、等待、唤醒、Gate、PR 创建、Review 发布、Merge 和 Deployment 编排。
+- Agent 负责分析、修改代码、运行本地测试、自审，并留下未提交 diff。
+- CCM Delivery Controller 负责长期状态、等待、唤醒、Gate、fenced commit、交付分支 push、PR 创建和 PR Monitor 绑定；成功终点由 Run 冻结为 `ready_to_merge` 或 confirmed `merged`。
 - GitHub、CI、Merge Queue 和 Deployment Adapter 是外部事实来源。
 - Agent 的自然语言结论和结构化 checkpoint 都只是提示，不是 Gate 证据。
 
@@ -74,34 +142,34 @@
 Developer Agent 可以：
 
 - 修改受控 worktree。
-- commit。
-- push 受控交付分支。
+- 运行本地测试并审查自己的 working-tree diff。
 
 Developer Agent 不可以：
 
-- push 默认分支。
+- commit 或改写 Git history。
+- push 任何分支。
 - 创建或修改 branch protection。
 - merge PR。
 - 自己把 CI、Review 或 Deployment 标为通过。
 
-下列动作全部由 CCM Action Outbox 执行：
+下列 Git/GitHub 动作不由 Developer 执行：
 
+- Controller 校验并 commit Developer 留下的 diff。
+- push 受控交付分支。
 - 创建 PR。
-- 发布 CCM Review / Finding 评论。
-- 重新运行 CI。
-- 进入 Merge Queue 或执行 merge。
-- 触发部署和回滚。
-- 发送持久通知。
+- 绑定 exact-head PR Monitor；Review/Finding 评论由 PR Monitor 发布，新 GitHub Review 恒用 `COMMENT` event。
+- direct auto-merge 只由 PR Monitor publication 执行冻结目标 ref 的 non-force fast-forward；自动重跑 CI、进入
+  Merge Queue、部署、回滚和其他持久通知仍不在 V1，后续实现也必须走 Controller-owned durable Action。
 
 ### 2.5 Checkpoint 协议必须 Provider-neutral
 
-CCM 默认 Provider 是 Codex，而 Codex 不支持 CCM 的 Claude MCP Skills 注入。因此：
+Plan/Review Capability 同时服务 Delivery required gate、人工 advisory 和普通 Auto Task 的模型请求，调用协议不能绑死到某个 provider 的 MCP 形态。因此：
 
 - 不把 `report_delivery_checkpoint` MCP 工具作为必需协议。
 - Controller 在唤醒前持久化 `DeliveryTurn`。
-- Agent 可以在最终输出中附带受限 JSON checkpoint。
-- Dispatcher / Worker Relay 解析 checkpoint 后只保存为 advisory evidence。
-- 不论 checkpoint 是否存在，回合结束后都必须重新查询 Git 和 GitHub。
+- 当前 V1 以 exact Task/Instance/Turn terminal generation 和 Controller 自己读取的 Git 状态为准，不相信 Agent 声称已经 commit/push/通过 Gate。
+- Capability Core 的 terminal-action/Invocation 协议是 Auto 模型请求的唯一接入点；必须有当前 exact terminal proof，provider 提供 native turn 时还必须精确匹配，不能用旧 turn 或日志邻接关系代替。
+- 后续若恢复受限 JSON checkpoint，也只能保存为 advisory evidence；回合结束后仍必须重新读取 Git 和 GitHub。
 
 ### 2.6 验证对象不只有 PR head SHA
 
@@ -109,7 +177,7 @@ CCM 默认 Provider 是 Codex，而 Codex 不支持 CCM 的 Claude MCP Skills �
 
 | subject_kind | 身份 | 用途 |
 |---|---|---|
-| `pr_head` | `head_sha + base_sha` | PR CI、AI Review、mergeability |
+| `pr_head` | `base_ref + base_sha + head_sha` | PR CI、AI Review、mergeability |
 | `merge_group` | `merge_group_sha` | Merge Queue 在最新 base 上的验证 |
 | `merged_revision` | `merge_commit_sha` | 合并后的代码身份 |
 | `deployment_artifact` | `deployment_id + environment + artifact/ref/digest` | 部署与健康验证 |
@@ -124,20 +192,23 @@ PR 合并后发生应用错误时，不能回到原 PR 继续 push。系统只�
 - 进入持久 Human Gate / Incident；或
 - 在未来启用的精确环境代次保护下执行回滚。
 
-### 2.8 默认关闭所有有副作用的自动化
+### 2.8 Admission 默认开启，merge 由 repo policy 显式控制
 
-默认值：
+V1 默认值：
 
 ```text
-delivery observe       = off
-delivery agent wake    = off
-delivery AI review     = off
-delivery auto merge    = off
-delivery deployment    = off
-delivery auto rollback = off
+CAPABILITY_CORE_ENABLED = true
+AUTO_CAPABILITY_ENABLED = true
+DELIVERY_LOOP_ENABLED   = true
+delivery auto merge     = MonitoredRepo.auto_merge（repo opt-in）
+delivery deployment     = unsupported/off
+delivery auto rollback  = unsupported/off
 ```
 
-首次上线只能按 `off → shadow → ci_repair → review → manual_merge → auto_merge → deploy` 逐级开启。
+三个开关默认允许各自的新 admission，显式关闭时也不抛弃已接纳 work。普通
+Auto Task 没有显式 `capability_policy` 时仍不能自行请求 Capability。Delivery 的
+merge 终点在 admission 时从 PR Monitor 冻结；deployment 仍没有可被误开的隐式
+路径。后续能力必须独立 opt-in 并保留同样的 exact-subject fence。
 
 ---
 
@@ -150,23 +221,26 @@ delivery auto rollback = off
 ```text
 本机 Project（有 GitHub remote）
 → CCM 创建固定交付 branch/worktree
-→ Developer Task 完成有限回合并退出
+→ Plan Capability 产出经 Reviewer 审过的计划
+→ Developer Task 完成有限回合、测试、自审，留下未提交 diff 后退出
+→ Controller 校验 exact turn/worktree 并创建 fenced commit
+→ Pre-PR Code Review Capability 对 exact commit range 给出结构化 verdict
 → CCM 创建或绑定一个 PR
-→ 等待 exact PR-head CI
-→ CI 代码失败时聚合为一个新 DeliveryTurn
-→ Developer 修复并 push 新 SHA
-→ 所有 required checks 通过
-→ 停在“等待人工合并”
+→ 等待 exact PR-head CI 与 PR Monitor Panel
+→ CI 或 Review 阻塞时聚合为一个新 Cycle
+→ Developer 修复并由 Controller push 新 SHA
+→ 所有 required checks 与 Review Gate 通过
+→ 按冻结策略停在 ready_to_merge，或完成 direct auto-merge 后停在 merged
 ```
 
 ### 3.2 MVP 明确拒绝
 
 - `worker_id != null` 的 DeliveryRun。
 - Shared shadow Task 发起或控制 DeliveryRun。
+- admission 未冻结为 `claude`/`codex` 的 Developer、任何 `codex exec` fallback，或无法证明上述 Claude exact-settings / Codex app-server 隔离边界的执行。
 - 已经有 session 的普通 Task 原地转换成受控 DeliveryRun。
 - 一个 Run 管理多个仓库或多个 PR。
-- 自动 AI Review Gate。
-- 自动 Merge Queue / merge。
+- 自动 Merge Queue；direct auto-merge 只允许继承 PR Monitor 的冻结策略。
 - 自动部署或自动回滚。
 - 无 remote 的纯本地项目。
 - 将现有 `mode=goal`、`mode=loop` 任务直接作为 Developer Task。
@@ -175,7 +249,6 @@ delivery auto rollback = off
 
 ### 3.3 后续完整目标
 
-- 多角色、独立证据的 Reviewer Panel。
 - Worker 上执行 Developer / Reviewer Turn。
 - Controller-only Merge Queue。
 - 可插拔 Deployment Adapter。
@@ -184,7 +257,9 @@ delivery auto rollback = off
 
 ---
 
-## 4. 当前 CCM 基线与连接矩阵
+## 4. 实现前 CCM 基线与连接矩阵（历史）
+
+本节保留 v0.2 方案评审时的差距快照，用于解释后续 Backlog 的来源；它不是 2026-08-05 代码状态。V1 的当前连接关系以第 0、5、6、9 节和代码为准。
 
 | 模块 | 当前实现 | 可复用 | Delivery 必须补充或修改 |
 |---|---|---|---|
@@ -211,9 +286,9 @@ delivery auto rollback = off
 | BackupService | 可选数据库备份 | 运维参考 | SQLite 文件语义不能证明 PostgreSQL/MySQL 可恢复 |
 | Frontend | Tasks、Chat、PR Monitor | 现有会话和配置入口 | 独立 Delivery Run 页面、Gate、Timeline、Finding、Decision、Deployment |
 
-### 4.1 当前必须承认的安全缺口
+### 4.1 原始安全缺口清单（历史）
 
-在 Delivery 自动合并前，以下问题必须先处理：
+这些条目是实现前审计结果，不能用来断言当前分支仍存在同一漏洞；自动合并若进入实施，仍须逐项重新验证：
 
 1. PR Monitor 的部分 detail/review GET 未按目标 repo 做 owner ACL。
 2. Repo 写操作只检查“用户拥有任一 Worker”，没有验证目标 `repo.worker_id`。
@@ -226,49 +301,47 @@ delivery auto rollback = off
 
 ---
 
-## 5. 目标架构与数据流
+## 5. V1 架构与数据流
 
 ```text
-                         GitHub / CI / Merge Queue
-                                    │
-                                    │ signed webhook
-                                    ▼
-                         ┌──────────────────────┐
-                         │ Delivery Event Inbox │
-                         │ verify / dedupe / DB │
-                         └──────────┬───────────┘
-                                    │ durable wake hint
-                                    ▼
-┌──────────────┐          ┌──────────────────────┐
-│ Human/API/UI │─────────▶│ Delivery Controller  │
-└──────────────┘ command  │ reducer / lease / CAS│
-                          └──────┬────────┬──────┘
-                                 │        │
-                         reconcile│        │effect intents
-                                 ▼        ▼
-                     ┌───────────────┐  ┌────────────────┐
-                     │ GitHub Gateway│  │ Action Outbox  │
-                     │ exact snapshot│  │ PR/merge/deploy│
-                     └───────┬───────┘  └────────────────┘
-                             │
-                             ▼
-                     ┌───────────────┐
-                     │ Gate Evaluator│
-                     │ pure function │
-                     └───────┬───────┘
-                             │ actionable failure
-                             ▼
-                     ┌──────────────────┐
-                     │ Durable Turn     │
-                     │ Bridge           │
-                     └────────┬─────────┘
-                              │ turn_id / receipt
-                     ┌────────▼─────────┐
-                     │ Dispatcher/Worker│
-                     │ Developer Task   │
-                     └────────┬─────────┘
-                              │ terminal hint
-                              └──────────────▶ reconcile again
+┌──────────────┐   atomic admission   ┌────────────────────────┐
+│ Human/API/UI │─────────────────────▶│ Run + Task + first Cycle│
+└──────────────┘                      └────────────┬───────────┘
+                                                 │ durable wake
+                                                 ▼
+                                      ┌──────────────────────┐
+                                      │ Delivery Controller  │
+                                      │ Run lease/reducer/CAS│
+                                      └───┬──────┬──────┬───┘
+                                          │      │      │
+                       required invocation│      │      │fenced Action
+                                          ▼      │      ▼
+                              ┌────────────────┐ │ ┌──────────────────┐
+                              │Capability Core │ │ │Delivery Publisher│
+                              │Plan / Review   │ │ │push / PR / bind  │
+                              └────────────────┘ │ └────────┬─────────┘
+                                                 │          │
+                                    durable Turn │          ▼
+                                                 ▼   GitHub PR + exact ref
+                                      ┌──────────────────┐   │
+                                      │TaskQueue/        │   ▼
+                                      │Dispatcher        │ ┌──────────────┐
+                                      └────────┬─────────┘ │ PR Monitor   │
+                                               │           │ CI + Panel   │
+                                               ▼           └──────┬───────┘
+                                      ┌──────────────────────┐    │
+                                      │Claude direct/PTY or  │    │ exact-head verdict
+                                      │Codex app-server      │    │
+                                      │isolated Developer    │    │
+                                      └──────────┬───────────┘    │
+                                               │ uncommitted diff │
+                                               ▼                  │
+                                      ┌──────────────────┐        │
+                                      │Workspace Manager │        │
+                                      │fenced commit     │        │
+                                      └────────┬─────────┘        │
+                                               └──────────────────┘
+                                                        reconcile
 ```
 
 ### 5.1 Authority Boundary
@@ -277,14 +350,13 @@ delivery auto rollback = off
 |---|---|
 | Task 当前是否有模型进程 | Task + Instance exact generation + InstanceManager/Worker snapshot |
 | Run 当前状态 | DeliveryRun reducer 的持久结果 |
-| Turn 是否被调度 | DeliveryTurn DB 状态和 receipt |
-| 分支/PR/head/base/merge commit | GitHub Gateway 的当前 snapshot |
-| CI | 当前 VerificationSubject 的 Check Run / Commit Status snapshot |
-| AI Review | 明确完成的 DeliveryReviewRun + structured result |
-| Finding 是否解除 | 后续 Reviewer 验证或有权限的人类 waiver |
-| 是否可 merge | Gate Evaluator |
-| 外部动作是否成功 | 远端对账 + DeliveryAction |
-| 部署是否成功 | Deployment Adapter + health evidence |
+| Turn 是否被调度 | DeliveryTurn active slot、Task retry/start generation 与队列 claim fence |
+| Developer 修改 | 受管 worktree 的 working tree；终态后由 Controller 复验并 commit |
+| Plan / Pre-PR Review | 完成且 subject/result hash 匹配的 Capability Invocation/Execution |
+| 分支/PR/head/base | Controller Publisher 的本地 Git + GitHub exact snapshot |
+| CI / Panel Review / Finding | 当前 exact-head PRReview + PRMonitorRun；`delivery_id` 必须属于该 Run/head |
+| 是否 ready to merge | Publisher 对 workspace、remote ref、GitHub PR、Review 和 Monitor state-version 的终态复验 |
+| 外部动作是否成功 | 远端对账 + exact DeliveryAction lease/token/payload fence |
 | UI | GET snapshot；WebSocket 只提示重新拉取 |
 
 ---
@@ -294,12 +366,11 @@ delivery auto rollback = off
 ### 6.1 Phase
 
 ```text
-preparing
-developing
-validating
-reviewing
-merging
-deploying
+planning
+coding
+pre_review
+publishing
+monitoring
 done
 ```
 
@@ -336,12 +407,12 @@ activity=paused, pause_reason=permission_missing
 
 | Phase | Activity | 含义 |
 |---|---|---|
-| preparing | ready/running/waiting | 创建 workspace、Task、首 Turn |
-| developing | ready/running/waiting | Developer Turn 或等待被验证的 push |
-| validating | ready/waiting | 等待或计算 PR-head CI Gate |
-| reviewing | ready/running/waiting | Reviewer Turn 与 Finding Gate |
-| merging | ready/running/waiting | PR/merge queue action 与 merge-group Gate |
-| deploying | ready/running/waiting | exact merged revision 的部署与健康检查 |
+| planning | ready/waiting | 创建或等待 Plan Capability |
+| coding | ready/running | 准入或观察一个 bounded Developer Turn；终态后 Controller commit |
+| pre_review | ready/waiting | 创建或等待 exact commit-range Code Review Capability |
+| frontend_review | ready/waiting | 创建或等待 exact-head Test Harness；off/auto-unavailable 留下可见 skip evidence |
+| publishing | ready/running | claim Action，并以双 lease fence push / create-or-bind PR / bind Monitor |
+| monitoring | waiting | 等待必经 Reviewer Panel，以及仓库声明时的 exact-head CI verdict |
 | 任意非 done | paused | 人工暂停或安全阻塞 |
 | done | terminal | 必须有 outcome 和 completed_at |
 
@@ -350,39 +421,41 @@ activity=paused, pause_reason=permission_missing
 ### 6.5 主要状态流程
 
 ```text
-preparing
-  ├─ workspace / Task 准备失败 → paused(permission|workspace)
-  └─ 准备完成 → developing/ready
+planning/ready
+  → create/recover Plan Capability → planning/waiting
+  ├─ waiting_user → 保持等待且不占 Developer Instance
+  ├─ failed/cancelled/stale → done/failed
+  └─ exact PlanVersion ready → coding/ready
 
-developing/ready
-  → 创建 durable DeliveryTurn
-  → developing/running
-  → Task 回合结束
-  → 对账远程 branch
-      ├─ 没有可验证 push → developing/ready 或 paused(no_progress)
-      └─ 新 head → validating/waiting
+coding/ready
+  → 持久 DeliveryTurn + Task queue fence → coding/running
+  ├─ Developer/ownership failure → done/failed
+  ├─ 无 diff → 计 no-progress，新 Cycle 回 planning/ready 或预算失败
+  └─ terminal + owner settled → Controller fenced commit → pre_review/ready
 
-validating/waiting
-  ├─ required CI running/missing → 继续等待
-  ├─ infrastructure failure → 有界 rerun action
-  ├─ code failure → developing/ready
-  └─ 全部通过 → reviewing 或 merging
+pre_review/ready
+  → create/recover exact commit-range Review Capability → pre_review/waiting
+  ├─ changes_requested → 完成当前 Cycle，新 Cycle 回 planning/ready
+  ├─ capability failure/subject mismatch → done/failed
+  └─ approved → frontend_review/ready
 
-reviewing
-  ├─ Reviewer 未完成/失败 → waiting 或 paused
-  ├─ blocking Finding → developing/ready
-  └─ required Reviewer 全部完成且无 blocking Finding → merging/ready
+frontend_review/ready
+  → start/recover exact owner/head Test Harness → frontend_review/waiting
+  ├─ off 或 auto-unavailable → 持久化 skip reason → publishing/ready
+  ├─ required-unavailable、stale、cleanup/evidence 不完整 → done/failed
+  ├─ archived failed findings → 完成当前 Cycle，新 Cycle回 planning/ready
+  └─ archived passed report+screenshot → publishing/ready
 
-merging
-  ├─ manual policy → waiting(human_merge)
-  ├─ merge-group 失败 → developing/ready
-  ├─ head/base/Gate 变化 → validating/waiting
-  └─ merge 成功 → deploying 或 done/success
+publishing/ready
+  → claim DeliveryAction → publishing/running
+  → exact non-force push + PR create-or-bind + Monitor bind
+  → monitoring/waiting
 
-deploying
-  ├─ transient infra → bounded retry
-  ├─ app failure → child remediation / Human Gate / rollback decision
-  └─ exact artifact + health passed → done/success
+monitoring/waiting
+  ├─ CI/Panel 仍运行 → 继续等待，不占 Developer Instance
+  ├─ exact-head blocked → 完成当前 Cycle，新 Cycle回 planning/ready
+  ├─ frozen auto_merge=false：exact-head ready_to_merge + 远端复验 → done/success
+  └─ frozen auto_merge=true：COMMENT-only Review + frozen-ref fast-forward/comment 复验 → done/success
 ```
 
 ### 6.6 reducer 规则
@@ -395,7 +468,9 @@ deploying
 
 ---
 
-## 7. Gate 与 VerificationSubject
+## 7. Gate 与 VerificationSubject（V1 与完整目标）
+
+当前实现使用两类 subject：Pre-PR Capability 的 `base_sha/head_sha/head_tree_sha/patch_sha256`，以及 PR Monitor 的 exact `base_ref/base_sha/head_sha`。direct auto-merge 固定 reviewed head 与目标 ref，只以该 ref 的 non-force fast-forward evidence 和最终 comment 作为成功证据；把 `merge_group`、`merged_revision` 或 `deployment_artifact` 建模为通用 Delivery subject 仍属于后续目标。
 
 ### 7.1 Gate 统一返回值
 
@@ -475,7 +550,9 @@ missing / queued / running / passed / failed / cancelled / skipped / neutral / s
 
 ---
 
-## 8. 数据模型与迁移方案
+## 8. 数据模型与迁移方案（V1 与后续目标）
+
+V1 已落地 `CapabilityInvocation/Execution`、`CodeReviewRun/Result`、`DeliveryRun/Cycle/Turn/Event/Action/Transition`，并扩展 Task、Worktree 和 PR Monitor ownership。以下 `DeliveryRepoPolicy`、独立 Finding/Decision/Deployment 等条目保留为完整平台目标，不能假定当前已存在。
 
 建议新增 `backend/models/delivery.py`，初期集中放置模型，稳定后再按领域拆分。
 
@@ -504,11 +581,11 @@ version
 created_at / updated_at
 ```
 
-规则：
+后续若实现，规则：
 
 - Run 创建时完整复制为 `policy_snapshot`，运行中不跟随配置漂移。
 - Repo policy 后续变化只影响新 Run；旧 Run要升级策略必须显式 command + audit。
-- Legacy `MonitoredRepo.auto_merge` 和 Delivery `auto_merge` 不允许同时生效。
+- `MonitoredRepo.auto_merge` 是新 Run 的唯一 direct merge 来源；Delivery 只保存它的冻结副本，运行中不得跟随配置漂移。
 
 ### 8.2 DeliveryRun
 
@@ -709,7 +786,10 @@ created_at / answered_at
 
 ### 8.11 迁移规则
 
-- 实施时先运行 `uv run alembic heads`；本文审查时唯一 head 为 `a4c8e2f19d77`。
+- 正式 schema rollout 必须 stop-the-world：停止所有连接同一数据库的 Manager/Worker 写入者后再迁移，
+  校验唯一 head 与约束后统一启动新 binary。禁止新旧 Manager 并行，也禁止只回滚 binary 后让旧代码读取
+  新 schema；回退必须保持停服并同时协调代码与 Alembic revision。
+- V1 使用串行 revision `8d4e1f7a9c20`（Pre-PR Review）→ `9e5b2a7c4d10`（Delivery state）；本文复验时唯一 head 为 `9e5b2a7c4d10`。
 - 新模型必须导入 `alembic/env.py` 和测试 metadata fixture。
 - 不使用数据库专属 Enum、partial index 或依赖 JSON 查询完成核心正确性。
 - 新列先 nullable，回填后再收紧。
@@ -717,12 +797,43 @@ created_at / answered_at
 - `MonitoredRepo` 不再硬删除关联历史；先 soft-delete/disable。
 - Task 删除时，活跃 Run 一律拒绝；终态证据保留并将可选 Task 引用设 NULL。
 - Migration 测试覆盖 fresh upgrade、legacy upgrade、重复 upgrade、downgrade→upgrade 和 single-head。
+- PR publication 的 `merge/squash` 状态只保留给升级前 durable outbox 的 evidence reconciliation，绝不
+  重放 merge mutation；新 binary 只创建 frozen-base-ref `fast-forward` publication，该兼容分支不代表
+  支持新旧 Manager 混跑。
 
 ---
 
-## 9. 建议的代码模块
+## 9. 当前 V1 代码模块
 
-### 9.1 新增后端文件
+### 9.1 Capability 与 Delivery 核心
+
+| 边界 | 当前关键文件 |
+|---|---|
+| 通用调用状态、CAS、恢复 | `backend/models/capability.py`、`backend/services/capability_service.py`、`backend/services/capability_coordinator.py`、`backend/api/capabilities.py` |
+| Plan adapter | `backend/services/plan_capability.py`；复用既有 Plan pipeline/runner，不在 Controller 内复制规划逻辑 |
+| Pre-PR Review adapter | `backend/models/code_review.py`、`backend/services/code_review_capability.py`、`backend/services/code_review_subject.py` |
+| Run 状态与 admission | `backend/models/delivery.py`、`backend/schemas/delivery.py`、`backend/services/delivery_reducer.py`、`backend/services/delivery_service.py`、`backend/api/delivery_runs.py` |
+| 持久编排 | `backend/services/delivery_controller.py` |
+| worktree 与 Controller commit | `backend/services/delivery_workspace.py` |
+| push / PR / Monitor effect | `backend/services/delivery_publisher.py`、`backend/services/delivery_pr_policy.py` |
+
+### 9.2 调度、隔离与 PR Monitor 接线
+
+- `backend/services/dispatcher.py`、`task_queue.py` 在 claim 前后校验 active Run/Turn fence；Controller 只通过正常 Dispatcher 唤醒 Developer Task。
+- `backend/services/instance_manager.py`、`task_agent_isolation.py` 与 `codex_app_server.py` 按 admission 冻结的 provider 实施隔离：Claude 使用 exact-settings 的 direct/PTY profile 与 linked-worktree Git metadata 只读投影，Codex 保持 app-server-only；两者均 network-off、no-MCP/no-credential，并在 provider effect 前复验边界。
+- `backend/api/tasks.py`、`chat.py`、`instances.py`、`projects.py`、`shared_access.py`、`task_migrator.py`、`task_termination.py` 封闭普通 Task/Worker/Shared/迁移旁路。
+- `backend/api/pr_monitor.py`、`pr_monitor_loop.py`、`pr_review_*` 封闭 legacy repair/merge 旁路，并让 Delivery 只消费 exact-head Review/Monitor evidence。
+- `backend/main.py` 按 Dispatcher → Capability Coordinator → Delivery Controller 启动恢复，并按反序停机。
+
+### 9.3 当前 UI 接入
+
+- 独立 `DeliveryPage` 以 `DeliveryRunDialog` 展示 Plan、Development、Code Review、Frontend Review、Publish PR、CI & PR Review 六个 tab，并保留公开 Timeline 和旧 Cycle 的前端证据摘要。
+- `DeliveryCreateForm` 通过 quick-start API 从一段需求创建 Run，并冻结 Frontend Review 与 auto-merge 选择；普通 Task API 不接受 Delivery ownership 字段。
+- Plan 的 open input 由 progress API 投影到当前 tab 内联回答；AppShell 展示 attention badge。Run-scoped WebSocket 驱动实时刷新，REST 轮询仅作断线兜底。
+
+### 9.4 长期 Backlog 的原始文件草案（历史）
+
+以下列表来自 v0.2 完整平台方案，其中部分文件已由上面的 V1 结构替代，不能作为当前代码索引。
 
 ```text
 backend/models/delivery.py
@@ -741,7 +852,7 @@ backend/services/delivery_deployment.py
 backend/services/github_delivery_client.py
 ```
 
-### 9.2 需要修改的后端文件
+### 9.5 长期 Backlog 可能涉及的后端文件（历史）
 
 ```text
 backend/main.py
@@ -773,7 +884,7 @@ backend/services/ws_broadcaster.py
 alembic/env.py
 ```
 
-### 9.3 前端文件
+### 9.6 长期 Backlog 可能涉及的前端文件（历史）
 
 ```text
 frontend/src/api/client.ts
@@ -805,7 +916,7 @@ frontend/src/components/icons.tsx
 
 ---
 
-## 10. API、事件和 checkpoint 合约
+## 10. API、事件和调用合约
 
 ### 10.1 Run API
 
@@ -816,33 +927,37 @@ GET    /api/delivery-runs/{run_id}
 POST   /api/delivery-runs/{run_id}/pause
 POST   /api/delivery-runs/{run_id}/resume
 POST   /api/delivery-runs/{run_id}/cancel
-POST   /api/delivery-runs/{run_id}/take-over
-POST   /api/delivery-runs/{run_id}/reconcile
-POST   /api/delivery-runs/{run_id}/retry-action
-POST   /api/delivery-decisions/{decision_id}/resolve
-GET    /api/delivery/attention
-GET    /api/delivery/system/status
+POST   /api/delivery-runs/{run_id}/retry
 ```
 
-所有 command 请求携带：
+`retry` 仅允许 failed terminal、尚未发布 PR 且无活跃 effect 的 Run 在剩余预算内创建新的审计 Cycle，必须携带 `expected_state_version`。V1 不暴露 take-over/reconcile/retry-action/merge/deploy 管理 API；Controller 的 crash takeover 与 reconcile 由持久 lease 和启动扫描内部完成。Decision/attention/system-status 属于后续运维 Backlog。
+
+普通 Auto Task 可人工调用 advisory Capability：
+
+```http
+POST /api/tasks/{task_id}/capability-invocations
+GET  /api/tasks/{task_id}/capability-invocations
+GET  /api/capability-invocations/{invocation_id}
+GET  /api/capability-invocations/{invocation_id}/result
+POST /api/capability-invocations/{invocation_id}/consume
+POST /api/capability-invocations/{invocation_id}/cancel
+```
+
+带显式 policy 的本地普通 Auto Task 还可在成功终态输出中提交严格
+`request_capability` action；后端绑定 exact turn、消费预算并通过 durable outbox
+恢复 G+1，不暴露伪造 Agent source 的 HTTP 创建入口。人工 consume/cancel 只允许
+`human_request + attach_only`。Delivery required-gate 与 Agent resume invocation 都由
+所属 Controller/Task 生命周期收口，不能借普通 Capability API 修改或取消。
+
+V1 的 pause/cancel 请求只携带必填 reason；resume 的 reason 可选：
 
 ```json
 {
-  "expected_version": 17,
-  "reason": "operator supplied reason",
-  "idempotency_key": "client-generated-key"
+  "reason": "operator supplied reason"
 }
 ```
 
-涉及 merge/deploy/rollback 时还必须携带 expected subject 或 environment generation。旧 version 返回结构化 409：
-
-```json
-{
-  "code": "delivery_state_stale",
-  "detail": "Run changed from version 17 to 18",
-  "current_version": 18
-}
-```
+服务端在 Run 行锁内重新计算 `allowed_actions`；Controller lease、active Capability/Action 或已进入 publishing/monitoring 时拒绝跨越 effect fence 的命令。`state_version` 随响应返回，但 V1 不接受客户端直接改写 version。未来 merge/deploy command 才需要额外的 expected subject/environment generation。
 
 ### 10.2 创建 Run
 
@@ -852,24 +967,29 @@ TaskForm 和 ProjectTodo 不应先创建一个可被 Dispatcher 抢走的普通 
 
 ```json
 {
+  "idempotency_key": "client-generated-key",
   "project_id": 5,
+  "monitored_repo_id": 3,
   "title": "Support checkpoint voting",
   "requirements": "...",
   "provider": "codex",
   "model": "gpt-5.6-sol",
+  "codex_service_tier": "default",
   "effort_level": "high",
-  "policy_id": 3,
-  "source_todo_id": 9
+  "source_todo_id": 9,
+  "max_cycles": 10,
+  "max_no_progress": 3
 }
 ```
 
 创建顺序：
 
-1. API 事务创建 `DeliveryRun(preparing)` 和 `prepare_workspace` Action。
-2. Outbox 幂等创建固定 branch/worktree。
-3. 同一事务创建 Developer Task、Run 关联和首个 queued Turn。
-4. commit 后唤醒 durable bridge。
-5. API 可先返回 `202 preparing`；前端通过 snapshot/WS 跟进。
+1. 以 principal scope + Project + `idempotency_key` 做 portable admission mutex，并比较 canonical request hash。
+2. 锁定并验证本地 Project 与对应 MonitoredRepo：GitHub remote、panel review、required CI、无 Merge Queue、无 Worker/Shared。
+3. 冻结 Claude/Codex provider、model、effort 与适用的 service tier、Monitor policy、cycle/no-progress budget，以及 repo 的 direct
+   merge policy：`false/ready_to_merge` 或 `true/merged`。
+4. 同一事务创建 `DeliveryRun(planning/ready)`、resting Developer Task、首个 active Cycle、初始 Transition；Todo 来源也在同一事务 claim。
+5. commit 后唤醒 Controller；Controller 再幂等 prepare 固定 worktree。API 返回 `201`，相同 key/相同 payload 返回既有 Run，不同 payload 返回 409。
 
 ### 10.3 Webhook
 
@@ -884,21 +1004,20 @@ POST /api/github/webhook
 1. 限制 body 大小。
 2. 按候选 repo secret 验证 HMAC。
 3. 校验 `X-GitHub-Event` 与 `X-GitHub-Delivery`。
-4. 规范化并 insert Event；唯一冲突返回幂等 accepted。
-5. commit。
-6. 发轻量 wake hint。
-7. 快速返回；绝不在 webhook 请求内启动/停止 Agent 或调用 GitHub。
+4. 交给既有 PR Monitor durable Review/Run 流程，按 exact base ref/base/head 去重并异步推进 CI/Panel。
+5. Delivery Publisher 只会 adopt 与本 Run exact subject 匹配且尚未产生 legacy Finding effect 的 webhook Review，并写入 `delivery:{run_id}:{head_sha}` ownership。
+6. Delivery Controller 通过 Monitor 当前状态和周期扫描收敛；Webhook 不直接启动/停止 Developer，也不执行 merge。
 
-Delivery 管理的 PR 走新 inbox；未被 Delivery 管理的 repo/PR 保留 legacy PR Monitor 路径。两者不能为同一 PR 同时创建 Reviewer Task。
+同一 exact PR subject 不能同时被普通 repair/Merge Queue 与 Delivery 控制；Delivery adoption 或 ownership 不明确时 fail closed。direct auto-merge 只能按 owning Run 的冻结值执行。
 
-### 10.4 WebSocket
+### 10.4 UI 刷新
 
-建议 channel：
+Delivery 页面订阅 Run-scoped channel，列表订阅管理员全局 channel；连接中断时分别以
+10/15 秒 REST 轮询兜底，命令 409 后仍立即读取权威 progress。channel 为：
 
 ```text
-delivery-run:{run_id}
-user:{user_id}
-delivery-runs           # admin only
+delivery:{run_id}       # Project ACL
+deliveries              # admin only
 ```
 
 事件 envelope：
@@ -925,9 +1044,9 @@ delivery-runs           # admin only
 - `backend/api/ws.py` 对 Run channel 复用 Task/Project/Worker owner ACL。
 - 当前 `pr-monitor` 的 `type` 字段逐步统一为 `event`，兼容期同时读两者。
 
-### 10.5 Agent checkpoint
+### 10.5 Agent checkpoint（后续可选 advisory）
 
-Agent 最终回复可以附带：
+V1 不解析也不要求 Delivery checkpoint；Controller 只看 exact Task terminal generation 和自己读取的 worktree。后续若增加，Agent 最终回复可以附带：
 
 ```text
 CCM_DELIVERY_CHECKPOINT_BEGIN
@@ -937,8 +1056,6 @@ CCM_DELIVERY_CHECKPOINT_BEGIN
   "correlation_id": "...",
   "result": "work_complete",
   "summary": "Fixed timeout handling",
-  "claimed_commits": ["def456"],
-  "claimed_branch": "ccm/delivery/123",
   "local_checks": [
     {"command": "pytest tests/test_timeout.py", "outcome": "passed"}
   ],
@@ -952,11 +1069,13 @@ CCM_DELIVERY_CHECKPOINT_END
 - 最大 32 KiB，Pydantic 严格 schema，未知字段丢弃或拒绝。
 - `turn_id + correlation_id` 必须匹配 active Turn。
 - 不接受 `gate_passed`、`merge_allowed`、`finding_resolved` 等越权字段。
-- claimed commit/branch/push 必须由 Git/GitHub 对账。
+- V1 Developer 无权 claim commit/branch/push；任何这类字段都不能驱动状态，Controller Git/GitHub 对账仍是唯一证据。
 - 缺失、截断或解析失败不会直接失败 Run；记录 `unreported/invalid` 后 reconcile。
 - Claude MCP 后续可作为同一服务的便利入口，但不能改变 Provider-neutral contract。
 
-### 10.6 Worker internal protocol
+### 10.6 Worker internal protocol（后续范围）
+
+V1 没有以下 endpoint；创建 Run 时已经拒绝 Worker scope。未来协议草案为：
 
 ```http
 POST /api/internal/delivery-turns/{turn_id}/accept
@@ -981,64 +1100,53 @@ Worker 对同一 Turn ID 重复 accept 必须返回同一个 receipt，不得 en
 
 ### 11.1 Durable Wake Bridge
 
-不能把 `dispatcher.enqueue_message()` 当作持久调度源。正确流程：
+V1 不为 Delivery 复制一套消息队列 receipt，也不调用普通 chat queue。持久准入流程是：
 
 ```text
-Controller 写 DeliveryTurn(status=queued)
-→ bridge CAS queued→dispatching，生成 receipt
-→ local enqueue 或 Worker accept
-→ queue consumer CAS dispatching→running
-→ Dispatcher 启动 exact Task turn
-→ Task terminal 后写 terminal hint
-→ Controller reconciliation
+Controller 同一事务写 DeliveryTurn(status=queued)
+  + Run(coding/running)
+  + Developer Task(pending)
+→ commit
+→ dispatcher.wake()（2 秒 poll 仅兜底）
+→ TaskQueue 的 SELECT 只返回存在匹配 active Turn 的 Delivery Task
+→ claim UPDATE / launch boundary 再复验同一 Run/Task/Worktree/frozen-policy tuple
+→ Task terminal；Controller 扫描 exact generation并继续 reconcile
 ```
 
 崩溃恢复：
 
 - 崩溃在 DB commit 前：没有 Turn，不会执行。
-- 崩溃在 commit 后、enqueue 前：startup bridge 重新领取。
-- enqueue 后 bridge 超时：重复 queue object 在 `dispatching→running` CAS 时被丢弃。
-- Turn 已 running 后进程崩溃：先对账 Task/Instance/Worker/GitHub，再决定恢复。
+- 崩溃在 commit 后、wake 前：Dispatcher 的 pending scan 会重新发现同一个 Task，Controller 也会恢复同一个 active Turn。
+- 伪造或孤立的 `Task(mode=delivery_loop,status=pending)` 不满足 queue SQL fence，无法被领取。
+- Turn 已 running 后进程崩溃：Controller 先核对 exact Task/Instance/Turn generation；不能证明 owner 已释放时不 commit、不发起下一轮。
 
 ### 11.2 Dispatcher 改动边界
 
-- `QueuedMessage` 增加可选 `delivery_turn_id/correlation_id`。
-- 增加 `enqueue_delivery_turn()`，按 Turn ID 做进程内去重和 DB admission。
-- Task launch 前回写 Turn running；Task terminal commit 后发送 durable hint。
+- `TaskQueue` 的 pending SELECT 与 claim UPDATE 都包含 active Run/Turn predicate；launch boundary 再做对象级复验。
+- Controller 观察 Task 的 exact `retry_count/started_at/status/session_id` 后推进 Turn running/terminal，不依赖易丢 callback。
 - 不在 Dispatcher 内实现 GitHub Gate、Run reducer 或 Outbox。
-- 保持现有 Task→Instance 锁序；Delivery 数据写入分事务，不能形成 Run→Task→Instance 与旧路径反向锁。
+- 保持 Task→Instance 锁序；Controller 不在持有 Run/Task 行锁时调用 Agent、Git 或 GitHub。
 
 ### 11.3 用户聊天
 
-Developer Task 仍允许用户发消息，但行为改为：
-
-- Run 正在 running：普通 chat 记录为 intervention，默认并入当前 Turn 或排在其后；`inject` 只有在现有 provider/transport 支持时才 steer，并记录 audit。
-- Run waiting/ready：消息先持久化为 `human_message` event，由 Controller 聚合成一个新 Turn。
-- Run paused：保存消息和 attention，不自动 wake，直到 resume。
-- Run terminal：允许普通续聊，但这次聊天不自动改变历史 Run；需要修复时创建 child Run。
-
-这样可以避免用户 chat 绕过 DeliveryTurn lease，直接触发第二个并发 resume。
+V1 把 Developer Task 视为 Controller-owned scheduler shell。普通 chat、Shared chat、运行中 inject、fork 与 ad-hoc Capability 全部在持久化消息前返回 409；它们不能形成未受 Run lease 管理的第二个 resume。未来若增加 intervention，必须先设计持久 Event 和 exact-turn fence，不能直接复用现有 chat queue。
 
 ### 11.4 Task 操作语义
 
 | 操作 | 活跃 Run 的规则 |
 |---|---|
-| stop current turn | 复用 `task_termination`，Turn terminal，Run paused(user_stopped) |
-| pause run | 关闭新 admission/action；可选 exact stop 当前 Turn |
-| cancel run | 终止 exact Task generation，取消未领取 Action，Run terminal/cancelled |
-| retry Task | 禁止直接 Task retry，改为 Run command |
-| delete Task | 活跃 Run 返回 409；终态默认 archive，强删要 admin + audit |
-| edit repo/project/base/mode | 活跃 Run 禁止 |
-| edit model/effort | 只允许 paused/waiting，作用于下一 Turn并写 policy change |
-| migrate Worker | MVP 禁止；实现 Worker 协议后只允许 paused 且无 active Turn/Action |
-| clone session | 不用于切换到新的 Delivery worktree |
+| pause/resume/cancel | 只走 Run command，并受 `allowed_actions`、Controller lease、active Capability/Action 与 publication boundary 限制 |
+| edit/delete/archive/cancel/retry/stop Task | 无论 Task 当前 UI 状态，Delivery-owned shell 均返回 409 |
+| chat/inject/fork/share/migrate/clone session | 返回 409；不能复制或迁走 Run session/cwd/ownership |
+| edit project/repo/Monitor policy | 有 active Run 时由相应 API 拒绝，冻结 policy 仍须 hash 匹配 |
+| presentation controls | star/read/unread 保留，因为不改变执行或 evidence |
 
 ### 11.5 Session 与上下文压缩
 
 - DeliveryRun 不保存 Provider session_id，永远读取当前 Task。
-- Claude/Codex 账号轮换和 context compact 继续由 Dispatcher/InstanceManager 管理。
+- V1 provider 固定 Codex；账号轮换和 context compact 仍由 Dispatcher/InstanceManager 管理，但 model/tier/effort 与 policy hash 不得漂移。
 - Session 变化不改变 DeliveryTurn generation 或 GitHub subject。
-- 创建受控 worktree 后不得把已有 session 直接 resume 到新 cwd；采用新 Developer Task 或新 session + requirements/plan snapshot。
+- Run admission 创建新的 Developer Task；后续 Cycle 只在同一受管 cwd 下复用其 session，不允许普通 Task clone/fork 把 session 带到别的 cwd。
 
 ---
 
@@ -1046,13 +1154,15 @@ Developer Task 仍允许用户发消息，但行为改为：
 
 ### 12.1 DeliveryWorkspaceService
 
-复用并扩展 `WorktreeManager`：
+`DeliveryWorkspaceManager` 是独立的窄 Git 边界：
 
-- branch 固定为 `ccm/delivery/{run_id}` 或经过长度限制的等价名称。
-- worktree 固定到 `.claude-manager/worktrees/delivery-{run_id}`。
+- branch 固定为 `ccm/delivery/{run_id}-{title_slug}`。
+- worktree 固定到 Project 根内 `.claude-manager/worktrees/delivery-{run_id}`。
 - create/ensure/recover 幂等。
 - 本地 DB 持久化 repo、worktree、branch、base、Run、Task。
 - 多个 Turn 使用同一个 cwd。
+- Developer terminal 后由 Controller `git add --all` 并 commit；hooks、GPG、credential helper、global/system config 均关闭，存在外部 clean/process filter 时 fail closed。
+- commit 带 exact Run/Turn trailer；没有 diff 时不制造空 commit。
 - 不调用现有 `merge_to_main()`。
 - 不使用无条件 `remove --force` 清理可能存在的用户改动。
 
@@ -1061,9 +1171,9 @@ Developer Task 仍允许用户发消息，但行为改为：
 Controller 启动或 Turn 前验证：
 
 - repo/worktree 仍属于预期 Project。
-- worktree `.git` 指针有效。
+- worktree `.git` pointer、common Git dir、commondir/backlink 全部仍属于预期 Project，且路径不是 symlink escape。
 - 当前 branch 是受控 branch。
-- remote URL 的 repository ID 与 Run 相符。
+- 当前 head 必须等于上一持久 head，或是其唯一直接子 commit且含 exact Run/Turn trailer（仅用于 commit 后崩溃恢复）。
 - branch remote head 没有未经识别的变化。
 - 没有 active rebase/merge/cherry-pick。
 
@@ -1075,17 +1185,19 @@ Controller 启动或 Turn 前验证：
 
 但 Prompt 不是安全边界，还必须：
 
-- 要求默认分支 branch protection。
-- Developer 使用与 Merge Controller 分离的身份。
-- auto-merge readiness 检查凭据能力和保护规则。
-- 发现默认分支被 Developer 身份修改时立即 pause 并告警。
+- Developer 运行于 provider-specific network-off sandbox，且不注入 Git/GitHub credential。
+- Claude direct/PTY 使用 exact settings、空 setting sources、无 MCP/Skills/AskUserQuestion/hook/token/autonomous tools，并对 linked-worktree Git metadata broad deny 后只开放已验证的 exact read projection；Codex 的 `writableRoots` 只显式列出 Run worktree，并关闭 MCP/Apps/web/autonomous routes、禁止 exec fallback。
+- 两条路径都在真正 spawn/provider effect 前复验冻结 execution policy；Claude 还须复验 Git identity fingerprint 与完整 read projection。
+- Controller 每次 privileged Git 前验证 linked-worktree control metadata，并只允许 non-force push frozen delivery ref。
+- workspace、base/head/tree/patch、remote PR 任一漂移都停止 publication，而不是依赖模型遵守提示。
 
 ### 12.4 PR 创建和绑定
 
-- Agent 只 push branch；Controller 在 reconcile 看到 remote branch 后创建 PR Action。
-- PR marker 只能辅助定位，实际绑定必须匹配 repository ID、branch、PR number 和 current head。
-- PR create 响应丢失时，Outbox 先按 head branch 查询是否已存在 PR。
-- PR 被 rename/transfer 时按 repository numeric ID 跟踪，并更新 display name snapshot。
+- Controller 在 Pre-PR Review approved 后 claim `ensure_pull_request` Action；Publisher 先复验 Run lease + Action token lease + exact reviewed subject，再 non-force push。
+- PR marker 只辅助人工识别；实际绑定必须匹配 frozen repo、same-repo head branch、base branch、PR number、base/head SHA 和 URL。
+- PR create 前先按 owner:branch + base 查询；创建响应丢失时再次查询同一自然键，不会盲目创建第二个 PR。
+- Webhook 先创建 exact Review 时只允许无 legacy FindingAction/Rebuttal 的行被原子 adopt；否则 fail closed。
+- PR/Monitor 绑定后，legacy repair 和 Merge Queue 路径不能接管 Delivery subject；direct auto-merge 只能按 Run 冻结的 policy 执行。
 
 ---
 
@@ -1093,27 +1205,37 @@ Controller 启动或 Turn 前验证：
 
 ### 13.1 同一 Webhook，两个模式
 
-- Legacy PR：保留当前 PR Monitor 行为，直到单独迁移。
-- Delivery PR：Webhook 只写 DeliveryEvent，由 Controller 创建 exact-subject Reviewer Run。
-- Repo 配置必须拒绝“Legacy auto_merge + Delivery enabled”组合。
-- 当前 self-PR ignore 逻辑只留在 Legacy；Delivery 使用独立 reviewer identity 后不应跳过。
+- Legacy PR 继续走既有 PR Monitor 行为；Delivery 不复制第二套 Webhook/Reviewer pipeline。
+- Run admission 要求同一 MonitoredRepo 已启用 exact required CI、`review_mode=panel` 且 Merge Queue 为 manual，并把 direct auto-merge 开关与对应终点冻结进 policy snapshot。
+- Publisher push/create PR 与 GitHub `opened` webhook 可以乱序：若 webhook 已为 exact base ref/base/head 创建 PRReview，Publisher 在行锁下把它 adopt 为 `delivery:{run_id}:{head_sha}`；有另一个 Delivery owner 或已有 legacy Finding effect 时拒绝 adopt。
+- Delivery ownership 落定后，legacy repair、Agent自行merge和 Merge Queue 均不得作用于该 Review/Monitor；后端 publisher 仅按 frozen `auto_merge` 执行，Controller 只消费 exact-head终态。
 
 ### 13.2 Reviewer 权限
 
 Reviewer Agent：
 
-- 只读 repo/PR/CI。
+- 使用 Manager 捕获的 immutable PR metadata/diff/context，运行在 tool-free profile。
 - 输出结构化 findings。
 - 不修改代码。
 - 不 push。
 - 不 merge。
 - 不直接把自己的 Task 结果解释为 Gate passed。
 
-Controller 通过 Outbox 发布 Review 内容。
+PR Monitor 的发布 outbox 在 exact completed reviewer generation 上发布 Review/Finding；新 GitHub Review 的
+event 恒为 head-pinned `COMMENT`，内部 pass/block 不写 `APPROVE` 或 `REQUEST_CHANGES`。Delivery Controller
+只读取已持久化 verdict，并在终态前重新验证 GitHub PR、frozen base ref 和 Monitor state-version。
+
+`auto_merge=true` 的新 publication 只调用冻结目标 branch 的 Git ref endpoint，以 exact head 和
+`force=false` 做原子 fast-forward；目标 ref 已推进、PR retarget、required PR review 或保护策略不兼容时
+fail closed。该准入不读取 GitHub merge/squash/rebase enable flags，只复验 repository identity、exact-ref
+write capability 与 branch protection；`required_conversation_resolution` 必须明确关闭，冻结 required CI
+必须由 `(context, app_id)` 精确覆盖，无法证明 App 身份的 legacy commit status 直接 fail closed。升级前
+legacy outbox 中的 merge/squash 只允许对账已存在的 exact remote evidence，绝不重放 PR merge mutation；
+缺少证据时终态 fail closed，也不得生成新的这类 Action。
 
 ### 13.3 Reviewer 角色
 
-建议角色：
+Panel 固定三个相互独立的角色：
 
 ```text
 principal_engineer  # 架构、并发、跨模块不变量
@@ -1121,28 +1243,26 @@ senior_engineer     # 实现正确性、维护性、边界条件
 qa_engineer         # 测试、回归、用户路径、部署验证
 ```
 
-MVP Reviewer 阶段可以先启用一个 `general` role，验证协议后再扩到三角色。角色、provider、model、effort 都来自 Run policy snapshot。
+三者都必须完成；任一失败、坏结构化输出或 blocking finding 都 fail closed。Reviewer provider/model/effort 由 MonitoredRepo policy 驱动，Delivery admission 冻结并在 publication 时复验 repo policy未漂移。
 
 ### 13.4 Finding 生命周期
 
 ```text
-open
-→ Developer 提交修复 → fix_proposed
-→ 新 subject Reviewer 验证 → resolved 或 open
-
-open
-→ Developer 提交反驳 → disputed
-→ 原 Reviewer/裁决 Reviewer → resolved 或 open
-
-open
-→ 有权限人类接受风险 → waived（必须 exact subject + reason + audit）
+exact-head blocking Finding
+→ PR Monitor 生成持久 RepairWake / waiting_for_fix
+→ Delivery Controller 携 Review/Wake evidence 创建下一 Cycle
+→ Plan → Code → Controller commit/push 新 head
+→ 新 subject Panel 重新验证
+→ 旧 subject Finding effect 全部可证明解决后，zero-thread Gate 才可能 ready_to_merge
 ```
 
-新 head 会 supersede 旧 ReviewRun，但 Finding 是否 carry-forward 必须由新 Reviewer 明确确认；第一版默认全部重审。
+Developer Task/用户 API 都不能自行 resolve、rebut 或 waive Delivery blocking Finding。Publisher adopt 遇到旧 legacy FindingAction/Rebuttal 也会拒绝，防止两套 effect owner 混合。
 
 ---
 
-## 14. Worker、Migration 与 Shared Task
+## 14. Worker、Migration 与 Shared Task（后续范围）
+
+V1 对 Worker Project、Shared shadow、Task migration 和远程 Developer 全部 fail closed；本节是后续协议目标，不是当前能力。
 
 ### 14.1 权威位置
 
@@ -1201,7 +1321,9 @@ Worker 必须声明：
 
 ---
 
-## 15. Human Gate、权限、凭据与通知
+## 15. Human Gate、权限、凭据与通知（V1 边界与后续目标）
+
+V1 只提供受 effect fence 限制的 Run pause/resume/cancel 与 Task presentation controls；独立 DeliveryDecision、waiver、跨页面通知和 merge/deploy动作级权限仍属后续范围。
 
 ### 15.1 持久 Human Decision
 
@@ -1235,15 +1357,17 @@ UI 只根据服务端返回的 `allowed_actions` 渲染按钮。所有 override/
 ### 15.3 凭据角色
 
 ```text
-Developer credential：只需要 clone/fetch/push delivery branch
-Reviewer credential：只读 private repo/PR
-Merge credential：Controller 专用，允许 merge queue/merge
-Deployment credential：Adapter 专用
+Developer：V1 不接收 Git/GitHub credential，也没有网络
+Publisher：Controller 进程内专用，只能发布 frozen delivery ref/PR subject
+Reviewer：读取 Manager 生成的 immutable diff/context，不拥有 merge authority
+Direct Merge：仅 PR Monitor 后端对 frozen base ref 执行 exact-head non-force fast-forward，不向 Agent 暴露 credential
+Deployment：V1 不存在；未来必须使用与 Developer 分离的 Controller/Adapter credential
 ```
 
-- 不把 Merge/Deployment credential 注入 Agent prompt、env 或 worktree。
-- Project 当前单套 Git credential 只能作为 Developer MVP 兼容路径。
-- 无法证明身份隔离或 branch protection 时，auto_merge readiness 必须失败。
+- 不把 Publisher/Merge/Deployment credential 注入 Agent prompt、env、thread config 或 worktree。
+- Publisher 每次 effect 前必须重验 Run/Action lease 与 exact subject；凭据存在本身不构成授权。
+- direct auto-merge 只有 COMMENT-only Review、固定 base ref/head、fast-forward merge evidence 与最终 comment
+  均能证明时才成功；任一身份、generation 或远端证据不确定都保持可恢复等待或 fail closed。
 - Deployment config 只保存 Secret ID；API/WS/log 不返回 secret content。
 
 ### 15.4 Prompt injection
@@ -1274,7 +1398,7 @@ Deployment credential：Adapter 专用
 ### 16.1 核心不变量
 
 1. 一个 Run 同时最多一个 active Developer Turn。
-2. Event、Turn、Action 必须先持久化再唤醒。
+2. Capability Invocation/Execution、Cycle、Turn、Action 必须先持久化再唤醒。
 3. 进程内 lock/queue 只作优化，数据库 CAS/lease 才是跨进程正确性来源。
 4. 每个证据绑定 exact VerificationSubject。
 5. 旧 subject 事件只能标 stale，不能推进新 Gate。
@@ -1283,37 +1407,45 @@ Deployment credential：Adapter 专用
 8. cancel/supersede 复用 exact-generation Task termination。
 9. 所有外部 action 在执行前再次验证 expected subject 和 state_version。
 10. `Task.status=completed` 只表示某个 Task turn 结束；完整交付完成只看 `DeliveryRun.outcome=success`。
+11. Developer 不创建 Git commit；Controller commit 必须绑定 exact old head + Run ID + Turn generation，随后 Code Review/Publisher 只接受该 exact subject。
 
 ### 16.2 Controller lease
 
-- 每个 claim 使用随机 owner token、lease expiry 和 `state_version` CAS。
-- lease 续约失败立即停止产生新 effect。
-- lease 过期后，新 owner 先外部 reconcile，再执行任何 action。
+- 每个 Run claim 使用 controller owner、递增 generation、lease expiry 与条件 UPDATE；每个 publication Action 另使用随机 token lease。
+- heartbeat 同时延长当前 Run 与 active Action；任一续约失败会取消本地 drive，旧 generation 不能再开始新 effect。
+- lease 过期后，新 owner 从持久 Run/Cycle/Turn/Action 与外部 exact subject 恢复，不相信旧进程内状态。
 - 多 Uvicorn worker / 多 Manager 不能依赖 `backend.main` 单例保证唯一性。
 
 ### 16.3 Lost wakeup
 
 ```text
-先注册 Event/Turn/Wait Set
+先持久化 Invocation/Turn/Action/Monitor 绑定
 → commit
-→ 检查过去已经到达的 Event
-→ 主动 reconcile 外部当前状态
+→ 发 wake hint
+→ Dispatcher/Capability Coordinator/Controller 启动扫描补漏
+→ 主动读取 Task/Git/GitHub/Monitor 当前状态
 → 条件仍未满足才 waiting
 ```
 
 ### 16.4 Agent 崩溃
 
-Agent 可能在 checkpoint 前已经 commit/push。恢复顺序：
+Developer 没有 commit/push authority。恢复顺序：
 
-1. 读取 exact Task/Instance/Worker generation。
-2. 检查 workspace 状态。
-3. 查询 remote branch、PR、CI、Review。
-4. 对比 Turn wake package 和上一个 snapshot。
-5. 只有仍存在可执行工作时才创建新 Turn。
+1. 读取 exact Run lease generation、Task/Instance owner、DeliveryTurn generation，不能证明 terminal owner 已完全释放就继续等待。
+2. 检查受管 worktree pointer/control metadata、branch 和持久 old head。
+3. 若 head 未变，Controller 可对 terminal turn 的 working tree执行一次 fenced commit；若 head 是 old head 的唯一直接子且 commit body 含 exact Run/Turn trailer，则视为“commit 已成功、DB finalize 前崩溃”并复用该 head。
+4. 其他 head advance、dirty Git operation、filter、path 或 base 漂移全部 fail closed，不再猜测。
+5. 进入 publication 后再查询 remote ref、PR 与 Monitor；已达到 desired exact state就补记成功，否则只有 lease/subject 仍有效时才重试。
 
 ### 16.5 无进展检测
 
-Progress Signature：
+V1 progress signature 是 Controller 创建并持久化的新 `head_sha`：
+
+- Developer terminal 后没有产生新 tree/commit会增加 `no_progress_count`；达到 `max_no_progress` 或耗尽 `max_cycles` 后确定性失败。
+- Plan/Pre-PR Review/PR Monitor 的 changes requested 或 blocked 都会完成当前 Cycle，并以结构化 evidence 创建下一 Cycle。
+- 任一新 Controller commit 清零连续 no-progress 计数；Run 的 cycle/turn 上限始终由 frozen policy 控制。
+
+完整平台后续可把签名扩展为：
 
 ```text
 current verification subject
@@ -1324,7 +1456,7 @@ current verification subject
 + deployment state
 ```
 
-建议默认：
+后续建议：
 
 - 第一次相同 signature：允许一次重新诊断。
 - 第二次：创建独立 diagnostic Turn/Reviewer。
@@ -1347,7 +1479,9 @@ Action → unknown
 
 ---
 
-## 17. Deployment Adapter 与 post-merge 修复
+## 17. Deployment Adapter 与 post-merge 修复（后续范围）
+
+Delivery 在 `ready_to_merge` 或 confirmed `merged` 结束；仍不观察 deployment、不执行 rollback，本节全部是后续设计。
 
 ### 17.1 不复用 UpdateService
 
@@ -1574,7 +1708,7 @@ rollback(expected_environment_generation, target_deployment_id)
 - 改动：InstanceManager 接受 `credential_role`；MVP 不把 merge/deploy凭据给 Agent。
 - 文件：`delivery_prompts.py`、`dispatcher.py`、`instance_manager.py`、Project credential builder、tests。
 - 测试：Claude/Codex 首轮与 resume、恶意 Issue/Review 注入、项目文档冲突、credential role 不越权、policy hash 不匹配时 fail closed。
-- 验收：Claude/Codex prompt 都包含一致 policy hash；Agent 结果不能修改 Gate；auto-merge 尚保持关闭。
+- 验收：Claude/Codex prompt 都包含一致 policy hash；Agent 结果不能修改 Gate或自行merge；后端只能按冻结的repo开关合并。
 - 回退：停止新 Delivery Turn，不把任务降级为普通 auto Task。
 - 证据：待填写。
 
@@ -1617,7 +1751,7 @@ rollback(expected_environment_generation, target_deployment_id)
 - 依赖：DL-080、DL-090、DL-125、DL-140、DL-150
 - 改动：聚合当前 subject 的 code failures 为一个 wake package；push 后转新 subject并等待新 CI。
 - 文件：Controller/Reconciler/Gate/Prompt/tests。
-- 测试：多个 job 同时失败、旧 SHA 迟到、CI 在 wait 注册前完成、Agent push 后崩溃、missing check。
+- 测试：多个 job 同时失败、旧 SHA 迟到、CI 在 wait 注册前完成、Controller push 成功但本地确认前崩溃、missing check。
 - 验收：等待 CI 时无模型进程；同批失败只消耗一个 Turn；旧绿灯不能证明新 head。
 - 回退：关 auto-wake，Run 退到 shadow/manual attention。
 - 证据：待填写。
@@ -1876,7 +2010,7 @@ rollback(expected_environment_generation, target_deployment_id)
 - [ ] Turn commit 后、enqueue 前崩溃。
 - [ ] enqueue 后、queue claim 前崩溃。
 - [ ] queue claim 后、Agent launch 前崩溃。
-- [ ] Agent push 后、checkpoint 前崩溃。
+- [ ] Controller commit/push 成功后、数据库确认前崩溃。
 - [ ] terminal callback 丢失，由扫描/reconcile 修复。
 - [ ] pause/cancel/takeover 与 Turn/Action claim 并发。
 - [ ] 同一 Task 多轮使用相同 retry_count，仍能正确区分 DeliveryTurn。

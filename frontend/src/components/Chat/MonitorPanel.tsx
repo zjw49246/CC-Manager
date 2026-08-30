@@ -41,7 +41,7 @@ function TypeChip({ agentType, source }: { agentType: string; source: string }) 
             : 'bg-teal-900/40 text-teal-300 border-teal-700'
       }`}
       title={
-        isNative ? '模型原生子 agent（PTY 观测）'
+        isNative ? '模型原生子 agent（Provider 生命周期观测）'
           : isSubAgent ? 'CCM Sub-Agent（一次性任务）'
             : 'CCM $monitor 子 agent'
       }
@@ -61,7 +61,7 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
   );
 
   const loadChecks = useCallback(() => {
-    api.getMonitorChecks(taskId, session.id).then(setChecks).catch(() => {});
+    api.getSubAgentReports(taskId, session.id).then(setChecks).catch(() => {});
   }, [taskId, session.id]);
 
   useEffect(() => {
@@ -71,7 +71,11 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
   const handleStop = async () => {
     setStopping(true);
     try {
-      await api.deleteMonitorSession(taskId, session.id);
+      if (session.agent_type === 'sub_agent') {
+        await api.deleteSubAgentSession(taskId, session.id);
+      } else {
+        await api.deleteMonitorSession(taskId, session.id);
+      }
       onStopped();
     } catch {
       // Terminal cleanup can fail after the backend has already persisted the
@@ -127,7 +131,11 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
             className="text-gray-400 hover:text-red-400 p-1 disabled:opacity-50"
             onClick={handleStop}
             disabled={stopping}
-            title={cleanupPending ? 'Retry Codex cleanup' : 'Stop monitor'}
+            title={cleanupPending
+              ? 'Retry Codex cleanup'
+              : session.agent_type === 'sub_agent'
+                ? 'Stop sub-agent'
+                : 'Stop monitor'}
           >
             <StopCircle size={16} />
           </button>
@@ -138,7 +146,9 @@ function MonitorSessionRow({ session, taskId, onStopped }: { session: MonitorSes
         <div className="border-t border-gray-700 px-3 py-2 space-y-1.5 max-h-48 overflow-y-auto">
           {checks.map((check) => (
             <div key={check.id} className="flex items-start gap-2 text-xs">
-              {check.status === 'success' ? (
+              {check.status === 'running' ? (
+                <Activity size={12} className="text-cyan-400 mt-0.5 shrink-0" />
+              ) : check.status === 'success' || check.status === 'completed' ? (
                 <CheckCircle2 size={12} className="text-emerald-500 mt-0.5 shrink-0" />
               ) : (
                 <AlertCircle size={12} className="text-red-500 mt-0.5 shrink-0" />
@@ -164,7 +174,7 @@ export function MonitorPanel({
   monitorSupported,
 }: MonitorPanelProps) {
   const refresh = useCallback(() => {
-    api.listMonitorSessions(taskId).then(onSessionsChange).catch(() => {});
+    api.listAllSubAgentSessions(taskId).then(onSessionsChange).catch(() => {});
   }, [taskId, onSessionsChange]);
 
   useEffect(() => {

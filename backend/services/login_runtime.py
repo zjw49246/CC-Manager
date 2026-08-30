@@ -26,6 +26,10 @@ from typing import Mapping
 logger = logging.getLogger(__name__)
 
 _DISPLAY_RE = re.compile(r"^:(\d+)$")
+_STABLE_PATH_IDENTITY_FIELDS = frozenset(
+    {"device", "inode", "uid", "file_type"},
+)
+_PATH_IDENTITY_FIELDS = _STABLE_PATH_IDENTITY_FIELDS | {"ctime_ns"}
 
 
 class LoginRuntimeError(RuntimeError):
@@ -238,7 +242,20 @@ class XvfbManager:
             ) from exc
 
     @staticmethod
-    def _path_identity(path: Path) -> dict[str, int] | None:
+    def _stat_identity(info: os.stat_result) -> dict[str, int]:
+        return {
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "uid": int(info.st_uid),
+            "file_type": int(stat.S_IFMT(info.st_mode)),
+            # A filesystem may immediately reuse an unlinked Unix socket's
+            # inode.  ctime changes for the new inode incarnation and keeps a
+            # stale owner record from authorizing removal of that replacement.
+            "ctime_ns": int(info.st_ctime_ns),
+        }
+
+    @classmethod
+    def _path_identity(cls, path: Path) -> dict[str, int] | None:
         try:
             info = path.lstat()
         except FileNotFoundError:
@@ -251,12 +268,7 @@ class XvfbManager:
             raise LoginRuntimeError(
                 f"Refusing symlink Xvfb runtime artifact: {path}",
             )
-        return {
-            "device": int(info.st_dev),
-            "inode": int(info.st_ino),
-            "uid": int(info.st_uid),
-            "file_type": int(stat.S_IFMT(info.st_mode)),
-        }
+        return cls._stat_identity(info)
 
     @staticmethod
     def _same_path_identity(
@@ -265,10 +277,153 @@ class XvfbManager:
     ) -> bool:
         if current is None or not isinstance(recorded, dict):
             return False
-        required = {"device", "inode", "uid", "file_type"}
-        if set(recorded) != required:
+        if set(recorded) != _PATH_IDENTITY_FIELDS:
             return False
-        return all(current[key] == recorded.get(key) for key in required)
+        return all(
+            current[key] == recorded.get(key)
+            for key in _PATH_IDENTITY_FIELDS
+        )
+
+    @staticmethod
+    def _valid_recorded_path_identity(
+        recorded: object,
+        *,
+        file_type: int,
+    ) -> bool:
+        return (
+            isinstance(recorded, dict)
+            and set(recorded) == _PATH_IDENTITY_FIELDS
+            and all(type(recorded.get(key)) is int for key in _PATH_IDENTITY_FIELDS)
+            and recorded["file_type"] == file_type
+        )
+
+    @staticmethod
+    def _same_stable_path_identity(
+        current: dict[str, int] | None,
+        recorded: object,
+    ) -> bool:
+        """Match fields that remain stable when an inode is renamed."""
+
+        if current is None or not isinstance(recorded, dict):
+            return False
+        if not _STABLE_PATH_IDENTITY_FIELDS.issubset(recorded):
+            return False
+        return all(
+            current[key] == recorded.get(key)
+            for key in _STABLE_PATH_IDENTITY_FIELDS
+        )
+
+    @classmethod
+    def _pin_path_identity(
+        cls,
+        path: Path,
+    ) -> tuple[int, dict[str, int]] | None:
+        """Open an artifact without following links and pin its inode."""
+
+        if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+            raise LoginRuntimeError(
+                "Safe Xvfb artifact recovery requires O_PATH and O_NOFOLLOW",
+            )
+        flags = os.O_PATH | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LoginRuntimeError(
+                f"Unable to pin Xvfb runtime artifact {path}: {exc}",
+            ) from exc
+
+        try:
+            identity = cls._stat_identity(os.fstat(descriptor))
+            if identity["file_type"] == stat.S_IFLNK:
+                raise LoginRuntimeError(
+                    f"Refusing symlink Xvfb runtime artifact: {path}",
+                )
+            return descriptor, identity
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _quarantine_path(path: Path) -> tuple[Path, Path]:
+        """Create a private, same-filesystem destination for one artifact."""
+
+        for _attempt in range(16):
+            quarantine_dir = path.parent / (
+                f".ccm-xvfb-recovery-{path.name}-{os.getpid()}-"
+                f"{secrets.token_hex(8)}"
+            )
+            try:
+                quarantine_dir.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise LoginRuntimeError(
+                    f"Unable to create Xvfb recovery quarantine for {path}: {exc}",
+                ) from exc
+            os.chmod(quarantine_dir, 0o700)
+            return quarantine_dir, quarantine_dir / path.name
+        raise LoginRuntimeError(
+            f"Unable to allocate Xvfb recovery quarantine for {path}",
+        )
+
+    @classmethod
+    def _move_to_quarantine(cls, path: Path) -> tuple[Path, Path]:
+        quarantine_dir, quarantine_path = cls._quarantine_path(path)
+        try:
+            os.rename(path, quarantine_path)
+        except OSError as exc:
+            try:
+                quarantine_dir.rmdir()
+            except OSError:
+                pass
+            raise LoginRuntimeError(
+                f"Unable to quarantine Xvfb runtime artifact {path}: {exc}",
+            ) from exc
+        return quarantine_dir, quarantine_path
+
+    @staticmethod
+    def _restore_quarantined_artifact(
+        path: Path,
+        quarantine_dir: Path,
+        quarantine_path: Path,
+    ) -> bool:
+        """Restore without overwriting a path created during recovery."""
+
+        try:
+            os.link(quarantine_path, path, follow_symlinks=False)
+        except OSError as exc:
+            logger.error(
+                "Could not restore quarantined Xvfb artifact %s to %s; "
+                "preserved it for manual recovery: %s",
+                quarantine_path,
+                path,
+                exc,
+            )
+            return False
+        try:
+            quarantine_path.unlink()
+        except OSError as exc:
+            logger.error(
+                "Restored Xvfb artifact %s but could not remove its quarantine "
+                "hard link %s: %s",
+                path,
+                quarantine_path,
+                exc,
+            )
+            return False
+        try:
+            quarantine_dir.rmdir()
+        except OSError as exc:
+            logger.warning(
+                "Could not remove empty Xvfb recovery quarantine %s: %s",
+                quarantine_dir,
+                exc,
+            )
+        return True
 
     @staticmethod
     def _write_owner_record(path: Path, record: dict[str, object]) -> None:
@@ -365,7 +520,7 @@ class XvfbManager:
         self._write_owner_record(
             owner_path,
             {
-                "version": 1,
+                "version": 2,
                 "display": display,
                 "pid": int(proc.pid),
                 "start_time_ticks": start_time_ticks,
@@ -385,62 +540,185 @@ class XvfbManager:
         """Remove artifacts only when they still belong to a dead CCM Xvfb."""
 
         record = self._read_owner_record(owner_path)
-        socket_identity = self._path_identity(socket_path)
-        x_lock_identity = self._path_identity(x_lock_path)
         if record is None:
             return False
+        if type(record.get("version")) is int and record["version"] == 1:
+            if (
+                record.get("display") != display
+                or type(record.get("pid")) is not int
+                or type(record.get("start_time_ticks")) is not int
+            ):
+                raise LoginRuntimeError(
+                    f"Invalid legacy v1 Xvfb owner record for display {display}",
+                )
+            if (
+                self._path_identity(socket_path) is not None
+                or self._path_identity(x_lock_path) is not None
+            ):
+                raise LoginRuntimeError(
+                    f"X display {display} has a legacy v1 CCM owner record that "
+                    "cannot be safely auto-recovered while artifacts exist; "
+                    "authenticate the existing display or verify and remove its "
+                    "artifacts manually",
+                )
+            pid = int(record["pid"])
+            process_identity = self._read_process_identity(pid)
+            if process_identity is not None:
+                state, start_time_ticks = process_identity
+                if (
+                    state != "Z"
+                    and start_time_ticks == record["start_time_ticks"]
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} is owned by live legacy CCM Xvfb "
+                        f"PID {pid} but cannot be authenticated",
+                    )
+            logger.warning(
+                "Recovered empty legacy CCM Xvfb owner display=%s pid=%s; "
+                "retaining the v1 record until a new v2 owner is ready",
+                display,
+                pid,
+            )
+            return True
         if (
-            record.get("version") != 1
+            type(record.get("version")) is not int
+            or record["version"] != 2
             or record.get("display") != display
-            or not isinstance(record.get("pid"), int)
-            or not isinstance(record.get("start_time_ticks"), int)
+            or type(record.get("pid")) is not int
+            or type(record.get("start_time_ticks")) is not int
+            or not self._valid_recorded_path_identity(
+                record.get("socket"),
+                file_type=stat.S_IFSOCK,
+            )
+            or (
+                record.get("x_lock") is not None
+                and not self._valid_recorded_path_identity(
+                    record.get("x_lock"),
+                    file_type=stat.S_IFREG,
+                )
+            )
         ):
             raise LoginRuntimeError(
                 f"Invalid Xvfb owner record for display {display}",
             )
 
-        pid = int(record["pid"])
-        process_identity = self._read_process_identity(pid)
-        if process_identity is not None:
-            state, start_time_ticks = process_identity
-            if state != "Z" and start_time_ticks == record["start_time_ticks"]:
-                raise LoginRuntimeError(
-                    f"X display {display} is owned by live CCM Xvfb PID {pid} "
-                    "but cannot be authenticated",
-                )
-
-        if socket_identity is not None:
-            if (
-                socket_identity["file_type"] != stat.S_IFSOCK
-                or not self._same_path_identity(socket_identity, record.get("socket"))
-            ):
-                raise LoginRuntimeError(
-                    f"X display {display} socket no longer matches its CCM owner "
-                    "record; refusing to remove it",
-                )
-        if x_lock_identity is not None and not self._same_path_identity(
-            x_lock_identity,
-            record.get("x_lock"),
-        ):
-            raise LoginRuntimeError(
-                f"X display {display} lock no longer matches its CCM owner "
-                "record; refusing to remove it",
-            )
-
-        if socket_identity is not None:
-            socket_path.unlink()
-        if x_lock_identity is not None:
-            x_lock_path.unlink()
+        pinned: list[tuple[Path, int]] = []
+        moved: list[tuple[Path, Path, Path, int]] = []
         try:
-            owner_path.unlink()
-        except FileNotFoundError:
-            pass
-        logger.warning(
-            "Recovered stale CCM-owned Xvfb artifacts display=%s pid=%s",
-            display,
-            pid,
-        )
-        return True
+            socket_pin = self._pin_path_identity(socket_path)
+            if socket_pin is not None:
+                socket_descriptor, socket_identity = socket_pin
+                pinned.append((socket_path, socket_descriptor))
+                if (
+                    socket_identity["file_type"] != stat.S_IFSOCK
+                    or not self._same_path_identity(
+                        socket_identity,
+                        record.get("socket"),
+                    )
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} socket no longer matches its CCM "
+                        "owner record; refusing to remove it",
+                    )
+
+            x_lock_pin = self._pin_path_identity(x_lock_path)
+            if x_lock_pin is not None:
+                x_lock_descriptor, x_lock_identity = x_lock_pin
+                pinned.append((x_lock_path, x_lock_descriptor))
+                if (
+                    x_lock_identity["file_type"] != stat.S_IFREG
+                    or not self._same_path_identity(
+                        x_lock_identity,
+                        record.get("x_lock"),
+                    )
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} lock no longer matches its CCM "
+                        "owner record; refusing to remove it",
+                    )
+
+            pid = int(record["pid"])
+            process_identity = self._read_process_identity(pid)
+            if process_identity is not None:
+                state, start_time_ticks = process_identity
+                if (
+                    state != "Z"
+                    and start_time_ticks == record["start_time_ticks"]
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} is owned by live CCM Xvfb PID {pid} "
+                        "but cannot be authenticated",
+                    )
+
+            for path, descriptor in pinned:
+                quarantine_dir, quarantine_path = self._move_to_quarantine(path)
+                moved.append(
+                    (path, quarantine_dir, quarantine_path, descriptor),
+                )
+                moved_identity = self._path_identity(quarantine_path)
+                pinned_identity = self._stat_identity(os.fstat(descriptor))
+                # rename updates ctime.  The held O_PATH descriptor prevents
+                # the original inode from being recycled, so the four stable
+                # fields prove that the node moved was the node we pinned.
+                if not self._same_stable_path_identity(
+                    moved_identity,
+                    pinned_identity,
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} artifact {path} changed while being "
+                        f"quarantined; preserved at {quarantine_path}",
+                    )
+
+            for movement in tuple(moved):
+                path, quarantine_dir, quarantine_path, descriptor = movement
+                moved_identity = self._path_identity(quarantine_path)
+                pinned_identity = self._stat_identity(os.fstat(descriptor))
+                if not self._same_stable_path_identity(
+                    moved_identity,
+                    pinned_identity,
+                ):
+                    raise LoginRuntimeError(
+                        f"X display {display} quarantined artifact {path} was "
+                        f"replaced; preserved at {quarantine_path}",
+                    )
+                try:
+                    quarantine_path.unlink()
+                except OSError as exc:
+                    raise LoginRuntimeError(
+                        f"Unable to remove verified stale Xvfb artifact "
+                        f"{quarantine_path}: {exc}",
+                    ) from exc
+                moved.remove(movement)
+                try:
+                    quarantine_dir.rmdir()
+                except OSError as exc:
+                    logger.warning(
+                        "Could not remove empty Xvfb recovery quarantine %s: %s",
+                        quarantine_dir,
+                        exc,
+                    )
+
+            # Keep the old owner record as crash evidence.  A newly ready Xvfb
+            # atomically replaces it in _record_owned_display().
+            logger.warning(
+                "Recovered stale CCM-owned Xvfb artifacts display=%s pid=%s",
+                display,
+                pid,
+            )
+            return True
+        except Exception:
+            for path, quarantine_dir, quarantine_path, _descriptor in reversed(
+                moved,
+            ):
+                self._restore_quarantined_artifact(
+                    path,
+                    quarantine_dir,
+                    quarantine_path,
+                )
+            raise
+        finally:
+            for _path, descriptor in pinned:
+                os.close(descriptor)
 
     @staticmethod
     def _display_ready(display: str, auth_path: Path) -> bool:

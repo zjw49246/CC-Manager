@@ -1,8 +1,8 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 
 import { api } from '../../api/client';
-import type { Task, Project } from '../../api/client';
-import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
+import type { PRReviewResult, Task, Project } from '../../api/client';
+import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin, GitPullRequest } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { AttentionTag } from './AttentionTag';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
@@ -10,8 +10,17 @@ import { ExpandableText } from '../ExpandableText';
 import { formatDateTime } from '../../config/timezone';
 import { useTaskReorder } from '../../hooks/useTaskReorder';
 import { getTaskStatusLabel } from './taskStatus';
+import { DeliveryRunPanel } from './DeliveryRunPanel';
+import {
+  canControlTask,
+  canManageTaskShare,
+  readStoredUserIdentity,
+  taskHasSession,
+} from './taskSharePermissions';
+import { isPRMonitorDisplayTask } from './prMonitorTask';
+import { PRMonitorTaskSummary } from './PRMonitorTaskSummary';
 
-interface TaskListProps {
+export interface TaskListProps {
   tasks: Task[];
   projects: Project[];
   onRefresh: () => void;
@@ -21,13 +30,17 @@ interface TaskListProps {
   autoSortOnAccess?: boolean;
   onBeforeArchive?: () => void;
   onReorder?: (tasks: Task[]) => void;
+  /** Safe aggregate PR results keyed by the durable display Task id. */
+  prResults?: ReadonlyMap<number, PRReviewResult>;
 }
 
 const statusColors: Record<string, string> = {
   pending: 'bg-yellow-500',
   in_progress: 'bg-blue-500',
   executing: 'bg-blue-400 animate-pulse',
+  waiting_capability: 'bg-violet-400 animate-pulse',
   background: 'bg-teal-400 animate-pulse',
+  delivery_waiting: 'bg-indigo-400',
   plan_review: 'bg-purple-500',
   superseded: 'bg-gray-500',
   completed: 'bg-green-500',
@@ -35,7 +48,21 @@ const statusColors: Record<string, string> = {
   cancelled: 'bg-gray-500',
 };
 
-export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
+// Keep this aligned with backend/api/tasks.py::_MANUAL_RETRYABLE_STATUSES.
+// Active background output and controller-owned task modes have separate
+// lifecycle controls and cannot be retried through the public Task action.
+const manualRetryableStatuses = new Set(['failed', 'cancelled', 'conflict', 'completed']);
+
+function canRetryTask(task: Task): boolean {
+  return !task.background_active
+    && task.mode !== 'plan'
+    && task.mode !== 'delivery_loop'
+    && task.delivery_run_id == null
+    && manualRetryableStatuses.has(task.status);
+}
+
+export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder, prResults }: TaskListProps) {
+  const currentUser = readStoredUserIdentity();
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
     for (const p of projects) map[p.id] = { name: p.name, color: p.badge_color };
@@ -46,6 +73,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
   const [menuOpenId, setMenuOpenId] = useState<number | null>(null);
   const [editingTitleId, setEditingTitleId] = useState<number | null>(null);
   const [editingAttentionTagId, setEditingAttentionTagId] = useState<number | null>(null);
+  const [openDeliveryRunId, setOpenDeliveryRunId] = useState<number | null>(null);
   const [titleDraft, setTitleDraft] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
@@ -142,7 +170,14 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
     }
     onRefresh();
   }, [onRefresh, onReorder]);
-  const { draggingId, overIndex, targetProps, pointerHandleProps, ghost } = useTaskReorder(tasks, handleReordered, autoSortOnAccess);
+  const {
+    draggingId,
+    overIndex,
+    dropTargetProps,
+    targetProps,
+    pointerHandleProps,
+    ghost,
+  } = useTaskReorder(tasks, handleReordered, autoSortOnAccess);
 
   if (tasks.length === 0) {
     return <p className="text-gray-500 text-sm text-center py-8">No tasks yet</p>;
@@ -153,9 +188,17 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
     <div className="space-y-2">
       {ghost}
       {tasks.map((t, idx) => (
+        // PR Monitor display Tasks are durable read-only projections. Their
+        // reviewer execution Tasks remain hidden and never enter this list.
+        (() => {
+        const prDisplay = isPRMonitorDisplayTask(t);
+        const prResult = prResults?.get(t.id);
+        return (
         <div
           key={t.id}
-          {...targetProps(t, idx)}
+          {...(prDisplay
+            ? {}
+            : canControlTask(t) ? targetProps(t, idx) : dropTargetProps(t, idx))}
           className={`relative rounded-xl p-3 border transition-[opacity,border-color,box-shadow] ${
             draggingId === t.id ? 'opacity-40' : ''
           } ${overIndex === idx && draggingId !== null && draggingId !== t.id ? 'ring-2 ring-indigo-400' : ''} ${
@@ -168,19 +211,44 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
         >
           {/* 拖拽手柄（右下角，空间更宽裕）：卡片正文是可选中文字，整卡
               draggable 会被文本选择手势抢走，必须用显式手柄拖动 */}
-          <span
-            {...pointerHandleProps(t, idx)}
-            className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
-            title="按住拖动排序"
-          >
-            <GripVertical size={16} />
-          </span>
+          {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && (
+            <span
+              {...pointerHandleProps(t, idx)}
+              className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
+              title="按住拖动排序"
+            >
+              <GripVertical size={16} />
+            </span>
+          )}
           {/* Row 1: status dot + badges (left, wraps) | action buttons (right, no wrap) */}
           <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`} />
+            <span className={`w-2.5 h-2.5 rounded-full shrink-0 self-start mt-[9px] ${statusColors[
+              t.background_active
+                ? 'background'
+                : t.mode === 'delivery_loop' && t.delivery_activity === 'running'
+                  ? 'executing'
+                  : t.mode === 'delivery_loop' && t.delivery_activity === 'waiting'
+                    ? 'delivery_waiting'
+                    : t.mode === 'delivery_loop' && t.delivery_activity === 'paused'
+                      ? 'plan_review'
+                      : t.status
+            ] || 'bg-gray-500'}`} />
             <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0 min-h-[28px]">
               <span className="text-xs text-gray-500">#{t.id}</span>
-              {editingAttentionTagId !== t.id && (
+              {t.mode === 'delivery_loop' && t.attention_tag ? (
+                <span
+                  className="inline-flex min-w-0 max-w-[min(16rem,55vw)] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300"
+                  title="Delivery-owned Task attention tag"
+                >
+                  <Pin size={11} className="shrink-0" />
+                  <span className="truncate">{t.attention_tag}</span>
+                </span>
+              ) : !canControlTask(t) && t.attention_tag ? (
+                <span className="inline-flex min-w-0 max-w-[min(16rem,55vw)] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300">
+                  <Pin size={11} className="shrink-0" />
+                  <span className="truncate">{t.attention_tag}</span>
+                </span>
+              ) : canControlTask(t) && !prDisplay && editingAttentionTagId !== t.id && (
                 <AttentionTag
                   taskId={t.id}
                   value={t.attention_tag}
@@ -191,9 +259,13 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   className="max-w-[min(16rem,55vw)]"
                 />
               )}
-              {t.shared_from_id && (
+              {prDisplay ? null : t.access_scope === 'chat' ? (
+                <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared · Chat</span>
+              ) : !canControlTask(t) ? (
+                <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Restricted</span>
+              ) : t.shared_from_id ? (
                 <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared</span>
-              )}
+              ) : null}
               {t.project_id && projectMap[t.project_id] && (() => {
                 const proj = projectMap[t.project_id!];
                 const colorDef = TAG_COLOR_OPTIONS.find((c) => c.key === proj.color);
@@ -205,12 +277,31 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                 <span className="text-xs bg-indigo-600/30 text-indigo-300 px-1.5 rounded">P{t.priority}</span>
               )}
               <span className={`text-xs text-gray-500 ${
-                t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status)
+                (t.mode === 'plan' && ['in_progress', 'executing'].includes(t.status))
+                  || t.mode === 'delivery_loop'
                   ? ''
                   : 'hidden sm:inline'
               }`}>
                 {getTaskStatusLabel(t)}
               </span>
+              {prDisplay && (
+                <span className="inline-flex items-center gap-1 rounded bg-indigo-600/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300">
+                  <GitPullRequest size={11} aria-hidden="true" /> PR review
+                </span>
+              )}
+              {canControlTask(t) && t.mode === 'delivery_loop' && t.delivery_run_id != null && (
+                <button
+                  type="button"
+                  onClick={() => setOpenDeliveryRunId((current) => (
+                    current === t.delivery_run_id ? null : t.delivery_run_id!
+                  ))}
+                  aria-expanded={openDeliveryRunId === t.delivery_run_id}
+                  className="rounded bg-indigo-600/20 px-1.5 text-[10px] font-medium text-indigo-300 hover:bg-indigo-600/30"
+                  title={`Delivery Run #${t.delivery_run_id}`}
+                >
+                  DLV-{t.delivery_run_id}
+                </button>
+              )}
               {t.mode === 'plan' ? (
                 <>
                   {t.canonical_plan_id != null && (
@@ -226,35 +317,48 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <PlanPipelineBadge task={t} />
                   <PlanRevisionBadge task={t} />
                 </>
-              ) : (
+              ) : prDisplay ? null : (
                 <>
                   <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
                     {t.provider === 'codex' ? 'Codex' : 'Claude'}
                   </span>
                   <FastModeBadge task={t} />
-                  <TaskConfigBadge task={t} onRefresh={onRefresh} />
-                  <PluginsBadge task={t} onRefresh={onRefresh} />
+                  {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && (
+                    <>
+                      <TaskConfigBadge task={t} onRefresh={onRefresh} />
+                      <PluginsBadge task={t} onRefresh={onRefresh} />
+                    </>
+                  )}
                   <SubAgentsBadge task={t} />
                 </>
               )}
             </div>
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">
-              <button
-                onClick={() => handleStar(t.id)}
-                className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
-                title={t.starred ? "Unstar" : "Star"}
-              >
-                <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
-              </button>
-              <button
-                onClick={() => handleToggleUnread(t.id, t.has_unread)}
-                className={`p-1.5 transition-colors ${t.has_unread ? 'text-indigo-400 hover:text-indigo-300' : 'text-gray-600 hover:text-indigo-400'}`}
-                title={t.has_unread ? "Mark as read" : "Mark as unread"}
-              >
-                {t.has_unread ? <MailOpen size={16} /> : <Mail size={16} />}
-              </button>
-              {t.session_id && (
+              {!prDisplay && canControlTask(t) && <button
+                  onClick={() => handleStar(t.id)}
+                  className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
+                  title={t.starred ? "Unstar" : "Star"}
+                >
+                  <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
+                </button>}
+              {!prDisplay && canControlTask(t) && <button
+                  onClick={() => handleToggleUnread(t.id, t.has_unread)}
+                  className={`p-1.5 transition-colors ${t.has_unread ? 'text-indigo-400 hover:text-indigo-300' : 'text-gray-600 hover:text-indigo-400'}`}
+                  title={t.has_unread ? "Mark as read" : "Mark as unread"}
+                >
+                  {t.has_unread ? <MailOpen size={16} /> : <Mail size={16} />}
+                </button>}
+              {prDisplay ? (
+                <button
+                  type="button"
+                  onClick={() => onOpenChat(t)}
+                  className="flex items-center gap-1 rounded bg-indigo-600/20 px-2 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-600/30"
+                  title="View PR review result"
+                >
+                  <GitPullRequest size={14} /><span className="hidden sm:inline"> View result</span>
+                </button>
+              ) : taskHasSession(t) && (
                 <button
                   onClick={() => onOpenChat(t)}
                   className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30"
@@ -263,15 +367,15 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <MessageCircle size={14} /><span className="hidden sm:inline"> Chat</span>
                 </button>
               )}
-              <button
+              {!prDisplay && <button
                 onClick={() => handleCopy(t)}
                 className="p-1.5 text-gray-600 hover:text-gray-300 transition-colors"
                 title="Copy prompt"
               >
                 {copiedId === t.id ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
-              </button>
-              {/* Overflow menu */}
-              <div className="relative">
+              </button>}
+              {/* Controller-owned Delivery Tasks are read-only scheduler shells. */}
+              {!prDisplay && canControlTask(t) && t.mode !== 'delivery_loop' && <div className="relative">
                 <button
                   onClick={() => {
                     setMenuOpenId(menuOpenId === t.id ? null : t.id);
@@ -298,17 +402,19 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                       </button>
                     )}
 
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setMenuOpenId(null);
-                        window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }));
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-800 text-left"
-                    >
-                      <UserPlus size={14} /> Team Share
-                    </button>
-                    {(t.background_active || ['in_progress', 'executing'].includes(t.status)) && (
+                    {canManageTaskShare(t, currentUser) && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMenuOpenId(null);
+                          window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }));
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-800 text-left"
+                      >
+                        <UserPlus size={14} /> Team Share
+                      </button>
+                    )}
+                    {(t.background_active || ['in_progress', 'executing', 'waiting_capability'].includes(t.status)) && (
                       <button
                         onClick={() => { handleCancel(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-yellow-400 hover:bg-gray-800 text-left"
@@ -316,7 +422,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                         <XCircle size={14} /> Cancel
                       </button>
                     )}
-                    {t.status === 'failed' && (
+                    {canRetryTask(t) && (
                       <button
                         onClick={() => { handleRetry(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-blue-400 hover:bg-gray-800 text-left"
@@ -341,12 +447,12 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                     )}
                   </div>
                 )}
-              </div>
+              </div>}
             </div>
           </div>
           {/* Row 2: title + description (full width; pr 留出右下角手柄位) */}
           <div className="mt-1 pl-[1.125rem] pr-7">
-            {editingAttentionTagId === t.id && (
+            {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
               <AttentionTag
                 taskId={t.id}
                 value={t.attention_tag}
@@ -358,7 +464,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               />
             )}
             {/* Title (editable) */}
-            {editingTitleId === t.id ? (
+            {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
               <input
                 ref={titleInputRef}
                 value={titleDraft}
@@ -377,7 +483,9 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               ) : null
             )}
             {/* Description (expandable) */}
-            {t.mode === 'loop' && !t.description ? (
+            {prDisplay ? (
+              <PRMonitorTaskSummary task={t} result={prResult} />
+            ) : t.mode === 'loop' && !t.description ? (
               <p className="text-sm mt-0.5 text-gray-500 italic">{t.todo_file_path}</p>
             ) : t.description ? (
               <ExpandableText
@@ -411,7 +519,18 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               <p className="text-red-400 text-xs mt-1">{t.error_message}</p>
             )}
           </div>
+          {canControlTask(t)
+            && t.mode === 'delivery_loop'
+            && t.delivery_run_id != null
+            && openDeliveryRunId === t.delivery_run_id && (
+            <DeliveryRunPanel
+              runId={t.delivery_run_id}
+              className="mt-3"
+            />
+          )}
         </div>
+        );
+        })()
       ))}
     </div>
     </>

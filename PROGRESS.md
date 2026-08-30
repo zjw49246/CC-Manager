@@ -4,6 +4,12 @@
 
 ## 已完成功能
 
+### 2026-08-18：一键更新 SQLite 快照提速
+
+- [x] 权威 Alembic revision 已是最新时不再生成数据库回滚快照；有待迁移项时只预留路径，由停服后的外部 worker 生成一次权威快照，取消会被立即覆盖的在线全量备份。
+- [x] 保留目标快照 `PRAGMA integrity_check` 与 fsync，去掉复制前重复的源库全量扫描；数据库恢复点上限从 5 个收紧为 2 个。
+- [x] 更新/迁移/回滚/部署租约专项回归 142 passed，覆盖无在线拷贝、保留策略、空目标快照创建和迁移失败恢复（`ee894bc`）。
+
 ### 阶段 1：基础设施
 - [x] 项目初始化 (pyproject.toml, .gitignore, .env)
 - [x] SQLAlchemy async + SQLite 数据库
@@ -1026,3 +1032,227 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **事故**：停止一个 Codex Task 时，未确认 `turn/interrupt` 的兜底路径会关闭该账号共享的 app-server，使同一 `CODEX_HOME` 上的其他 Task 一并失败；clean exit 0 又被误报为 unexpected，并把账号级历史 stderr 拼到每个 Task 的错误中。
 - **修复**：已领取 turn 改走 exact-generation `stop_claimed_turn`。只有目标仍是权威 live turn、没有 peer turn、没有已准入 RPC 时才允许关闭 transport；存在 peer、并发 steer/RPC 或目标已变化时保留原 process/consumer/DB owner 并向停止接口返回 409。未领取 turn 的清理仍保持 fail-closed。transport EOF 时冻结精确 shutdown intent，计划关闭与真实异常分开归因；共享 stderr 只留服务日志，不再泄漏到 Task 错误。
 - **验证**：Codex app-server 与 InstanceManager 完整文件 `456 passed`，关键停止/EOF/steer 并发矩阵 `10 passed`；后端全量 `3247 passed, 2 failed`，两项均与修改前基线相同（queued-message 旧 prompt 断言、login-runtime stale socket 环境断言），无新增回归。前端全量 `40 files / 525 tests`、`tsc --noEmit`、production build、Python compile 与 `git diff --check` 均通过。
+
+### 2026-08-06 — Delivery Loop V1 与通用 Capability Core（commit 9c128ba）
+
+- **产品边界**：`Plan` / `Code Review` 是可复用 Capability，调用入口与后端 Sub-agent Run 解耦；`auto` 保持 Coding Agent 自由执行并为后续按需调用预留入口，`delivery_loop` 则由 Controller 强制编排 Plan → Code → Pre-PR Review → Publish → PR Monitor。没有引入 Auto 的固定组合模式。V1 仅允许本地 Task，拒绝 Worker、Shared 和迁移导入；功能默认关闭。
+- **持久状态机**：新增 provider-neutral `CapabilityInvocation` / result adapter、严格 terminal action 协议及唯一活动槽；Delivery Run/Cycle/Action 以 lease、版本和 Task incarnation 做 fencing。Controller 可从 Plan、Code、Review、Git commit、PR 发布 receipt、Monitor 绑定等任意 durable 边界冷启动恢复；外部写入先落 outbox/receipt，再用 exact subject、commit trailer、head SHA 与 webhook/Monitor 状态对账，避免崩溃后重复提交或重复发布。
+- **安全与生命周期**：Delivery 使用隔离 Git worktree，分支、base/head、dirty tree、commit subject/action 全部 fail closed；Task 删除、取消、暂停/恢复、Todo 创建、ACL、共享、重试、队列领取和高水位 ID 均纳入同一代次约束。公开 Capability API 只能创建人工 advisory 请求，不能伪造 Agent source、执行策略或远程 Worker；ready 结果通过带版本号的 consume 原子确认并释放活动槽。
+- **界面与兼容**：新增 Delivery Task 创建、运行进度、Cycle/Plan/Review/PR 状态和安全点控制；现有 `loop` 保留兼容并标为 Legacy Todo Loop。Todo → Delivery 保留原 Todo 溯源，重复请求幂等回放同一 Task。
+- **验证**：受影响后端矩阵 `1820 passed, 1 skipped`；前端全量 `653 passed`，Vite production build（4758 modules）和新增文件 ESLint 通过；合入最新 `origin/main` 的 Codex/Delivery 回归 `574 passed, 1 skipped`；Alembic 单 head `9e5b2a7c4d10`，`compileall`、`git diff --check` 通过。后端全量 `4192 passed, 1 skipped, 1 failed`，唯一失败是既有 `test_stale_owner_record_does_not_authorize_replaced_socket`：单项稳定得到 `Xvfb :199 did not become ready` 而非测试期望的 `socket no longer matches`；在独立 `origin/main@d822d02` worktree 复跑仍为同一失败，确认不是本分支回归，本轮未修改相关实现或测试。
+
+### 2026-08-06 — Exact logical turn 与 Xvfb stale artifact 恢复（commits 010dcd4 / 92d3c70 / 913b499）
+
+- **Logical turn**：新增跨 provider 的 `Task.turn_generation`，retry/账号轮换保持同代，只有新 admission 才推进；日志、原生 turn、Worker handoff receipt、Manager/Worker 对账和前端事件都携带 exact retry/turn identity。Manager 崩溃、Worker ACK 丢失、取消、Plan 联合投递和启动边界由结构化 receipt 状态机恢复，无法证明未启动时一律禁止盲重放。
+- **Xvfb 安全修复**：owner record 升级为 v2，artifact identity 增加 `ctime_ns`；stale v2 恢复使用 `O_PATH | O_NOFOLLOW` 固定 inode，再搬入同文件系统私有 quarantine 并在删除前复核。恢复失败只做无覆盖 hardlink 回放或保留 quarantine，绝不 unlink replacement；v1 有残留 artifact 时 fail closed，只在 artifact 已自然消失且旧 PID/start 已死时允许新实例覆盖 owner。
+- **验证**：exact-turn 补齐恢复与广播的非默认 generation 断言；Xvfb 覆盖 PID 检查竞态、inode 立即复用、v1/v2 升级、hardlink 恢复失败及 SIGKILL 残留。登录相关联跑 `120 passed`，最终后端全量 `4383 passed, 1 skipped`（10m50s），不再保留此前的 stale-socket 已知失败。
+
+### 2026-08-06 — Auto Capability policy dark rollout（commit 39a9f65）
+
+- **准入边界**：`Task.capability_policy` 仅允许本地普通 `mode=auto` Task 在创建时显式冻结，SQL `NULL` 是唯一关闭态；V1 只允许 `plan` / `code_review`，总预算与分类预算均为严格正整数且硬上限 8。PUT、Manager-forwarded ID、Worker、migration import、Shared shadow、Delivery、Plan、Loop、Goal 和 clone 继承全部 fail closed。
+- **开关与执行边界**：`AUTO_CAPABILITY_ENABLED=false` 独立默认关闭，并要求 Capability Core 同时开启；当前 `create_agent_invocation` 仍无条件拒绝，尚未写入 `waiting_capability`。预算消费、terminal output arbitration 和 durable resume outbox 未同时完成前不得开放模型自助入口。
+- **防绕过**：normalizer 对 mutated / `model_construct` 的 typed instance 也先深拷贝再 strict revalidate；migration import 遇到同 ID 且带 policy 的既有本地 Task，在任何写入前返回 409，避免把授权带入 Worker scope。
+- **验证**：policy 定向矩阵 `38 passed`，前端全量 `661 passed`、TypeScript 0 errors、production build 4758 modules，Python compile 与 `git diff --check` 通过；上述后端全量结果同时覆盖本提交。
+
+### 2026-08-07 — Terminal arbitration Slice A
+
+- **source 与终态契约**：`Task.turn_source_log_id` 绑定当前 exact logical turn 的可见 source 或隐藏 alias；`LogEntry.turn_scope=source/foreground/autonomous/orphan` 把前台终态与自主/孤儿事件隔离。Claude/Codex 都执行 last-terminal-authoritative：后到 failed/interrupted/malformed 否决旧成功；Codex app-server 对成功和失败显式落 status/success/error。后续 capability parser 必须从 Task pointer 读取 source，并要求实际 transport 的 durable native/terminal proof，不能从日志邻接关系推断。
+- **ACK-lost 恢复**：普通 Plan 与 Worker admission 的 commit ACK 不确定时先废弃当前 DB session，再以 fresh session 按 Task→Worker→Plan 对账完整代次、source、payload、route 与 launch evidence。仅在 provider boundary 前恢复原 status/owner、Plan `launching→queued` 和同一 G/source；cancellation 也先 shield 完成对账再优雅传播。越过 boundary 或证据不足一律保持 uncertain，不重放潜在副作用。
+- **Context replay fence**：Codex context overflow 不再接受泛文本，只认当前 exact source/transport 的 structured preflight。proof、summary 与最终 session 清理绑定完整 status/instance/retry/turn/source/session/timestamps；`compact_retry` 必须携带同一 permit，并在初读、等待 live writer 后及最终 Task writer fence 三次复核，取消或 retry 后的延迟 enqueue 不能复活 Task。
+- **Loop/Goal exact proof**：每个 mode turn 无超时等待 exact output consumer 完整结算，只有 provider-semantic exit 0 才读取 Loop signal或进入 Goal evaluator。proof 绑定 Task retry/turn、source/Instance、exact process、prelaunch log boundary、`loop_iteration`、terminal log/native turn；signal repair 必须先消费前轮 proof，再由 repair turn 的 exit-0 exact terminal 授权。Goal transcript 只取同 generation/Instance、foreground、非错误且位于 source→terminal prefix 的输出；evaluator 前后、最终 complete 前以及 Loop done/continuation 前都重验 terminal tail，晚到 fatal/malformed 行会否决旧成功。
+- **Legacy Plan carrier**：升级前已经在 Worker 的 approved Plan execution carrier 不再经通用 POST 重放；Manager 以双侧 Version/Application proof、portable execution fingerprint、snapshot/history 和 proof-before/after 稳定读取回。缺失/不一致原子转 `conflict` 并退订；成功采纳后持锁释放 quarantine 并做 closing readback，覆盖 terminal event 竞态。
+- **Worker durable termination receipt**：Manager 的 cancel/stop-session/destroy-stop/supersede 先提交 exact operation receipt，再按远端 GET → 仅缺失时 PUT → Manager exact result CAS → ACK 恢复；PUT/ACK 丢失或崩溃都复用同一 operation id 对账，不盲重放。旧 `POST /terminate-generation` 固定 409 且无副作用，Worker-managed 副本即使被 service token 直连公共 cancel/stop-session 也必须无 receipt fail closed。Worker destroy 仍由 opaque lifecycle claim 授权并复用同一 receipt，公开 proxy 不放宽 `destroying`。
+- **fresh lease 与 writer 收口**：active termination receipt 是 exact generation 的 Task-side durable writer fence，覆盖 completion/failure、source-aware finalizer、Loop/Goal claim、queued recovery、stale reset 与首次 provider effect；queue、Plan、process signal、terminal CAS、publication 均按 Task→receipt→Instance 锁序，在锁后重新捕获 UTC 验 lease，每一条外部广播前再次验权，首条广播跨期后其余事件全部抑制。receipt 与普通 lifecycle 谁先提交谁独占该代；无 canonical terminal 的 dead lifecycle 原子 fail closed 为 `failed` 并释放 Instance，绝不伪造 `completed`。
+- **迁移 fence**：PostgreSQL preflight 前取 `ACCESS EXCLUSIVE`，SQLite 先通过 `alembic_version` 写入取得 writer transaction。MySQL 仅接受 8.0.16+ InnoDB，phase DDL 用单条 atomic ALTER，shadow/gate/canonical CHECK 在约束交换与 stamp 窗口持续守卫，并能从 partial/complete schema 幂等恢复。真实 MySQL 8.4 已验证同一 ALTER 内替换同名 CHECK 可行；故意制造唯一键冲突时整条 ALTER 原子回滚，新列/unique 不残留且旧 CHECK 保留。
+- **暗发布边界与验证**：`AUTO_CAPABILITY_ENABLED=false`，`create_agent_invocation` 仍无条件拒绝，Task 尚不会进入 `waiting_capability`。定向矩阵覆盖 Loop/Goal、mode 竞态、Worker receipt/admission、SQLite WAL 跨 lease、Manager delayed publication、Dispatcher、InstanceManager、relay/proxy 与 migration；termination admission 单文件 `54 passed`，receipt/API 高风险组合 `314 passed`。最终后端全量 `5061 passed, 1 skipped`（13m53s），Python compile、关键 import、Alembic 单 head `4b8d2f6a1c90` 与 `git diff --check` 通过；本阶段无前端改动，沿用进入 Slice A 前的前端全量 `661 passed`、TypeScript 与 production build（4758 modules）绿灯。仅本地开发，未 push 或部署。
+
+### 2026-08-07 — Auto Capability Slice B 与 main 本地集成（commits cc3852b / 489162c）
+
+- **Slice B 主链**：开放受 `AUTO_CAPABILITY_ENABLED` 与 Task 冻结 policy 双重控制的 Agent Capability 请求；只从 exact source/output/terminal/native turn 严格解析，并原子消费总预算与分类预算。Task 进入 `waiting_capability` 后复用 Plan / Code Review executor，完成结果由 durable resume outbox 恢复同一 Task/session 的下一 logical turn；开关默认仍为关闭。
+- **代次与终止安全**：G→G+1 claim 绑定 Task incarnation、retry、turn、provider boundary 与 payload digest，覆盖 Claude/Codex、PTY/非 PTY、连续 Capability、ACK 丢失和 Manager 崩溃恢复。terminal admission、termination receipt、queued resume 与 Capability settlement 共用 exact Task writer fence；stop/cancel 会先静止已领取 consumer 和 executor，再终结 Invocation/Execution/outbox，禁止旧消息或 G+2 在终态后复活。
+- **main 本地集成与修复**：将本地 tracking ref `origin/main@90ee9c8` 合入功能分支，HEAD 为 `489162c`；保留 main 的 Plan pipeline、structured-response fallback、dead-owner cleanup 和前端最新行为。合并复审修复两项真实问题：移除 `tasks.py` 重复 stop-session core，恢复完整 receipt 参数契约；调整 Dispatcher restart cleanup，使无 transport evidence 的 pre-spawn Worker handoff 按 exact receipt 幂等恢复，而不是提前失败。
+- **Migration 决策**：保留 main 已发布的 `e5b8d1c4a7f2` merge history，并让 Capability migration 线性接续 `e5 → 6a → 8d → 9e → c3 → 4b → 7c`；删除从未发布、与 main Plan schema 重复的 `3f2a9c8e7b10` squash。Alembic 最终唯一 head 为 `7c1e4a9d2f60`；若有数据库曾手工 stamp 到未发布 revision，需人工对账，正常部署路径不受影响。
+- **最终验证与发布边界**：Dispatcher `364 passed`、Task API `211 passed`、Plan/Capability `181 passed`、Worker/termination/queue/migrator `472 passed`、stale cleanup `65 passed`；后端全量 `5182 passed, 1 skipped`（15m04s），前端全量 `56 files / 700 tests passed`，TypeScript 与 Vite production build（4758 modules）通过。`compileall`、关键 imports、Alembic 单 head 与 `git diff --check` 均通过；全部改动只在本地开发分支，未 push、未部署、未重启生产服务。
+
+### 2026-08-10 — Capability/Delivery 默认开启与 Browser child 生命周期收口（commit 1059a31）
+
+- **默认开关与边界**：`CAPABILITY_CORE_ENABLED`、`AUTO_CAPABILITY_ENABLED`、`DELIVERY_LOOP_ENABLED` 的代码与示例配置默认值统一改为 `true`。普通 Auto Task 仍必须在创建时显式冻结 `capability_policy` 和预算，Delivery 仍须显式选择独立 mode，V1 只到 `ready_to_merge`；自动 merge、deploy、rollback 未开启。
+- **Browser 锁序与回队列**：queue claim/defer/retry 统一按 parent owner Task → binding → child Task 写入，Browser child CAS miss 会回滚整个 binding 变更；Dispatcher 的 active→pending 路径在同一事务释放 `running → ready` claim，runtime reap 使用 binding → child → Instance，避免与 stop/delete 形成跨数据库死锁或留下 `pending/running` 悬挂状态。
+- **重放安全**：安全回队列的只读分类在 writer 内重复验证。若 provider transport 在分类后抢先提交，typed unsafe 结果转入普通 terminal fence，最终持久化 Task `failed`、binding `completed`、Instance `idle`；Browser 的冻结 launch profile 只允许 fresh launch，structured context preflight 不再压缩、换 prompt 或重启。
+- **验证**：最终只读审查未发现剩余 P0/P1/P2。后端全量 `6323 passed, 4 skipped`（0 failed）；Browser 竞态专项 `4 passed`，TaskQueue/child/stale cleanup 独立矩阵 `219 passed`。Alembic 往返/历史矩阵 `204 passed`，唯一 head `6f3b9d2a7c10`；前端 `62 files / 756 tests passed`，TypeScript 与 production build（4761 modules）通过；`compileall`、`git diff --check` 通过。四项 skip 与 bundle size/弃用 warning 均为既有非阻塞项。
+
+### 2026-08-11 — 按发起角色执行 Task，并修复 Member 沙箱兼容（commit a876207）
+
+- **阶段一：角色运行边界**：每个聊天回合把实际发起账号、角色和 `sandbox/unrestricted` 模式写入 source log 与 durable queue；后台启动前复验账号仍 active 且角色未变化。管理员/超级管理员普通回合不套 Task provider 沙箱，Member 及无可信用户主体的内部回合继续 fail closed；Manager→Worker handoff 同步冻结原始 principal，重试不借 system 身份提权。
+- **阶段二：Task 300/315 故障链**：Codex Member 隔离只准入经 inventory 验证的内置 `codex` code-mode MCP，继续拒绝 ambient MCP；Claude canary 兼容 2.1.168 在缺失 bwrap 时的新零模型错误协议；聊天附件启动前复验为 uploads 根下的非 symlink 普通文件，并只投影 exact 文件读取权限。管理员回合仍保留 task-scoped `ccm_ssh`，Task SSH Profile/grant 的管理员配置边界不变。
+- **验证**：Chat/Worker principal 链路 `385 passed`；隔离与运行服务矩阵首次执行到 `1141 passed, 3 skipped` 后仅遇到测试并发覆盖固定 settings 文件，隔离文件单独复跑 `41 passed`；新增相关定向测试全部通过。Python `compileall`、TypeScript `tsc --noEmit`、`git diff --check` 通过。后端全量被 main 同样可复现的既有 SQLite migration downgrade trigger 错误阻断（`trg_task_ssh_effect_project_share_insert` 在 batch rename 时引用暂时不存在的 `tasks`），未混入无关 migration 修复。尚未重启生产服务；Task 300/315 的旧 turn 必须在重启后由用户明确重发，避免自动重复副作用。
+## 2026-08-12 — 沙盒 Task 的 CloudRouter Claude API 认证投影
+
+- **问题**：生产 task 320 正确选中 `cloudrouter-3` 且 Key 存在，但 Task wrapper 使用 `--setting-sources ""` 后不会读取账号 `settings.json` 的 `apiKeyHelper`；旧 CloudRouter wrapper 又清除了主进程认证变量，Claude 因此返回 `Not logged in · Please run /login`。该普通 assistant error 还因 CLI exit 0 被误标为 Task completed。
+- **解决**：在 direct 与 PTY 两条启动路径都先清除 ambient auth，再用所选受管账号向 Claude 主进程投影 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`；继续保留 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`，使 Bash/hooks/MCP 子进程拿不到 Key。删除互相冲突的旧 wrapper，并把普通登录错误纳入 fatal provider error 判定。
+- **避免复发**：隔离测试必须同时证明“模型主进程拥有所选账号认证”和“工具子进程清洗开关存在”，不能把两层权限混为同一环境；`--setting-sources ""` 路径不得依赖账号 settings 中的 helper。
+- **提交**：`67e7c6e`
+## 2026-08-12 — Codex 超大日志库阻塞 app-server 初始化
+
+- **问题**：生产 task 321 正确选中 `apex-1` 和 Fast/priority route，但该 home 的 `logs_2.sqlite` 膨胀到约 3.8 GiB；同版本 Codex 使用干净 home 可立即 initialize，实际 home 超过 30 秒仍无响应，CCM 因无法取得 exact runtime/Fast proof 而 fail closed。
+- **解决**：app-server 在独占启动边界检查 1 GiB 阈值，只将同 owner、单硬链接的 `logs_2.sqlite{,-wal,-shm}` 原子移入私有 quarantine；新 app-server initialize/version proof 成功后才删除旧库。启动失败保留证据，下一次成功启动会收敛合法的 crash 遗留 quarantine，config/auth/sessions/rollout/state 不进入清理范围。
+- **避免复发**：Codex home 的 diagnostics DB 与 session/rollout 必须分层维护；不能靠放宽 Fast proof 或无限增加初始化超时掩盖本地状态膨胀。任何自动回收都必须精确文件 allowlist、先完整 lstat 校验再移动、成功启动后才清除。
+- **提交**：`2c7e007`
+## 2026-08-12 — Apex Fast thread/start 省略 serviceTier
+
+- **问题**：日志库恢复后 task 321 的 Apex `thread/start` 成功，但 Codex 0.147 custom-provider 响应省略 `serviceTier`；旧门禁在真正的 actual-tier proxy proof 之前把缺字段误判为降级。
+- **解决**：只有请求为 priority、exact actual-tier proxy 存在且强制 proof 时，允许缺失的 thread 响应 tier 临时通过；turn 仍须由代理观察首个上游 `response.created.response.service_tier=priority` 才发布成功。没有 proxy proof 的相同响应继续在 turn/start 前 fail closed。
+- **提交**：`5fa758c`
+
+## 2026-08-12 — Codex 0.147 custom-provider Fast 请求字段修复
+
+- **问题**：Task 321 在 thread 准入兼容后仍被 actual-tier proxy 拒绝；精确证据显示 Codex 0.147 虽收到 `thread/start.serviceTier=priority`，实际发往 custom provider 的 Responses JSON 却缺失或重置为 `service_tier=default`。
+- **解决**：仅对代理中已由 CCM 精确登记为 priority 的 root/child lineage，将缺失/default 的出站字段重写为当前请求拼写 `fast`（`priority` 保留为兼容别名）；Standard lineage 不升级，显式冲突/未知值仍在任何上游请求前拒绝。代理继续缓存首个 SSE，只有 GPT-5.6 上游 `response.created.response.service_tier=priority` 才发布并生成 actual-tier proof，因此不是放宽校验。
+- **验证**：代理与 app-server 完整测试 `328 passed, 3 skipped`；覆盖缺失/default 两种兼容输入、Standard 防升级、未知 tier 拒绝和上游 proof。
+
+### 2026-08-12 — Task 315 Claude PTY 隐藏权限框修复（commit 905f9b1）
+
+- **根因**：Claude Code 2.1.168 在 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` 下会把有效 permission mode 强制为 `default`；普通 Task 又默认注入 `ccm_frontend_review` / `ccm_workspace_review`，但 Task 隔离 allowlist 未包含这些工具，CloudRouter PTY 因此停在无法经 channel bridge 展示的原生 permission prompt。
+- **修复与边界**：保留凭据隔离所需的 scrub，在 `task_agent_isolation._mcp_allow_rules()` 补齐 frontend/workspace/browser review 的 CCM-owned 精确工具清单；`--strict-mcp-config` 仍只暴露本轮私有 MCP。新增精确集合回归，要求内置工具与七类可能注入的 CCM MCP 权限既不缺失也不扩张。
+- **验证**：隔离策略完整文件与 PTY scrub 启动边界共 `43 passed`；Python 编译与 `git diff --check` 通过。未调用真实模型、未运行无关全量测试、未修改或重启生产环境；已有卡住的旧 turn 不会被代码提交自动恢复，部署后需显式重发。
+# 2026-08-12 — Claude 受管 API 账号 PTY 认证修复
+
+- 问题：Claude CLI 2.1.168 的交互 PTY 路径只在 `.claude.json.customApiKeyResponses.approved` 包含 Key 后缀时才使用 `ANTHROPIC_API_KEY`；headless `-p` 会跳过该门禁，导致 smoke 通过而生产 PTY 报 `Not logged in`。
+- 修复：受管 CloudRouter Key 改用无交互 `ANTHROPIC_AUTH_TOKEN` Bearer 投影，继续保留子进程凭据 scrub。
+- 防回归：新增 opt-in 真实 claude-pty 测试，刻意把当前 Key 指纹写入 `rejected` 后验证首轮返回固定文本。
+- 实现提交：`e0ea9e04`。
+
+## 2026-08-15 — 撤回 Delivery 全角色扩权，改用逐回合 principal
+
+- **撤回**：`c3e951f4` 的全局 unrestricted 开关会让 Plan、Reviewer、PR Review 与 Browser 越过各自 capability contract，因此不再是当前运行契约；相关配置、Settings 入口和 provider 扩权已移除。
+- **当前边界**：每个用户回合冻结并在 provider boundary 复验真实 principal。管理员发起的普通 Task 可使用 unrestricted profile；member 保持 sandbox。Plan/Reviewer 固定只读、PR Review 固定 tool-free、Browser 固定 MCP-only，Delivery 继续使用专用隔离协议，后台 retry、账号切换与 Worker handoff 均继承原 principal。
+- **兼容保留**：只保留 Codex aggregate MCP identity 的精确映射；仅当解析后的 `(server, tool)` 已在冻结 allowlist 中才放行，不能借聚合 server 名扩权。
+- **避免复发**：权限必须来自逐回合 durable principal 与专用 capability contract，禁止再用全局布尔开关同时改变多个角色或工作流的工具、文件系统和网络边界。
+
+## 2026-08-15 — Delivery 可信多 Preview Profile（commit feb285e4）
+
+- **问题**：Project 只能保存一个 Preview 启动契约；monorepo 同时修改 `web/`、`admin/` 等多个可见前端时，Delivery 无法按实际 diff 选择正确入口，也无法证明所有受影响界面都经过 Browser Review。让 Agent 临时生成启动命令又会把不可信 PR 内容带入宿主进程边界。
+- **解决**：新增兼容 v1 的 v2 Preview Profiles。管理员登记 shell-free 的 ID、`match_paths`、enabled/default 和启动契约；Controller 读取最终 `base..head` changed paths，冻结完整配置与匹配顺序，并为每个 Profile 串行运行独立、幂等、exact owner/head/profile 的 Test Harness。全部通过才发布 PR，任一 finding 回流下一 Cycle。Projects 页面可查看/编辑可信 Profiles，Delivery 页面展示逐项进度与结果。
+- **避免复发**：Delivery Agent 只能提交已登记的 Profile ID，不能通过 PR、Task target 或运行时 mutation 注入 argv；活跃 Delivery 期间 Preview 配置作为 Project identity 被写屏障保护。新增契约、路径匹配、配置冻结、多 Profile 串行、migration 往返和 UI 构建回归。
+- **验证**：Delivery/Project API/migration 回归 `119 passed`；Workspace/Harness/changed-path 相关矩阵此前同轮 `92 passed` 后仅由已修复的“首项通过即提前发布”断言截停，修复后 Controller 全文件纳入上述 119 项通过。前端 Delivery/Browser 相关 `23 passed`，TypeScript 0 errors，Vite production build（4763 modules）通过；Python compile、Ruff check 与 `git diff --check` 通过。仓库既有整库 SQLite downgrade trigger 问题仍可独立复现，未混入本功能修复。
+
+## 2026-08-15 — Task/Worker 权限与 PR Monitor 上下文收口（commits 4959854c / 3eab20c5 / d5e4c974 / b216bd54 / 4d8f0279）
+
+- **权限与生命周期**：Share 回归为同一 CCM 内的资源 ACL，执行权限始终取本轮真实 principal；Manager→Worker 冻结并复验真实操作者，Worker Token 不再具有模型运行身份。Worker drain/destroy、Task 迁移、重试/恢复、锁序和损坏 envelope 全部以 durable generation/receipt fail closed。
+- **PR Monitor 最小上下文与可读发布**：Reviewer 只接收冻结 subject、紧凑文件清单、完整 exact patch 与显式 manifest Guide，不再注入 CCM 当前会话、产物规则、隐式根文档或 changed-file 全文。新 GitHub Review 把 publication nonce 写成末尾隐藏 HTML comment；人类可见正文不再显示 nonce/JSON/schema，旧明文 marker 仅作只读恢复兼容。
+- **迁移与更新安全**：合并 Delivery/PR Monitor Alembic heads，并让 SQLite sibling/partial DDL 可安全重放。更新脚本的 SQLite 独占证明只在 child session、账号 tty 命令、同 cgroup 和 root-owned OpenSSH `[priv]` parent 全部精确匹配时忽略不可读的 `sshd-session` FD；仅伪造进程名或命令仍被拒绝。
+- **验证**：后端最终全量 `7671 passed, 6 skipped`；PR Review/Panel/更新/Alembic 合并定向 `283 passed`；最终整合 `origin/main@fdc0c92a` 后 Plan receipt/recovery/Dispatcher `458 passed, 1 skipped`；前端 `66 files / 815 passed, 7 skipped`，TypeScript 与 Vite production build（4764 modules）通过。`compileall`、`uv lock --check`、Alembic 唯一 head `f4c7a9d2e610`、冲突/secret/debug/whitespace 审计均通过。真实 GitHub/Webhook E2E 以临时 PR #3 验证 `HTTP 200 → Review #4 / Task #156 → exact-head COMMENTED`：Task prompt 为 9,395 bytes、空 Guide Pack、无 changed-file 全文/当前会话/产物规则/隐式项目指南且全程 tool-free；GitHub `body_text` 无协议字段，raw body 只有一个末尾隐藏 marker。临时 PR 未合并并已关闭，exact branch 已删除，Monitor 与既有 PR/Review/Task 基线全部恢复。首轮 Claude E2E 还识别出独立环境问题：共享 pool 的 `cloudrouter-5` 已被上游以 `401 Invalid API key` 拒绝；未擅自修改账号池，需通过账号管理轮换该 Key 或显式改用已验证的 Codex 路由。
+
+## 2026-08-15 — API 网关账号安全删除解除误阻塞（commit：本提交）
+
+- **根因**：账号删除恢复扫描同时相信可变的 `Task.provider` 和复用槽位中可能陈旧的 `Instance.provider`。真实 Codex generation 即使 canonical source 已写 `actual_transport=codex_*`，旧 Claude 槽位仍会让扫描错误检查 Claude/Codex 双 binding，把无关账号永久留在 `cleanup_pending`。
+- **修复**：运行占用只以 exact task/retry/turn/scope/instance 的 canonical source `actual_transport → provider` 为权威，并只检查该 provider 的 durable account binding；source 缺失、畸形、未知 transport 或空白 binding 全部 fail closed。真实 provider 在公共 provider boundary 的 Task→Instance→source 事务中、任何模型 effect 前写入 Instance，direct/PTY PID commit 与 PTY background 路径再做 provider CAS。
+- **清理诊断与界面**：pending tombstone 持久化有界脱敏的 `cleanup_code/reason/last_attempt_at/last_error_at`；409 返回结构化诊断，unsafe storage 仍为 500 且不再次触碰不安全路径。Claude/Codex 两页签明确展示同一底层账号的“已停用 / 删除受阻 / 重试清理”，成功后清空诊断。没有增加后台 reaper：账号根可能跨 ASGI/滚动升级进程共享，缺少跨进程全生命周期 lease 时只允许管理员显式重试。
+- **验证**：账号 Store/API/Pool 定向 `344 passed`，ownership 与 provider-boundary 新矩阵及补强回归全部通过；整合 `origin/main@c8e4dee5` 后，后端整库 `7696 passed, 6 skipped`。随后同步 `origin/main@d1ca81de` 的 report-only Delivery 改动，受影响后端矩阵 `653 passed`；其新增前端断言改用有超时的 `waitFor` 等待 React effect，消除整套并发时的调度假红，前端最终 `66 files / 816 passed, 7 skipped`，TypeScript 与 Vite production build（4764 modules）通过。依赖锁、安装包兼容、Alembic 唯一 head/current、Python compile、冲突/secret/debug/whitespace 审计均通过。
+
+## 2026-08-15 — Test Harness 慢扫描耗尽连接池与 Task 中断失效修复（commit：本提交）
+
+- **生产证据与根因**：Task 300 的聊天页在没有 Harness 证据时仍每秒重入请求 `/test-runs`；列表接口为计算 staleness，在 request DB session 未释放时对大型工作区执行完整 Git diff、未跟踪文件枚举与哈希。慢请求堆叠后耗尽 `5 + 10 overflow` 连接池，使 `stop-session` 在进入 Codex exact-turn interrupt 前就卡死。只读审计确认生产累计 16,662 次 pool timeout、Task 300 的 `/test-runs` 3,544 次 500，并由 Task 301 再次复现；SSH `Broken pipe` 只是运维连接超时后的表象，不是模型拒绝中断。
+- **后端修复**：ACL 后先结束 request transaction；没有 completed `current_workspace` 证据时直接跳过仓库扫描。同 Task staleness 刷新 single-flight，短 DB preflight 后释放所有 connection/owner/manager fence 执行 Git 与文件 I/O，再按 Project→Task writer 复验 Task incarnation、Project 关系、workspace route 与 Preview config 后才投影 stale。Workspace 首次启动也先持久化 Harness Run，再无锁 snapshot，最后在 exact owner/node/Task/Harness 围栏下链接；stop/cancel 胜出后，晚到 snapshot 不能复活 Run。
+- **安全与恢复**：未跟踪文件读取移到线程，并以目录 FD 逐层 `O_NOFOLLOW`、叶子 `O_NONBLOCK` 拒绝祖先 symlink、FIFO 与超限文件；重启可证明尚未物化任何 Workspace/child/attempt/lease 的 admitted Run 已完成 cleanup。Worker migration rollback 修复为 operation lock → owner fence → node-control → Task，避免与 Harness 物化形成锁反序；新增确定性顺序回归。
+- **前端节流**：轮询改为前一请求 settle 后递归调度，同 Task/generation 只允许一个 in-flight；活跃/等待 Run 保持 1 秒，普通执行 Task 的发现轮询降为 5 秒，失败指数退避至 30 秒。Task 切换或卸载后的旧响应不能覆盖新状态。
+- **验证**：锁文件精确环境下后端整库 `7709 passed, 6 skipped`（0 failed）；Task API、Harness、Workspace 受影响矩阵 `360 passed`，新增连接释放、single-flight、route/config CAS、慢 snapshot 取消胜出、symlink/FIFO 与 rollback 锁序测试全部通过。前端全量 `66 files / 820 passed, 7 skipped`，TypeScript 与 Vite production build（4764 modules）通过；Python compile、Ruff（本次相关文件）、`uv lock --check`、Alembic 唯一 head `f4c7a9d2e610`、冲突/secret/whitespace 审计通过。两轮独立只读审查未发现剩余正确性、跨数据库或死锁 blocker。首次整库暴露共享 `.venv` 的 PTY revision 漂移与 worktree umask 权限污染；按 `uv.lock@d5ff119` 和 Git `100755` 重建环境后相关单项及上述整库均通过，未改依赖锁或放宽测试。
+
+## 2026-08-16 — Delivery 按失败阶段重试（commit a76ce4a9）
+
+- **问题**：人工 Retry 把任何失败统一重置到 Plan，导致 Development、Code Review、Frontend Review、Publishing 或 PR Monitoring 的暂时故障都会重复已经通过的阶段；已有 PR 的失败还被完全禁止 Retry。
+- **解决**：从终态 `fail` transition 的 `before_state` 精确恢复失败阶段。新 Round 只用于保留审计历史，并复制此前已批准的 Plan、开发结果、Code Review、Frontend Review 与 PR Monitor 绑定；每个恢复点都验证所需证据，缺失时明确拒绝而不猜测。Monitoring 原地恢复 observer，Publishing/Monitoring 不再因已有 PR 被笼统排除。
+- **避免复发**：Retry reducer 只接受六个固定安全恢复状态，API 必须从持久化 transition 证明目标阶段；新增 Development 失败 API 回归，证明已批准 Plan 被复用且新 Round 直接进入 `coding/ready`，并对全部阶段 reducer 路径和非法目标做参数化覆盖。
+- **验证**：Delivery reducer/API `86 passed`；Retry 面板 `7 passed`；TypeScript 与 Vite production build（4764 modules）通过；Ruff check 与 `git diff --check` 通过。
+
+## 2026-08-16 — Claude Planner 流式监督与探索预算（commit baaf7e0f）
+
+- **问题**：真实 Delivery E2E 的 Claude Planner 在只读仓库中连续执行 69 个 Glob/Grep/Read 回合，约 15 分钟仍未生成最终 Plan；`--output-format json` 又让 CCM 在结束前看不到任何活动，页面错误显示 0 输出。人工终止产生普通 exit 143，既不会触发同一 Plan Run 的 Codex fallback，又会被 Capability 第二次 attempt 从 Claude primary 完整重跑，合计成本约 9.42 美元。
+- **解决**：Claude Plan 路由改用 `stream-json --verbose`，逐行消费事件并持久化最后活动、累计输出量及最近工具名；Planner/Reviewer 分别冻结 12/8 次只读工具调用预算。超限时只终止该精确 runtime，并抛出 typed `PlanAgentTimeout`，由 Stage 立即切换配置的 fallback，而不进入同 route transient retry。
+- **避免复发**：任何可调用工具的独立 Agent 都必须同时具备实时可观察性和确定性工作预算；总超时不能替代工具回合上限，终止原因也必须保留为可驱动 fallback 的类型，不能统一折叠为普通非零退出。
+- **验证**：Plan Agent Runner 定向测试 `42 passed`；新增 Claude NDJSON terminal `structured_output` 解析与命令参数回归；Ruff check、Python 编译和 `git diff --check` 通过。真实 Delivery E2E 在生产重启后继续验证。
+
+## 2026-08-16 — Delivery Retry 阶段标签与 Publisher SSH 凭据（commits d33a54fa / b60220d5）
+
+- **问题**：阶段级 Retry 已正确从 Development 恢复，但 Round 标签仍固定显示 `Retried from Plan`；同时 Publishing 的 hardened Git 清除了 ambient 配置，却没有投影 Project 已绑定的 SSH key，导致有效凭据存在时仍反复报 `Unable to read the exact remote ref`。
+- **解决**：Round 标签从冻结的 `trigger_payload.resume_phase` 映射真实恢复阶段；Publisher subject 冻结 Project SSH key 路径，仅接受当前 UID 拥有、非 symlink、权限不宽于 `0600` 的普通文件，并只通过 Git 子进程环境投影 `ssh -F /dev/null -i <key> -o IdentitiesOnly=yes -o BatchMode=yes`。
+- **避免复发**：Retry 展示必须使用与 reducer 相同的 durable resume evidence，不能从 trigger kind 猜阶段；hardened Git 清空 ambient credential 后，必须显式投影已审核的 Project credential，且路径验证、权限边界和无交互 SSH 参数必须有回归测试。
+- **验证**：真实 E2E 证明 Development 失败后新 Cycle 复用同一 `plan_version_id=3`、`plan_invocation_id=NULL`，状态直接 `coding/ready → coding/running`，没有新 Plan；Publisher 完整测试 `60 passed`，Delivery 对话框 `9 passed`，前端 production build（4764 modules）通过。绑定 key 的 GitHub SSH 认证和只读 main ref 成功；旧冻结 base 在 main 前进后被正确 fail closed。三个测试 Delivery/Task/Plan/worktree/本地分支均已清理，GitHub 无测试 PR/远端分支，`foreign_key_check` 通过。
+
+## 2026-08-16 — Delivery 真实 E2E：按阶段恢复、风险校准与完整 PR 管线（commits f57c8109 / b3c5a50f / 426c8103 / da83a6d7 / 474dba7c / 99379ec3 / ca897737）
+
+- **继续暴露的问题**：此前的清理结论只覆盖当时已结束的测试样本；后续为验证完整 Publishing/Monitoring 又创建了 DLV-1～3，因此不能继续声称“无测试 PR/分支/数据残留”。真实 E2E 还暴露出 Plan 单事件截断、仓库 dirty 证据缺失、Development 无进展回退 Planning、Plan 修订预算不足、简单 README 任务被过度审查，以及 Task 安全 PATH 找不到服务器已有 `uv`。
+- **修复**：Plan 审计记录 `AGENTS.md → CLAUDE.md` 指令链接；Claude NDJSON 单事件采用受控 1 MiB 上限；repo revision 显式冻结 `dirty`；无进展 Development 直接在 Development 重试并复用 approved Plan；默认允许最多三轮 Plan 修订；Planner/Reviewer 按变更风险校准取证深度；Task 安全 PATH 纳入受信任的 `~/.local/bin` 与 `~/.cargo/bin`。
+- **真实链路证据**：DLV-2 完成 Plan、Development 和 Code Review，Controller 产出 `b5f2fd4b42e1e49fe842072cd837956b6868a686`；Publishing 因审核期间远端 main 前进而以 `delivery_publisher_unavailable` 正确 fail closed。DLV-3 第一轮 Plan 直接批准，随后 Development、Code Review、Publishing 全部成功，创建未合并测试 PR #1170（base `d5245bcf2701e67f4b48d7b00251597f2b892d66`，head `983ea792fcba3e16f74442af94e03c4835b688e0`），Monitor 精确绑定为 `waiting_ci`，`repair_attempts=0`、`no_progress_count=0`。
+- **验证**：Delivery/Task isolation `147 passed`；Plan defaults/tasks/runner `99 passed`；Plan Agent Runner 风险校准 `43 passed`；Codex app-server `310 passed, 3 skipped`；Publisher `60 passed`；Delivery UI `9 passed`；前端 production build 通过。生产服务重启后 `systemctl --user is-active ccm=active`，localhost HTTP 返回 200。
+- **最终清理与终审**：用户明确授权后，PR #1170 已关闭且 `mergedAt=null`，远端测试分支 `ccm/delivery/3-e2e-final-pr-pipeline-verification` 已删除；DLV-1～3 的三个干净 worktree、本地分支以及 Task 1009/1010/1011/1012/1013 均已删除。Delivery、Cycle、Turn、Action、Event、Transition、Plan/Run/Version、Capability、Code Review、PR Review/Monitor 和 worktree 关联计数全部为 0，`PRAGMA foreign_key_check` 无输出。最终定向回归为 `664 passed, 3 skipped`；服务恢复为 `active` 且 localhost HTTP 200。约 12GB 的 `claude_manager.db.pre_e2e_cleanup_20260816` 备份和服务器既有 PEM/CSV 等无关文件保持原状。
+
+## 2026-08-16 — Delivery 内部资源只在 Delivery 页面展示（commit：本提交）
+
+- **问题**：Delivery Controller 创建的 Developer Task、Plan、Pre-PR Code Review Task 和 Delivery PR Review 同时出现在全局 Tasks、Plans、PR Review 页面。它们本质上是一个 Delivery 拓扑内的阶段证据，重复展示会让用户误以为是四套独立工作流，并造成分页、计数和搜索结果混乱。
+- **解决**：统一在服务端列表边界按 durable ownership 过滤，而不是前端逐卡片隐藏。Task 列表/计数/搜索排除 `delivery_run_id`/`delivery_loop` Developer shell，并沿 `CodeReviewRun → developer Task` 排除其 Reviewer Task；Plan 列表与 count 同时识别 Delivery target Task 和 `DeliveryCycle.plan_version_id`；PR Review 列表只识别 Publisher 保留的不可变 `delivery:` namespace。Delivery 详情仍通过自己的 Progress 投影和精确资源链接展示完整 Plan、Development、Review 与 PR 状态。
+- **避免复发**：任何 Controller 派生资源必须在创建时留下 durable owner edge，公共 catalog 必须在数据库查询阶段过滤，不能先分页再由前端隐藏。PR Review 归属禁止通过“同 repo + PR number”或可复用 Monitor 关系猜测；测试已证明这种模糊匹配会误隐藏普通 Review，且 nullable marker 必须使用 NULL-safe 条件。
+- **验证**：新增精确回归 `5 passed`；Task Queue、Plan Resources、PR Monitor、Delivery API 四个受影响模块完整回归 `400 passed`。覆盖 Delivery Plan 在 detail/Progress 仍可读但 catalog/count 不出现、Developer Task 不出现在普通 Task API、Delivery PR Review 不出现在 Review catalog、普通 Review 与 NULL marker 保持可见，以及 SQL 在 SQLite/PostgreSQL/MySQL 三种方言可编译。Python compile、`git diff --check`、服务重启与 HTTP 健康检查在部署提交后复核。
+
+## 2026-08-16 — Delivery 可信 CI 只等待当前 PR 实际触发项（commit f3f40ae8）
+
+- **问题**：可信模式把默认分支某次提交上出现过的全部 GitHub Check Run 固化为每个 Delivery PR 的 required checks。路径过滤、矩阵和发布条件导致大量任务在普通 PR 上缺失或 skipped，使实际 CI 已通过的 Delivery 永久停在 `Waiting CI`。
+- **解决**：可信模式持久化一个明确的“当前 PR 精确 head 上实际触发检查”策略标记；Gate 每次从精确 head 动态展开 GitHub 实际创建的 Check Run/Status，只等待其中 pending 项、阻断真实失败项，并把 `skipped`/`neutral` 视为正常结束。严格模式仍使用 Branch Protection 的固定 producer identity，行为不变。旧的可信观察列表在下次 Delivery setup 时自动收敛为新策略标记。
+- **避免复发**：不得用默认分支或历史提交上的 CI 名称集合推断任意 PR 必须运行的检查；可信模式的检查集合必须绑定当前不可变 head，且在至少一个实际检查成功前不能放行，避免 GitHub 尚未创建 checks 时误判通过。
+- **验证**：Delivery setup、PR Panel、Delivery/PR Monitor integration、PR publication 与 Merge Queue 受影响矩阵 `291 passed`；新增“成功 + skipped 条件任务”和“checks 尚未出现”回归；Ruff check 与 `git diff --check` 通过。
+
+## 2026-08-16 — Delivery 内嵌 Plan 对话子页面（commits 3b6cb918 / 4614ac20）
+
+- **问题**：Delivery 创建的 Plan 已从全局 Plans catalog 隐藏，但 Delivery 内的 `Open Plan` 仍跳转到全局 Plans 详情，形成“列表里不存在、只能靠深链打开”的孤儿页面；详情只突出最终方案和技术记录，用户也看不到 Planner 与 Reviewer 的公开工作过程。
+- **解决**：Delivery 的全部 Plan 入口改为在当前 Delivery 工作区内打开覆盖式子页面，并提供明确的 `Delivery #N / Plan` 上下文与返回入口。Plan 详情新增按 Run/Step 顺序组织的对话视图，首条消息使用 Delivery 原始需求而不是 Controller 内部编排 prompt，并展示 Planner/Reviewer 公开输出、角色、模型、轮次、状态、错误和实时活动摘要；运行中的 Plan 每 2 秒刷新一次，输入请求仍由原有表单处理，生命周期操作继续由 Delivery 控制。
+- **避免复发**：Capability 派生资源的导航必须跟随其 owner workspace，不能把已从公共 catalog 隐藏的资源再导航到公共 catalog shell；工作过程视图必须使用后端持久化的公开 output/event 证据，并覆盖运行中刷新，禁止伪造或暴露隐藏推理。
+- **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；新增内嵌导航、返回 Delivery、公开 Planner 输出、Reviewer live activity 回归。TypeScript 与 Vite production build（4764 modules）通过，相关四个文件 ESLint 0 errors，`git diff --check` 通过；整库 ESLint 的 49 个既有错误不属于本次改动。
+
+## 2026-08-16 — Codex 号池运行策略在线配置（commit 04f9b6a3）
+
+- **问题**：Codex 号池启停、冷却和换号阈值只能依赖部署环境变量，首选账号又仅存于进程内存；管理员无法从账号面板在线调整，服务重启后也会丢失选择。
+- **解决**：在账号私有 JSON 中原子持久化 `pool_settings`，新增管理员设置 API 和 Codex 面板表单，支持启停、冷却、阈值、API/OAuth 路由顺序及首选账号。暂停对主任务、Monitor、Sub-Agent 和 Distill 全部 fail closed；Worker 写入参加 node account-mutation fence。
+- **避免复发**：部署级开关/路径与日常运行策略分层；涉及账号文件的新增写入口必须复用私有原子写和 Worker 围栏，禁用号池时不得隐式使用 ambient `CODEX_HOME`。
+- **验证**：Codex Pool/Distill `95 passed`，Worker/Monitor/Resume 相关矩阵除独立 worktree 缺 `.venv` 导致一个既有 Claude relogin fixture 501 外 `137 passed`；PoolDrawer `49 passed`，TypeScript 与 production build（4764 modules）通过，`git diff --check` 通过。
+
+## 2026-08-16 — PR Monitor 结果工作项、状态归因与 GitHub 发布证据（commit：本提交）
+
+- **问题与取证**：内部 Reviewer/Fix/Rebuttal Task 按安全边界从普通 Tasks 隐藏后，用户缺少一个稳定入口查看 PR 结论；API 又把 aggregate verdict 完整但 publication 因 PR 已合并/subject stale 而无法继续的 Review 统一渲染成 `Infrastructure error`，页面甚至同时显示 verdict 与“No code verdict”。新 GitHub Review 实际恒为 `COMMENT`，旧 UI 却可能显示 Approved；临时 `publishing_actor` 在成功收尾后被清空，无法证明实际后端发布身份。Webhook 只处理 opened/synchronize，外部 close/merge 后 Run 会残留 paused，既有 Resume 也不等于重新审核。生产历史 Review 108–112 的 Senior prompt 曾因 changed-file base/head 全文和隐式根文档重复注入达到 1.71–2.01M 字符；2026-08-15 已先行删除重复上下文并把 Codex prompt 限为 786,432 字符，Review 113 的三个约 106K prompt 均成功，因此这部分是已修复的历史输入问题。
+- **结果与状态模型**：内部执行 Task 继续永久隐藏；Tasks 改为展示只读 `PR Review Result`，新记录按 `PRMonitorRun` 聚合且 Panel 不展开，缺少可靠 Run 快照的历史 Single 以不可重跑的 `review:<id>` 结果展示。新 head 更新同一 Run，旧 subject 留在 Review History。code verdict、publication、PR lifecycle 与 `failure_stage` 四维独立投影，publication stale/failed/not-applicable 不再抹掉已有 verdict。字段白名单禁止 prompt、patch、session、内部 Task/Worker、nonce 和 pending body，结果卡不继承 Chat、Task Retry、中断或分享。
+- **发布身份与生命周期**：新 Review 明确恒为 head-pinned `COMMENT`；成功写入或恢复对账后固化 actor/time/GitHub Review ID/URL/event evidence，后续收尾和 lifecycle 变化不得清空。publisher 只取运行 CCM 后端的系统用户 `gh` 身份，与浏览器 GitHub Connector、当前 Codex 会话或 Reviewer thread 登录态无关，Reviewer 仍不获得 GitHub token。Webhook 补齐 ready-for-review/reopen/close/merge；终态 intent 立即阻止新 effect、取消未 dispatch 工作，已开始的外部 effect 保守等待确认/对账后收口，迟到 callback 不能复活 Run。
+- **安全重审**：新增 current exact-head rerun，客户端必须提交 expected head 与 idempotency key；后端锁内复验 PR open、非 draft、repo/base/head 后创建新 attempt并保留旧 history/evidence。head 漂移、close/merge/draft 均拒绝，不调用内部 Task retry，也不重放旧 publication outbox。可选“创建跟进 Task”只创建新的普通 Task，绝不解封 Reviewer Task。
+- **Delivery 与迁移收口**：普通 `synchronize`/`reopened`/`ready_for_review` 在 exact Delivery owner 或 adoption pre-bind evidence 存在时均 409，不能清终态或替换 current Review；权威 attach guard 与 webhook Repo/Run 写屏障双重验证，保留既有 DeliveryRun→PRMonitorRun 锁序。迁移 downgrade 的旧 subject 冲突审计改为只检查全非 NULL key，避免把生产中合法的 NULL subject 重复误判为 rerun；attempt/lineage CHECK 同时覆盖首次 ready-for-review 与父行删除后的历史形状。
+- **避免复发**：凡外部 publication 都必须把“模型是否产出结论”“副作用是否执行”“当前资源生命周期”“失败发生阶段”分开建模；浏览器/模型工具登录态不能替代服务端凭据 evidence。Controller 派生的可执行资源与面向用户的只读结果必须通过 durable owner edge和公共 projection 解耦，禁止为展示方便放宽内部 Task ACL。
+- **验证**：自动化回归覆盖 verdict/publication/lifecycle 组合、immutable publisher evidence、COMMENT 语义、result feed 字段白名单与 Panel 聚合、terminal/reopen webhook fencing、exact-head rerun 幂等/漂移拒绝，以及 Tasks/PR detail 的只读交互；完整测试与构建结果记录在本次变更的最终验证中。
+## 2026-08-17 — Delivery Plan 页面信息层级收敛（commit：本提交）
+
+- **问题**：Plan 子页面首屏被重复容器、冗长 Capability 说明、重复的 Delivery 导航和过大的对话卡片占满；用户请求、Agent 状态和技术信息没有清晰主次。
+- **解决**：标题区只保留 Delivery 上下文、Plan 标题和当前状态；Capability 归属改为单行弱提示；对话区改为无外层卡片的紧凑时间线；Delivery 子页面隐藏重复的 `Open Delivery` 操作；无版本状态改为简短空状态，保留技术详情在折叠区。
+- **避免复发**：首屏只放用户当前决策所需信息；生命周期、路由、审计和内部运行标识必须进入折叠或次级区域，避免把诊断信息当成主内容展示。
+- **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4764 modules）和 PlanDetail ESLint 通过，`git diff --check` 通过。
+
+## 2026-08-17 — Delivery Plan 补回实时 Agent 活动（commit：本提交）
+
+- **问题**：首屏精简后只剩用户请求和 `Live`，Planner 没有公开输出时用户无法知道当前正在做什么。
+- **解决**：Delivery 将当前 headline、detail、角色、Provider/Model 和最近活动时间传入 Plan 子页；对话时间线在没有 Step 输出时展示紧凑的 Agent 活动消息，有输出时与现有 Planner/Reviewer 消息并存。
+- **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4766 modules）通过，相关组件 ESLint 0 errors（仅保留既有 Hook warnings）。
+
+## 2026-08-17 — Codex 共享 app-server 的 Task 级精确停止（commit：本提交）
+
+- **问题**：同一 Codex 账号的普通 Task、Delivery/Plan 等回合会复用常驻 app-server。旧的显式停止为了证明原生 helper 已退出，只能回收整个 transport；发现共享 peer 时因此返回 409，Task 300 无法在 Task 301 运行期间停止，若放宽又会误伤 Delivery 或其他 Task。
+- **修复**：按 `task_id` 建立停止准入栅栏，冻结目标 Task 的全部 root/descendant lineage；逐个精确中断并用 `thread/read` 确认终态，再以 parent-first archive/unarchive 和 unsubscribe 只替换目标 runtime。共享 app-server 与其他 Task/Delivery peer 始终保留；账号迁移留下的历史 home 也按 exact server/process generation 清理。当前/历史 home 的 stop reservation 分开精确记账，late child 收尾不会吞掉无关 Delivery/Plan admission 的计数。失败或竞态保留可重试 receipt/fence，只有无 peer 且隔离已证明时才允许回收整个 transport。
+- **避免复发**：共享进程不是共享生命周期。停止、重绑和迁移必须以 durable Task owner、精确 thread lineage 与 process generation 为边界；不得把 app-server PID 当成 Task 所有权，也不得先中断后再检查 peer。
+- **验证**：最终代码的 Task/API/InstanceManager/Codex app-server 五文件矩阵 `1151 passed, 3 skipped`，后端整库 `8096 passed, 6 skipped`；Delivery shared-peer 精确隔离、历史 generation 恢复和 late-child + 无关 admission 组合回归均通过。前端全量 `890 passed, 7 skipped`，TypeScript 两套配置及 Vite production build（4766 modules）通过。全程未运行真实 Codex canary，未操作或重启 8002/8003、未停止生产 Task。
+
+## 2026-08-26 — 项目 clone 失败后任务仍可启动的事故链收口（commit：本提交）
+
+- **问题与事故链**：创建 Project 后 clone 在后台异步执行、接口立即返回成功；HTTPS 无凭据时后台 clone 因无 TTY 报 `could not read Username ... No such device or address`，项目标 `error` 但 `local_path` 保留指向不存在目录。Task 创建（API 两处校验）与 dispatcher 领取都不检查 `project.status`，dispatcher 以 `last_cwd or target_repo` 直接作 cwd 且无存在性校验；Codex `thread/start` 的三个 required MCP 报 `No such file or directory` 后走 safe-fallback，`create_subprocess_exec(cwd=...)` 抛 `FileNotFoundError`，页面最终只显示缺上下文的裸 `[Errno 2]`，且每次失败烧掉 retry 预算（3 次后永久 failed，reclone 也救不回）。
+- **修复（三层防御）**：① 出队门禁：`task_queue.project_ready_dispatch_predicate`（否定式 correlated-EXISTS）同时加进 dequeue 候选 SELECT 与领取 CAS，非 ready 项目的 Task 留在 pending（NULL/悬空 `project_id` 不受影响、不写 Task.status、无广播义务、不烧 retry），clone/reclone 成功回 ready 后 `_wake_dispatcher()` 唤醒（2s poll 兜底）；② 入口拒绝：POST /api/tasks（乐观+锁内两处）、PUT 换 project、Todo Run、standalone Plan 物化经 `project_readiness.require_project_dispatchable` 对 error 项目 422（豁免 migration-import / shared shadow / chat fork / PR Review 内部 / Harness child，故不放进 `stage_task_record`）；③ 启动兜底：新增 `TaskWorkingDirectoryMissingError`（继承 `TaskAgentIsolationError`），`prepare_task_working_directory` 对显式 workspace 校验存在性，`_spawn_managed_direct_process` 把 cwd 缺失的 ENOENT 翻译成同一异常（可执行文件缺失保持原样）；queued chat 将其并入 permanent prelaunch（聊天红色通知 + Task 回滚发送前状态 + 消息不重排，替代旧的无限重排）；Monitor/Sub-Agent 直 spawn 路径经 `require_existing_task_cwd` preflight（Monitor 保留有界退避，Sub-Agent 失败补写 `last_error`）。
+- **附带修复**：后台 clone 无条件 `GIT_TERMINAL_PROMPT=0` + `stdin=DEVNULL`、SSH 追加 `BatchMode=yes`（仅 clone 作用域，**不动公共 `_build_git_env`**——它同时供 agent 子进程 env 使用且有空配置断言）；认证类 clone stderr 归一化为「git authentication failed …」可操作文案；clone 失败/成功由 `_sync_waiting_task_clone_notes` 批量注记/清除等待任务的 error_message；`worker_proxy.ensure_worker_project` 对远端 clone `error` 秒级失败（原来白等 300s 超时）；前端 ProjectSelect 对 error 项目红色标注+悬停原因，TaskForm/PlanCreateForm 对 error 项目警示并禁用提交、cloning 项目提示等待。
+- **附带修复（Codex runtime scope 竞态）**：Codex launch 此前从不 reserve/adopt task runtime scope，而 spec 构建即向 `task-{id}` scope 物化 MCP 入口文件——旧 lifecycle 的 dispatcher finally 可在「新代次已物化、app-server 尚未 spawn MCP 子进程（等 codex home guard）」的窗口整删 scope。现与 Claude 共用 reserve → exact-generation adopt（app-server 的 `CodexTurnProcess` adapter 与 exec 进程都在注册进 `self.processes` 的同一同步步骤 adopt，`_launch_impl` 失败分支统一 discard），dispatcher finally 保持原样、自动变成无 owner 兜底；Codex chat turn 的 scope 泄漏（原来要等下个 fresh turn 的 finally 才删）一并收口。
+- **以后如何避免**：后台异步任务的失败必须让下游消费方可机器判定（状态门禁），不能只写一行 error_message 等人看见；任何作为子进程 cwd 的路径要么 spawn 前验证存在、要么把 ENOENT 翻译成带上下文的人话；「可重试」分类必须区分临时与永久，否则永久失败会退化成无限静默重试；会向共享 scope 物化文件的 launch 路径必须先 reserve、spawn 后 adopt，清理只认 owner。
+- **验证**：Linux 容器（python:3.11 + `--init`，干净 clone + patch）跑定向回归；Windows 开发机 `test_project_readiness.py` 6 passed / 7 skipped（POSIX-only 用例）、红绿验证（基线上出队门禁测试红）、`test_task_queue.py` 与 `test_task_agent_isolation.py` 失败集与基线逐条一致（均为 fcntl/geteuid/chmod 等 Windows 平台限制）；前端 `npx tsc --noEmit` 零错误、TaskForm/PlanCreateForm vitest `48 passed, 7 skipped`。注意本次开发环境为 Windows，合入前建议在 Linux 部署机补一次后端整库回归。
+
+- **评审跟进（PR #141 Reviewer Panel，同分支第二个 commit）**：① SSH clone 在无 `GIT_SSH_COMMAND` 时也强制 batch mode（SSH 会绕过 stdin 直开 /dev/tty，仅 `stdin=DEVNULL`+`GIT_TERMINAL_PROMPT=0` 挡不住交互）——无配置用默认 `ssh -o BatchMode=yes`，有配置则增补；② `ready` 提交改为 clone 的最终发布：Delivery Monitor 自动配置移到 ready 之后并隔离异常（失败只记日志，绝不翻回 error），`_wake_dispatcher` 挪到全部后置步骤之后，杜绝「任务已被领走、项目又被后置失败翻成 error」的窗口；③ PUT 只在 project 归属真正变更时做 error 项目门禁，全量表单带原 project_id 的编辑不再 422；④ Panel 的 HIGH finding（Codex reservation 早期泄漏）经代码核实不成立——`_launch_locked` 只经 `_launch_impl` 调用，reserve 后任何异常都落入其 BaseException 分支的 provider 无关 discard（instance_manager.py:3479-3486）——但按 QA 要求补了三个确定性回归测试锁死该协议（pre-spawn 窗口跳过清理 / adopt 交接 / 失败 discard）。教训：安全兜底要按「最弱前提」设计，不能假设某个环境变量一定存在；成功状态一经发布就必须不可逆，可选后置步骤的失败域要显式隔离。
+
+- **评审跟进（PR #141 Reviewer Panel 第三轮，同分支第四个 commit）**：clone 失败注记 `_sync_waiting_task_clone_notes` 的写入侧此前无条件覆盖等待任务的 `error_message`，会冲掉任务已有的独立启动/校验诊断且不可恢复——与清除侧的 prefix-only 守卫不对称。修复：写入侧补对称守卫，只对 `error_message` 为 NULL/空串或已带本 helper 前缀（`Project clone failed: `）的任务写注记；清除逻辑不变。红绿验证：`test_clone_note_annotation_preserves_foreign_error_messages`（独立错误保留 / 空任务收到注记 / 旧注记可更新 / 成功清除后独立错误仍在）在未打补丁时确实失败。教训：成对的写入/清除逻辑必须共享同一识别谓词，只给一侧加守卫等于没有守卫。

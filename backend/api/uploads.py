@@ -13,6 +13,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 
+from backend.config import settings
+from backend.services.upload_references import is_managed_upload_basename
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
@@ -29,10 +32,6 @@ _MAX_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 _MAX_TOTAL_SIZE_BYTES = 50 * 1024 * 1024  # bound request memory
 _MAX_FILES = 10
 _SAFE_EXTENSION_RE = re.compile(r"^\.[a-z0-9]{1,16}$")
-_MANAGED_UPLOAD_NAME_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12}(?:\.[a-z0-9]{1,16})?$"
-)
 _UPLOAD_FS_LOCK = threading.RLock()
 
 
@@ -62,13 +61,75 @@ def _get_upload_dir() -> Path:
     return UPLOAD_DIR
 
 
-def is_managed_upload_basename(value: object) -> bool:
-    """Return whether *value* can only be a CCM-generated upload basename."""
+def _upload_storage_usage_locked(upload_dir: Path) -> tuple[int, int]:
+    """Return regular-file bytes/count while ``_UPLOAD_FS_LOCK`` is held."""
 
-    return (
-        isinstance(value, str)
-        and _MANAGED_UPLOAD_NAME_RE.fullmatch(value) is not None
-    )
+    total_bytes = 0
+    total_files = 0
+    try:
+        for candidate in upload_dir.iterdir():
+            try:
+                info = candidate.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # In-process writers and cleanup use the same lock. Tolerate a
+                # file removed independently by an administrator.
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total_bytes += max(0, info.st_size)
+                total_files += 1
+    except OSError as exc:
+        # A quota that cannot be measured must fail closed; accepting the
+        # upload would make the configured hard limit advisory.
+        raise HTTPException(
+            503,
+            "Upload storage quota could not be verified",
+        ) from exc
+    return total_bytes, total_files
+
+
+def _commit_uploaded_files(
+    pending: list[tuple[str, str, bytes, str, str]],
+    total_size: int,
+) -> list[dict[str, Any]]:
+    """Atomically admit and persist one validated upload batch."""
+
+    written: list[Path] = []
+    results: list[dict[str, Any]] = []
+    with _UPLOAD_FS_LOCK:
+        upload_dir = _get_upload_dir()
+        existing_size, existing_files = _upload_storage_usage_locked(upload_dir)
+        if (
+            existing_size + total_size > settings.upload_max_total_bytes
+            or existing_files + len(pending) > settings.upload_max_total_files
+        ):
+            raise HTTPException(507, "Upload storage quota exceeded")
+        try:
+            for display_name, ext, data, file_id, saved_name in pending:
+                save_path = upload_dir / saved_name
+                # Exclusive creation preserves the UUID capability contract
+                # without ever following or overwriting an unexpected entry.
+                with save_path.open("xb") as destination:
+                    written.append(save_path)
+                    destination.write(data)
+                results.append(
+                    {
+                        "id": file_id,
+                        "filename": display_name,
+                        "path": str(save_path.resolve()),
+                        "url": f"/api/uploads/{saved_name}",
+                        "is_image": ext in _IMAGE_EXTENSIONS,
+                    }
+                )
+        except BaseException:
+            for path in written:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.exception("Failed to roll back partial upload %s", path)
+            raise
+    return results
 
 
 def _safe_display_filename(value: str | None) -> str:
@@ -147,14 +208,22 @@ def _validate_upload_attachments_locked(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     for raw_path in raw_files:
-        if (
-            not isinstance(raw_path, str)
-            or not raw_path
-            or "\x00" in raw_path
-            or not os.path.isabs(raw_path)
-        ):
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
             raise UploadAttachmentValidationError("Invalid upload path")
-        candidate = Path(os.path.abspath(raw_path))
+        if raw_path.startswith("/api/uploads/"):
+            # Public Task projections never disclose the absolute host upload
+            # root.  A managed URL is the opaque browser-side reference and is
+            # resolved only inside this already-confined validation boundary.
+            filename = raw_path.removeprefix("/api/uploads/")
+            if not is_managed_upload_basename(filename):
+                raise UploadAttachmentValidationError(
+                    "Attachment URL is not a CCM-managed upload"
+                )
+            candidate = upload_root / filename
+        elif os.path.isabs(raw_path):
+            candidate = Path(os.path.abspath(raw_path))
+        else:
+            raise UploadAttachmentValidationError("Invalid upload path")
         if candidate.parent != upload_root:
             raise UploadAttachmentValidationError(
                 "Attachments must come from the CCM upload directory"
@@ -265,11 +334,11 @@ def _validate_upload_attachments_locked(
 
 @router.post("")
 async def upload_files(files: list[UploadFile] = File(...)):
-    """Upload up to 5 files. Returns list of {id, filename, path, url, is_image}."""
+    """Upload up to 10 files. Returns list of {id, filename, path, url, is_image}."""
     if len(files) > _MAX_FILES:
         raise HTTPException(400, f"Maximum {_MAX_FILES} files allowed per request")
 
-    pending: list[tuple[UploadFile, str, bytes, str, str]] = []
+    pending: list[tuple[str, str, bytes, str, str]] = []
     total_size = 0
     for file in files:
         display_name = _safe_display_filename(file.filename)
@@ -287,38 +356,14 @@ async def upload_files(files: list[UploadFile] = File(...)):
 
         file_id = str(uuid.uuid4())
         saved_name = f"{file_id}{ext}" if ext else file_id
-        file.filename = display_name
-        pending.append((file, ext, data, file_id, saved_name))
+        pending.append((display_name, ext, data, file_id, saved_name))
 
     # Validation is intentionally all-or-nothing.  If any later write fails,
     # remove files created by this request so a 4xx/5xx never leaves uploads
     # that the client did not receive identifiers for.
-    upload_dir = _get_upload_dir()
-    written: list[Path] = []
-    results = []
-    try:
-        for file, ext, data, file_id, saved_name in pending:
-            save_path = upload_dir / saved_name
-            save_path.write_bytes(data)
-            written.append(save_path)
-            results.append(
-                {
-                    "id": file_id,
-                    "filename": file.filename,
-                    "path": str(save_path.resolve()),
-                    "url": f"/api/uploads/{saved_name}",
-                    "is_image": ext in _IMAGE_EXTENSIONS,
-                }
-            )
-    except BaseException:
-        for path in written:
-            try:
-                path.unlink()
-            except OSError:
-                logger.exception("Failed to roll back partial upload %s", path)
-        raise
-
-    return results
+    # Quota scanning and filesystem writes are synchronous. Keep their shared
+    # lock off the event loop because the cleanup thread may currently own it.
+    return await asyncio.to_thread(_commit_uploaded_files, pending, total_size)
 
 
 @router.get("/{filename}")

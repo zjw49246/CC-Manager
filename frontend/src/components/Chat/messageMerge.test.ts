@@ -106,6 +106,57 @@ describe('mergeChatHistory ephemeral events', () => {
 });
 
 describe('mergeChatHistory persisted identity', () => {
+  it('reconciles only the matching optimistic occurrence when equal text is sent twice', () => {
+    const firstOptimistic = message({
+      id: 1001,
+      role: 'user',
+      event_type: 'user_message',
+      content: '[Admin] same text',
+      raw_content: 'same text',
+      client_message_id: 'client-message-first',
+    });
+    const secondOptimistic = message({
+      id: 1002,
+      role: 'user',
+      event_type: 'user_message',
+      content: '[Admin] same text',
+      raw_content: 'same text',
+      client_message_id: 'client-message-second',
+    });
+    const firstPersisted = message({
+      id: 20,
+      role: 'user',
+      event_type: 'user_message',
+      content: '[Admin] same text',
+      raw_content: 'same text',
+      client_message_id: 'client-message-first',
+      task_retry_count: 1,
+      task_turn_generation: 8,
+      persisted: true,
+    });
+
+    const firstMerge = mergeChatHistory(
+      [firstPersisted],
+      [firstOptimistic, secondOptimistic],
+    );
+
+    expect(firstMerge.map((entry) => entry.id)).toEqual([20, 1002]);
+
+    const secondPersisted = message({
+      ...firstPersisted,
+      id: 21,
+      client_message_id: 'client-message-second',
+      task_turn_generation: 9,
+    });
+    const secondMerge = mergeChatHistory(
+      [firstPersisted, secondPersisted],
+      firstMerge,
+    );
+
+    expect(secondMerge.map((entry) => entry.id)).toEqual([20, 21]);
+    expect(secondMerge.filter((entry) => entry.raw_content === 'same text')).toHaveLength(2);
+  });
+
   it('keeps a persisted injected message outside the latest page in id order', () => {
     const injected = message({
       id: 10,

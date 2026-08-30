@@ -22,6 +22,8 @@ vi.mock('../../api/client', () => ({
     deleteCloudRouterAccount: vi.fn(),
     getCodexPoolStatus: vi.fn(),
     getCodexPoolUsage: vi.fn(),
+    getCodexPoolSettings: vi.fn(),
+    putCodexPoolSettings: vi.fn(),
     clearCodexPoolCooldown: vi.fn(),
     setCodexPoolPreferred: vi.fn(),
     codexPoolDeleteAccount: vi.fn(),
@@ -497,19 +499,19 @@ describe('PoolDrawer', () => {
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
     });
 
-    it('adds an ApexRouter key as a Codex-only API account', async () => {
+    it('adds an ApexRouter key as a dual-provider API account', async () => {
       vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
         ...apiAccount,
         id: 'apex-1',
-        name: 'Apex Codex',
+        name: 'Apex',
         api_provider: 'apex',
         auth_kind: 'apex_api',
         models: {
-          claude: [],
+          claude: ['claude-opus-4-8'],
           codex: ['gpt-5.4'],
         },
-        providers: ['codex'],
-        supported_models: ['gpt-5.4'],
+        providers: ['claude', 'codex'],
+        supported_models: ['claude-opus-4-8', 'gpt-5.4'],
         api_quota: {
           state: 'active',
           mode: 'shared_group',
@@ -539,21 +541,51 @@ describe('PoolDrawer', () => {
       await user.selectOptions(screen.getByLabelText('API 渠道'), 'apex');
 
       expect(screen.getByLabelText('ApexRouter API Key')).toBeInTheDocument();
-      expect(screen.getByText(/ApexRouter 仅用于 Codex/)).toBeInTheDocument();
-      expect(screen.getByText(/通过 \/v1\/models 验证 Key/)).toBeInTheDocument();
+      expect(screen.getByText(/自动识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
+      expect(screen.getByText(/Anthropic Messages 与 OpenAI Responses/)).toBeInTheDocument();
       expect(screen.getByText(/额度通过 \/v1\/usage 获取/)).toBeInTheDocument();
       expect(screen.getByText(/剩余、上限与并发限制由同组 Key 共享/)).toBeInTheDocument();
       expect(screen.getByText(/当前不返回到期时间/)).toBeInTheDocument();
 
-      await user.type(screen.getByLabelText('账号名称'), 'Apex Codex');
+      await user.type(screen.getByLabelText('账号名称'), 'Apex');
       await user.type(screen.getByLabelText('ApexRouter API Key'), 'lck_test_only_not_real');
       await user.click(screen.getByRole('button', { name: '验证并添加' }));
 
       await waitFor(() => {
         expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
-          name: 'Apex Codex',
+          name: 'Apex',
           api_key: 'lck_test_only_not_real',
           api_provider: 'apex',
+        });
+      });
+    });
+
+    it('adds an APIBest key as a dual-provider API account', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'apibest-1',
+        name: 'APIBest',
+        api_provider: 'apibest',
+        auth_kind: 'apibest_api',
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'apibest');
+
+      expect(screen.getByLabelText('APIBest API Key')).toBeInTheDocument();
+      expect(screen.getByText(/公开价格目录识别可用的 Claude 与 Codex 模型/)).toBeInTheDocument();
+      await user.type(screen.getByLabelText('账号名称'), 'APIBest');
+      await user.type(screen.getByLabelText('APIBest API Key'), 'sk-test-only');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'APIBest',
+          api_key: 'sk-test-only',
+          api_provider: 'apibest',
         });
       });
     });
@@ -647,6 +679,24 @@ describe('PoolDrawer', () => {
     });
 
     it('keeps a busy API tombstone visible with a safe cleanup retry action', async () => {
+      vi.mocked(api.getCloudRouterAccounts).mockResolvedValue([{
+        ...apiAccount,
+        id: 'cloudrouter-pending',
+        name: 'CloudRouter Pending',
+        enabled: false,
+        retired: true,
+        cleanup_pending: true,
+        cleanup_code: 'runtime_busy',
+        cleanup_reason: 'Task #42 is still using this API account',
+        cleanup_last_attempt_at: 1786802400,
+        cleanup_last_error_at: 1786802401,
+        models: {
+          claude: ['claude-sonnet-4-6'],
+          codex: ['gpt-5.5'],
+        },
+        providers: ['claude', 'codex'],
+        supported_models: ['claude-sonnet-4-6', 'gpt-5.5'],
+      }]);
       vi.mocked(api.getPoolUsage).mockResolvedValue({
         enabled: true,
         total: 1,
@@ -673,17 +723,40 @@ describe('PoolDrawer', () => {
           api_quota: apiQuota,
         }],
       });
-      vi.mocked(api.getCodexPoolUsage).mockResolvedValue({
+      enableCodexPool({
         enabled: true,
-        total: 0,
+        total: 1,
         available: 0,
         cooldown: 0,
-        disabled: 0,
+        disabled: 1,
         preferred: null,
-        accounts: [],
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-pending:codex',
+          codex_home: '/tmp/cloudrouter-pending/codex',
+          email: '',
+          enabled: false,
+          available: false,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Pending',
+          api_account_id: 'cloudrouter-pending',
+          retired: true,
+          cleanup_pending: true,
+          supported_models: ['gpt-5.5'],
+        }],
       });
       vi.mocked(api.deleteCloudRouterAccount).mockRejectedValue(
-        Object.assign(new Error('API account is still in use'), { status: 409 }),
+        Object.assign(new Error('Conflict'), {
+          status: 409,
+          detail: {
+            message: 'API account is still in use',
+            error: 'API account is still in use',
+            code: 'runtime_busy',
+            reason: 'Task #42 is still using this API account',
+            cleanup_pending: true,
+          },
+        }),
       );
       const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
       const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
@@ -693,32 +766,51 @@ describe('PoolDrawer', () => {
       await openDrawer(user);
 
       const card = screen.getByText('CloudRouter Pending').closest('.rounded-lg') as HTMLElement;
-      expect(within(card).getByText('待清理')).toBeInTheDocument();
+      expect(within(card).getByText('已停用')).toBeInTheDocument();
+      expect(within(card).getByText('删除受阻')).toBeInTheDocument();
       expect(card).toHaveTextContent('账号已停用，新的 Claude/Codex 任务不会再使用它');
-      expect(card).toHaveTextContent('API Key 与配置仍在等待安全清理');
+      expect(card).toHaveTextContent('API Key 与配置尚未删除');
+      expect(card).toHaveTextContent('账号仍被运行中的任务或监控使用，请先停止相关运行再重试');
+      expect(card).toHaveTextContent('后端详情：Task #42 is still using this API account');
+      expect(card).toHaveTextContent('Task #42 is still using this API account');
+      expect(card).toHaveTextContent('runtime_busy');
+      expect(card).toHaveTextContent('最近失败：');
       expect(card).toHaveTextContent('Claude projects 与 Codex sessions 会保留');
+      expect(card).toHaveTextContent('同一共享 API 账号会投影到 Claude 与 Codex 页签');
+      expect(card).not.toHaveTextContent('待清理');
       expect(within(card).queryByText('优先账号')).not.toBeInTheDocument();
       expect(within(card).queryByText('最近使用')).not.toBeInTheDocument();
       expect(within(card).queryByRole('button', { name: '切换到此账号' })).not.toBeInTheDocument();
       expect(within(card).queryByRole('button', { name: '查看额度与有效期' })).not.toBeInTheDocument();
 
-      await user.click(within(card).getByRole('button', { name: '继续清理' }));
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+      const codexCard = (await screen.findByText('CloudRouter Pending')).closest('.rounded-lg') as HTMLElement;
+      expect(codexCard).toHaveTextContent('Task #42 is still using this API account');
+      expect(codexCard).toHaveTextContent('同一共享 API 账号会投影到 Claude 与 Codex 页签');
+      expect(within(codexCard).getByRole('button', { name: '重试清理' })).toBeEnabled();
+
+      await user.click(screen.getByRole('button', { name: 'Claude' }));
+      const retryCard = (await screen.findByText('CloudRouter Pending')).closest('.rounded-lg') as HTMLElement;
+      await user.click(within(retryCard).getByRole('button', { name: '重试清理' }));
 
       await waitFor(() => {
         expect(api.deleteCloudRouterAccount).toHaveBeenCalledWith('cloudrouter-pending');
         expect(alert).toHaveBeenCalledWith(expect.stringContaining(
-          '账号已安全停用，但暂时无法完成清理',
+          '账号已停用，但删除受阻：账号仍被运行中的任务或监控使用，请先停止相关运行再重试',
+        ));
+        expect(alert).toHaveBeenCalledWith(expect.stringContaining(
+          '后端详情：Task #42 is still using this API account',
         ));
       });
       expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
-        '继续清理 API 账号“CloudRouter Pending”',
+        '重试清理 API 账号“CloudRouter Pending”',
       ));
       expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
-        '若仍在使用该账号，本次会继续保留“待清理”状态',
+        '若阻塞仍未解除，账号会继续显示“删除受阻”',
       ));
       expect(api.getPoolUsage).toHaveBeenCalledWith(false);
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
-      expect(within(card).getByRole('button', { name: '继续清理' })).toBeEnabled();
+      expect(within(retryCard).getByRole('button', { name: '重试清理' })).toBeEnabled();
     });
 
     it('renders the same API account in Codex without OAuth controls and refreshes its shared quota', async () => {
@@ -1196,6 +1288,49 @@ describe('PoolDrawer', () => {
       await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
       expect(card).toHaveTextContent('剩余 无限');
       expect(card).not.toHaveTextContent('-$1');
+    });
+  });
+
+  describe('Codex pool settings', () => {
+    it('edits and persists runtime settings', async () => {
+      const settings = {
+        enabled: true,
+        cooldown_seconds: 300,
+        quota_switch_threshold_percent: 90,
+        routing_policy: 'api_first' as const,
+        preferred_account_id: null,
+      };
+      enableCodexPool({
+        enabled: true,
+        total: 0,
+        available: 0,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        settings,
+        accounts: [],
+      });
+      vi.mocked(api.putCodexPoolSettings).mockResolvedValue(settings);
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+      await user.click(await screen.findByTitle('Codex 号池设置'));
+      await user.clear(screen.getByLabelText('撞限冷却时间（秒）'));
+      await user.type(screen.getByLabelText('撞限冷却时间（秒）'), '600');
+      await user.clear(screen.getByLabelText('主动换号阈值（%）'));
+      await user.type(screen.getByLabelText('主动换号阈值（%）'), '80');
+      await user.selectOptions(screen.getByLabelText('新会话路由顺序'), 'native_first');
+      await user.click(screen.getByRole('button', { name: '保存并生效' }));
+
+      await waitFor(() => expect(api.putCodexPoolSettings).toHaveBeenCalledWith({
+        ...settings,
+        cooldown_seconds: 600,
+        quota_switch_threshold_percent: 80,
+        routing_policy: 'native_first',
+      }));
+      expect(api.getCodexPoolUsage).toHaveBeenLastCalledWith(false);
     });
   });
 

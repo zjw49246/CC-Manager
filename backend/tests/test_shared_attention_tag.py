@@ -75,6 +75,10 @@ async def test_owner_config_backfill_mirrors_attention_tag_to_new_share_shadow(
         ).scalar_one()
         shadow = await db.get(Task, received.local_task_id)
         assert shadow.shared_from_id == received.id
+        assert shadow.execution_user_id is None
+        assert shadow.execution_user_role == "member"
+        assert shadow.execution_mode == "sandbox"
+        assert shadow.execution_principal_kind == "system"
         shadow.attention_tag = stale_shadow_tag
         await db.commit()
         shadow_task_id = shadow.id

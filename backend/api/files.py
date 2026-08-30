@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import os
+import posixpath
+import socket
+import stat as stat_mod
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -15,10 +18,29 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
-from backend.api.deps import require_admin
+from backend.api.deps import (
+    require_admin,
+    require_managed_ssh_auth_configured,
+)
+from backend.config import settings
+from backend.database import get_db
+from backend.models.ssh_profile import SSHProfile
+from backend.services.ssh_executor import (
+    SSHHostKeyMismatchError,
+    SSHKeyPreflightError,
+)
+from backend.services.ssh_profiles import executor_for_profile
+from backend.services.ssh_remote_paths import resolve_existing_remote_path
+from backend.services.ssh_sftp import (
+    SSHSFTPBusyError,
+    SSHSFTPOperationTimeout,
+    configure_sftp_channel_timeout,
+    run_bounded_sftp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +54,7 @@ MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB (for reading)
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB (for uploading)
 MAX_UPLOAD_TOTAL_SIZE = 50 * 1024 * 1024  # bound request memory
 MAX_UPLOAD_FILES = 10
+MAX_MANAGED_SSH_DIRECTORY_ENTRIES = 2000
 
 
 def _unlink_temporary_download(path: str) -> None:
@@ -75,6 +98,17 @@ class SSHReadRequest(SSHCreds):
     path: str
 
 
+class ManagedSSHPathRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("path")
+    @classmethod
+    def validate_remote_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value:
+            raise ValueError("Remote path must be an absolute POSIX path")
+        return value
+
+
 def _make_ssh_client(creds: SSHCreds):
     try:
         import paramiko
@@ -99,6 +133,172 @@ def _make_ssh_client(creds: SSHCreds):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"SSH connection failed: {e}")
     return client
+
+
+async def _live_managed_ssh_profile(
+    profile_id: int,
+    db: AsyncSession,
+) -> SSHProfile:
+    profile = await db.get(SSHProfile, profile_id)
+    if profile is None or profile.deleted_at is not None:
+        raise HTTPException(404, "SSH profile not found")
+    if not profile.enabled:
+        raise HTTPException(409, "SSH profile is disabled")
+    return profile
+
+
+def _managed_ssh_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(404, "Remote path not found")
+    if isinstance(exc, PermissionError):
+        return HTTPException(403, "Remote permission denied")
+    if isinstance(exc, SSHHostKeyMismatchError):
+        return HTTPException(409, "SSH host key does not match the pinned identity")
+    if isinstance(exc, SSHKeyPreflightError):
+        return HTTPException(400, {"code": exc.code, "message": exc.detail})
+    if isinstance(exc, SSHSFTPBusyError):
+        return HTTPException(503, "SSH file capacity is busy; try again shortly")
+    if isinstance(exc, SSHSFTPOperationTimeout):
+        return HTTPException(504, "SSH file operation timed out")
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return HTTPException(504, "SSH operation timed out")
+    logger.warning("Managed SSH file operation failed: %s", type(exc).__name__)
+    return HTTPException(400, "SSH operation failed")
+
+
+def _managed_ssh_list_sync(
+    profile: SSHProfile,
+    path: str,
+) -> tuple[str, list[dict], bool]:
+    client = executor_for_profile(profile).connect(timeout=10)
+    try:
+        sftp = client.open_sftp()
+        try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_existing_remote_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
+            attrs = []
+            for attr in sftp.listdir_iter(path, read_aheads=10):
+                attrs.append(attr)
+                if len(attrs) > MAX_MANAGED_SSH_DIRECTORY_ENTRIES:
+                    break
+            truncated = len(attrs) > MAX_MANAGED_SSH_DIRECTORY_ENTRIES
+            entries = []
+            for attr in sorted(
+                attrs[:MAX_MANAGED_SSH_DIRECTORY_ENTRIES],
+                key=lambda item: (
+                    not stat_mod.S_ISDIR(item.st_mode or 0),
+                    (item.filename or "").lower(),
+                ),
+            ):
+                is_dir = stat_mod.S_ISDIR(attr.st_mode or 0)
+                entries.append({
+                    "name": attr.filename,
+                    "path": posixpath.join(path, attr.filename),
+                    "is_dir": is_dir,
+                    "size": attr.st_size if not is_dir else None,
+                })
+            return path, entries, truncated
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def _managed_ssh_read_sync(
+    profile: SSHProfile,
+    path: str,
+) -> tuple[str, str, int]:
+    client = executor_for_profile(profile).connect(timeout=10)
+    try:
+        sftp = client.open_sftp()
+        try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_existing_remote_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
+            size = sftp.stat(path).st_size or 0
+            if size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    413,
+                    f"File too large ({size // 1024} KB). Max is {MAX_FILE_SIZE // 1024} KB.",
+                )
+            with sftp.open(path, "rb") as remote_file:
+                raw = remote_file.read(MAX_FILE_SIZE + 1)
+            if len(raw) > MAX_FILE_SIZE:
+                raise HTTPException(413, "Remote file exceeds the 1 MB preview limit")
+            return path, raw.decode("utf-8", errors="replace"), size
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def _remote_download_name(path: str) -> str:
+    name = posixpath.basename(path.rstrip("/")) or "download"
+    return "".join(character if character.isprintable() else "_" for character in name)
+
+
+def _managed_ssh_download_sync(
+    profile: SSHProfile,
+    path: str,
+) -> tuple[str, str]:
+    client = executor_for_profile(profile).connect(timeout=10)
+    temporary_path: str | None = None
+    try:
+        sftp = client.open_sftp()
+        try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_existing_remote_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
+            size = sftp.stat(path).st_size or 0
+            if size > MAX_DOWNLOAD_SIZE:
+                raise HTTPException(
+                    413,
+                    f"File too large ({size // 1024 // 1024} MB). Max is {MAX_DOWNLOAD_SIZE // 1024 // 1024} MB.",
+                )
+            filename = _remote_download_name(path)
+            temporary_file = tempfile.NamedTemporaryFile(
+                delete=False,
+                prefix="ccm-managed-ssh-download-",
+                suffix=".tmp",
+            )
+            temporary_path = temporary_file.name
+            try:
+                with sftp.open(path, "rb") as remote_file:
+                    transferred = 0
+                    while True:
+                        chunk = remote_file.read(64 * 1024)
+                        if not chunk:
+                            break
+                        transferred += len(chunk)
+                        if transferred > MAX_DOWNLOAD_SIZE:
+                            raise HTTPException(
+                                413,
+                                "Remote file exceeds the 100 MB download limit",
+                            )
+                        temporary_file.write(chunk)
+            finally:
+                temporary_file.close()
+            return temporary_path, filename
+        finally:
+            sftp.close()
+    except BaseException:
+        if temporary_path:
+            _unlink_temporary_download(temporary_path)
+        raise
+    finally:
+        client.close()
 
 
 @router.post("/upload")
@@ -372,7 +572,94 @@ async def download_file(path: str = Query(..., description="Absolute file path")
 # SSH endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/ssh/list")
+@router.post(
+    "/ssh/{profile_id}/list",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
+async def managed_ssh_list_directory(
+    profile_id: int,
+    req: ManagedSSHPathRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """List a directory through a backend-managed, host-key-pinned profile."""
+
+    profile = await _live_managed_ssh_profile(profile_id, db)
+    try:
+        canonical_path, entries, truncated = await run_bounded_sftp(
+            _managed_ssh_list_sync,
+            profile,
+            req.path,
+        )
+    except Exception as exc:
+        raise _managed_ssh_error(exc) from exc
+    return {
+        "path": canonical_path,
+        "entries": entries,
+        "truncated": truncated,
+    }
+
+
+@router.post(
+    "/ssh/{profile_id}/read",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
+async def managed_ssh_read_file(
+    profile_id: int,
+    req: ManagedSSHPathRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview a file without returning profile credentials to the browser."""
+
+    profile = await _live_managed_ssh_profile(profile_id, db)
+    try:
+        canonical_path, content, size = await run_bounded_sftp(
+            _managed_ssh_read_sync,
+            profile,
+            req.path,
+        )
+    except Exception as exc:
+        raise _managed_ssh_error(exc) from exc
+    return {"path": canonical_path, "content": content, "size": size}
+
+
+@router.post(
+    "/ssh/{profile_id}/download",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
+async def managed_ssh_download_file(
+    profile_id: int,
+    req: ManagedSSHPathRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Download a bounded file through a managed SSH profile."""
+
+    profile = await _live_managed_ssh_profile(profile_id, db)
+    try:
+        temporary_path, filename = await run_bounded_sftp(
+            _managed_ssh_download_sync,
+            profile,
+            req.path,
+            operation_timeout=settings.ssh_sftp_download_timeout_seconds,
+            abandoned_result_cleanup=lambda result: _unlink_temporary_download(
+                result[0]
+            ),
+        )
+    except Exception as exc:
+        raise _managed_ssh_error(exc) from exc
+    return FileResponse(
+        path=temporary_path,
+        filename=filename,
+        media_type="application/octet-stream",
+        background=BackgroundTask(
+            _unlink_temporary_download,
+            temporary_path,
+        ),
+    )
+
+@router.post(
+    "/ssh/list",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_list_directory(req: SSHListRequest):
     """List contents of a directory on a remote SSH server."""
     client = _make_ssh_client(req)
@@ -402,7 +689,10 @@ async def ssh_list_directory(req: SSHListRequest):
     return {"path": req.path, "entries": entries}
 
 
-@router.post("/ssh/read")
+@router.post(
+    "/ssh/read",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_read_file(req: SSHReadRequest):
     """Read a file from a remote SSH server (max 1 MB)."""
     client = _make_ssh_client(req)
@@ -434,7 +724,10 @@ async def ssh_read_file(req: SSHReadRequest):
     return {"path": req.path, "content": content, "size": size}
 
 
-@router.post("/ssh/download")
+@router.post(
+    "/ssh/download",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_download_file(req: SSHReadRequest):
     """Download a file from a remote SSH server (max 100 MB)."""
     client = _make_ssh_client(req)

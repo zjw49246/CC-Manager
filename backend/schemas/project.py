@@ -36,6 +36,7 @@ class ProjectUpdate(BaseModel):
     git_ssh_key_path: str | None = None
     git_https_username: str | None = None
     git_https_token: str | None = None
+    preview_config: dict | None = None
 
 
 class ProjectReorderItem(BaseModel):
@@ -57,6 +58,7 @@ class ProjectResponse(BaseModel):
     sort_order: int
     tags: list[str]
     env_files: list[str]
+    preview_config: dict | None = None
     git_author_name: str | None
     git_author_email: str | None
     git_credential_type: str | None

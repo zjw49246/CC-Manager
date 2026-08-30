@@ -11,6 +11,27 @@ function titleCaseStatus(status: string): string {
 export function getTaskStatusLabel(task: Task): string {
   if (task.background_active) return 'Background';
 
+  if (task.status === 'waiting_capability') return 'Waiting Capability';
+
+  if (task.mode === 'delivery_loop' && task.delivery_run_id != null) {
+    if (task.delivery_phase === 'done') {
+      if (task.delivery_outcome === 'success') {
+        return task.delivery_terminal === 'merged' ? 'Merged' : 'Ready to Merge';
+      }
+      return task.delivery_outcome
+        ? `Delivery ${titleCaseStatus(task.delivery_outcome)}`
+        : 'Delivery Done';
+    }
+    if (task.delivery_phase) {
+      const phase = titleCaseStatus(task.delivery_phase);
+      const activity = task.delivery_activity
+        ? titleCaseStatus(task.delivery_activity)
+        : null;
+      return activity ? `${phase} · ${activity}` : phase;
+    }
+    return 'Delivery Preparing';
+  }
+
   if (
     task.mode === 'plan'
     && ['in_progress', 'executing'].includes(task.status)

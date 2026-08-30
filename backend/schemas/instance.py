@@ -18,6 +18,7 @@ class InstanceCreate(BaseModel):
 
 class InstanceStopRequest(BaseModel):
     expected_task_id: PositiveInt
+    expected_task_turn_generation: int = Field(ge=0)
     # Required even when null so callers explicitly acknowledge the complete
     # generation they observed. Omission would silently degrade back to a
     # task-id-only ABA check.
@@ -31,6 +32,8 @@ class InstanceResponse(BaseModel):
     pid: int | None
     status: str
     current_task_id: int | None
+    current_task_retry_count: int | None = None
+    current_task_turn_generation: int | None = None
     current_plan_run_id: int | None
     worktree_path: str | None
     worktree_branch: str | None

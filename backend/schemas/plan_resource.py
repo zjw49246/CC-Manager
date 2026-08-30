@@ -200,6 +200,20 @@ class WorkerPlanRunImportRequest(BaseModel):
     attachment_manifest: list[dict] | None = None
 
 
+class WorkerPlanRunCancelRequest(BaseModel):
+    """Internal exact cancellation for one immutable Manager import."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: Literal[1]
+    plan_id: int = Field(gt=0)
+    payload_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
 class WorkerPlanVersionImportRequest(BaseModel):
     """Internal request to materialize an immutable Version near a Task."""
 
@@ -361,6 +375,11 @@ class PlanResource(BaseModel):
     updated_at: datetime
     display_state: str
     legacy: bool = False
+    ownership: Literal["standard", "capability"] = "standard"
+    read_only: bool = False
+    # Read-only projection resolved from the Delivery Task or an applied cycle.
+    # DeliveryRun remains the sole owner of orchestration state.
+    delivery_run_id: int | None = None
     latest_run_status: str | None = None
     latest_run_error: str | None = None
     pipeline_config: PlanPipelineConfig

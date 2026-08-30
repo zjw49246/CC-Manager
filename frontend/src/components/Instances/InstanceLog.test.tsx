@@ -36,6 +36,9 @@ function log(id: number, content: string, overrides: Partial<LogEntry> = {}): Lo
     id,
     instance_id: 7,
     task_id: 10,
+    task_retry_count: 0,
+    task_turn_generation: 1,
+    native_turn_id: null,
     event_type: 'message',
     role: 'assistant',
     content,
@@ -73,8 +76,8 @@ describe('InstanceLog live/history merge', () => {
       });
       // No server id: the local monotonic key must still retain both events
       // even when they arrive in the same millisecond/React batch.
-      messageHandler?.({ channel: 'instance:7', data: { event_type: 'message_delta', content: 'third-a' } });
-      messageHandler?.({ channel: 'instance:7', data: { event_type: 'message_delta', content: 'third-b' } });
+      messageHandler?.({ channel: 'instance:7', data: { event_type: 'message', content: 'third-a' } });
+      messageHandler?.({ channel: 'instance:7', data: { event_type: 'message', content: 'third-b' } });
     });
 
     expect(screen.getByText('second')).toBeInTheDocument();
@@ -250,6 +253,9 @@ describe('InstanceLog live/history merge', () => {
           event_type: 'message_delta',
           item_id: 'msg-1',
           content: 'Hel',
+          task_id: 10,
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
       messageHandler?.({
@@ -258,6 +264,9 @@ describe('InstanceLog live/history merge', () => {
           event_type: 'message_delta',
           item_id: 'msg-1',
           content: 'lo',
+          task_id: 10,
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
     });
@@ -277,6 +286,8 @@ describe('InstanceLog live/history merge', () => {
           role: 'assistant',
           item_id: 'msg-1',
           content: 'Hello',
+          task_retry_count: 0,
+          task_turn_generation: 1,
           timestamp: '2026-07-23T00:01:00.000Z',
         },
       });
@@ -286,6 +297,96 @@ describe('InstanceLog live/history merge', () => {
     expect(screen.getAllByTestId('instance-log-entry')).toHaveLength(1);
     expect(screen.getByText('[message]')).toBeInTheDocument();
     expect(screen.queryByText('[message_delta]')).not.toBeInTheDocument();
+  });
+
+  it('drops deltas that do not carry an exact task retry and turn identity', async () => {
+    apiMock.getInstanceLogs.mockResolvedValueOnce([]);
+    render(<InstanceLog instanceId={7} onClose={vi.fn()} />);
+    await waitFor(() => expect(apiMock.getInstanceLogs).toHaveBeenCalled());
+
+    act(() => {
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          event_type: 'message_delta', item_id: 'missing-retry',
+          task_id: 10, task_turn_generation: 1, content: 'missing retry',
+        },
+      });
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          event_type: 'thinking_delta', item_id: 'missing-turn',
+          task_id: 10, task_retry_count: 0, content: 'missing turn',
+        },
+      });
+    });
+
+    expect(screen.queryByText('missing retry')).not.toBeInTheDocument();
+    expect(screen.queryByText('missing turn')).not.toBeInTheDocument();
+    expect(screen.getByText('No logs yet')).toBeInTheDocument();
+  });
+
+  it('does not merge a reused item id across task turns or accept a late old delta', async () => {
+    apiMock.getInstanceLogs.mockResolvedValueOnce([]);
+    render(<InstanceLog instanceId={7} onClose={vi.fn()} />);
+    await waitFor(() => expect(apiMock.getInstanceLogs).toHaveBeenCalled());
+
+    act(() => {
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          event_type: 'message_delta', item_id: 'same-item', content: 'turn one partial',
+          task_id: 10, task_retry_count: 5, task_turn_generation: 30,
+        },
+      });
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          event_type: 'message_delta', item_id: 'same-item', content: 'turn two partial',
+          task_id: 10, task_retry_count: 5, task_turn_generation: 31,
+        },
+      });
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          event_type: 'message_delta', item_id: 'same-item', content: ' late turn one',
+          task_id: 10, task_retry_count: 5, task_turn_generation: 30,
+        },
+      });
+    });
+
+    expect(screen.queryByText('turn one partial')).not.toBeInTheDocument();
+    expect(screen.queryByText(/late turn one/)).not.toBeInTheDocument();
+    expect(screen.getByText('turn two partial')).toBeInTheDocument();
+
+    act(() => {
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          id: 80, instance_id: 7, task_id: 10,
+          task_retry_count: 5, task_turn_generation: 30,
+          event_type: 'message', role: 'assistant', item_id: 'same-item',
+          content: 'turn one persisted', timestamp: '2026-07-23T00:02:00.000Z',
+        },
+      });
+    });
+    expect(screen.getByText('turn one persisted')).toBeInTheDocument();
+    expect(screen.getByText('turn two partial')).toBeInTheDocument();
+
+    act(() => {
+      messageHandler?.({
+        channel: 'instance:7',
+        data: {
+          id: 81, instance_id: 7, task_id: 10,
+          task_retry_count: 5, task_turn_generation: 31,
+          event_type: 'message', role: 'assistant', item_id: 'same-item',
+          content: 'turn two persisted', timestamp: '2026-07-23T00:02:01.000Z',
+        },
+      });
+    });
+    expect(screen.queryByText('turn two partial')).not.toBeInTheDocument();
+    expect(screen.getByText('turn two persisted')).toBeInTheDocument();
+    expect(screen.getByText('turn one persisted')).toBeInTheDocument();
   });
 
   it('aggregates thinking deltas independently by their item id', async () => {
@@ -300,6 +401,9 @@ describe('InstanceLog live/history merge', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: 'Check ',
+          task_id: 10,
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
       messageHandler?.({
@@ -308,6 +412,9 @@ describe('InstanceLog live/history merge', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: 'state',
+          task_id: 10,
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
     });
@@ -324,6 +431,8 @@ describe('InstanceLog live/history merge', () => {
           role: 'assistant',
           item_id: 'reasoning-1',
           content: 'Check state',
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
     });
@@ -344,6 +453,9 @@ describe('InstanceLog live/history merge', () => {
           event_type: 'message_delta',
           item_id: 'disconnected-message',
           content: 'part',
+          task_id: 10,
+          task_retry_count: 0,
+          task_turn_generation: 1,
         },
       });
     });

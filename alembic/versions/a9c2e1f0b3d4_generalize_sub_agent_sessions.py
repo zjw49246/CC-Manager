@@ -45,7 +45,13 @@ def upgrade() -> None:
     # 索引先删再改名（batch 模式按声明顺序对旧表反射，列改名后旧索引列名失配）
     with op.batch_alter_table('sub_agent_reports', schema=None) as batch_op:
         batch_op.drop_index('ix_monitor_checks_monitor_session_id')
-        batch_op.alter_column('monitor_session_id', new_column_name='session_id')
+        # MySQL's CHANGE/MODIFY syntax always requires the existing type even
+        # when the operation only renames a column.
+        batch_op.alter_column(
+            'monitor_session_id',
+            existing_type=sa.Integer(),
+            new_column_name='session_id',
+        )
     with op.batch_alter_table('sub_agent_reports', schema=None) as batch_op:
         batch_op.create_index(
             'ix_sub_agent_reports_session_id', ['session_id'], unique=False
@@ -55,7 +61,11 @@ def upgrade() -> None:
 def downgrade() -> None:
     with op.batch_alter_table('sub_agent_reports', schema=None) as batch_op:
         batch_op.drop_index('ix_sub_agent_reports_session_id')
-        batch_op.alter_column('session_id', new_column_name='monitor_session_id')
+        batch_op.alter_column(
+            'session_id',
+            existing_type=sa.Integer(),
+            new_column_name='monitor_session_id',
+        )
     with op.batch_alter_table('sub_agent_reports', schema=None) as batch_op:
         batch_op.create_index(
             'ix_monitor_checks_monitor_session_id',

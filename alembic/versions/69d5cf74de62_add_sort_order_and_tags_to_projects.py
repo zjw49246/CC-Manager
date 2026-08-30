@@ -19,9 +19,24 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    dialect = op.get_bind().dialect
+    mysql_family = dialect.name in {"mysql", "mariadb"} or bool(
+        getattr(dialect, "is_mariadb", False)
+    )
     with op.batch_alter_table('projects', schema=None) as batch_op:
         batch_op.add_column(sa.Column('sort_order', sa.Integer(), server_default='0', nullable=False))
-        batch_op.add_column(sa.Column('tags', sa.JSON(), server_default='[]', nullable=False))
+        # MySQL rejects a bare literal default on JSON (error 1101).  Its
+        # parenthesized JSON_ARRAY expression is the equivalent canonical
+        # empty-array default; SQLite/PostgreSQL retain the historical literal.
+        tags_default = (
+            sa.text("(JSON_ARRAY())") if mysql_family else sa.text("'[]'")
+        )
+        batch_op.add_column(sa.Column(
+            'tags',
+            sa.JSON(),
+            server_default=tags_default,
+            nullable=False,
+        ))
         batch_op.create_index(batch_op.f('ix_projects_sort_order'), ['sort_order'], unique=False)
 
 

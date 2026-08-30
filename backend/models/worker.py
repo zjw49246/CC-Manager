@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Integer, String, Text, DateTime, JSON
+from sqlalchemy import CheckConstraint, Integer, String, Text, DateTime, JSON, event
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.database import Base
 
@@ -32,6 +32,17 @@ class Worker(Base):
     # before the call so a lost AWS response can be retried with an identical
     # ClientToken *and* identical parameters.
     provision_spec: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Monotonic journal for the externally visible cloud ``Name`` tag.  The
+    # database name and this outbox are committed together before create_tags
+    # is called; ``rename_generation`` is never decremented, while the outbox
+    # is cleared only after the exact generation has been acknowledged.
+    rename_generation: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    rename_tag_outbox: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # 连接信息
     ssh_user: Mapped[str] = mapped_column(String(50), default="ubuntu", server_default="ubuntu")
@@ -52,6 +63,112 @@ class Worker(Base):
     bootstrap_step: Mapped[str | None] = mapped_column(String(100), nullable=True)
     bootstrap_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     bootstrap_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stable identity for one Manager-side destroy lifecycle.  Unlike
+    # ``updated_at`` this changes only when a fresh destroy is admitted, so
+    # harmless metadata/log writers cannot revoke an in-flight coordinator.
+    # ``ready|error`` + bootstrap_step="destroy" deliberately retains it for
+    # restart/reconciliation retry of the same irreversible node drain.
+    destroy_lifecycle_nonce: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    # Short-lived durable authorization outbox installed only after the final
+    # signed Worker drain proof and every Manager ownership fence succeed.
+    # It survives a crash or ambiguous cloud response so restart recovery can
+    # idempotently retry EC2 termination without contacting the sealed/dead
+    # Worker again.  Successful terminalization clears it atomically with the
+    # Worker credential scrub.
+    destroy_termination_receipt: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+WORKER_NODE_CONTROL_SINGLETON_ID = 1
+
+
+class WorkerNodeControl(Base):
+    """Worker-local durable admission fence for node destruction.
+
+    The row exists on Manager and Worker databases so one schema can be
+    deployed everywhere, but it is consulted only when ``CCM_NODE_ROLE`` is
+    ``worker``.  Once ``drain_claim`` is installed it is deliberately
+    irreversible: a failed destroy/restarted Manager may retry the same claim,
+    while no Task/runtime/login mutation can reopen the node before the cloud
+    instance is finally terminated.
+    """
+
+    __tablename__ = "worker_node_controls"
+    __table_args__ = (
+        CheckConstraint(
+            "id = 1",
+            name="ck_worker_node_controls_singleton",
+        ),
+        CheckConstraint(
+            "(drain_claim IS NULL AND drain_started_at IS NULL "
+            "AND runtime_seal_claim IS NULL AND runtime_sealed_at IS NULL) "
+            "OR (drain_claim IS NOT NULL AND drain_started_at IS NOT NULL "
+            "AND ((runtime_seal_claim IS NULL AND runtime_sealed_at IS NULL) "
+            "OR (runtime_seal_claim = drain_claim "
+            "AND runtime_sealed_at IS NOT NULL)))",
+            name="ck_worker_node_controls_drain_phase",
+        ),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=False,
+        default=WORKER_NODE_CONTROL_SINGLETON_ID,
+    )
+    drain_claim: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Phase one (drain_claim) rejects every new Task/runtime ownership while
+    # callbacks from the already-admitted exact generation may still persist
+    # their final output.  Phase two is installed only after those consumers
+    # have stopped; it makes every later runtime callback fail closed before
+    # Manager log backfill and the final cloud-termination proof.
+    runtime_seal_claim: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    # Codex login is a background process whose HTTP request returns before
+    # credential mutation is complete.  Persist its exact attempt identity so
+    # a node drain cannot cross that background effect or a crash-left journal.
+    active_login_attempt_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    active_login_kind: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    drain_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
+    runtime_sealed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+
+@event.listens_for(WorkerNodeControl.__table__, "after_create")
+def _seed_worker_node_control(target, connection, **_kwargs) -> None:
+    """Seed metadata-created test/dev databases with the singleton row."""
+
+    connection.execute(
+        target.insert().values(
+            id=WORKER_NODE_CONTROL_SINGLETON_ID,
+            drain_claim=None,
+            runtime_seal_claim=None,
+            active_login_attempt_id=None,
+            active_login_kind=None,
+            drain_started_at=None,
+            runtime_sealed_at=None,
+            updated_at=None,
+        )
+    )

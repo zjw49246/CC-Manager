@@ -15,12 +15,18 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
+from backend.database import get_db
 from backend.services.codex_app_server import CodexAppServerBusyError
+from backend.services.cancellation import (
+    await_task_completion,
+)
 from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.login_runtime import (
     LoginRuntimeError,
@@ -31,6 +37,9 @@ from backend.services.login_runtime import (
 from backend.services.process_safety import (
     UnsafeProcessGroupError,
     require_safe_process_group_id,
+)
+from backend.services.worker_node_control import (
+    fence_worker_node_account_mutation,
 )
 
 router = APIRouter(prefix="/api/codex-pool", tags=["codex-pool"])
@@ -206,6 +215,52 @@ def _reject_unresolved_login_transactions(pool=None) -> None:
                 f"恢复（pending={len(pending)}）"
             ),
         )
+
+
+def pending_codex_login_transaction_ids(pool=None) -> set[str]:
+    """Expose only opaque journal ids for Worker node-drain recovery."""
+
+    return {path.stem for path in _pending_login_transaction_paths(pool)}
+
+
+async def _admit_worker_node_login_attempt(attempt_id: str) -> bool:
+    """Persist background login ownership before the wrapper can be spawned."""
+
+    from backend.database import async_session
+    from backend.services.worker_node_control import (
+        admit_worker_node_login_attempt,
+    )
+
+    async with async_session() as db:
+        admitted = await admit_worker_node_login_attempt(
+            db,
+            attempt_id=attempt_id,
+        )
+        if admitted:
+            await db.commit()
+        return admitted
+
+
+async def _finish_worker_node_login_if_reconciled(attempt_id: str) -> bool:
+    """Release the node fence only after process/journal cleanup is proven."""
+
+    if attempt_id in _login_attempts:
+        return False
+    if attempt_id in pending_codex_login_transaction_ids():
+        return False
+    from backend.database import async_session
+    from backend.services.worker_node_control import (
+        finish_worker_node_login_attempt,
+    )
+
+    async with async_session() as db:
+        cleared = await finish_worker_node_login_attempt(
+            db,
+            attempt_id=attempt_id,
+        )
+        if cleared:
+            await db.commit()
+        return cleared
 
 
 def _begin_login_transaction(
@@ -784,32 +839,21 @@ async def _stop_unfinished_login_process(
             logger.exception("Failed to stop Codex %s wrapper process", operation)
     waiter = asyncio.create_task(proc.wait())
     deadline = asyncio.get_running_loop().time() + LOGIN_REAP_TIMEOUT_SECONDS
-    while not waiter.done():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise LoginProcessNotTerminal(
-                f"Codex {operation} wrapper did not terminate after SIGKILL"
-            )
-        try:
-            done, _pending = await asyncio.wait({waiter}, timeout=remaining)
-        except asyncio.CancelledError:
-            # Cleanup itself may be targeted during application shutdown. Keep
-            # waiting; the persistent journal is the fallback for hard kill.
-            continue
-        if not done:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise LoginProcessNotTerminal(
-                f"Codex {operation} wrapper termination timed out"
-            )
+    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    deadline_wait = asyncio.create_task(
+        asyncio.wait({waiter}, timeout=remaining)
+    )
+    # Keep the exact wrapper/journal finalizer uncancellable.  Its outer
+    # _await_login_cleanup boundary re-delivers request cancellation only after
+    # every credential and journal transition has settled.
+    await await_task_completion(deadline_wait)
+    done, _pending = deadline_wait.result()
+    if not done:
+        waiter.cancel()
+        await await_task_completion(waiter)
+        raise LoginProcessNotTerminal(
+            f"Codex {operation} wrapper termination timed out"
+        )
     if waiter.cancelled():
         raise LoginProcessNotTerminal(
             f"Codex {operation} wrapper waiter was cancelled"
@@ -830,17 +874,12 @@ async def _await_login_cleanup(coro):
     """Delay caller cancellation until the isolated cleanup task is complete."""
 
     cleanup_task = asyncio.create_task(coro)
-    cancelled = False
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError:
-            # Do not let HTTP disconnect/app shutdown cancel process reaping or
-            # credential rollback. Repeated cancellation is handled by looping.
-            cancelled = True
+    # Do not let HTTP disconnect/app shutdown cancel process reaping or
+    # credential rollback.
+    cancellation = await await_task_completion(cleanup_task)
     result = cleanup_task.result()
-    if cancelled:
-        raise asyncio.CancelledError
+    if cancellation is not None:
+        raise cancellation
     return result
 
 
@@ -1010,6 +1049,14 @@ async def _finalize_login_transaction(
         pool._quota_cache = None
     except Exception:
         logger.exception("Failed to reload Codex pool after %s", operation)
+    try:
+        await _finish_worker_node_login_if_reconciled(attempt_id)
+    except Exception:
+        # Credential cleanup is already complete/isolated. Keep the durable
+        # node fence fail-closed if its exact release cannot be committed.
+        logger.exception(
+            "Failed to release Worker node login fence for %s", attempt_id,
+        )
     return {
         "committed": committed,
         "cleanup_safe": cleanup_safe,
@@ -1079,6 +1126,13 @@ async def _rollback_unspawned_login_transaction(
     finally:
         if login_lock.locked():
             login_lock.release()
+    try:
+        await _finish_worker_node_login_if_reconciled(attempt_id)
+    except Exception:
+        logger.exception(
+            "Failed to release unspawned Worker node login fence for %s",
+            attempt_id,
+        )
 
 
 _FAILED_LOGIN_REUSABLE_FILES = frozenset({"models_cache.json"})
@@ -1435,11 +1489,37 @@ def _read_saved_mailbox_credential(
     )
 
 
-def _get_pool():
+def _get_optional_pool():
     from backend.main import codex_pool
-    if not codex_pool:
-        raise HTTPException(status_code=404, detail="Codex pool not enabled. Set CODEX_POOL_ENABLED=true in .env")
+
     return codex_pool
+
+
+def _get_pool():
+    pool = _get_optional_pool()
+    if not pool:
+        raise HTTPException(status_code=404, detail="Codex pool not enabled. Set CODEX_POOL_ENABLED=true in .env")
+    return pool
+
+
+def _disabled_pool_status() -> dict:
+    return {
+        "enabled": False,
+        "total": 0,
+        "available": 0,
+        "cooldown": 0,
+        "disabled": 0,
+        "preferred": None,
+        "last_selected": None,
+        "settings": {
+            "enabled": False,
+            "cooldown_seconds": 300,
+            "quota_switch_threshold_percent": 90.0,
+            "routing_policy": "api_first",
+            "preferred_account_id": None,
+        },
+        "accounts": [],
+    }
 
 
 def _get_instance_manager():
@@ -1458,8 +1538,80 @@ def _get_dispatcher():
 
 @router.get("/status")
 async def codex_pool_status():
+    pool = _get_optional_pool()
+    return pool.status() if pool else _disabled_pool_status()
+
+
+class CodexPoolSettingsBody(BaseModel):
+    enabled: bool = True
+    cooldown_seconds: int = Field(ge=1, le=8 * 24 * 60 * 60)
+    quota_switch_threshold_percent: float = Field(ge=1, le=100)
+    routing_policy: Literal["api_first", "native_first"] = "api_first"
+    preferred_account_id: str | None = None
+
+
+def _persist_pool_settings(pool, values: dict) -> dict:
+    """Atomically persist validated policy beside the native account list."""
+
+    pool_path = _pool_config_path(pool)
+    snapshot = _snapshot_private_file(pool_path)
+    if snapshot["existed"]:
+        original_bytes = base64.b64decode(snapshot["content_b64"], validate=True)
+        data = json.loads(original_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("Invalid Codex pool config")
+    else:
+        data = {"accounts": []}
+    data["pool_settings"] = values
+    _write_private_json(pool_path, data)
+    try:
+        pool.reload()
+        effective = pool.settings()
+    except Exception:
+        _restore_private_file(snapshot)
+        try:
+            pool.reload()
+        except Exception:
+            pass
+        raise
+    if effective != values:
+        _restore_private_file(snapshot)
+        pool.reload()
+        raise RuntimeError("Codex pool settings could not be activated")
+    return effective
+
+
+@router.get("/settings")
+async def codex_pool_settings(request: Request):
+    require_admin(request)
+    return _get_pool().settings()
+
+
+@router.put("/settings")
+async def codex_update_pool_settings(
+    request: Request,
+    body: CodexPoolSettingsBody,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
     pool = _get_pool()
-    return pool.status()
+    values = body.model_dump()
+    if _login_lock.locked():
+        raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
+    await fence_worker_node_account_mutation(db)
+    async with _login_lock:
+        preferred = values["preferred_account_id"]
+        if preferred is not None:
+            account = pool.account(preferred)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(404, f"Unknown account: {preferred}")
+        try:
+            effective = _persist_pool_settings(pool, values)
+            await db.commit()
+            return effective
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.exception("Failed to update Codex pool settings")
+            raise HTTPException(500, "Codex 号池配置保存失败") from exc
 
 
 @router.get("/usage")
@@ -1470,13 +1622,19 @@ async def codex_pool_usage(force: bool = False):
     app-server; rollout snapshots remain the background/failure fallback.
     """
     pool = _get_pool()
-    status = pool.status()
     quota_list = await pool.fetch_quota(force=force, live=force)
+    # Build status after the refresh so a newly observed native terminal quota
+    # is reflected in ``available`` immediately, rather than one request later.
+    status = pool.status()
     quota_by_id = {q["id"]: q for q in quota_list}
     for account in status["accounts"]:
         q = quota_by_id.get(account["id"], {})
         account["plan_type"] = q.get("plan_type")
-        account["quota"] = q.get("quota")
+        # A live RPC can briefly return an older 0% window after the native
+        # rollout has recorded a structured terminal usage-limit event. Use the
+        # pool's effective evidence for the UI as well as for routing.
+        effective_quota = pool.cached_quota_for_home(account["codex_home"])
+        account["quota"] = effective_quota or q.get("quota")
         account["quota_error"] = q.get("error")
         account["api_quota"] = q.get("api_quota")
     return status
@@ -1616,12 +1774,17 @@ async def codex_relogin(request: Request, account_id: str):
     instance_manager = _get_instance_manager()
     login_lock = _login_lock
     pool_path = _pool_config_path(pool)
+    attempt_id = uuid.uuid4().hex
     await login_lock.acquire()
     maintenance_started = False
     watcher_started = False
+    node_login_admitted = False
     proc: asyncio.subprocess.Process | None = None
     journal_path: Path | None = None
     try:
+        node_login_admitted = await _admit_worker_node_login_attempt(
+            attempt_id
+        )
         # Starting Xvfb does not touch CODEX_HOME, so reserve the account only
         # after the shared browser runtime is ready.
         await _ensure_xvfb()
@@ -1634,7 +1797,6 @@ async def codex_relogin(request: Request, account_id: str):
         maintenance_started = True
 
         script = root / "scripts" / "codex_login.py"
-        attempt_id = uuid.uuid4().hex
         journal_path = _begin_login_transaction(
             attempt_id=attempt_id,
             kind="relogin",
@@ -1731,6 +1893,15 @@ async def codex_relogin(request: Request, account_id: str):
                     finally:
                         if login_lock.locked():
                             login_lock.release()
+            if node_login_admitted and journal_path is None:
+                try:
+                    await _finish_worker_node_login_if_reconciled(attempt_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release unstarted Worker node login fence "
+                        "for %s",
+                        attempt_id,
+                    )
 
 
 @router.get("/accounts/{account_id}/relogin")
@@ -1922,9 +2093,13 @@ async def codex_add_account(request: Request, body: AddCodexAccountRequest):
     await login_lock.acquire()
     maintenance_started = False
     watcher_started = False
+    node_login_admitted = False
     proc: asyncio.subprocess.Process | None = None
     journal_path: Path | None = None
     try:
+        node_login_admitted = await _admit_worker_node_login_attempt(
+            attempt_id
+        )
         # The browser/Xvfb runtime and account-id allocation are process-wide;
         # serialize the full login and reserve the destination CODEX_HOME so
         # credentials cannot change underneath an active exec/app-server turn.
@@ -2061,6 +2236,15 @@ async def codex_add_account(request: Request, body: AddCodexAccountRequest):
                     finally:
                         if login_lock.locked():
                             login_lock.release()
+            if node_login_admitted and journal_path is None:
+                try:
+                    await _finish_worker_node_login_if_reconciled(attempt_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release unstarted Worker node login fence "
+                        "for %s",
+                        attempt_id,
+                    )
 
 
 @router.get("/add/{email}")
@@ -2107,6 +2291,18 @@ async def codex_submit_login_otp(
     if proc is None or proc.returncode is not None or stdin is None:
         raise HTTPException(status_code=409, detail="登录进程已经结束")
 
+    # Close the one-time-effect gate before touching the pipe.  ``drain`` is
+    # an await point and an HTTP response can be lost after the child consumed
+    # the code; leaving ``awaiting_otp`` visible until afterwards allowed a
+    # concurrent/retried request to write the same challenge twice.  On an
+    # ambiguous pipe failure we deliberately remain ``verifying_otp`` and let
+    # the child emit success/expiry (or cancellation) rather than replaying an
+    # effect whose acceptance cannot be known.
+    state.update({
+        "status": "verifying_otp",
+        "attempt_id": attempt_id,
+        "challenge_id": body.challenge_id,
+    })
     payload = json.dumps({
         "challenge_id": body.challenge_id,
         "code": code,
@@ -2118,11 +2314,6 @@ async def codex_submit_login_otp(
         raise HTTPException(status_code=409, detail="登录进程已无法接收验证码") from exc
 
     # Never retain the OTP. Only the opaque challenge id remains in state.
-    state.update({
-        "status": "verifying_otp",
-        "attempt_id": attempt_id,
-        "challenge_id": body.challenge_id,
-    })
     return {"ok": True, "status": "verifying_otp"}
 
 
@@ -2405,7 +2596,11 @@ async def codex_delete_account(request: Request, account_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/preferred")
-async def codex_set_preferred(request: Request, body: dict):
+async def codex_set_preferred(
+    request: Request,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
     """Pin a Codex route, or clear it to restore automatic selection.
 
     A compatible available pin takes effect on the next turn. Existing native
@@ -2416,6 +2611,20 @@ async def codex_set_preferred(request: Request, body: dict):
     require_admin(request)
     pool = _get_pool()
     account_id = body.get("account_id")
-    if not pool.set_preferred(account_id):
-        raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    return {"ok": True, "preferred": pool.preferred_account_id}
+    if _login_lock.locked():
+        raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
+    await fence_worker_node_account_mutation(db)
+    async with _login_lock:
+        if account_id is not None:
+            account = pool.account(account_id)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+        values = pool.settings()
+        values["preferred_account_id"] = account_id
+        try:
+            effective = _persist_pool_settings(pool, values)
+            await db.commit()
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.exception("Failed to persist preferred Codex account")
+            raise HTTPException(500, "Codex 优先账号保存失败") from exc
+    return {"ok": True, "preferred": effective["preferred_account_id"]}

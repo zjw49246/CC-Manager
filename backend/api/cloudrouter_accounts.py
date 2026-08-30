@@ -1,7 +1,7 @@
 """Administrative API for managed API-gateway Claude/Codex accounts.
 
 The historical route is retained so existing CloudRouter clients continue to
-work; the request's ``api_provider`` selects CloudRouter or ApexRouter.
+work; ``api_provider`` selects CloudRouter, ApexRouter, or APIBest.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ router = APIRouter(
 class CloudRouterAccountCreate(BaseModel):
     name: str
     api_key: SecretStr
-    api_provider: Literal["cloudrouter", "apex"] = "cloudrouter"
+    api_provider: Literal["cloudrouter", "apex", "apibest"] = "cloudrouter"
 
 
 def _get_store() -> CloudRouterAccountStore:
@@ -106,7 +106,13 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, CloudRouterAccountNotFound):
         return HTTPException(404, "API account not found")
     if isinstance(exc, CloudRouterAccountBusyError):
-        return HTTPException(409, str(exc))
+        return HTTPException(409, {
+            "message": str(exc),
+            "error": str(exc),
+            "code": exc.code,
+            "reason": exc.reason,
+            "cleanup_pending": True,
+        })
     if isinstance(exc, CloudRouterUnsafePathError):
         # A storage-integrity failure can occur before the durable retirement
         # tombstone is written. Keep 409 exclusively for staged/busy cleanup
@@ -195,6 +201,7 @@ async def _runtime_retirement_fence(account, store):
                 raise CloudRouterAccountBusyError(
                     "API account still has an active quota/credential request; "
                     "retry deletion after it finishes",
+                    code="credential_busy",
                 )
             blockers = await runtime.instance_manager.api_account_runtime_users(
                 account
@@ -212,7 +219,8 @@ async def _runtime_retirement_fence(account, store):
                 summary = ", ".join(blockers[:5])
                 raise CloudRouterAccountBusyError(
                     "API account is still in use by "
-                    f"{summary}; stop it and retry deletion"
+                    f"{summary}; stop it and retry deletion",
+                    code="runtime_busy",
                 )
 
             maintenance_started = False
@@ -232,6 +240,7 @@ async def _runtime_retirement_fence(account, store):
                     raise CloudRouterAccountBusyError(
                         "API account still has an active quota/credential request; "
                         "retry deletion after it finishes",
+                        code="credential_busy",
                     )
                 blockers = (
                     await runtime.instance_manager.api_account_runtime_users(
@@ -251,6 +260,7 @@ async def _runtime_retirement_fence(account, store):
                     raise CloudRouterAccountBusyError(
                         "API account acquired a runtime user before disable "
                         "completed; retry deletion",
+                        code="runtime_busy",
                     )
                 # Shared-project containers are a Claude-only execution path.
                 # ApexRouter has never exposed a Claude route, so no CCM
@@ -275,16 +285,21 @@ async def _runtime_retirement_fence(account, store):
             # fails before reaching the home lock; this preserves the global
             # lifecycle -> Store -> home ordering.
             yield
-    except CloudRouterAccountBusyError:
+    except (CloudRouterAccountBusyError, CloudRouterUnsafePathError):
         raise
     except Exception as exc:
         from backend.services.task_migrator import MigrationError
 
         if isinstance(exc, MigrationError):
-            raise CloudRouterAccountBusyError(str(exc)) from exc
+            raise CloudRouterAccountBusyError(
+                "API account cleanup is blocked by an active task migration; "
+                "retry after it finishes",
+                code="migration_busy",
+            ) from exc
         raise CloudRouterAccountBusyError(
             "API account runtime state could not be verified safely; "
             "retry deletion after active work finishes",
+            code="runtime_verification_failed",
         ) from exc
 
 
@@ -300,8 +315,17 @@ async def retire_account(request: Request, account_id: str):
             _reload_runtime_pools()
             if account.retired and not account.cleanup_pending:
                 return {"ok": True, **account.public_dict()}
-            async with _runtime_retirement_fence(account, store):
-                account = await store.finalize_retirement(account_id)
+            account = await store.mark_cleanup_attempt(account_id)
+            try:
+                async with _runtime_retirement_fence(account, store):
+                    account = await store.finalize_retirement(account_id)
+            except CloudRouterAccountBusyError as exc:
+                await store.record_cleanup_failure(
+                    account_id,
+                    code=exc.code,
+                    reason=exc.reason,
+                )
+                raise
             _reload_runtime_pools()
     except Exception as exc:
         # Stage may have succeeded before a busy/failure response. Project the

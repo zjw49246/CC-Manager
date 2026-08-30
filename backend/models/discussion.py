@@ -1,6 +1,14 @@
 from datetime import datetime
 
-from sqlalchemy import Integer, String, Text, DateTime, Boolean, Index
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -8,6 +16,18 @@ from backend.database import Base
 
 class Discussion(Base):
     __tablename__ = "discussions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'closing', 'closed')",
+            name="ck_discussions_status",
+        ),
+        Index(
+            "ix_discussions_project_status_id",
+            "project_id",
+            "status",
+            "id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")

@@ -1,5 +1,93 @@
 import json
+import re
 from datetime import datetime
+
+
+LEGACY_TOOL_MARKUP_ANOMALY = "legacy_tool_markup"
+
+_LEGACY_TOOL_TAG = re.compile(
+    r"<\s*(?P<closing>/\s*)?(?:antml:)?"
+    r"(?P<tag>invoke|parameter)\b(?P<attrs>[^>]{0,512})>",
+    re.IGNORECASE,
+)
+_LEGACY_TOOL_NAME_ATTR = re.compile(
+    r"\bname\s*=\s*(?:\"[^\"]+\"|'[^']+')",
+    re.IGNORECASE,
+)
+_MAX_LEGACY_TOOL_TAG_DEPTH = 1024
+
+
+def _contains_complete_legacy_tool_call(content: str) -> bool:
+    """Scan legacy tool tags once without backtracking across message text."""
+
+    # Each entry is [tag, has_name, has_closed_named_parameter]. Lists keep
+    # the final flag mutable when a matching parameter closes.
+    stack: list[list[object]] = []
+    for match in _LEGACY_TOOL_TAG.finditer(content):
+        tag = match.group("tag").lower()
+        if not match.group("closing"):
+            # Parameter text is opaque. A shell command or file body may
+            # contain literal target-looking tags; the first real closing
+            # parameter tag still determines the legacy call boundary.
+            if stack and stack[-1][0] == "parameter":
+                continue
+            if len(stack) >= _MAX_LEGACY_TOOL_TAG_DEPTH:
+                stack.clear()
+            stack.append([
+                tag,
+                bool(_LEGACY_TOOL_NAME_ATTR.search(match.group("attrs"))),
+                False,
+            ])
+            continue
+
+        if not stack or stack[-1][0] != tag:
+            if stack and stack[-1][0] == "parameter":
+                # See the opaque-parameter rule above: an invoke-looking
+                # closing string inside a command is not structural.
+                continue
+            # A malformed target-tag nesting cannot prove a complete call.
+            # Reset so a later independent, well-formed call can still match.
+            stack.clear()
+            continue
+
+        closed = stack.pop()
+        if tag == "parameter":
+            if closed[1]:
+                for parent in reversed(stack):
+                    if parent[0] == "invoke":
+                        if parent[1]:
+                            parent[2] = True
+                        break
+            continue
+        if closed[1] and closed[2]:
+            return True
+    return False
+
+
+def detect_assistant_protocol_anomaly(
+    event_type: object,
+    role: object,
+    content: object,
+    *,
+    provider: object = "claude",
+) -> str | None:
+    """Classify legacy tool markup emitted as assistant text.
+
+    Claude tools are valid only when the provider emits a structured
+    ``tool_use`` content block. Legacy XML-like wrappers inside a text block
+    are evidence of a provider/CLI protocol mismatch; they must remain inert
+    text and must never be parsed into an executable tool call by CCM.
+    """
+
+    if str(provider or "").strip().lower() != "claude":
+        return None
+    if event_type not in ("message", "result"):
+        return None
+    if (role is not None and role != "assistant") or not isinstance(content, str):
+        return None
+    if _contains_complete_legacy_tool_call(content):
+        return LEGACY_TOOL_MARKUP_ANOMALY
+    return None
 
 
 class StreamParser:
@@ -80,17 +168,33 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                if "stop_reason" in message_obj:
+                    event["stop_reason"] = message_obj["stop_reason"]
+                anomaly = detect_assistant_protocol_anomaly(
+                    event["event_type"],
+                    event["role"],
+                    event.get("content"),
+                )
+                if anomaly:
+                    event["protocol_anomaly"] = anomaly
                 if data.get("isApiErrorMessage"):
                     event["is_error"] = True
                 if usage_data:
                     event["context_usage"] = usage_data
                 return [event]
             events = []
+            envelope_has_tool_use = any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in content_blocks
+            )
             for block in content_blocks:
                 if not isinstance(block, dict):
                     continue
                 evt = _base_event()
                 evt["role"] = "assistant"
+                evt["assistant_envelope_has_tool_use"] = (
+                    envelope_has_tool_use
+                )
                 if block.get("type") == "tool_use":
                     evt["event_type"] = "tool_use"
                     evt["tool_name"] = block.get("name")
@@ -104,11 +208,20 @@ class StreamParser:
                 elif block.get("type") == "text":
                     evt["event_type"] = "message"
                     evt["content"] = block.get("text", "")
+                    anomaly = detect_assistant_protocol_anomaly(
+                        evt["event_type"],
+                        evt["role"],
+                        evt["content"],
+                    )
+                    if anomaly:
+                        evt["protocol_anomaly"] = anomaly
                     events.append(evt)
             if not events:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                if "stop_reason" in message_obj:
+                    event["stop_reason"] = message_obj["stop_reason"]
                 if data.get("isApiErrorMessage"):
                     event["is_error"] = True
                 if usage_data:
@@ -117,6 +230,10 @@ class StreamParser:
             if data.get("isApiErrorMessage"):
                 for event in events:
                     event["is_error"] = True
+            if "stop_reason" in message_obj:
+                stop_reason = message_obj["stop_reason"]
+                for event in events:
+                    event["stop_reason"] = stop_reason
             # Attach usage data to the first event only
             if usage_data and events:
                 events[0]["context_usage"] = usage_data
@@ -169,6 +286,13 @@ class StreamParser:
         elif event_type == "result":
             event = _base_event()
             event["content"] = self._extract_content(data)
+            anomaly = detect_assistant_protocol_anomaly(
+                event["event_type"],
+                event["role"],
+                event["content"],
+            )
+            if anomaly:
+                event["protocol_anomaly"] = anomaly
             event["session_id"] = data.get("session_id")
             cost = data.get("total_cost_usd")
             if cost is not None:

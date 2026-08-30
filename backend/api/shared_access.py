@@ -17,6 +17,7 @@ from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.log_entry import LogEntry
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 from backend.services.worker_proxy import get_task_operation_lock
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,12 @@ async def shared_history(
             "loop_iteration": row.loop_iteration,
             "task_retry_count": row.task_retry_count,
             "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+            "protocol_anomaly": detect_assistant_protocol_anomaly(
+                row.event_type,
+                row.role,
+                row.content,
+                provider=task.provider,
+            ),
         }
         if row.raw_json:
             try:
@@ -160,6 +167,20 @@ async def shared_chat(
         task = await db.get(Task, task_id)
         if not task:
             raise HTTPException(404, "Task not found")
+        from backend.api.tasks import (
+            _require_not_delivery_owned_task,
+            _require_not_isolated_browser_child,
+        )
+
+        _require_not_delivery_owned_task(
+            task,
+            action="sent shared-access chat messages",
+        )
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="sent shared-access chat messages",
+        )
         if not task.session_id:
             raise HTTPException(400, "Task has no active session")
         from backend.api.tasks import _require_pr_review_chat_allowed
@@ -211,6 +232,10 @@ async def shared_chat(
                 priority=PRIORITY_USER,
                 source="shared",
                 source_log_id=user_log.id,
+                initiating_user_id=None,
+                initiating_user_role="member",
+                execution_mode="sandbox",
+                execution_principal_kind="system",
             )
         except TaskStartPausedError as exc:
             raise HTTPException(

@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 
 import httpx
@@ -129,6 +130,6 @@ if __name__ == "__main__":
     _SUB_AGENT_SESSION_ID = args.sub_agent_session_id
     _TASK_ID = args.task_id
     _API_BASE = args.api_base
-    _AUTH_TOKEN = args.auth_token
+    _AUTH_TOKEN = os.environ.get("CCM_INTERNAL_SERVICE_TOKEN", "") or args.auth_token
 
     mcp.run(transport="stdio")

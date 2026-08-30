@@ -44,6 +44,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     merge_status: 'pending',
     instance_id: 1,
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 2,
     mode: 'loop',
     todo_file_path: 'TODO.md',
@@ -308,7 +309,13 @@ describe('LoopChatView', () => {
 
       // History arrives with the same message (DB id is smaller than the WS id)
       const historyMsgs: ChatMessage[] = [
-        makeMsg({ id: 50, content: 'Will be in history too', loop_iteration: 0 }),
+        makeMsg({
+          id: 50,
+          content: 'Will be in history too',
+          loop_iteration: 0,
+          task_retry_count: task.retry_count,
+          task_turn_generation: task.turn_generation,
+        }),
       ];
 
       await act(async () => {
@@ -471,9 +478,102 @@ describe('LoopChatView', () => {
         expect(screen.getByText('Iter 2 msg')).toBeInTheDocument();
       });
     });
+
+    it('ignores an older completed lifecycle after reconnecting to a later iteration', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        retry_count: 5,
+        turn_generation: 13,
+      });
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 20,
+          content: 'Iteration one answer',
+          loop_iteration: 0,
+          task_retry_count: 5,
+          task_turn_generation: 13,
+        }),
+        makeMsg({
+          id: 21,
+          role: 'system',
+          event_type: 'background_lifecycle',
+          content: null,
+          loop_iteration: 0,
+          task_retry_count: 5,
+          task_turn_generation: 13,
+          background_lifecycle: {
+            state: 'completed',
+            reason: 'descendants_completed',
+            active_count: 0,
+            active_thread_ids: [],
+            started_at: '2026-08-18T12:00:00Z',
+            last_activity_at: '2026-08-18T12:00:01Z',
+          },
+        }),
+        makeMsg({
+          id: 22,
+          content: 'Iteration two resumed',
+          loop_iteration: 1,
+          task_retry_count: 5,
+          task_turn_generation: 13,
+        }),
+      ]);
+
+      render(<LoopChatView task={task} onBack={onBack} />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Iteration two resumed')).toBeInTheDocument();
+        expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Main loop response finished; background agents are still running')).not.toBeInTheDocument();
+    });
   });
 
   describe('Detached background activity', () => {
+    it('uses the Codex background lifecycle without keeping the loop iteration active', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+        retry_count: 2,
+        turn_generation: 7,
+      });
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 10,
+          content: 'Foreground loop reply',
+          task_retry_count: 2,
+          task_turn_generation: 7,
+        }),
+      ]);
+
+      render(<LoopChatView task={task} onBack={onBack} />);
+      expect(await screen.findByText('Claude is working...')).toBeInTheDocument();
+
+      act(() => {
+        sendWs({
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 1,
+          background_active_thread_ids: ['child-loop-42'],
+          background_started_at: new Date().toISOString(),
+          background_last_activity_at: new Date().toISOString(),
+          task_retry_count: 2,
+          task_turn_generation: 7,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('Main loop response finished; background agents are still running')).toBeInTheDocument();
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+        expect(screen.queryByText('running', { selector: 'span' })).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+    });
+
     it('keeps a terminal task active and cancellable from its initial marker', async () => {
       vi.mocked(api.getTaskChatHistory).mockResolvedValue([
         makeMsg({ id: 1, content: 'Native child is still working' }),
@@ -487,7 +587,8 @@ describe('LoopChatView', () => {
       );
 
       await waitFor(() => {
-        expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+        expect(screen.getByText('Main loop response finished; background agents are still running')).toBeInTheDocument();
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
         expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
       });
       expect(capturedChannels).toEqual(['task:42', 'tasks']);
@@ -536,12 +637,157 @@ describe('LoopChatView', () => {
       });
 
       await waitFor(() => {
+        expect(screen.getByText('Main loop response finished; background agents are still running')).toBeInTheDocument();
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+    });
+
+    it('projects a current Codex lifecycle as background-only work', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+        retry_count: 2,
+        turn_generation: 9,
+      });
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({ id: 4, content: 'Foreground answer', loop_iteration: 1 }),
+      ]);
+      render(<LoopChatView task={task} onBack={onBack} />);
+      await screen.findByText('Foreground answer');
+      expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+
+      act(() => {
+        sendWs({
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 1,
+          background_active_thread_ids: ['codex-child'],
+          background_started_at: '2026-08-18T12:00:00Z',
+          background_last_activity_at: '2026-08-18T12:00:01Z',
+          task_retry_count: 2,
+          task_turn_generation: 9,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('Main loop response finished; background agents are still running')).toBeInTheDocument();
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
+      });
+
+      act(() => {
+        sendWs({
+          event_type: 'background_lifecycle',
+          background_state: 'completed',
+          background_reason: 'descendants_completed',
+          background_active_count: 0,
+          background_active_thread_ids: [],
+          background_started_at: '2026-08-18T12:00:00Z',
+          background_last_activity_at: '2026-08-18T12:00:02Z',
+          task_retry_count: 2,
+          task_turn_generation: 9,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByText('Main loop response finished; background agents are still running')).not.toBeInTheDocument();
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /Cancel Loop/i })).not.toBeInTheDocument();
+      });
+    });
+
+    it('treats a later loop iteration as foreground after completion', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+        retry_count: 4,
+        turn_generation: 12,
+      });
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({
+          id: 6,
+          content: 'Iteration one answer',
+          loop_iteration: 0,
+          task_retry_count: 4,
+          task_turn_generation: 12,
+        }),
+      ]);
+      render(<LoopChatView task={task} onBack={onBack} />);
+      await screen.findByText('Iteration one answer');
+
+      act(() => {
+        sendWs({
+          event_type: 'background_lifecycle',
+          background_state: 'completed',
+          background_reason: 'descendants_completed',
+          background_active_count: 0,
+          background_active_thread_ids: [],
+          background_started_at: '2026-08-18T12:00:00Z',
+          background_last_activity_at: '2026-08-18T12:00:02Z',
+          loop_iteration: 0,
+          task_retry_count: 4,
+          task_turn_generation: 12,
+        });
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
+      });
+
+      act(() => {
+        sendWs({
+          event_type: 'message',
+          role: 'assistant',
+          content: 'Iteration two is active',
+          loop_iteration: 1,
+          task_retry_count: 4,
+          task_turn_generation: 12,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('Iteration two is active')).toBeInTheDocument();
         expect(screen.getByText('Claude is working...')).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
       });
     });
 
-    it('does not reset on terminal status until the exact background marker settles', async () => {
+    it('ignores a Codex lifecycle from a stale loop turn', async () => {
+      const task = makeTask({
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+        retry_count: 3,
+        turn_generation: 10,
+      });
+      vi.mocked(api.getTaskChatHistory).mockResolvedValue([
+        makeMsg({ id: 5, content: 'Current foreground', loop_iteration: 2 }),
+      ]);
+      render(<LoopChatView task={task} onBack={onBack} />);
+      await screen.findByText('Current foreground');
+
+      act(() => {
+        sendWs({
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 1,
+          background_active_thread_ids: ['stale-child'],
+          background_started_at: '2026-08-18T12:00:00Z',
+          background_last_activity_at: '2026-08-18T12:00:01Z',
+          task_retry_count: 3,
+          task_turn_generation: 9,
+        });
+      });
+
+      expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+      expect(screen.queryByText('Main loop response finished; background agents are still running')).not.toBeInTheDocument();
+    });
+
+    it('keeps the background hint and cancel action after terminal status without marking an iteration active', async () => {
       vi.mocked(api.getTaskChatHistory).mockResolvedValue([
         makeMsg({ id: 3, content: 'Foreground and child output' }),
       ]);
@@ -558,7 +804,8 @@ describe('LoopChatView', () => {
           background_active: true,
         }, 'tasks');
       });
-      expect(screen.getByText('Claude is working...')).toBeInTheDocument();
+      expect(screen.getByText('Main loop response finished; background agents are still running')).toBeInTheDocument();
+      expect(screen.queryByText('Claude is working...')).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: /Cancel Loop/i })).toBeInTheDocument();
 
       act(() => {

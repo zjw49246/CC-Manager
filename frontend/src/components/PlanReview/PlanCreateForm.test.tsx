@@ -70,6 +70,8 @@ describe('PlanCreateForm', () => {
     const onCreated = vi.fn();
     render(<PlanCreateForm onCreated={onCreated} />);
 
+    expect(screen.queryByPlaceholderText('Plan title (optional)')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'New Plan' }));
     await userEvent.type(screen.getByPlaceholderText('Plan title (optional)'), 'Migration design');
     await userEvent.type(screen.getByPlaceholderText('What should this Plan investigate and decide?'), 'Compare migration strategies');
     await userEvent.selectOptions(screen.getByLabelText('Plan project'), '3');
@@ -86,5 +88,6 @@ describe('PlanCreateForm', () => {
     expect(payload).not.toHaveProperty('model');
     expect(payload).not.toHaveProperty('pipeline_config');
     expect(onCreated).toHaveBeenCalledWith(createdPlan);
+    expect(screen.getByRole('button', { name: 'New Plan' })).toBeInTheDocument();
   });
 });

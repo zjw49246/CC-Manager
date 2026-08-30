@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterator
 
+from backend.services.cancellation import await_task_completion
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -163,14 +165,7 @@ class TmpSpaceManager:
     ) -> TmpCleanupReport:
         """Wait for an in-flight rename/unlink even if the caller is cancelled."""
 
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-            except BaseException:
-                break
+        cancellation = await await_task_completion(operation)
 
         try:
             report = operation.result()

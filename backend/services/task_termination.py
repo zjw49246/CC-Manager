@@ -14,17 +14,27 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Awaitable, TypeVar
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.instance import Instance
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable
 from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
+)
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationConflict as DurableWorkerTaskTerminationConflict,
+    WorkerTaskTerminationPending as DurableWorkerTaskTerminationPending,
+    active_worker_task_termination_receipt,
+    create_or_resume_manager_receipt,
+    no_active_worker_task_termination_predicate,
+    reconcile_manager_receipt,
+    worker_task_termination_authority_predicate,
+    worker_task_termination_authority_matches,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +98,7 @@ class TaskTerminationResult:
     stopped: bool
     cleared_messages: int
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
@@ -107,31 +118,21 @@ class LocalTaskGeneration:
 
     status: str
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
     pty_background_generation: str | None
 
 
-_T = TypeVar("_T")
 _MAX_LATE_AUXILIARY_REAP_SWEEPS = 8
 _AUXILIARY_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
 
 
-async def _finish_despite_cancellation(awaitable: Awaitable[_T]) -> _T:
+async def _finish_despite_cancellation(awaitable):
     """Finish safety-critical cleanup before propagating caller cancellation."""
 
-    operation = asyncio.create_task(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    result = operation.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+    return await finish_awaitable(awaitable)
 
 
 def _utc_naive(value: datetime | None) -> datetime | None:
@@ -144,6 +145,7 @@ def local_task_generation(task: Task) -> LocalTaskGeneration:
     return LocalTaskGeneration(
         status=task.status,
         retry_count=task.retry_count,
+        turn_generation=task.turn_generation,
         instance_id=task.instance_id,
         started_at=_utc_naive(task.started_at),
         completed_at=_utc_naive(task.completed_at),
@@ -157,6 +159,7 @@ def normalize_local_task_generation(
     return LocalTaskGeneration(
         status=generation.status,
         retry_count=generation.retry_count,
+        turn_generation=generation.turn_generation,
         instance_id=generation.instance_id,
         started_at=_utc_naive(generation.started_at),
         completed_at=_utc_naive(generation.completed_at),
@@ -175,6 +178,7 @@ def local_task_generation_predicates(
         Task.shared_from_id.is_(None),
         Task.status == generation.status,
         Task.retry_count == generation.retry_count,
+        Task.turn_generation == generation.turn_generation,
         (
             Task.instance_id.is_(None)
             if generation.instance_id is None
@@ -212,7 +216,13 @@ async def stop_task_process(
     db: AsyncSession,
     *,
     expected_generations: list[tuple[int, int | None, datetime | None]],
+    expected_task_turn_generation: int,
     task_status: str = "completed",
+    allow_delivery_effect_stop: bool = False,
+    worker_termination_operation_id: str | None = None,
+    worker_termination_operation: str | None = None,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> bool:
     """Stop only exact Instance generations invalidated by the caller.
 
@@ -225,16 +235,93 @@ async def stop_task_process(
 
     from backend.main import instance_manager
 
+    receipt_identity = (
+        worker_termination_operation_id,
+        worker_termination_operation,
+        worker_termination_execution_token,
+        worker_termination_state_version,
+    )
+    if worker_termination_operation_id is None:
+        if any(value is not None for value in receipt_identity[1:]):
+            return False
+    elif (
+        worker_termination_operation
+        not in {"cancel", "stop_session", "supersede"}
+        or worker_termination_execution_token is None
+        or worker_termination_state_version is None
+    ):
+        return False
+
+    async def effect_authorized() -> bool:
+        await db.rollback()
+        task_lock = await db.execute(
+            sa_update(Task)
+            .where(Task.id == task_id)
+            .values(status=Task.status)
+            .execution_options(synchronize_session=False)
+        )
+        if task_lock.rowcount != 1:
+            await db.rollback()
+            return False
+        active_receipt = await active_worker_task_termination_receipt(
+            db,
+            task_id,
+            for_update=True,
+        )
+        lease_valid_at = datetime.utcnow()
+        authorized = worker_task_termination_authority_matches(
+            active_receipt,
+            operation_id=worker_termination_operation_id,
+            operation=worker_termination_operation,
+            execution_token=worker_termination_execution_token,
+            state_version=worker_termination_state_version,
+            lease_valid_at=lease_valid_at,
+        )
+        await db.rollback()
+        return authorized
+
+    if not await effect_authorized():
+        return False
+
     stopped = False
     for instance_id, expected_pid, expected_started_at in expected_generations:
+        if not await effect_authorized():
+            return stopped
+        protected_stop_kwargs = (
+            {"allow_delivery_effect_stop": True}
+            if allow_delivery_effect_stop
+            else {}
+        )
+        receipt_stop_kwargs = (
+            {
+                "worker_termination_operation_id": (
+                    worker_termination_operation_id
+                ),
+                "worker_termination_operation": worker_termination_operation,
+                "worker_termination_execution_token": (
+                    worker_termination_execution_token
+                ),
+                "worker_termination_state_version": (
+                    worker_termination_state_version
+                ),
+            }
+            if worker_termination_operation_id is not None
+            else {}
+        )
         generation_stopped = await instance_manager.stop(
             instance_id,
             expected_task_id=task_id,
+            expected_task_turn_generation=expected_task_turn_generation,
             expected_pid=expected_pid,
             expected_started_at=expected_started_at,
             task_status=task_status,
             terminal_consumer_timeout=30.0,
             consumer_cancel_timeout=10.0,
+            yield_to_worker_task_termination=(
+                worker_termination_operation_id is None
+            ),
+            **receipt_stop_kwargs,
+            **protected_stop_kwargs,
         )
         if not generation_stopped:
             # ``stop(False)`` can still mean that terminal bookkeeping won
@@ -261,12 +348,15 @@ async def stop_task_process(
         else:
             exact_owner_remains = None
         if not generation_stopped and exact_owner_remains is not None:
+            if not await effect_authorized():
+                return stopped
             generation_stopped = (
                 await instance_manager.reconcile_dead_reverse_task_owner(
                     instance_id,
                     expected_task_id=task_id,
                     expected_pid=expected_pid,
                     expected_started_at=expected_started_at,
+                    **receipt_stop_kwargs,
                 )
             )
         stopped = generation_stopped or stopped
@@ -339,10 +429,15 @@ async def lock_task_generation(
     *,
     expected_status: str,
     expected_retry_count: int,
+    expected_turn_generation: int,
     expected_instance_id: int | None,
     expected_started_at: datetime | None,
     expected_completed_at: datetime | None,
     expected_pty_background_generation: str | None,
+    allow_worker_termination_operation_id: str | None = None,
+    worker_termination_operation: str | None = None,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> Task | None:
     """Lock one exact Task generation until its terminal event is published."""
 
@@ -352,6 +447,7 @@ async def lock_task_generation(
         Task.shared_from_id.is_(None),
         Task.status == expected_status,
         Task.retry_count == expected_retry_count,
+        Task.turn_generation == expected_turn_generation,
         (
             Task.instance_id.is_(None)
             if expected_instance_id is None
@@ -377,6 +473,40 @@ async def lock_task_generation(
         sa_update(Task).where(*predicates).values(status=expected_status)
     )
     if not locked.rowcount:
+        await db.rollback()
+        return None
+    receipt = await active_worker_task_termination_receipt(
+        db,
+        task_id,
+        for_update=True,
+    )
+    lease_valid_at = datetime.utcnow()
+    if not worker_task_termination_authority_matches(
+        receipt,
+        operation_id=allow_worker_termination_operation_id,
+        operation=worker_termination_operation,
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=lease_valid_at,
+    ):
+        await db.rollback()
+        return None
+    authority_guard = await db.execute(
+        sa_update(Task)
+        .where(
+            *predicates,
+            worker_task_termination_authority_predicate(
+                operation_id=allow_worker_termination_operation_id,
+                operation=worker_termination_operation,
+                execution_token=worker_termination_execution_token,
+                state_version=worker_termination_state_version,
+                lease_valid_at=lease_valid_at,
+            ),
+        )
+        .values(status=expected_status)
+        .execution_options(synchronize_session=False)
+    )
+    if authority_guard.rowcount != 1:
         await db.rollback()
         return None
     db.expire_all()
@@ -540,6 +670,7 @@ def _same_local_identity(
         task.worker_id is None
         and task.shared_from_id is None
         and task.retry_count == generation.retry_count
+        and task.turn_generation == generation.turn_generation
         and task.instance_id == generation.instance_id
         and _utc_naive(task.started_at) == generation.started_at
     )
@@ -608,6 +739,7 @@ async def _terminate_local_task_generation_impl(
         "cancelled",
         "conflict",
     ),
+    allow_delivery_effect_stop: bool = False,
 ) -> TaskTerminationResult:
     """Safely terminalize one local Task and reap its exact Instance owners.
 
@@ -658,7 +790,8 @@ async def _terminate_local_task_generation_impl(
                 *local_task_generation_predicates(
                     task_id,
                     pre_abort_generation,
-                )
+                ),
+                no_active_worker_task_termination_predicate(),
             )
             .with_for_update()
         )
@@ -687,6 +820,7 @@ async def _terminate_local_task_generation_impl(
             .where(
                 *task_generation_fence(task_id, task),
                 task_retry_not_superseded_predicate(),
+                no_active_worker_task_termination_predicate(),
             )
             .values(metadata_=metadata)
         )
@@ -754,11 +888,15 @@ async def _terminate_local_task_generation_impl(
                 task_id,
                 db,
                 expected_generations=expected_generations,
+                expected_task_turn_generation=(
+                    observed_generation.turn_generation
+                ),
                 task_status=(
                     terminal_status
                     if terminal_status in {"completed", "cancelled"}
                     else "completed"
                 ),
+                allow_delivery_effect_stop=allow_delivery_effect_stop,
             )
         except asyncio.CancelledError:
             raise
@@ -794,6 +932,7 @@ async def _terminate_local_task_generation_impl(
                 observed_generation.pty_background_generation,
                 expected_status=observed_generation.status,
                 expected_retry_count=observed_generation.retry_count,
+                expected_turn_generation=observed_generation.turn_generation,
                 expected_instance_id=observed_generation.instance_id,
                 expected_started_at=observed_generation.started_at,
                 expected_completed_at=observed_generation.completed_at,
@@ -935,6 +1074,9 @@ async def _terminate_local_task_generation_impl(
         generation_predicates = task_generation_fence(task_id, current)
         if not marker_already_persisted:
             generation_predicates.append(task_retry_not_superseded_predicate())
+        generation_predicates.append(
+            no_active_worker_task_termination_predicate()
+        )
         guarded = await db.execute(
             sa_update(Task).where(*generation_predicates).values(**values)
         )
@@ -963,6 +1105,7 @@ async def _terminate_local_task_generation_impl(
                 )
             )
         expected_retry_count = observed_generation.retry_count
+        expected_turn_generation = observed_generation.turn_generation
         expected_instance_id = observed_generation.instance_id
         expected_started_at = observed_generation.started_at
         expected_completed_at = await read_persisted_task_completed_at(
@@ -1024,6 +1167,7 @@ async def _terminate_local_task_generation_impl(
             db,
             expected_status=terminal_status,
             expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
             expected_instance_id=expected_instance_id,
             expected_started_at=expected_started_at,
             expected_completed_at=expected_completed_at,
@@ -1054,6 +1198,7 @@ async def _terminate_local_task_generation_impl(
         stopped=stopped,
         cleared_messages=cleared,
         retry_count=expected_retry_count,
+        turn_generation=expected_turn_generation,
         instance_id=expected_instance_id,
         started_at=expected_started_at,
         completed_at=expected_completed_at,
@@ -1069,6 +1214,7 @@ async def _terminate_local_task_generation_with_cancellation_lease(
     expected_generation: LocalTaskGeneration | None,
     active_statuses: tuple[str, ...],
     terminal_statuses: tuple[str, ...],
+    allow_delivery_effect_stop: bool,
 ) -> TaskTerminationResult:
     """Fence new messages through the exact terminal generation commit."""
 
@@ -1082,7 +1228,47 @@ async def _terminate_local_task_generation_with_cancellation_lease(
             expected_generation=expected_generation,
             active_statuses=active_statuses,
             terminal_statuses=terminal_statuses,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
         )
+
+
+async def _fence_ordinary_task_termination(
+    task_id: int,
+    db: AsyncSession,
+) -> None:
+    """Serialize ordinary termination against durable receipt admission.
+
+    Receipt executors use the dedicated cancel/stop cores and never enter this
+    gate.  All legacy/internal PR workflow termination does, so an accepted
+    receipt remains the sole Task terminal writer.  The write intentionally
+    begins a fresh transaction to avoid a stale SQLite WAL read snapshot.
+    """
+
+    await db.rollback()
+    admitted = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if admitted.rowcount == 1:
+        await db.rollback()
+        return
+
+    await db.rollback()
+    receipt = await active_worker_task_termination_receipt(db, task_id)
+    await db.rollback()
+    if receipt is not None:
+        raise TaskGenerationTerminationConflict(
+            f"Task {task_id} has an active Worker termination receipt"
+        )
+    raise TaskTerminationConflict(
+        f"Task {task_id} is absent or is not authoritative on this Manager"
+    )
 
 
 async def terminate_local_task_generation(
@@ -1103,6 +1289,8 @@ async def terminate_local_task_generation(
         "cancelled",
         "conflict",
     ),
+    allow_delivery_effect_stop: bool = False,
+    operation_locks_held: bool = False,
 ) -> TaskTerminationResult:
     """Run the complete termination transaction despite caller cancellation.
 
@@ -1113,6 +1301,20 @@ async def terminate_local_task_generation(
     therefore one delayed-cancellation operation.
     """
 
+    if not operation_locks_held:
+        async with task_termination_operation_locks((task_id,)):
+            return await terminate_local_task_generation(
+                task_id,
+                db,
+                reason=reason,
+                expected_generation=expected_generation,
+                active_statuses=active_statuses,
+                terminal_statuses=terminal_statuses,
+                allow_delivery_effect_stop=allow_delivery_effect_stop,
+                operation_locks_held=True,
+            )
+
+    await _fence_ordinary_task_termination(task_id, db)
     return await _finish_despite_cancellation(
         _terminate_local_task_generation_with_cancellation_lease(
             task_id,
@@ -1121,6 +1323,7 @@ async def terminate_local_task_generation(
             expected_generation=expected_generation,
             active_statuses=active_statuses,
             terminal_statuses=terminal_statuses,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
         )
     )
 
@@ -1138,6 +1341,7 @@ async def lock_worker_task_generation(
         .where(
             *worker_task_generation_predicates(generation),
             Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
         )
         .values(status=generation.status)
     )
@@ -1154,24 +1358,39 @@ async def _terminate_worker_task_generation_impl(
     *,
     operation_locks_held: bool,
 ) -> WorkerTaskTerminationResult:
-    """Stop one Worker Task under migration/proxy locks and mirror its result."""
+    """Durably supersede one exact Worker Task and mirror its result.
 
-    from backend.main import task_migrator, worker_proxy
+    The Manager receipt is the cross-process operation owner.  It is committed
+    before even the first remote GET, then the shared query-before-write
+    reconciler drives Worker admission, exact stop, marker application and ACK.
+    A timeout is therefore retryable by operation id and never falls back to
+    the legacy blind GET/POST mutation path.
+    """
+
+    from backend.main import worker_proxy
     from backend.services.worker_relay import (
-        apply_authoritative_worker_task,
-        authoritative_worker_task_values,
         read_worker_task_generation,
         worker_task_generation,
+        WorkerTaskGeneration,
     )
 
     if worker_proxy is None:
         raise WorkerTaskTerminationConflict("Worker proxy is not available")
 
-    # End the webhook's earlier REPEATABLE READ snapshot before choosing the
-    # authoritative Worker assignment.
+    if not operation_locks_held:
+        async with task_termination_operation_locks((task_id,)):
+            return await _terminate_worker_task_generation_impl(
+                task_id,
+                db,
+                operation_locks_held=True,
+            )
+
+    # End the caller's earlier snapshot before receipt admission.  The helper
+    # performs a Task write/CAS and commits the immutable operation id before
+    # ``reconcile_manager_receipt`` can issue its first remote GET.
     await db.rollback()
     db.expire_all()
-    initial_task = (
+    current_task = (
         await db.execute(
             select(Task).where(
                 Task.id == task_id,
@@ -1180,189 +1399,121 @@ async def _terminate_worker_task_generation_impl(
             )
         )
     ).scalar_one_or_none()
-    if initial_task is None or type(initial_task.worker_id) is not int:
+    current_generation = (
+        worker_task_generation(current_task)
+        if current_task is not None
+        else None
+    )
+    if current_task is None or current_generation is None:
         await db.rollback()
         raise WorkerTaskTerminationConflict(
             f"Task {task_id} is absent or no longer Worker-authoritative"
         )
-    worker_id = initial_task.worker_id
-    await db.rollback()
 
-    migration_lock = (
-        task_migrator._locks.setdefault(task_id, asyncio.Lock())
-        if task_migrator is not None and not operation_locks_held
-        else None
-    )
-    operation_lock = (
-        worker_proxy.task_operation_lock(task_id) if not operation_locks_held else None
-    )
-    async with AsyncExitStack() as stack:
-        if not operation_locks_held:
-            if migration_lock is not None:
-                await stack.enter_async_context(migration_lock)
-            await stack.enter_async_context(operation_lock)
-
-        # Revalidate after both locks. Do not retain a database row lock across
-        # network I/O; exact response application below is the durable CAS.
-        await db.rollback()
-        db.expire_all()
-        current_task = (
-            await db.execute(
-                select(Task).where(
-                    Task.id == task_id,
-                    Task.worker_id == worker_id,
-                    Task.shared_from_id.is_(None),
-                )
-            )
-        ).scalar_one_or_none()
-        observed = (
-            worker_task_generation(
-                current_task,
-                expected_worker_id=worker_id,
-            )
-            if current_task is not None
-            else None
-        )
-        if observed is None:
-            await db.rollback()
-            raise WorkerTaskTerminationConflict(
-                f"Task {task_id} Worker assignment changed before stop"
-            )
-        await db.rollback()
-
-        routing_task = SimpleNamespace(id=task_id, worker_id=worker_id)
-        try:
-            remote_before = await worker_proxy.proxy_to_worker(
-                routing_task,
-                "GET",
-                f"/api/tasks/{task_id}/terminate-generation",
-                require_json=True,
-                operation_lock_held=True,
-            )
-        except Exception as exc:
-            raise WorkerTaskTerminationConflict(
-                f"Could not read Worker task {task_id} before stop"
-            ) from exc
-
-        remote_background_generation = remote_before.get("pty_background_generation")
-        if "pty_background_generation" not in remote_before or (
-            remote_background_generation is not None
-            and not isinstance(remote_background_generation, str)
-        ):
-            raise WorkerTaskTerminationConflict(
-                f"Worker task {task_id} omitted its opaque termination generation"
-            )
-
-        remote_values = authoritative_worker_task_values(
-            remote_before,
-            task_id=task_id,
-        )
-        if (
-            remote_values is None
-            or remote_before.get("retry_count") != observed.retry_count
-        ):
-            raise WorkerTaskTerminationConflict(
-                f"Worker task {task_id} generation does not match its Manager mirror"
-            )
-
-        remote_status = remote_before["status"]
-        terminal_statuses = {"completed", "failed", "cancelled", "conflict"}
-        active_statuses = {"pending", "in_progress", "executing", "merging"}
-        if remote_status not in active_statuses | terminal_statuses:
-            raise WorkerTaskTerminationConflict(
-                f"Worker task {task_id} cannot be stopped from {remote_status}"
-            )
-        try:
-            remote_result = await worker_proxy.proxy_to_worker(
-                routing_task,
-                "POST",
-                f"/api/tasks/{task_id}/terminate-generation",
-                body={
-                    "expected_status": remote_before["status"],
-                    "expected_retry_count": remote_before["retry_count"],
-                    "expected_instance_id": remote_before.get("instance_id"),
-                    "expected_started_at": remote_before.get("started_at"),
-                    "expected_completed_at": remote_before.get("completed_at"),
-                    "expected_pty_background_generation": (
-                        remote_background_generation
-                    ),
-                },
-                require_json=True,
-                operation_lock_held=True,
-            )
-        except WorkerTaskTerminationConflict:
-            raise
-        except Exception as exc:
-            # A timeout can mean the Worker committed the stop but its response
-            # was lost. Never create a replacement on an indeterminate result;
-            # a later synchronize retries through the terminal cleanup branch.
-            raise WorkerTaskTerminationConflict(
-                f"Worker task {task_id} stop was not authoritatively confirmed"
-            ) from exc
-
-        result_values = authoritative_worker_task_values(
-            remote_result,
-            task_id=task_id,
-        )
-        if (
-            result_values is None
-            or remote_result.get("retry_count") != observed.retry_count
-            or remote_result.get("status") not in terminal_statuses
-            or (remote_result.get("metadata_") or {}).get(
-                PR_REVIEW_SUPERSEDED_METADATA_KEY
-            )
-            is not True
-        ):
-            raise WorkerTaskTerminationConflict(
-                f"Worker task {task_id} returned a non-terminal generation"
-            )
-
-        resulting = await apply_authoritative_worker_task(
+    try:
+        receipt = await create_or_resume_manager_receipt(
             db,
-            observed,
-            remote_result,
-            metadata_updates={
-                PR_REVIEW_SUPERSEDED_METADATA_KEY: True,
-            },
+            current_task,
+            operation="supersede",
         )
-        if resulting is None:
-            # Relay may win the same authoritative status update while the
-            # HTTP response is in flight. Re-read and either accept that exact
-            # Worker retry generation or CAS the current mirror once more.
-            await db.rollback()
-            current = await read_worker_task_generation(db, task_id, worker_id)
-            if current is None or current.retry_count != remote_result["retry_count"]:
-                raise WorkerTaskTerminationConflict(
-                    f"Task {task_id} mirror changed before Worker stop applied"
-                )
-            resulting = await apply_authoritative_worker_task(
-                db,
-                current,
-                remote_result,
-                metadata_updates={
-                    PR_REVIEW_SUPERSEDED_METADATA_KEY: True,
-                },
-            )
-            if resulting is None:
-                raise WorkerTaskTerminationConflict(
-                    f"Task {task_id} mirror rejected Worker stop result"
-                )
+    except DurableWorkerTaskTerminationConflict as exc:
+        raise WorkerTaskTerminationConflict(str(exc)) from exc
 
-        locked = await lock_worker_task_generation(db, resulting)
-        if locked is None:
-            raise WorkerTaskTerminationConflict(
-                f"Task {task_id} changed generation before terminal publication"
-            )
-        if resulting.status != observed.status:
-            from backend.services.task_events import broadcast_status_change
-
-            await broadcast_status_change(task_id, resulting.status)
-        await db.commit()
-        return WorkerTaskTerminationResult(
-            task_id=task_id,
-            observed=observed,
-            resulting=resulting,
+    # Reconstruct the pre-stop contract from the immutable receipt, not from a
+    # terminal Manager row on a retry after result application / ACK loss.
+    observed = WorkerTaskGeneration(
+        task_id=receipt.task_id,
+        worker_id=receipt.worker_id,
+        incarnation_id=current_task.incarnation_id,
+        execution_user_id=current_task.execution_user_id,
+        execution_user_role=current_task.execution_user_role,
+        execution_mode=current_task.execution_mode,
+        execution_principal_kind=current_task.execution_principal_kind,
+        status=receipt.source_task_status,
+        retry_count=receipt.source_task_retry_count,
+        turn_generation=receipt.source_task_turn_generation,
+        instance_id=receipt.source_task_instance_id,
+        started_at=receipt.source_task_started_at,
+        completed_at=receipt.source_task_completed_at,
+        pty_background_generation=(
+            receipt.source_task_pty_background_generation
+        ),
+        worker_turn_handoff_id=receipt.source_worker_turn_handoff_id,
+        worker_turn_handoff_worker_id=(
+            receipt.source_worker_turn_handoff_worker_id
+        ),
+        worker_turn_handoff_retry_count=(
+            receipt.source_worker_turn_handoff_retry_count
+        ),
+        worker_turn_handoff_from_generation=(
+            receipt.source_worker_turn_handoff_from_generation
+        ),
+        worker_turn_handoff_source_log_id=(
+            receipt.source_worker_turn_handoff_source_log_id
+        ),
+        worker_turn_handoff_acknowledged=(
+            receipt.source_worker_turn_handoff_acknowledged
+        ),
+    )
+    operation_id = receipt.operation_id
+    worker_id = receipt.worker_id
+    try:
+        outcome = await reconcile_manager_receipt(
+            db,
+            operation_id,
+            proxy_request=worker_proxy.proxy_to_worker,
         )
+    except DurableWorkerTaskTerminationPending as exc:
+        # The active Manager receipt remains the durable retry identity.  Do
+        # not let the caller create the replacement until the exact result and
+        # ACK have converged and released the active slot.
+        raise WorkerTaskTerminationConflict(
+            f"Worker task {task_id} supersede is durably pending "
+            f"({operation_id})"
+        ) from exc
+    except DurableWorkerTaskTerminationConflict as exc:
+        raise WorkerTaskTerminationConflict(str(exc)) from exc
+
+    if outcome.status != "settled" or not isinstance(
+        outcome.result_payload,
+        dict,
+    ):
+        raise WorkerTaskTerminationConflict(
+            f"Worker task {task_id} supersede did not settle"
+        )
+    result_task = outcome.result_payload.get("task")
+    if not isinstance(result_task, dict):
+        raise WorkerTaskTerminationConflict(
+            f"Worker task {task_id} supersede omitted its exact Task result"
+        )
+
+    await db.rollback()
+    resulting = await read_worker_task_generation(db, task_id, worker_id)
+    mirrored_task = await db.get(Task, task_id, populate_existing=True)
+    if (
+        resulting is None
+        or mirrored_task is None
+        or resulting.status not in {"completed", "failed", "cancelled", "conflict"}
+        or result_task.get("id") != task_id
+        or result_task.get("status") != resulting.status
+        or result_task.get("retry_count") != resulting.retry_count
+        or result_task.get("turn_generation") != resulting.turn_generation
+        or result_task.get("background_active")
+        != (resulting.pty_background_generation is not None)
+        or not isinstance(mirrored_task.metadata_, dict)
+        or mirrored_task.metadata_.get(PR_REVIEW_SUPERSEDED_METADATA_KEY)
+        is not True
+    ):
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            f"Worker task {task_id} durable supersede result is invalid"
+        )
+    await db.rollback()
+    return WorkerTaskTerminationResult(
+        task_id=task_id,
+        observed=observed,
+        resulting=resulting,
+    )
 
 
 async def terminate_worker_task_generation(
@@ -1388,10 +1539,22 @@ async def terminate_authoritative_task_generation(
     *,
     reason: str,
     operation_locks_held: bool = False,
+    expected_local_generation: LocalTaskGeneration | None = None,
+    allow_delivery_effect_stop: bool = False,
 ) -> TaskTerminationResult | WorkerTaskTerminationResult:
     """Route termination to the currently authoritative local/Worker owner."""
 
-    await db.rollback()
+    if not operation_locks_held:
+        async with task_termination_operation_locks((task_id,)):
+            return await terminate_authoritative_task_generation(
+                task_id,
+                db,
+                reason=reason,
+                operation_locks_held=True,
+                expected_local_generation=expected_local_generation,
+                allow_delivery_effect_stop=allow_delivery_effect_stop,
+            )
+
     authority = (
         await db.execute(
             select(
@@ -1406,10 +1569,22 @@ async def terminate_authoritative_task_generation(
             f"Task {task_id} is absent or is not authoritative on this Manager"
         )
     if authority.worker_id is None:
+        # Local termination remains an ordinary writer and must yield to an
+        # already-admitted Worker-side receipt.  Worker-authoritative routing
+        # below deliberately skips this preflight: create-or-resume is the
+        # receipt arbiter and must be able to recover its own active supersede.
         return await terminate_local_task_generation(
             task_id,
             db,
             reason=reason,
+            expected_generation=expected_local_generation,
+            allow_delivery_effect_stop=allow_delivery_effect_stop,
+            operation_locks_held=True,
+        )
+    if expected_local_generation is not None:
+        raise TaskGenerationTerminationConflict(
+            f"Task {task_id} moved to a Worker after its local generation "
+            "was captured"
         )
     if type(authority.worker_id) is not int:
         raise TaskTerminationConflict(

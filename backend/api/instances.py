@@ -4,10 +4,10 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
-from backend.config import settings
 from backend.database import get_db
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
+from backend.models.task import Task
 from backend.schemas.instance import (
     InstanceCreate,
     InstanceResponse,
@@ -18,7 +18,11 @@ from backend.services.instance_capacity import (
     instance_capacity_lock,
     occupied_slot_predicate,
 )
-from backend.services.task_queue import persisted_pid_is_definitively_dead
+from backend.services.pr_review_runtime import is_pr_sandbox_task
+from backend.services.process_identity import (
+    persisted_process_is_definitively_dead,
+)
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 
 router = APIRouter(
     prefix="/api/instances",
@@ -50,6 +54,11 @@ def _instance_generation_predicates(instance: Instance) -> list:
             Instance.pid.is_(None)
             if instance.pid is None
             else Instance.pid == instance.pid
+        ),
+        (
+            Instance.process_identity.is_(None)
+            if instance.process_identity is None
+            else Instance.process_identity == instance.process_identity
         ),
         (
             Instance.started_at.is_(None)
@@ -95,15 +104,26 @@ async def _reconcile_dead_terminal_pid(
     The caller must hold InstanceManager's lifecycle lock. The exact status,
     PID and task owner predicates keep a stale cleanup request from clearing a
     newer generation that changed while the OS probe was in progress.
+
+    Death is proven from the full recorded identity (PID, start ticks and boot
+    id) so a reused PID number cannot keep a dead generation pinned forever.
     """
 
     pid = instance.pid
-    if pid is None or not persisted_pid_is_definitively_dead(pid):
+    if pid is None or not persisted_process_is_definitively_dead(
+        pid,
+        instance.process_identity,
+    ):
         return False
     predicates = [
         Instance.id == instance.id,
         Instance.status == instance.status,
         Instance.pid == pid,
+        (
+            Instance.process_identity.is_(None)
+            if instance.process_identity is None
+            else Instance.process_identity == instance.process_identity
+        ),
     ]
     if instance.current_task_id is None:
         predicates.append(Instance.current_task_id.is_(None))
@@ -123,16 +143,56 @@ async def _reconcile_dead_terminal_pid(
     reconciled = await db.execute(
         update(Instance)
         .where(*predicates)
-        .values(pid=None, current_task_id=None, current_plan_run_id=None)
+        .values(
+            pid=None,
+            process_identity=None,
+            current_task_id=None,
+            current_plan_run_id=None,
+        )
     )
     await db.commit()
     return bool(reconciled.rowcount)
 
 
+def _instance_response(
+    instance: Instance,
+    *,
+    task_retry_count: int | None,
+    task_turn_generation: int | None,
+) -> InstanceResponse:
+    """Expose the exact Task generation currently owned by an Instance."""
+
+    return InstanceResponse.model_validate(instance).model_copy(
+        update={
+            "current_task_retry_count": task_retry_count,
+            "current_task_turn_generation": task_turn_generation,
+        }
+    )
+
+
+def _instance_with_task_generation_query():
+    return select(
+        Instance,
+        Task.retry_count,
+        Task.turn_generation,
+    ).outerjoin(Task, Task.id == Instance.current_task_id)
+
+
 @router.get("", response_model=list[InstanceResponse])
 async def list_instances(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Instance).order_by(Instance.id))
-    return list(result.scalars().all())
+    rows = (
+        await db.execute(
+            _instance_with_task_generation_query().order_by(Instance.id)
+        )
+    ).all()
+    return [
+        _instance_response(
+            instance,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+        )
+        for instance, task_retry_count, task_turn_generation in rows
+    ]
 
 
 @router.post("", response_model=InstanceResponse, status_code=201)
@@ -146,7 +206,9 @@ async def create_instance(
     # Without it two simultaneous API/dispatcher admissions can both observe a
     # free slot and exceed the configured hard cap.
     async with instance_capacity_lock:
-        cap = settings.max_concurrent_instances
+        from backend.main import dispatcher
+
+        cap = dispatcher.max_concurrent_instances
         if cap > 0:
             live_count = await db.scalar(
                 select(func.count(Instance.id)).where(
@@ -239,10 +301,21 @@ async def cleanup_instances(request: Request, db: AsyncSession = Depends(get_db)
 
 @router.get("/{instance_id}", response_model=InstanceResponse)
 async def get_instance(instance_id: int, db: AsyncSession = Depends(get_db)):
-    instance = await db.get(Instance, instance_id)
-    if not instance:
+    row = (
+        await db.execute(
+            _instance_with_task_generation_query().where(
+                Instance.id == instance_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
         raise HTTPException(404, "Instance not found")
-    return instance
+    instance, task_retry_count, task_turn_generation = row
+    return _instance_response(
+        instance,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+    )
 
 
 @router.delete("/{instance_id}")
@@ -330,23 +403,83 @@ async def stop_instance(
     db: AsyncSession = Depends(get_db),
 ):
     from backend.main import instance_manager, ralph_loop
-    instance = await db.get(Instance, instance_id)
-    if instance is None:
-        raise HTTPException(404, "Instance not found")
-    if (
-        instance.current_plan_run_id is not None
-        or
-        instance.current_task_id != body.expected_task_id
-        or instance.pid != body.expected_pid
-        or instance.started_at != body.expected_started_at
-    ):
-        raise HTTPException(
-            409,
-            "Instance process generation changed; refresh before stopping",
-        )
+    from backend.services.worker_proxy import get_task_operation_lock
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+    )
 
-    # Stop the producer first so it cannot claim another task immediately after
-    # InstanceManager has reaped the current process.
+    # The Task operation lock is shared by receipt admission, migration, chat,
+    # and every Manager->Worker mutation.  Re-read the complete owner only
+    # after entering it: an administrator may have clicked Stop before a
+    # durable termination request committed, then waited behind that request.
+    await db.rollback()
+    async with get_task_operation_lock(body.expected_task_id):
+        instance = await db.get(Instance, instance_id)
+        if instance is None:
+            raise HTTPException(404, "Instance not found")
+        exact_owner = (
+            await db.execute(
+                select(Instance, Task)
+                .join(Task, Task.id == Instance.current_task_id)
+                .where(
+                    Instance.id == instance_id,
+                    Instance.current_plan_run_id.is_(None),
+                    Instance.current_task_id == body.expected_task_id,
+                    (
+                        Instance.pid.is_(None)
+                        if body.expected_pid is None
+                        else Instance.pid == body.expected_pid
+                    ),
+                    (
+                        Instance.started_at.is_(None)
+                        if body.expected_started_at is None
+                        else Instance.started_at == body.expected_started_at
+                    ),
+                    Task.id == body.expected_task_id,
+                    Task.instance_id == instance_id,
+                    Task.turn_generation
+                    == body.expected_task_turn_generation,
+                )
+            )
+        ).one_or_none()
+        if exact_owner is None:
+            raise HTTPException(
+                409,
+                "Instance Task or process generation changed; refresh before stopping",
+            )
+        instance, task = exact_owner
+        if await active_worker_task_termination_receipt(
+            db,
+            body.expected_task_id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+            raise HTTPException(
+                409,
+                "Delivery Developer instances are controlled by DeliveryRun; "
+                "the process was not stopped",
+            )
+        if is_pr_sandbox_task(task):
+            raise HTTPException(
+                409,
+                "Automated PR and Delivery Capability reviewer instances are "
+                "workflow-controlled; the process was not stopped",
+            )
+
+        # The operation lock is an admission preflight, not a lifecycle lease.
+        # Ralph shutdown can wait for InstanceManager/consumer cleanup, whose
+        # own terminal path may need this same Task lock. Release both the DB
+        # snapshot and process-local lock before any lifecycle wait. A receipt
+        # admitted afterwards still wins InstanceManager's final SQL gate via
+        # ``yield_to_worker_task_termination=True`` below.
+        await db.rollback()
+
+    # Stop the producer first so it cannot claim another task immediately
+    # after InstanceManager has reaped the current process.
     ralph_was_running = ralph_loop.is_running(instance_id)
     if await ralph_loop.stop(instance_id) is False:
         raise HTTPException(
@@ -356,18 +489,36 @@ async def stop_instance(
     ok = await instance_manager.stop(
         instance_id,
         expected_task_id=body.expected_task_id,
+        expected_task_turn_generation=(
+            body.expected_task_turn_generation
+        ),
         expected_pid=body.expected_pid,
         expected_started_at=body.expected_started_at,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
     if not ok:
         db.expire_all()
+        if await active_worker_task_termination_receipt(
+            db,
+            body.expected_task_id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         remaining_exact_owner = await db.scalar(
             select(Instance.id)
+            .join(Task, Task.id == Instance.current_task_id)
             .where(
                 Instance.id == instance_id,
                 Instance.current_task_id == body.expected_task_id,
+                Task.id == body.expected_task_id,
+                Task.instance_id == instance_id,
+                Task.turn_generation
+                == body.expected_task_turn_generation,
                 (
                     Instance.pid.is_(None)
                     if body.expected_pid is None
@@ -409,7 +560,8 @@ async def get_logs(
     event_type: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    if await db.get(Instance, instance_id) is None:
+    instance = await db.get(Instance, instance_id)
+    if instance is None:
         raise HTTPException(404, "Instance not found")
     if after_id is not None and offset:
         raise HTTPException(
@@ -417,7 +569,14 @@ async def get_logs(
             detail="after_id and offset cannot be used together",
         )
 
-    stmt = select(LogEntry).where(LogEntry.instance_id == instance_id)
+    # An Instance is reused across providers, so its current provider is not
+    # authoritative for historical rows. Prefer the Task that owns each log
+    # and retain the Instance only as the legacy/orphan fallback.
+    stmt = (
+        select(LogEntry, Task.provider)
+        .outerjoin(Task, Task.id == LogEntry.task_id)
+        .where(LogEntry.instance_id == instance_id)
+    )
     if event_type:
         stmt = stmt.where(LogEntry.event_type == event_type)
     if after_id is not None:
@@ -433,7 +592,18 @@ async def get_logs(
         # loads and existing callers.
         stmt = stmt.order_by(LogEntry.id.desc()).limit(limit).offset(offset)
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    entries = list(result.all())
+    responses = []
+    for entry, task_provider in entries:
+        response = LogEntryResponse.model_validate(entry)
+        response.protocol_anomaly = detect_assistant_protocol_anomaly(
+            entry.event_type,
+            entry.role,
+            entry.content,
+            provider=task_provider or instance.provider,
+        )
+        responses.append(response)
+    return responses
 
 
 @router.post("/{instance_id}/ralph/start")
@@ -474,17 +644,20 @@ async def dispatcher_status():
 @dispatcher_router.post("/start")
 async def start_dispatcher(request: Request):
     require_admin(request)
-    from backend.main import dispatcher
-    await dispatcher.start()
+    from backend.main import start_dispatcher_runtime
+    try:
+        await start_dispatcher_runtime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "message": "Dispatcher started"}
 
 
 @dispatcher_router.post("/stop")
 async def stop_dispatcher(request: Request):
     require_admin(request)
-    from backend.main import dispatcher
+    from backend.main import stop_dispatcher_runtime
     try:
-        await dispatcher.stop()
+        await stop_dispatcher_runtime()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "message": "Dispatcher stopped"}

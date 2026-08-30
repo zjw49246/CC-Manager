@@ -4,6 +4,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from backend.models.instance import Instance
+from backend.models.pr_monitor import MonitoredRepo, PRReview, PRReviewerRun
+from backend.models.task import Task
+
+
+def test_interactive_frontend_is_manager_only():
+    from backend.main import _serve_interactive_frontend
+
+    assert _serve_interactive_frontend("manager") is True
+    assert _serve_interactive_frontend("worker") is False
 
 
 @pytest.mark.asyncio
@@ -56,6 +65,125 @@ async def test_stats_with_tasks(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_stats_excludes_internal_pr_reviewers_without_changing_task_scope(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        ordinary = Task(
+            title="ordinary",
+            description="visible active work",
+            status="pending",
+        )
+        ordinary_archived = Task(
+            title="ordinary archived",
+            description="visible history",
+            status="completed",
+            archived=True,
+        )
+        db.add_all((ordinary, ordinary_archived))
+        await db.flush()
+        shared_mirror = Task(
+            title="shared mirror",
+            description="still part of execution statistics",
+            status="pending",
+            shared_from_id=ordinary.id,
+        )
+        legacy_single_task = Task(
+            title="legacy single reviewer",
+            description="internal review protocol",
+            status="pending",
+        )
+        panel_first_task = Task(
+            title="panel principal reviewer",
+            description="internal review protocol",
+            status="pending",
+            archived=True,
+        )
+        panel_second_task = Task(
+            title="panel senior reviewer",
+            description="internal review protocol",
+            status="completed",
+        )
+        db.add_all((
+            shared_mirror,
+            legacy_single_task,
+            panel_first_task,
+            panel_second_task,
+        ))
+        await db.flush()
+
+        repo = MonitoredRepo(
+            repo_full_name="example/system-stats-reviewers",
+            webhook_secret="stats-secret",
+        )
+        db.add(repo)
+        await db.flush()
+        legacy_review = PRReview(
+            repo_id=repo.id,
+            pr_number=10,
+            base_ref="main",
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            pr_title="Legacy single",
+            pr_author="alice",
+            pr_url="https://github.com/example/system-stats-reviewers/pull/10",
+            task_id=legacy_single_task.id,
+            status="reviewing",
+        )
+        panel_review = PRReview(
+            repo_id=repo.id,
+            pr_number=11,
+            base_ref="main",
+            base_sha="c" * 40,
+            head_sha="d" * 40,
+            pr_title="Reviewer panel",
+            pr_author="bob",
+            pr_url="https://github.com/example/system-stats-reviewers/pull/11",
+            # The first panel Task deliberately has both legacy and panel
+            # links.  It must still count as one internal reviewer, not leak
+            # through either classification branch.
+            task_id=panel_first_task.id,
+            status="reviewing",
+        )
+        db.add_all((legacy_review, panel_review))
+        await db.flush()
+        db.add_all((
+            PRReviewerRun(
+                pr_review_id=panel_review.id,
+                role="principal_engineer",
+                task_id=panel_first_task.id,
+                provider="claude",
+                status="reviewing",
+                prompt_policy_hash="e" * 64,
+                guide_pack_hash="f" * 64,
+            ),
+            PRReviewerRun(
+                pr_review_id=panel_review.id,
+                role="senior_engineer",
+                task_id=panel_second_task.id,
+                provider="claude",
+                status="passed",
+                prompt_policy_hash="1" * 64,
+                guide_pack_hash="2" * 64,
+            ),
+        ))
+        await db.commit()
+
+    response = await client.get("/api/system/stats")
+
+    assert response.status_code == 200
+    counts = response.json()["tasks"]
+    assert counts == {
+        "pending": 2,
+        "in_progress": 0,
+        "executing": 0,
+        "completed": 1,
+        "failed": 0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_stats_running_instances(client, session_factory):
     # Create an instance with status="running"
     async with session_factory() as db:
@@ -84,7 +212,30 @@ async def test_update_dry_run_forwards_force_and_branch(client, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json() == {"has_updates": False}
-    service.dry_run.assert_awaited_once_with(branch="release/test", force=True)
+    service.dry_run.assert_awaited_once_with(
+        branch="release/test",
+        force=True,
+        channel=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_dry_run_forwards_explicit_channel(client, monkeypatch):
+    service = MagicMock()
+    service.dry_run = AsyncMock(return_value={"has_updates": False})
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    resp = await client.post(
+        "/api/system/update",
+        json={"dry_run": True, "force": True, "channel": "stable"},
+    )
+
+    assert resp.status_code == 200
+    service.dry_run.assert_awaited_once_with(
+        branch=None,
+        force=True,
+        channel="stable",
+    )
 
 
 @pytest.mark.asyncio
@@ -107,6 +258,7 @@ async def test_update_returns_conflict_when_active_tasks_block_start(client, mon
         skip_frontend_build=False,
         force=True,
         branch="main",
+        channel=None,
     )
 
 
@@ -201,6 +353,24 @@ async def test_config_returns_default_model(client):
 
 
 @pytest.mark.asyncio
+async def test_config_advertises_exact_task_id_namespace(client, monkeypatch):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "auth_token", "worker-config-test-token")
+    resp = await client.get(
+        "/api/system/config",
+        headers={"Authorization": "Bearer worker-config-test-token"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["task_id_namespace_protocol"] == 1
+    assert data["task_id_namespace_boundary"] == 1_000_000_000
+    assert data["ccm_node_role"] == "worker"
+    assert data["worker_delegated_launch_admission_protocol"] == 2
+
+
+@pytest.mark.asyncio
 async def test_config_ships_codex_sol_as_default(client):
     resp = await client.get("/api/system/config")
     assert resp.status_code == 200
@@ -243,7 +413,7 @@ async def test_config_returns_two_stage_plan_pipeline_defaults(client):
                 "effort": "high",
             },
         },
-        "max_revision_cycles": 2,
+        "max_revision_cycles": 3,
         "max_interactions": 3,
     }
 
@@ -327,6 +497,29 @@ async def test_config_reflects_settings(client):
     data = resp.json()
     assert data["default_model"] == "haiku"
     assert data["model_options"] == ["haiku", "sonnet"]
+
+
+@pytest.mark.asyncio
+async def test_auto_capability_switch_is_independent_and_fail_closed(client):
+    from unittest.mock import patch
+    from backend.config import settings
+
+    response = await client.get("/api/system/config")
+    assert response.status_code == 200
+    assert response.json()["capability_core_enabled"] is True
+    assert response.json()["auto_capability_enabled"] is True
+    assert response.json()["delivery_loop_enabled"] is True
+
+    with patch.object(settings, "auto_capability_enabled", True), \
+         patch.object(settings, "capability_core_enabled", False):
+        response = await client.get("/api/system/config")
+    assert response.json()["auto_capability_enabled"] is False
+    assert response.json()["delivery_loop_enabled"] is False
+
+    with patch.object(settings, "auto_capability_enabled", True), \
+         patch.object(settings, "capability_core_enabled", True):
+        response = await client.get("/api/system/config")
+    assert response.json()["auto_capability_enabled"] is True
 
 
 # === Effort config tests ===

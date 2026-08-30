@@ -58,7 +58,7 @@ class PlanPipelineConfig(BaseModel):
     version: Literal[1] = 1
     planner: PlanStageRoutes
     reviewer: PlanReviewerRoutes
-    max_revision_cycles: int = Field(default=2, ge=0, le=10)
+    max_revision_cycles: int = Field(default=3, ge=0, le=10)
     # Independent from reviewer revision cycles: this bounds how many times a
     # single Run may pause for user input.  It is frozen with every Run.
     max_interactions: int = Field(default=3, ge=0, le=5)

@@ -89,10 +89,13 @@ def test_parse_alembic_revision_accepts_multiple_status_markers():
     output = (
         "INFO  [alembic.runtime.migration] Context impl SQLiteImpl.\n"
         "c7e9b1d42f60 (head) (mergepoint)\n"
+        "warning: unrelated command output\n"
+        "def456\n"
     )
 
     assert UpdateService._parse_alembic_revisions(output) == [
-        "c7e9b1d42f60"
+        "c7e9b1d42f60",
+        "def456",
     ]
 
 
@@ -113,6 +116,7 @@ async def test_status_reports_exact_code_and_database_revisions(tmp_path):
     )
 
     status = await service.get_status()
+    cached = await service.get_status()
 
     assert status["running_commit"] == "a" * 40
     assert status["disk_commit"] == "b" * 40
@@ -122,6 +126,9 @@ async def test_status_reports_exact_code_and_database_revisions(tmp_path):
     assert "database_migration_pending" in status["repair_reason_codes"]
     assert "runtime_code_stale" in status["repair_reason_codes"]
     assert status["restart_only_safe"] is False
+    assert cached == status
+    service._disk_commit.assert_awaited_once()
+    service._database_revision_status.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -698,6 +705,140 @@ def test_terminal_success_with_wrong_running_sha_becomes_incomplete(tmp_path):
     assert "不一致" in service._current.error
 
 
+def test_finish_claim_keeps_owner_token_when_terminal_write_fails(tmp_path):
+    service = _service(tmp_path)
+    service._lease_token = "owner"
+
+    with patch.object(
+        service,
+        "_update_deployment_lease",
+        return_value=False,
+    ):
+        persisted = service._finish_deployment_claim(
+            "failed",
+            "write failed",
+            incomplete=True,
+        )
+
+    assert persisted is False
+    assert service._lease_token == "owner"
+
+
+def test_current_owner_terminal_failure_is_reconciled(tmp_path):
+    commit = "a" * 40
+    service = _service(tmp_path, running_commit=commit)
+    state = _state(
+        status="restarting",
+        operation="restart",
+        old_commit=commit,
+        new_commit=commit,
+    )
+    service._current = state
+    token = service._claim_deployment_lease("restart")
+    assert token
+    lease = service._read_deployment_lease()
+    lease.update(
+        {
+            "status": "failed",
+            "handoff": False,
+            "message": "stop service failed",
+            "deployment_incomplete": False,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    _write_json(service._lease_file, lease)
+
+    service._reconcile_external_terminal_status()
+
+    assert service._current.status == "failed"
+    assert service._current.error == "stop service failed"
+    assert service._current.deployment_incomplete is False
+    assert service._lease_token is None
+
+
+def test_status_file_without_owner_token_cannot_finalize_current_claim(
+    tmp_path,
+):
+    commit = "a" * 40
+    service = _service(tmp_path, running_commit=commit)
+    state = _state(
+        status="restarting",
+        operation="restart",
+        old_commit=commit,
+        new_commit=commit,
+    )
+    service._current = state
+    token = service._claim_deployment_lease("restart")
+    assert token
+    _write_json(
+        service._status_file,
+        {
+            "status": "completed",
+            "port": service.port,
+            "new_commit": commit,
+            "expected_commit": commit,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    service._reconcile_external_terminal_status()
+
+    assert service._current.status == "restarting"
+    assert service._lease_token == token
+
+
+def test_expired_provisional_handoff_fails_closed(tmp_path):
+    service = _service(tmp_path)
+    state = _state(status="restarting")
+    service._current = state
+    assert service._claim_deployment_lease("update")
+    service._mark_deployment_handoff("restart")
+    lease = service._read_deployment_lease()
+    lease["handoff_ack_deadline"] = "2000-01-01T00:00:00+00:00"
+    _write_json(service._lease_file, lease)
+
+    service._reconcile_external_terminal_status()
+
+    assert service._current.status == "failed"
+    assert service._current.deployment_incomplete is True
+    assert service._lease_token is None
+    assert service._read_deployment_lease()["handoff"] is False
+
+
+@pytest.mark.asyncio
+async def test_repair_admission_reconciles_terminal_handoff_first(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    service._current = _state(status="restarting")
+    token = service._claim_deployment_lease("update")
+    assert token
+    lease = service._read_deployment_lease()
+    lease.update(
+        {
+            "status": "failed",
+            "handoff": False,
+            "message": "worker failed",
+            "deployment_incomplete": True,
+        }
+    )
+    _write_json(service._lease_file, lease)
+    service._pause_dispatching = AsyncMock()
+    service._resume_dispatching = MagicMock()
+    service._get_blocking_tasks = AsyncMock(return_value=[])
+    service._disk_commit = AsyncMock(return_value="b" * 40)
+
+    with patch(
+        "backend.services.update_service.asyncio.create_task"
+    ) as create_task:
+        result = await service.start_repair()
+
+    assert result["status"] == "started"
+    assert service._current.operation == "repair"
+    create_task.assert_called_once()
+    create_task.call_args.args[0].close()
+
+
 def test_legacy_missing_migration_result_recovers_as_unknown(tmp_path):
     service = _service(tmp_path)
     _write_json(
@@ -746,6 +887,81 @@ def test_fresh_tokenless_legacy_starting_waits_for_exact_terminal(tmp_path):
     service._reconcile_external_terminal_status()
     assert service._current.status == "completed"
     assert service._legacy_handoff is False
+
+
+def test_terminal_handoff_restores_release_metadata_and_completed_steps(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=new_commit)
+    service._current = _state(
+        status="restarting",
+        operation="update",
+        old_commit=old_commit,
+        new_commit=new_commit,
+    )
+    service._current.steps[-1].status = "failed"
+    token = service._claim_deployment_lease("update")
+    assert token
+    lease = service._read_deployment_lease()
+    lease.update(
+        {
+            "status": "completed",
+            "handoff": False,
+            "expected_commit": new_commit,
+            "update_channel": "stable",
+            "target_version": "v1.0.0",
+            "deployment_incomplete": False,
+        }
+    )
+    _write_json(service._lease_file, lease)
+
+    service._reconcile_external_terminal_status()
+
+    assert service._current.status == "completed"
+    assert service._current.update_channel == "stable"
+    assert service._current.target_version == "v1.0.0"
+    assert all(step.status == "completed" for step in service._current.steps)
+    assert all(step.message is None for step in service._current.steps)
+
+
+def test_recovery_enriches_legacy_lease_from_same_owner_status_metadata(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=new_commit)
+    lease = {
+        "port": service.port,
+        "owner_token": "legacy-owner",
+        "status": "completed",
+        "old_commit": old_commit,
+        "new_commit": new_commit,
+        "expected_commit": new_commit,
+        "operation": "update",
+        "deployment_incomplete": False,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(service._lease_file, lease)
+    _write_json(
+        service._status_file,
+        {
+            **lease,
+            "update_id": "upd_legacy",
+            "update_channel": "stable",
+            "target_version": "v1.0.2",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    service.recover_from_status_file()
+
+    assert service._current is not None
+    assert service._current.status == "completed"
+    assert service._current.update_channel == "stable"
+    assert service._current.target_version == "v1.0.2"
+    assert all(step.status == "completed" for step in service._current.steps)
 
 
 @pytest.mark.asyncio
@@ -1046,13 +1262,13 @@ async def test_repair_rechecks_dirty_checkout_before_backup(tmp_path):
     service._dirty_worktree_files = AsyncMock(
         return_value=[" M frontend/package.json"]
     )
-    service._backup_database = AsyncMock()
+    service._reserve_database_backup = MagicMock()
 
     await service._repair_inner(state, skip_frontend_build=False)
 
     assert state.status == "failed"
     assert "本地改动" in state.error
-    service._backup_database.assert_not_awaited()
+    service._reserve_database_backup.assert_not_called()
 
 
 def _configure_same_commit_update_pipeline(
@@ -1089,6 +1305,238 @@ def _configure_same_commit_update_pipeline(
         raise AssertionError(f"unexpected command: {command}")
 
     service._run_cmd = AsyncMock(side_effect=run_command)
+
+
+def _configure_changed_commit_update_pipeline(
+    service: UpdateService,
+    *,
+    old_commit: str,
+    new_commit: str,
+    changed_files: str,
+    command_order: list[str] | None = None,
+) -> None:
+    service._disk_commit = AsyncMock(return_value=old_commit)
+    service._deployment_base_commit = AsyncMock(return_value=old_commit)
+    service._resolve_remote = AsyncMock(return_value="origin")
+    service._fetch_and_validate_target_protocol = AsyncMock(
+        return_value=(True, "", new_commit)
+    )
+    service._reserve_database_backup = MagicMock(
+        return_value=str(Path(service.project_dir) / "before.db")
+    )
+    service._backup_frontend_dist = AsyncMock(
+        return_value=str(Path(service.project_dir) / "before-dist")
+    )
+    service._get_blocking_tasks = AsyncMock(return_value=[])
+
+    async def run_command(command, **_kwargs):
+        if command == [
+            "git",
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ]:
+            return {"returncode": 0, "stdout": "main\n", "stderr": ""}
+        if command[:3] == ["git", "merge", "--ff-only"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ["git", "rev-parse", "HEAD"]:
+            return {
+                "returncode": 0,
+                "stdout": f"{new_commit}\n",
+                "stderr": "",
+            }
+        if command[:3] == ["git", "diff", "--name-only"]:
+            return {
+                "returncode": 0,
+                "stdout": changed_files,
+                "stderr": "",
+            }
+        if command == ["uv", "sync"]:
+            if command_order is not None:
+                command_order.append("uv_sync")
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        raise AssertionError(f"unexpected command: {command}")
+
+    service._run_cmd = AsyncMock(side_effect=run_command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_files", "database_up_to_date", "expected_path"),
+    [
+        ("backend/example.py\n", False, "migration"),
+        ("alembic/versions/new_revision.py\n", True, "restart"),
+    ],
+)
+async def test_database_revision_is_authoritative_for_update_path(
+    tmp_path,
+    changed_files,
+    database_up_to_date,
+    expected_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    order: list[str] = []
+    service = _service(tmp_path, running_commit=old_commit)
+    state = _state(
+        status="running",
+        old_commit=old_commit,
+        new_commit="",
+    )
+    service._current = state
+    assert service._claim_deployment_lease("update")
+    _configure_changed_commit_update_pipeline(
+        service,
+        old_commit=old_commit,
+        new_commit=new_commit,
+        changed_files=changed_files,
+        command_order=order,
+    )
+
+    async def database_status():
+        order.append("database_check")
+        return {
+            "database_up_to_date": database_up_to_date,
+            "database_revision_error": "",
+        }
+
+    service._database_revision_status = AsyncMock(
+        side_effect=database_status
+    )
+    service._migration_path = AsyncMock()
+    service._fast_restart_path = AsyncMock()
+
+    await service._pipeline_inner(
+        state,
+        skip_frontend_build=True,
+        force=False,
+    )
+
+    assert order == ["uv_sync", "database_check"]
+    assert state.database_migration_required is (
+        not database_up_to_date
+    )
+    if expected_path == "migration":
+        service._migration_path.assert_awaited_once_with(state)
+        service._fast_restart_path.assert_not_awaited()
+    else:
+        service._migration_path.assert_not_awaited()
+        service._fast_restart_path.assert_awaited_once_with(state)
+
+
+@pytest.mark.asyncio
+async def test_dependency_failure_after_checkout_starts_code_only_rollback(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=old_commit)
+    state = _state(
+        status="running",
+        old_commit=old_commit,
+        new_commit="",
+    )
+    service._current = state
+    assert service._claim_deployment_lease("update")
+    _configure_changed_commit_update_pipeline(
+        service,
+        old_commit=old_commit,
+        new_commit=new_commit,
+        changed_files="backend/example.py\n",
+    )
+    original_run = service._run_cmd
+
+    async def fail_uv(command, **kwargs):
+        if command == ["uv", "sync"]:
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "broken dependency",
+            }
+        return await original_run(command, **kwargs)
+
+    service._run_cmd = AsyncMock(side_effect=fail_uv)
+    service._spawn_update_script = MagicMock()
+
+    async def commit_shutdown(callback):
+        callback()
+        return []
+
+    service._commit_shutdown_if_idle = AsyncMock(
+        side_effect=commit_shutdown
+    )
+    with patch(
+        "backend.services.update_service.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        await service._pipeline_inner(
+            state,
+            skip_frontend_build=True,
+            force=False,
+        )
+
+    assert state.status == "restarting"
+    assert state.deployment_incomplete is True
+    assert service._spawn_update_script.call_args.args[0] == (
+        "rollback_code"
+    )
+    assert service._spawn_update_script.call_args.kwargs["state"] is state
+
+
+@pytest.mark.asyncio
+async def test_repair_rebuilds_before_authoritative_revision_check(
+    tmp_path,
+):
+    service = _service(tmp_path)
+    state = _state(status="running", operation="repair")
+    service._current = state
+    assert service._claim_deployment_lease(
+        "repair", allow_failed=True
+    )
+    order: list[str] = []
+    service._reserve_database_backup = MagicMock(
+        return_value=str(tmp_path / "before.db")
+    )
+    service._backup_frontend_dist = AsyncMock(
+        return_value=str(tmp_path / "before-dist")
+    )
+
+    async def run_command(command, **_kwargs):
+        if command == ["uv", "sync"]:
+            order.append("uv_sync")
+        elif command == ["npm", "install"]:
+            order.append("npm_install")
+        elif command == ["npm", "run", "build"]:
+            order.append("frontend_build")
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    async def database_status():
+        order.append("database_check")
+        return {
+            "database_up_to_date": True,
+            "database_revision_error": "",
+        }
+
+    service._run_cmd = AsyncMock(side_effect=run_command)
+    service._database_revision_status = AsyncMock(
+        side_effect=database_status
+    )
+    service._fast_restart_path = AsyncMock()
+
+    await service._repair_inner(
+        state,
+        skip_frontend_build=False,
+    )
+
+    assert order == [
+        "uv_sync",
+        "npm_install",
+        "frontend_build",
+        "database_check",
+    ]
+    service._fast_restart_path.assert_awaited_once_with(state)
 
 
 @pytest.mark.asyncio
@@ -1205,7 +1653,7 @@ async def test_same_commit_repair_transition_failure_stops_pipeline(
         }
     )
     service._repair_inner = AsyncMock()
-    service._backup_database = AsyncMock()
+    service._reserve_database_backup = MagicMock()
     real_lease_update = service._update_deployment_lease
 
     def update_lease(**updates):
@@ -1228,7 +1676,7 @@ async def test_same_commit_repair_transition_failure_stops_pipeline(
     assert state.deployment_incomplete is True
     assert "修复事务" in state.error
     service._repair_inner.assert_not_awaited()
-    service._backup_database.assert_not_awaited()
+    service._reserve_database_backup.assert_not_called()
     assert service._read_deployment_lease()["operation"] == "update"
 
 
@@ -1393,6 +1841,81 @@ async def test_late_rollback_blocker_releases_lease_and_preserves_retry_record(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        _state(
+            status="completed",
+            operation="restart",
+            old_commit="a" * 40,
+            new_commit="a" * 40,
+        ),
+        _state(
+            status="failed",
+            old_commit="a" * 40,
+            new_commit="",
+        ),
+        _state(status="rolled_back"),
+    ],
+)
+async def test_manual_rollback_rejects_non_transition_state(
+    tmp_path,
+    state,
+):
+    service = _service(tmp_path)
+    service._current = state
+
+    result = await service.rollback(confirm_database_restore=True)
+
+    assert result == {"error": "没有可回滚的更新记录"}
+
+
+@pytest.mark.asyncio
+async def test_recovered_applied_migration_requires_restore_confirmation(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=new_commit)
+    payload = {
+        "status": "completed",
+        "operation": "update",
+        "owner_token": "owner-token",
+        "port": service.port,
+        "old_commit": old_commit,
+        "new_commit": new_commit,
+        "expected_commit": new_commit,
+        "backup_file": str(tmp_path / "before.db"),
+        "database_migration_required": True,
+        "database_migration_applied": True,
+        "deployment_incomplete": False,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(service._status_file, payload)
+    _write_json(service._lease_file, payload)
+    service.recover_from_status_file()
+
+    refused = await service.rollback()
+
+    assert refused["confirmation_required"] is True
+    assert refused["database_restore_required"] is True
+    service._get_blocking_tasks = AsyncMock(return_value=[])
+    service._pause_dispatching = AsyncMock()
+    service._resume_dispatching = MagicMock()
+    service._spawn_update_script = MagicMock()
+    with patch(
+        "backend.services.update_service.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        accepted = await service.rollback(
+            confirm_database_restore=True
+        )
+
+    assert accepted["status"] == "rolling_back"
+    assert service._spawn_update_script.call_args.args[0] == "rollback"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_post_claim_rollback_preserves_incomplete_fence(
     tmp_path,
 ):
@@ -1471,8 +1994,32 @@ def test_spawn_passes_protocol_v2_run_copy_directory(tmp_path):
     run_dir = Path(argv[-1])
     assert run_dir.name.startswith("ccm-update-run-")
     assert Path(argv[1]).parent == run_dir
+    assert argv[-3] == "retry"
+    assert argv[-2] == "restart"
     service.close_runtime_snapshot()
     assert Path(argv[1]).is_file()
+
+
+def test_spawn_passes_repair_operation_and_rollback_policy(tmp_path):
+    service = _service(tmp_path)
+    state = _state(status="restarting", operation="repair")
+    service._current = state
+    assert service._claim_deployment_lease("repair", allow_failed=True)
+
+    with patch.object(service, "_systemd_scope", return_value=None), patch(
+        "backend.services.update_service.subprocess.Popen"
+    ) as popen:
+        service._spawn_update_script(
+            "restart",
+            state.old_commit,
+            "",
+            state=state,
+            restart_failure_policy="rollback",
+        )
+
+    argv = popen.call_args.args[0]
+    assert argv[-3] == "rollback"
+    assert argv[-2] == "repair"
 
 
 def test_ambiguous_systemd_launch_keeps_lease_and_run_copy(tmp_path):
@@ -1553,3 +2100,36 @@ async def test_frontend_snapshot_records_that_dist_was_absent(tmp_path):
 
     assert snapshot.is_dir()
     assert (snapshot / ".ccm-dist-absent").is_file()
+
+
+def test_database_backup_reservation_does_not_copy_live_database(tmp_path):
+    service = _service(tmp_path)
+    service.db_path = tmp_path / "claude_manager.db"
+    service.db_path.write_bytes(b"live database bytes")
+
+    reserved = Path(service._reserve_database_backup())
+
+    assert reserved.parent == tmp_path / "backups"
+    assert reserved.name.startswith("claude_manager.db.bak.")
+    assert not reserved.exists()
+
+
+def test_database_backup_reservation_keeps_one_previous_snapshot(tmp_path):
+    service = _service(tmp_path)
+    service.db_path = tmp_path / "claude_manager.db"
+    service.db_path.write_bytes(b"live database bytes")
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    snapshots = []
+    for index in range(4):
+        snapshot = backup_dir / f"claude_manager.db.bak.{index}"
+        snapshot.write_bytes(str(index).encode())
+        os.utime(snapshot, (index + 1, index + 1))
+        snapshots.append(snapshot)
+
+    reserved = Path(service._reserve_database_backup())
+
+    assert not reserved.exists()
+    assert [path.name for path in backup_dir.glob("claude_manager.db.bak.*")] == [
+        snapshots[-1].name
+    ]

@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -22,6 +23,9 @@ from backend.models.pr_monitor import (
 )
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
+)
 
 
 BASE_SHA = "1" * 40
@@ -55,6 +59,7 @@ async def _seed_finding(db_session):
     review = PRReview(
         repo_id=repo.id,
         pr_number=7,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         pr_title="Fix issue",
@@ -161,6 +166,57 @@ async def _seed_confirmable_action(
     }
     await db_session.commit()
     return repo, review, finding, action, token, receipt, patch_sha
+
+
+async def _seed_terminal_fix_action(
+    db_session,
+    *,
+    task_status: str = "completed",
+    retry_count: int = 2,
+):
+    repo, review, finding = await _seed_finding(db_session)
+    task = Task(
+        title="terminal fix",
+        description="immutable",
+        status=task_status,
+        retry_count=retry_count,
+        started_at=datetime.utcnow() - timedelta(seconds=5),
+        completed_at=datetime.utcnow(),
+        metadata_={},
+    )
+    db_session.add(task)
+    await db_session.flush()
+    action = PRFindingAction(
+        finding_id=finding.id,
+        action_type="ai_fix",
+        status="running",
+        idempotency_key=f"terminal-fix-{task_status}-{retry_count}",
+        task_id=task.id,
+        expected_head_sha=HEAD_SHA,
+        active_fix_finding_id=finding.id,
+        result={
+            "allowed_files": [finding.path],
+            "action_nonce": "nonce-terminal",
+            "head_repo_full_name": "fork-owner/repo",
+            "head_ref": "feature/fix",
+        },
+    )
+    db_session.add(action)
+    await db_session.flush()
+    task.metadata_ = {
+        "pr_finding_action_id": action.id,
+        "expected_head_sha": HEAD_SHA,
+    }
+    if task_status == "completed":
+        db_session.add(LogEntry(
+            task_id=task.id,
+            task_retry_count=retry_count,
+            event_type="result",
+            content=_patch_terminal(),
+            timestamp=task.started_at + timedelta(seconds=1),
+        ))
+    await db_session.commit()
+    return repo, review, finding, action, task
 
 
 def test_patch_protocol_accepts_only_the_exact_allowed_file():
@@ -455,8 +511,11 @@ async def test_capture_failure_cleans_reservation_after_concurrent_wal_writer(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -558,6 +617,10 @@ async def test_create_fix_task_captures_route_and_uses_tool_free_tag(db_session)
     assert action.result["head_ref"] == "feature/fix"
     assert task.tags == ["pr-review-fix"]
     assert task.metadata_["pr_finding_action_id"] == action.id
+    assert task.execution_user_id is None
+    assert task.execution_user_role == "member"
+    assert task.execution_mode == "sandbox"
+    assert task.execution_principal_kind == "system"
     assert "backend/example.py" in task.description
 
 
@@ -570,6 +633,10 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
     import backend.main
     from backend.services import pr_review_fix
     from backend.services.worker_proxy import get_task_operation_lock
+    from backend.services.worker_task_termination import (
+        canonical_json_digest,
+        receipt_not_found_payload,
+    )
 
     _, _, finding = await _seed_finding(db_session)
     worker = Worker(
@@ -607,6 +674,8 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
     action_id = action.id
 
     calls = []
+    remote_receipt = None
+    receipt_path = None
 
     async def exact_worker_protocol(
         routing_task,
@@ -615,43 +684,115 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
         body=None,
         **kwargs,
     ):
+        nonlocal receipt_path, remote_receipt
         assert routing_task.id == task_id
         assert routing_task.worker_id == worker_id
-        assert path == f"/api/tasks/{task_id}/terminate-generation"
         assert kwargs == {
             "require_json": True,
             "operation_lock_held": True,
         }
-        calls.append((method, body))
+        operation_path = path.removesuffix("/ack")
+        operation_id = operation_path.rsplit("/", 1)[-1]
+        assert len(operation_id) == 32
+        assert all(char in "0123456789abcdef" for char in operation_id)
+        if receipt_path is None:
+            receipt_path = operation_path
+            assert receipt_path.startswith(
+                f"/api/tasks/{task_id}/termination-receipts/"
+            )
+        else:
+            assert operation_path == receipt_path
+        calls.append((method, path, body))
         if method == "GET":
-            return {
-                "id": task_id,
+            assert body is None
+            assert remote_receipt is None
+            return receipt_not_found_payload(task_id, operation_id)
+        if method == "PUT":
+            assert path == receipt_path
+            assert body["operation"] == "supersede"
+            request_payload = body["request_payload"]
+            request_digest = body["request_digest"]
+            assert request_digest == canonical_json_digest(request_payload)
+            assert request_payload["expected_remote"] == {
                 "status": "executing",
                 "retry_count": 0,
-                "instance_id": None,
-                "started_at": None,
-                "completed_at": None,
-                "pty_background_generation": None,
+                "turn_generation": 0,
             }
-        assert method == "POST"
+            result_payload = {
+                "version": 2,
+                "operation_id": operation_id,
+                "task_id": task_id,
+                "operation": "supersede",
+                "request_digest": request_digest,
+                "task": {
+                    "id": task_id,
+                    "status": "completed",
+                    "retry_count": 0,
+                    "turn_generation": 0,
+                    "instance_id": None,
+                    "started_at": None,
+                    "completed_at": "2026-01-02T03:04:06.000000",
+                    "session_id": None,
+                    "error_message": "Superseded by new PR push",
+                    "background_active": False,
+                },
+                "response": {
+                    "ok": True,
+                    "stopped": True,
+                    "cleared_messages": 0,
+                },
+            }
+            remote_receipt = {
+                "version": 2,
+                "operation_id": operation_id,
+                "task_id": task_id,
+                "side": "worker",
+                "worker_id": None,
+                "operation": "supersede",
+                "status": "succeeded",
+                "state_version": 3,
+                "source": {
+                    "incarnation_id": "1" * 32,
+                    "status": "executing",
+                    "retry_count": 0,
+                    "turn_generation": 0,
+                    "source_log_id": None,
+                    "instance_id": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "session_id": None,
+                    "pty_background_generation": None,
+                },
+                "request_payload": request_payload,
+                "request_digest": request_digest,
+                "result_payload": result_payload,
+                "result_digest": canonical_json_digest(result_payload),
+                "attempt_count": 1,
+                "reconcile_count": 0,
+                "last_error": None,
+                "accepted_at": "2026-01-02T03:04:05.000000",
+                "completed_at": "2026-01-02T03:04:06.000000",
+                "ack_intent_at": None,
+                "acknowledged_at": None,
+                "created_at": "2026-01-02T03:04:05.000000",
+                "updated_at": "2026-01-02T03:04:06.000000",
+            }
+            return remote_receipt
+        assert method == "POST" and path == receipt_path + "/ack"
+        assert remote_receipt is not None
         assert body == {
-            "expected_status": "executing",
-            "expected_retry_count": 0,
-            "expected_instance_id": None,
-            "expected_started_at": None,
-            "expected_completed_at": None,
-            "expected_pty_background_generation": None,
+            "request_digest": remote_receipt["request_digest"],
+            "result_digest": remote_receipt["result_digest"],
         }
-        return {
-            "id": task_id,
-            "status": "completed",
-            "retry_count": 0,
-            "instance_id": None,
-            "started_at": None,
-            "completed_at": None,
-            "error_message": "PR finding fix action cancelled",
-            "metadata_": {"pr_review_superseded": True},
-        }
+        acknowledged = deepcopy(remote_receipt)
+        acknowledged["status"] = "acknowledged"
+        acknowledged["state_version"] += 1
+        acknowledged["acknowledged_at"] = (
+            "2026-01-02T03:04:07.000000"
+        )
+        acknowledged["updated_at"] = "2026-01-02T03:04:07.000000"
+        remote_receipt = acknowledged
+        return acknowledged
 
     proxy = SimpleNamespace(
         task_operation_lock=get_task_operation_lock,
@@ -664,8 +805,9 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
             SimpleNamespace(_locks={}),
         ),
         patch.object(backend.main, "worker_proxy", proxy),
-        patch(
-            "backend.services.task_events.broadcast_status_change",
+        patch.object(
+            backend.main.broadcaster,
+            "broadcast",
             new_callable=AsyncMock,
         ) as publish,
     ):
@@ -680,16 +822,31 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
             cancelled_by_user_id=None,
         )
 
-    assert [method for method, _body in calls] == ["GET", "POST"]
+    assert [method for method, _path, _body in calls] == [
+        "GET",
+        "PUT",
+        "POST",
+    ]
     assert cancelled.status == "cancelled"
     assert cancelled.active_fix_finding_id is None
     assert cancelled_again.status == "cancelled"
-    publish.assert_awaited_once_with(task_id, "completed")
+    publish.assert_awaited_once_with(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": task_id,
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+            "new_status": "completed",
+            "background_active": False,
+        },
+    )
     current_task = await db_session.get(Task, task_id, populate_existing=True)
     assert current_task.status == "completed"
     assert current_task.metadata_ == {
         "pr_finding_action_id": action_id,
         "pr_review_superseded": True,
+        "ccm_worker_remote_materialized_v1": True,
     }
 
 
@@ -705,6 +862,7 @@ async def test_fix_completion_stages_hash_bound_confirmation(db_session):
         retry_count=2,
         started_at=datetime.utcnow() - timedelta(seconds=5),
         completed_at=datetime.utcnow(),
+        pty_background_generation="fix-background-generation",
         metadata_={
             "pr_finding_action_id": 1,
             "expected_head_sha": HEAD_SHA,
@@ -741,6 +899,7 @@ async def test_fix_completion_stages_hash_bound_confirmation(db_session):
         timestamp=task.started_at + timedelta(seconds=1),
     ))
     await db_session.commit()
+    finding_id = finding.id
 
     with (
         patch.object(pr_review_fix, "_verify_current_snapshot", AsyncMock()),
@@ -751,14 +910,17 @@ async def test_fix_completion_stages_hash_bound_confirmation(db_session):
             action_id=action.id,
             task_id=task.id,
             retry_count=2,
+            expected_background_generation="fix-background-generation",
         )
 
     await db_session.refresh(action)
     assert action.status == "awaiting_confirmation"
     assert action.patch_sha256 == hashlib.sha256(_patch_text().encode()).hexdigest()
     assert action.result["confirmation_token"]
+    await db_session.refresh(task)
+    assert task.pty_background_generation == "fix-background-generation"
     assert (
-        await db_session.get(PRFinding, finding.id, populate_existing=True)
+        await db_session.get(PRFinding, finding_id, populate_existing=True)
     ).status == "open"
 
 
@@ -819,6 +981,8 @@ async def test_fix_completion_distinguishes_snapshot_outage_from_drift(
         timestamp=task.started_at + timedelta(seconds=1),
     ))
     await db_session.commit()
+    action_id = action.id
+    finding_id = finding.id
 
     with (
         patch.object(
@@ -837,18 +1001,146 @@ async def test_fix_completion_distinguishes_snapshot_outage_from_drift(
 
     current = await db_session.get(
         PRFindingAction,
-        action.id,
+        action_id,
         populate_existing=True,
     )
     assert current.status == expected_status
     if expected_status == "running":
-        assert current.active_fix_finding_id == finding.id
+        assert current.active_fix_finding_id == finding_id
         assert "recovery will retry" in current.error_message
     else:
         assert current.active_fix_finding_id is None
     assert (
-        await db_session.get(PRFinding, finding.id, populate_existing=True)
+        await db_session.get(PRFinding, finding_id, populate_existing=True)
     ).status == "open"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", ["completed", "failed"])
+async def test_fix_terminal_consumers_yield_to_active_termination_receipt(
+    db_session,
+    db_factory,
+    task_status,
+):
+    from backend.services import pr_review_fix
+
+    _, _, finding, action, task = await _seed_terminal_fix_action(
+        db_session,
+        task_status=task_status,
+    )
+    finding_id = finding.id
+    action_id = action.id
+    task_id = task.id
+    retry_count = task.retry_count
+    await persist_active_worker_receipt(db_factory, task_id)
+
+    with (
+        patch.object(pr_review_fix, "_verify_current_snapshot", AsyncMock()),
+        patch.object(pr_review_fix, "_validate_patch_applies", AsyncMock()),
+    ):
+        if task_status == "completed":
+            await pr_review_fix.handle_fix_task_completion(
+                db_session,
+                action_id=action_id,
+                task_id=task_id,
+                retry_count=retry_count,
+            )
+        else:
+            await pr_review_fix.handle_fix_task_failure(
+                db_session,
+                action_id=action_id,
+                task_id=task_id,
+                retry_count=retry_count,
+                error="receipt owns failure arbitration",
+            )
+
+    current = await db_session.get(
+        PRFindingAction,
+        action_id,
+        populate_existing=True,
+    )
+    assert current.status == "running"
+    assert current.active_fix_finding_id == finding_id
+
+
+@pytest.mark.asyncio
+async def test_fix_completion_final_cas_yields_to_receipt_race(
+    tmp_path,
+):
+    from backend.services import pr_review_fix
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'fix-receipt-race.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as consumer:
+            _, _, finding, action, task = await _seed_terminal_fix_action(
+                consumer,
+            )
+            finding_id = finding.id
+            action_id = action.id
+            task_id = task.id
+            retry_count = task.retry_count
+            original_transition = pr_review_fix._commit_task_transition
+            raced = False
+
+            async def receipt_wins_before_final_cas(*args, **kwargs):
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    await persist_active_worker_receipt(sessions, task_id)
+                return await original_transition(*args, **kwargs)
+
+            with (
+                patch.object(
+                    pr_review_fix,
+                    "_verify_current_snapshot",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    pr_review_fix,
+                    "_validate_patch_applies",
+                    AsyncMock(),
+                ),
+                patch.object(
+                    pr_review_fix,
+                    "_commit_task_transition",
+                    side_effect=receipt_wins_before_final_cas,
+                ),
+            ):
+                await pr_review_fix.handle_fix_task_completion(
+                    consumer,
+                    action_id=action_id,
+                    task_id=task_id,
+                    retry_count=retry_count,
+                )
+
+            assert raced is True
+        async with sessions() as verifier:
+            current = await verifier.get(PRFindingAction, action_id)
+            assert current.status == "running"
+            assert current.active_fix_finding_id == finding_id
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1062,7 +1354,7 @@ async def test_current_head_route_rejects_retargeted_base_with_same_head(
         AsyncMock(return_value={
             "state": "open",
             "draft": False,
-            "base": {"sha": "2" * 40},
+            "base": {"ref": "main", "sha": "2" * 40},
             "head": {
                 "repo": {"full_name": "fork-owner/repo"},
                 "ref": "feature/fix",
@@ -1671,6 +1963,9 @@ async def test_worker_recovery_uses_detached_worker_snapshot(
             *,
             sync_status,
         ):
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            assert get_task_operation_lock(task_id).locked()
             observed.append((
                 loaded_worker.id,
                 loaded_worker.private_ip,
@@ -1685,6 +1980,12 @@ async def test_worker_recovery_uses_detached_worker_snapshot(
         "handle_fix_task_completion",
         new_callable=AsyncMock,
     ) as complete:
+        async def assert_completion_lock(*args, **kwargs):
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            assert get_task_operation_lock(task_id).locked()
+
+        complete.side_effect = assert_completion_lock
         changed = await pr_review_fix.reconcile_finding_action(
             db_factory,
             action_id,
@@ -1699,3 +2000,31 @@ async def test_worker_recovery_uses_detached_worker_snapshot(
         task_id=task_id,
         retry_count=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_finding_recovery_yields_to_active_termination_receipt(
+    db_session,
+    db_factory,
+):
+    from backend.services import pr_review_fix
+
+    _, _, finding, action, task = await _seed_terminal_fix_action(db_session)
+    finding_id = finding.id
+    action_id = action.id
+    task_id = task.id
+    await persist_active_worker_receipt(db_factory, task_id)
+
+    with (
+        patch.object(pr_review_fix, "_verify_current_snapshot", AsyncMock()),
+        patch.object(pr_review_fix, "_validate_patch_applies", AsyncMock()),
+    ):
+        recovered = await pr_review_fix.recover_incomplete_finding_actions(
+            db_factory,
+        )
+
+    assert recovered == 0
+    async with db_factory() as db:
+        current = await db.get(PRFindingAction, action_id)
+        assert current.status == "running"
+        assert current.active_fix_finding_id == finding_id

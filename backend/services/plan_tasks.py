@@ -5,19 +5,373 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
+from backend.models.sub_agent import SubAgentSession
 from backend.models.task import Task
+from backend.services.cancellation import settle_awaitable
+from backend.services.task_termination import _finish_despite_cancellation
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 
 ACTIVE_PLAN_STATUSES = frozenset({"pending", "in_progress", "executing"})
 MAX_ACTIVE_PLANS_PER_TASK = 3
 PLAN_CONTEXT_SNAPSHOT_MAX_CHARS = 60_000
+_T = TypeVar("_T")
+
+
+class PlanTerminalQuiescenceError(RuntimeError):
+    """A Plan committed terminal state but could not fully quiesce."""
+
+
+@dataclass(frozen=True)
+class _PlanTerminalGeneration:
+    status: str
+    retry_count: int
+    turn_generation: int
+    instance_id: int | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    pty_background_generation: str | None
+
+
+async def _read_plan_terminal_generation(
+    db: AsyncSession,
+    plan_task_id: int,
+    *,
+    for_update: bool = False,
+) -> _PlanTerminalGeneration | None:
+    query = select(
+        Task.status,
+        Task.retry_count,
+        Task.turn_generation,
+        Task.instance_id,
+        Task.started_at,
+        Task.completed_at,
+        Task.pty_background_generation,
+    ).where(
+        Task.id == plan_task_id,
+        Task.mode == "plan",
+    )
+    if for_update:
+        query = query.with_for_update()
+    row = (await db.execute(query)).one_or_none()
+    return _PlanTerminalGeneration(*row) if row is not None else None
+
+
+async def _stage_plan_auxiliary_cancellation(
+    db: AsyncSession,
+    plan_task_id: int,
+) -> list[tuple[int, str]]:
+    """Snapshot active/retryable producers and cancel running rows atomically."""
+
+    rows = list(
+        (
+            await db.execute(
+                select(
+                    SubAgentSession.id,
+                    SubAgentSession.agent_type,
+                )
+                .where(
+                    SubAgentSession.task_id == plan_task_id,
+                    SubAgentSession.source == "ccm",
+                    SubAgentSession.agent_type.in_(("monitor", "sub_agent")),
+                    SubAgentSession.status.in_(("running", "cancelled")),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not rows:
+        return []
+    session_ids = [session_id for session_id, _agent_type in rows]
+    await db.execute(
+        update(SubAgentSession)
+        .where(
+            SubAgentSession.id.in_(session_ids),
+            SubAgentSession.task_id == plan_task_id,
+            SubAgentSession.source == "ccm",
+            SubAgentSession.agent_type.in_(("monitor", "sub_agent")),
+            SubAgentSession.status == "running",
+        )
+        .values(
+            status="cancelled",
+            completed_at=datetime.utcnow(),
+            next_check_at=None,
+            active_turn_generation=None,
+            turn_started_at=None,
+        )
+    )
+    return rows
+
+
+async def run_plan_terminal_transition(
+    db: AsyncSession,
+    plan_task_id: int,
+    terminal_status: str,
+    mutate: Callable[[], Awaitable[_T]],
+    *,
+    authorize_effect_boundary: Callable[[], Awaitable[None]] | None = None,
+) -> _T:
+    """Commit and publish one Plan terminal decision under queue quiescence.
+
+    ``authorize_effect_boundary`` may establish the global Worker-node ->
+    Project -> Task -> Worker -> membership -> User fence after all queue
+    cleanup rollbacks and before this helper re-enters the Plan Task row.
+    ``mutate`` must then stage (but not commit) the exact Plan transition and
+    any successor row. The helper commits those writes together with
+    cancellation of every running CCM auxiliary producer. Once that commit
+    succeeds, all process cleanup, a second queue drain, and the exact status
+    publication are completed before the admission lease is released, even if
+    the HTTP caller is cancelled meanwhile.
+    """
+
+    async def operation() -> _T:
+        from backend.main import dispatcher
+        from backend.services.dispatcher import TaskQueueAbortTimeoutError
+        from backend.services.task_events import broadcast_status_change
+
+        if dispatcher is None:
+            raise PlanTerminalQuiescenceError("Dispatcher is unavailable")
+
+        async with dispatcher.task_queue_cancellation_lease(plan_task_id):
+            # clear_task_queue may commit durable delivery cancellations through
+            # ``durable_db``. It must therefore run before the caller stages the
+            # Plan/successor transaction.
+            await db.rollback()
+            try:
+                await dispatcher.abort_task_queue(
+                    plan_task_id,
+                    cancel_durable=False,
+                    durable_db=db,
+                )
+            except TaskQueueAbortTimeoutError as exc:
+                raise PlanTerminalQuiescenceError(
+                    "Plan queue worker could not be proven stopped; no "
+                    "terminal decision was committed"
+                ) from exc
+            await db.rollback()
+
+            pre_transition = await _read_plan_terminal_generation(
+                db,
+                plan_task_id,
+            )
+            await db.rollback()
+            if (
+                pre_transition is not None
+                and pre_transition.pty_background_generation is not None
+            ):
+                raise PlanTerminalQuiescenceError(
+                    "Plan still has detached PTY output; stop the session "
+                    "before publishing a terminal decision"
+                )
+
+            try:
+                if authorize_effect_boundary is not None:
+                    await authorize_effect_boundary()
+                # The read above is only an early diagnostic. This no-op CAS is
+                # the transaction-local authority: it serializes a detached PTY
+                # publication with the Plan decision on every supported DB and
+                # keeps the row locked through successor/terminal commit.
+                pty_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == plan_task_id,
+                        Task.mode == "plan",
+                        Task.pty_background_generation.is_(None),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if pty_guard.rowcount != 1:
+                    if await active_worker_task_termination_receipt(
+                        db,
+                        plan_task_id,
+                    ):
+                        raise PlanTerminalQuiescenceError(
+                            "Plan has an active Worker termination receipt"
+                        )
+                    raise PlanTerminalQuiescenceError(
+                        "Plan acquired detached PTY output while its terminal "
+                        "decision was starting"
+                    )
+                result = await mutate()
+                auxiliary_sessions = await _stage_plan_auxiliary_cancellation(
+                    db,
+                    plan_task_id,
+                )
+                precommit_generation = await _read_plan_terminal_generation(
+                    db,
+                    plan_task_id,
+                    for_update=True,
+                )
+                if (
+                    precommit_generation is None
+                    or precommit_generation.pty_background_generation is not None
+                ):
+                    raise PlanTerminalQuiescenceError(
+                        "Plan acquired detached PTY output before its terminal "
+                        "decision could commit"
+                    )
+                await db.commit()
+            except BaseException:
+                if db.in_transaction():
+                    await db.rollback()
+                raise
+
+            # Freeze the database-normalized generation written by the commit.
+            # Publication below compares every scalar that identifies a Plan
+            # turn, rather than trusting status alone.
+            # A stop failure is surfaced after the queue has still been drained
+            # and the already-committed exact terminal state has been published.
+            # The cancelled DB rows and advanced generation remain a durable
+            # fence against any producer whose callback was already in flight.
+            cleanup_failures: list[str] = []
+            delayed_cancellation: asyncio.CancelledError | None = None
+            expected_generation = None
+            try:
+                expected_generation = await _read_plan_terminal_generation(
+                    db,
+                    plan_task_id,
+                )
+            except asyncio.CancelledError as exc:
+                delayed_cancellation = exc
+                cleanup_failures.append(
+                    "terminal generation snapshot was cancelled"
+                )
+            except Exception as exc:
+                cleanup_failures.append(
+                    f"terminal generation snapshot failed: {exc}"
+                )
+            finally:
+                try:
+                    await db.rollback()
+                except asyncio.CancelledError as exc:
+                    delayed_cancellation = exc
+                    cleanup_failures.append(
+                        "terminal generation snapshot rollback was cancelled"
+                    )
+                except Exception as exc:
+                    cleanup_failures.append(
+                        f"terminal generation snapshot rollback failed: {exc}"
+                    )
+            if (
+                expected_generation is None
+                or expected_generation.status != terminal_status
+            ):
+                cleanup_failures.append(
+                    "Plan terminal transaction committed an unexpected generation"
+                )
+
+            for session_id, agent_type in auxiliary_sessions:
+                try:
+                    if agent_type == "sub_agent":
+                        await dispatcher.stop_sub_agent_session_process(session_id)
+                    else:
+                        await dispatcher.stop_monitor_session_process(
+                            session_id,
+                            terminal=True,
+                        )
+                except asyncio.CancelledError as exc:
+                    delayed_cancellation = exc
+                    cleanup_failures.append(
+                        f"session {session_id}: cleanup was cancelled"
+                    )
+                except Exception as exc:
+                    cleanup_failures.append(f"session {session_id}: {exc}")
+
+            try:
+                await dispatcher.abort_task_queue(
+                    plan_task_id,
+                    cancel_durable=False,
+                    durable_db=db,
+                )
+            except asyncio.CancelledError as exc:
+                delayed_cancellation = exc
+                cleanup_failures.append("queue drain was cancelled")
+            except TaskQueueAbortTimeoutError as exc:
+                cleanup_failures.append(f"queue drain: {exc}")
+            except Exception as exc:
+                cleanup_failures.append(f"queue drain: {exc}")
+
+            exact_generation = None
+            try:
+                await db.rollback()
+                db.expire_all()
+                exact_generation = await _read_plan_terminal_generation(
+                    db,
+                    plan_task_id,
+                    for_update=True,
+                )
+                if (
+                    expected_generation is None
+                    or expected_generation.status != terminal_status
+                    or exact_generation != expected_generation
+                ):
+                    cleanup_failures.append(
+                        "Plan generation changed before terminal publication "
+                        f"(expected {expected_generation}, "
+                        f"found {exact_generation})"
+                    )
+                    await db.rollback()
+                else:
+                    await broadcast_status_change(plan_task_id, terminal_status)
+                    await db.commit()
+            except asyncio.CancelledError as exc:
+                delayed_cancellation = exc
+                cleanup_failures.append(
+                    "terminal generation verification/publication was cancelled"
+                )
+                try:
+                    await db.rollback()
+                except asyncio.CancelledError as rollback_exc:
+                    delayed_cancellation = rollback_exc
+                    cleanup_failures.append(
+                        "terminal generation verification rollback was cancelled"
+                    )
+                except Exception as rollback_exc:
+                    cleanup_failures.append(
+                        "terminal generation verification rollback failed: "
+                        f"{rollback_exc}"
+                    )
+            except Exception as exc:
+                cleanup_failures.append(
+                    f"terminal generation verification/publication failed: {exc}"
+                )
+                try:
+                    await db.rollback()
+                except asyncio.CancelledError as rollback_exc:
+                    delayed_cancellation = rollback_exc
+                    cleanup_failures.append(
+                        "terminal generation verification rollback was cancelled"
+                    )
+                except Exception as rollback_exc:
+                    cleanup_failures.append(
+                        "terminal generation verification rollback failed: "
+                        f"{rollback_exc}"
+                    )
+
+            if delayed_cancellation is not None:
+                raise delayed_cancellation
+            if cleanup_failures:
+                raise PlanTerminalQuiescenceError(
+                    "Plan terminal state was committed, but cleanup could not "
+                    "be fully confirmed: " + "; ".join(cleanup_failures)
+                )
+            return result
+
+    return await _finish_despite_cancellation(operation())
 
 
 async def mark_plan_superseded(
@@ -42,6 +396,7 @@ async def mark_plan_superseded(
             Task.id == source.id,
             Task.mode == "plan",
             Task.status == "plan_review",
+            no_active_worker_task_termination_predicate(),
         )
         .values(
             status="superseded",
@@ -163,6 +518,21 @@ async def capture_repo_revision(path: str | None) -> dict | None:
     async def run_git(*args: str) -> tuple[int, bytes]:
         process = None
         communicate_task = None
+
+        async def finish_process() -> None:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            if communicate_task is not None:
+                await asyncio.gather(
+                    communicate_task,
+                    return_exceptions=True,
+                )
+            if process is not None and process.returncode is None:
+                await process.wait()
+
         try:
             git_env = {
                 key: value
@@ -190,31 +560,14 @@ async def capture_repo_revision(path: str | None) -> dict | None:
             )
             return process.returncode or 0, stdout
         except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
+            cleanup, _ = await settle_awaitable(finish_process())
+            cleanup.result()
             raise
-        except asyncio.TimeoutError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
-            return -1, b""
-        except OSError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
+        except (asyncio.TimeoutError, OSError):
+            cleanup, cancellation = await settle_awaitable(finish_process())
+            cleanup.result()
+            if cancellation is not None:
+                raise cancellation
             return -1, b""
 
     head_rc, head_raw = await run_git("rev-parse", "--verify", "HEAD")
@@ -233,6 +586,7 @@ async def capture_repo_revision(path: str | None) -> dict | None:
             if head_rc == 0
             else None
         ),
+        "dirty": bool(status_raw) if status_rc == 0 else None,
         "dirty_sha256": (
             hashlib.sha256(
                 status_raw

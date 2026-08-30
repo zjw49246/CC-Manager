@@ -104,6 +104,188 @@ def _make_gate_dispatcher(db_factory):
 # ---- update safety and version detection ----
 
 
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [
+        ("v1.2.3", (1, 2, 3)),
+        ("v10.0.0+build.4", (10, 0, 0)),
+        ("v1.2.3-rc.1", None),
+        ("v1.2", None),
+    ],
+)
+def test_stable_tag_parser_accepts_only_semver_releases(tag, expected):
+    assert UpdateService._stable_tag_key(tag) == expected
+
+
+@pytest.mark.asyncio
+async def test_stable_check_treats_main_ahead_as_explicit_channel_switch(
+    tmp_path,
+):
+    service = _make_service(tmp_path, running_commit="b" * 40)
+    current = "b" * 40
+    release = "a" * 40
+
+    async def run_cmd(args, **_kwargs):
+        command = tuple(args)
+        if command == ("git", "fetch", "--tags"):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "rev-parse", "HEAD"):
+            return {"returncode": 0, "stdout": current, "stderr": ""}
+        if command == ("git", "tag", "--list", "v*"):
+            return {"returncode": 0, "stdout": "v1.0.0\n", "stderr": ""}
+        if command == ("git", "rev-list", "-n", "1", "v1.0.0"):
+            return {"returncode": 0, "stdout": release, "stderr": ""}
+        if command == ("git", "merge-base", "--is-ancestor", release, current):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "log", "--oneline", f"{current}..{release}"):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "diff", "--name-only", f"{current}..{release}"):
+            return {
+                "returncode": 0,
+                "stdout": "frontend/src/App.tsx\n",
+                "stderr": "",
+            }
+        raise AssertionError(command)
+
+    service._run_cmd = AsyncMock(side_effect=run_cmd)
+
+    result = await service._check_stable_updates()
+
+    assert result["has_updates"] is True
+    assert result["update_kind"] == "stable_switch"
+    assert result["is_stable_downgrade"] is True
+    assert result["stable_switch_blocked"] is False
+    assert result["latest_version"] == "v1.0.0"
+    assert result["latest_commit"] == release
+
+
+@pytest.mark.asyncio
+async def test_stable_check_blocks_test_to_release_database_downgrade(
+    tmp_path,
+):
+    service = _make_service(tmp_path, running_commit="b" * 40)
+    current = "b" * 40
+    release = "a" * 40
+
+    async def run_cmd(args, **_kwargs):
+        command = tuple(args)
+        responses = {
+            ("git", "fetch", "--tags"): (0, ""),
+            ("git", "rev-parse", "HEAD"): (0, current),
+            ("git", "tag", "--list", "v*"): (0, "v1.0.0\n"),
+            ("git", "rev-list", "-n", "1", "v1.0.0"): (0, release),
+            ("git", "merge-base", "--is-ancestor", release, current): (0, ""),
+            ("git", "log", "--oneline", f"{current}..{release}"): (0, ""),
+            ("git", "diff", "--name-only", f"{current}..{release}"): (
+                0,
+                "alembic/versions/new_test_schema.py\n",
+            ),
+        }
+        if command not in responses:
+            raise AssertionError(command)
+        returncode, stdout = responses[command]
+        return {"returncode": returncode, "stdout": stdout, "stderr": ""}
+
+    service._run_cmd = AsyncMock(side_effect=run_cmd)
+
+    result = await service._check_stable_updates()
+
+    assert result["has_updates"] is False
+    assert result["stable_switch_blocked"] is True
+    assert result["migration_count"] == 1
+    assert "不能自动切回 Stable" in result["error"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+@pytest.mark.asyncio
+async def test_run_cmd_timeout_kills_grandchild_process_group(tmp_path):
+    service = _make_service(tmp_path)
+    pid_file = tmp_path / "child.pid"
+    code = (
+        "import os,time\n"
+        "pid=os.fork()\n"
+        "if pid == 0:\n"
+        " open(%r,'w').write(str(os.getpid()))\n"
+        " time.sleep(60)\n"
+        "else:\n"
+        " time.sleep(60)\n"
+    ) % str(pid_file)
+
+    result = await service._run_cmd(
+        [sys.executable, "-c", code], timeout=1
+    )
+
+    assert result["returncode"] == -1
+    child_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_run_cmd_anyio_cancel_reaps_process_and_streams(
+    tmp_path,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    service = _make_service(tmp_path)
+    scope_holder: dict[str, CancelScope] = {}
+    reaped = asyncio.Event()
+    killed = asyncio.Event()
+
+    class FakeStream:
+        async def readline(self):
+            await reaped.wait()
+            return b""
+
+    class FakeProcess:
+        pid = 515_151
+        returncode = None
+        stdout = FakeStream()
+        stderr = FakeStream()
+        wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                scope_holder["scope"].cancel()
+                await asyncio.Future()
+            await asyncio.sleep(0)
+            self.returncode = -9
+            reaped.set()
+            return self.returncode
+
+        def kill(self):
+            killed.set()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    def kill_group(pid, _signal):
+        assert pid == process.pid
+        killed.set()
+
+    monkeypatch.setattr(
+        "backend.services.update_service.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(
+        "backend.services.update_service.os.killpg",
+        kill_group,
+    )
+
+    with CancelScope() as scope:
+        scope_holder["scope"] = scope
+        with pytest.raises(asyncio.CancelledError):
+            await service._run_cmd(["fake-update-command"])
+
+    assert killed.is_set()
+    assert reaped.is_set()
+    assert process.returncode == -9
+
+
 def test_helper_missing_at_process_start_cannot_be_captured_late(tmp_path):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
@@ -700,6 +882,19 @@ async def test_concurrent_dry_runs_share_one_remote_check(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_main_dry_run_identifies_its_update_channel(tmp_path):
+    svc = _make_service(tmp_path)
+    svc._check_remote_updates = AsyncMock(return_value={
+        "has_updates": False,
+        "branch": "main",
+    })
+
+    result = await svc.dry_run(channel="main", force=True)
+
+    assert result["channel"] == "main"
+
+
+@pytest.mark.asyncio
 async def test_dry_run_cache_keeps_blockers_fresh_and_force_bypasses_cache(tmp_path):
     svc = _make_service(tmp_path)
     svc._check_remote_updates = AsyncMock(return_value={
@@ -850,7 +1045,9 @@ async def test_pipeline_rechecks_tasks_before_restart_and_resumes_dispatcher(tmp
         return {"returncode": 0, "stdout": "", "stderr": ""}
 
     svc._run_cmd = AsyncMock(side_effect=run_cmd)
-    svc._backup_database = AsyncMock(return_value=str(tmp_path / "backup.db"))
+    svc._reserve_database_backup = MagicMock(
+        return_value=str(tmp_path / "backup.db")
+    )
     svc._get_active_tasks = AsyncMock(return_value=[
         {"id": 12, "title": "started during update", "status": "executing"}
     ])
@@ -1311,7 +1508,35 @@ def _script_env(
     # stub uv: alembic hangs so the test can kill the script mid-migration
     uv = bin_dir / "uv"
     uv.write_text('#!/bin/bash\nif [[ "$*" == *alembic* ]]; then sleep 30; fi\nexit 0\n')
-    for f in (systemctl, sudo, uv):
+    bwrap = bin_dir / "bwrap"
+    bwrap.write_text("#!/bin/bash\nexit 0\n")
+    socat = bin_dir / "socat"
+    socat.write_text("#!/bin/bash\nexit 0\n")
+    npm_root = tmp_path / "npm-root"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/bash\n"
+        'if [ "$*" = "root -g" ]; then\n'
+        f"  printf '%s\\n' '{npm_root}'\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    for arch in ("x64", "arm64"):
+        apply_seccomp = (
+            npm_root
+            / "@anthropic-ai"
+            / "sandbox-runtime"
+            / "vendor"
+            / "seccomp"
+            / arch
+            / "apply-seccomp"
+        )
+        apply_seccomp.parent.mkdir(parents=True, exist_ok=True)
+        apply_seccomp.write_text("#!/bin/bash\nexit 0\n")
+        apply_seccomp.chmod(
+            apply_seccomp.stat().st_mode | stat.S_IEXEC
+        )
+    for f in (systemctl, sudo, uv, bwrap, socat, npm):
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
 
     env = os.environ.copy()

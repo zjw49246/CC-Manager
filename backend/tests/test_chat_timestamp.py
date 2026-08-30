@@ -20,7 +20,8 @@ def _make_log_row(timestamp: datetime | None = None, **kwargs):
         tool_name=None, tool_input=None, tool_output=None,
         is_error=False, loop_iteration=None,
         timestamp=timestamp or datetime(2026, 6, 10, 14, 30, 45, 123456),
-        raw_json=None,
+        raw_json=None, task_retry_count=None, task_turn_generation=None,
+        native_turn_id=None,
     )
     defaults.update(kwargs)
     row = MagicMock()
@@ -75,6 +76,9 @@ async def test_chat_history_null_timestamp():
     row.loop_iteration = None
     row.timestamp = None
     row.raw_json = None
+    row.task_retry_count = None
+    row.task_turn_generation = None
+    row.native_turn_id = None
 
     mock_db = AsyncMock()
     mock_db.get.return_value = mock_task

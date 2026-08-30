@@ -3,7 +3,9 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -108,6 +110,58 @@ async def test_codex_verify_endpoint_rejects_non_admin_before_pool_access():
     assert exc_info.value.status_code == 403
 
 
+def test_pool_settings_api_persistence_is_atomic_and_private(
+    pool: CodexPool, pool_config: Path
+):
+    from backend.api.codex_pool import _persist_pool_settings
+
+    expected = {
+        "enabled": True,
+        "cooldown_seconds": 600,
+        "quota_switch_threshold_percent": 80.0,
+        "routing_policy": "native_first",
+        "preferred_account_id": "codex-1",
+    }
+
+    assert _persist_pool_settings(pool, expected) == expected
+    stored = json.loads(pool_config.read_text(encoding="utf-8"))
+    assert stored["pool_settings"] == expected
+    assert pool_config.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_pool_settings_update_uses_worker_account_mutation_fence(
+    pool: CodexPool,
+):
+    from backend.api.codex_pool import (
+        CodexPoolSettingsBody,
+        codex_update_pool_settings,
+    )
+
+    request = Request({"type": "http", "method": "PUT", "path": "/"})
+    request.state.user_id = 1
+    request.state.user_role = "admin"
+    db = AsyncMock()
+    body = CodexPoolSettingsBody(**pool.settings())
+
+    with (
+        patch("backend.api.codex_pool._get_pool", return_value=pool),
+        patch(
+            "backend.api.codex_pool.fence_worker_node_account_mutation",
+            new=AsyncMock(),
+        ) as fence,
+        patch(
+            "backend.api.codex_pool._persist_pool_settings",
+            return_value=body.model_dump(),
+        ),
+    ):
+        result = await codex_update_pool_settings(request, body, db)
+
+    fence.assert_awaited_once_with(db)
+    db.commit.assert_awaited_once()
+    assert result == body.model_dump()
+
+
 def _rollout(home: Path, session_id: str, timestamp: str = "2026-07-21T00-00-00") -> Path:
     path = home / "sessions" / "2026" / "07" / "21" / f"rollout-{timestamp}-{session_id}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +202,31 @@ def _quota_rollout(
     return path
 
 
+def _usage_limit_rollout(
+    home: Path,
+    session_id: str,
+    *,
+    event_timestamp: str = "2026-08-18T19:40:04.821Z",
+    reset_text: str = "Aug 20th, 2026 7:15 AM",
+) -> Path:
+    path = _rollout(home, session_id, timestamp="2026-08-18T19-40-04")
+    path.write_text(json.dumps({
+        "timestamp": event_timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "error": {
+                "message": (
+                    "You've hit your usage limit. Visit the usage page or try "
+                    f"again at {reset_text}."
+                ),
+                "codex_error_info": "usage_limit_exceeded",
+            },
+        },
+    }) + "\n", encoding="utf-8")
+    return path
+
+
 class TestSharedDetectors:
     def test_imports_the_canonical_codex_detectors(self):
         assert (
@@ -164,6 +243,10 @@ class TestSharedDetectors:
         assert is_pool_rotatable("You have hit your usage limit")
         assert is_pool_rotatable("The refresh token was revoked")
         assert not is_pool_rotatable("request timed out")
+
+    def test_structured_usage_limit_code_is_detected(self):
+        assert is_rate_limited("usage_limit_exceeded")
+        assert is_rate_limited("Usage limit exceeded")
 
 
 class TestSelection:
@@ -315,6 +398,112 @@ class TestSelection:
             service_tier="priority",
         )
 
+    def test_default_selection_excludes_known_incompatible_native_catalog(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [{"id": "priority"}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+        assert not pool.supports_model_for_home(
+            tmp_path / "codex-1",
+            "gpt-5.6-sol",
+            service_tier="default",
+        )
+
+    def test_known_native_catalog_outranks_missing_catalog_for_default_tier(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        # codex-1 has no catalog, so it remains a compatibility fallback;
+        # the verified model-compatible account should be selected first.
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+
+    def test_missing_native_catalog_remains_default_tier_fallback(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+        assert pool.supports_model_for_home(
+            tmp_path / "codex-2",
+            "gpt-5.6-sol",
+            service_tier="default",
+        )
+
+    def test_malformed_native_catalog_remains_default_tier_fallback(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            "not-json\n",
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+
+    def test_null_and_default_model_resolve_configured_default_for_native_routing(
+        self, pool: CodexPool, tmp_path: Path, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            codex_pool_module.settings,
+            "default_codex_model",
+            "gpt-5.6-sol",
+        )
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.6-sol", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+
+        expected = str((tmp_path / "codex-2").resolve())
+        assert pool.select(model=None) == expected
+        pool._selection_cursor_id = None
+        assert pool.select(model="default") == expected
+        assert pool.account("codex-2").supports_model(None)
+        assert pool.account("codex-2").supports_model("default")
+
 
 class TestAccountHomeHelpers:
     def test_canonical_home_resolves_alias_and_drives_lookup(
@@ -424,6 +613,39 @@ class TestSessionLookup:
 
 
 class TestReload:
+    def test_legacy_config_uses_runtime_defaults(self, pool: CodexPool):
+        assert pool.settings() == {
+            "enabled": True,
+            "cooldown_seconds": 60,
+            "quota_switch_threshold_percent": 90.0,
+            "routing_policy": "api_first",
+            "preferred_account_id": None,
+        }
+
+    def test_persisted_pool_settings_survive_reload(
+        self, pool: CodexPool, pool_config: Path
+    ):
+        data = json.loads(pool_config.read_text(encoding="utf-8"))
+        data["pool_settings"] = {
+            "enabled": False,
+            "cooldown_seconds": 900,
+            "quota_switch_threshold_percent": 75,
+            "routing_policy": "native_first",
+            "preferred_account_id": "codex-2",
+        }
+        pool_config.write_text(json.dumps(data), encoding="utf-8")
+
+        pool.reload()
+
+        assert pool.settings() == {
+            "enabled": False,
+            "cooldown_seconds": 900,
+            "quota_switch_threshold_percent": 75.0,
+            "routing_policy": "native_first",
+            "preferred_account_id": "codex-2",
+        }
+        assert pool.select() is None
+
     def test_clears_removed_runtime_references_and_quota_cache(
         self, pool: CodexPool, pool_config: Path
     ):
@@ -699,6 +921,90 @@ async def test_rollout_scan_skips_newer_snapshot_without_usage_data(
     result = {item["id"]: item for item in await pool.fetch_quota(force=True)}
 
     assert result["codex-1"]["quota"]["primary_used_percent"] == 64
+
+
+def test_zero_addon_credit_wallet_is_not_native_quota_exhaustion():
+    quota = codex_pool_module._normalize_rate_limits({
+        "primary": {
+            "used_percent": 0.0,
+            "window_minutes": 300,
+            "resets_at": 1_800_000_000,
+        },
+        "secondary": None,
+        "credits": {
+            "has_credits": False,
+            "unlimited": False,
+            "balance": "0",
+        },
+    })
+
+    assert quota is not None
+    assert quota["primary_used_percent"] == 0.0
+    assert quota["is_rate_limited"] is False
+    assert "usage_limit_exceeded" not in quota
+    assert "credits_exhausted" not in quota
+
+
+def test_structured_terminal_beats_older_zero_percent_rollout(tmp_path: Path):
+    home = tmp_path / "codex-1"
+    _quota_rollout(
+        home,
+        "old-healthy",
+        0,
+        event_timestamp="2026-08-18T19:39:00Z",
+        mtime=2_000_000_000,
+    )
+    _usage_limit_rollout(home, "terminal")
+
+    quota = codex_pool_module._read_quota_from_rollout(str(home))
+
+    assert quota is not None
+    assert quota["usage_limit_exceeded"] is True
+    assert quota["is_rate_limited"] is True
+    expected_reset = time.mktime((2026, 8, 20, 7, 15, 0, 0, 0, -1))
+    assert quota["usage_limit_resets_at"] == expected_reset
+
+
+def test_terminal_before_account_quota_cutoff_is_ignored(tmp_path: Path):
+    home = tmp_path / "codex-1"
+    _usage_limit_rollout(home, "migrated-old-terminal")
+
+    quota = codex_pool_module._read_quota_from_rollout(
+        str(home),
+        min_event_timestamp=datetime.fromisoformat(
+            "2026-08-19T00:00:00+00:00"
+        ).timestamp(),
+    )
+
+    assert quota is None
+
+
+def test_rollout_tail_stops_after_first_quota_candidate(monkeypatch, tmp_path: Path):
+    event = json.dumps({
+        "timestamp": "2026-08-18T19:40:04.821Z",
+        "payload": {
+            "type": "task_complete",
+            "error": {"codex_error_info": "usage_limit_exceeded"},
+        },
+    }).encode()
+
+    def bounded_tail(_path):
+        yield event
+        raise AssertionError("quota parser read past the latest candidate")
+
+    monkeypatch.setattr(
+        codex_pool_module,
+        "_iter_rollout_lines_reverse",
+        bounded_tail,
+    )
+
+    candidate = codex_pool_module._latest_quota_event_in_rollout(
+        tmp_path / "large-rollout.jsonl",
+        0,
+    )
+
+    assert candidate is not None
+    assert candidate[1]["usage_limit_exceeded"] is True
 
 
 @pytest.mark.asyncio
@@ -1014,6 +1320,39 @@ async def test_usage_api_only_requests_live_quota_for_explicit_force(
     fake_pool.fetch_quota.assert_awaited_once_with(force=force, live=force)
 
 
+@pytest.mark.asyncio
+async def test_usage_api_projects_effective_terminal_over_stale_live_snapshot(
+    monkeypatch,
+):
+    from backend.api import codex_pool as codex_pool_api
+
+    terminal = {
+        "usage_limit_exceeded": True,
+        "is_rate_limited": True,
+        "usage_limit_resets_at": time.time() + 600,
+    }
+    fake_pool = type("FakePool", (), {})()
+    fake_pool.status = lambda: {
+        "accounts": [{
+            "id": "codex-1",
+            "codex_home": "/codex/one",
+            "available": False,
+        }],
+    }
+    fake_pool.fetch_quota = AsyncMock(return_value=[{
+        "id": "codex-1",
+        "quota": {"primary_used_percent": 0},
+        "plan_type": "pro",
+        "error": None,
+    }])
+    fake_pool.cached_quota_for_home = lambda _home: terminal
+    monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: fake_pool)
+
+    result = await codex_pool_api.codex_pool_usage(force=True)
+
+    assert result["accounts"][0]["quota"] == terminal
+
+
 class TestQuotaAwareSelection:
     def test_threshold_checks_primary_or_secondary(self):
         assert quota_at_or_above({"primary_used_percent": 90})
@@ -1022,6 +1361,122 @@ class TestQuotaAwareSelection:
             "primary_used_percent": 89.9,
             "secondary_used_percent": 40,
         })
+
+    def test_expired_window_no_longer_blocks_selection(self):
+        now = 1_700_000_000
+        assert not quota_at_or_above({
+            "primary_used_percent": 100,
+            "primary_resets_at": now - 1,
+            "is_rate_limited": True,
+        }, now=now)
+
+    def test_known_healthy_native_precedes_unknown_native(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        pool._selection_quota_cache = {
+            "codex-1": {"id": "codex-1", "quota": None},
+            "codex-2": {
+                "id": "codex-2",
+                "quota": {"primary_used_percent": 20},
+            },
+        }
+        pool._selection_quota_cache_at = time.time()
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
+
+    def test_active_terminal_beats_later_stale_live_zero(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {
+                    "usage_limit_exceeded": True,
+                    "is_rate_limited": True,
+                    "usage_limit_resets_at": now + 600,
+                },
+            },
+            "codex-2": {
+                "id": "codex-2",
+                "quota": {"primary_used_percent": 10},
+            },
+        }
+        pool._selection_quota_cache_at = now
+        pool._quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {"primary_used_percent": 0},
+            },
+        }
+        pool._quota_cache_at = now + 1
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
+        assert pool.account_status("codex-1")["available"] is False
+
+    def test_expired_terminal_can_be_reopened_by_known_healthy_live(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {
+                    "usage_limit_exceeded": True,
+                    "is_rate_limited": True,
+                    "usage_limit_resets_at": now - 1,
+                },
+            },
+        }
+        pool._selection_quota_cache_at = now
+        pool._quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {"primary_used_percent": 0},
+            },
+            "codex-2": {"id": "codex-2", "quota": None},
+        }
+        pool._quota_cache_at = now + 1
+
+        assert pool.select() == str((tmp_path / "codex-1").resolve())
+        assert pool.account_status("codex-1")["available"] is True
+
+    def test_all_known_high_native_accounts_defer_but_remain_retryable(
+        self, pool: CodexPool,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            account_id: {
+                "id": account_id,
+                "quota": {
+                    "primary_used_percent": 100,
+                    "primary_resets_at": now + 300,
+                    "is_rate_limited": True,
+                },
+            }
+            for account_id in ("codex-1", "codex-2")
+        }
+        pool._selection_quota_cache_at = now
+
+        assert pool.select() is None
+        assert pool.has_retryable_compatible_account(None)
+        assert 1 <= pool.quota_retry_after() <= 300
+
+    @pytest.mark.asyncio
+    async def test_cold_cache_refresh_skips_structured_terminal_account(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        _usage_limit_rollout(tmp_path / "codex-1", "terminal")
+        _quota_rollout(
+            tmp_path / "codex-2",
+            "healthy",
+            10,
+            event_timestamp="2026-08-18T19:41:00Z",
+        )
+
+        await pool.refresh_selection_quota()
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
 
     def test_api_unlimited_window_does_not_trigger_threshold(self):
         assert not codex_pool_module.api_quota_at_or_above({
@@ -1209,11 +1664,103 @@ class TestCloudRouterCodexProjection:
         )
         assert pool.status()["last_selected"] is None
 
+    def test_native_first_policy_is_loaded_from_pool_config(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool, native_home = self._mixed_pool(tmp_path, account)
+        data = json.loads(pool._config_path.read_text(encoding="utf-8"))
+        data["pool_settings"] = {"routing_policy": "native_first"}
+        pool._config_path.write_text(json.dumps(data), encoding="utf-8")
+        pool.reload()
+
+        assert pool.select(model="gpt-5.5") == str(native_home.resolve())
+
+    def test_unknown_api_health_uses_native_until_probe_settles(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+            "windows": [],
+        }
+        pool, native_home = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="gpt-5.5") == str(native_home.resolve())
+
+    def test_unknown_api_health_remains_api_only_fallback(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+            "windows": [],
+        }
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
+
+    def test_api_only_pool_resolves_null_model_to_configured_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            codex_pool_module.settings,
+            "default_codex_model",
+            "gpt-5.5",
+        )
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+
+        expected = str(Path(account.codex_home).resolve())
+        assert pool.select(model=None) == expected
+        assert pool.select(model="default") == expected
+
     def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
         pool, native_home = self._mixed_pool(tmp_path, account)
 
         assert pool.select(model="gpt-5.6-sol") == str(native_home.resolve())
+
+    def test_supported_api_model_fallback_wins_over_known_incompatible_native(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        native_home = tmp_path / "native-codex"
+        native_home.mkdir()
+        (native_home / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{"slug": "gpt-5.4", "service_tiers": []}],
+            }),
+            encoding="utf-8",
+        )
+        native_path = tmp_path / "native-codex-accounts.json"
+        native_path.write_text(json.dumps({
+            "pool_settings": {"routing_policy": "native_first"},
+            "accounts": [{
+                "id": "native-1",
+                "codex_home": str(native_home),
+                "enabled": True,
+            }],
+        }))
+        pool = CodexPool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
 
     def test_exhausted_api_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")

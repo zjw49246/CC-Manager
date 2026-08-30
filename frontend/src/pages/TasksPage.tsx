@@ -1,9 +1,14 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { api } from '../api/client';
-import type { Task, Project, TagItem } from '../api/client';
+import type { PRReviewResult, Task, Project, TagItem } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
+import {
+  canControlTask,
+  canManageTaskShare,
+  readStoredUserIdentity,
+} from '../components/Tasks/taskSharePermissions';
 import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
@@ -15,8 +20,25 @@ import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
 import { useTaskSearch } from '../hooks/useTaskSearch';
 import { TeamShareModal } from '../components/TeamShareModal';
 import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
+import { isPRMonitorDisplayTask } from '../components/Tasks/prMonitorTask';
+import { PRMonitorTaskDetail } from '../components/Tasks/PRMonitorTaskDetail';
+import { PRMonitorTaskSummary } from '../components/Tasks/PRMonitorTaskSummary';
 
 const PAGE_SIZE = 20;
+
+function isDeliveryOwnedTask(task: Task): boolean {
+  return task.mode === 'delivery_loop' || task.delivery_run_id != null;
+}
+
+function taskStatusColorKey(task: Task): string {
+  if (task.background_active) return 'background';
+  if (isDeliveryOwnedTask(task)) {
+    if (task.delivery_activity === 'running') return 'executing';
+    if (task.delivery_activity === 'waiting') return 'delivery_waiting';
+    if (task.delivery_activity === 'paused') return 'delivery_paused';
+  }
+  return task.status;
+}
 
 interface TasksPageProps {
   chatTaskId: number | null;
@@ -26,6 +48,7 @@ interface TasksPageProps {
 export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [, setAllTasks] = useState<Task[]>([]);
+  const [prReviewResults, setPRReviewResults] = useState<PRReviewResult[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -71,7 +94,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   useEffect(() => {
     const teamHandler = (e: Event) => {
       const task = (e as CustomEvent).detail?.task;
-      if (task) setTeamSharingTask(task);
+      if (task && canManageTaskShare(task, readStoredUserIdentity())) {
+        setTeamSharingTask(task);
+      }
     };
     window.addEventListener('ccm-team-share-task', teamHandler);
     return () => window.removeEventListener('ccm-team-share-task', teamHandler);
@@ -99,6 +124,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       && (
         event === 'status_change'
         || event === 'background_activity'
+        || event === 'sub_agent_count'
         || event === 'plan_stage_change'
         || event === 'plan_ready'
       )
@@ -117,6 +143,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         );
       const backgroundActive = typeof data.background_active === 'boolean'
         ? data.background_active
+        : undefined;
+      const activeSubAgents = event === 'sub_agent_count'
+        && Number.isSafeInteger(Number(data.active_sub_agents))
+        && Number(data.active_sub_agents) >= 0
+        ? Number(data.active_sub_agents)
         : undefined;
       const planStage = event === 'plan_stage_change'
         && typeof data.plan_stage === 'string'
@@ -147,6 +178,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       if (
         newStatus === undefined
         && backgroundActive === undefined
+        && activeSubAgents === undefined
         && planStage === undefined
         && planStageRound === undefined
         && planStageProvider === undefined
@@ -161,6 +193,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         const backgroundChanged = (
           backgroundActive !== undefined
           && task.background_active !== backgroundActive
+        );
+        const subAgentCountChanged = (
+          activeSubAgents !== undefined
+          && task.active_sub_agents !== activeSubAgents
         );
         const planStageChanged = (
           planStage !== undefined
@@ -179,6 +215,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         if (
           !statusChanged
           && !backgroundChanged
+          && !subAgentCountChanged
           && !planStageChanged
           && !planStageRoundChanged
           && !planRouteChanged
@@ -187,6 +224,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           ...task,
           ...(newStatus !== undefined ? { status: newStatus } : {}),
           ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
+          ...(activeSubAgents !== undefined ? { active_sub_agents: activeSubAgents } : {}),
           ...(planStage !== undefined ? { plan_stage: planStage } : {}),
           ...(planStageRound !== undefined ? { plan_stage_round: planStageRound } : {}),
           ...(planStageProvider !== undefined ? { plan_stage_provider: planStageProvider } : {}),
@@ -215,6 +253,31 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [setSearchResults]);
   useWebSocket(['system', 'tasks'], handleGlobalWs);
+
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    const refreshPRResults = async () => {
+      try {
+        // The endpoint caps a page at 100. Keep enough recent lifecycles in
+        // memory for ordinary Task rows without turning every poll into an
+        // unbounded history scan; opening an older row still loads its exact
+        // review detail from the Task's durable metadata identity.
+        const results = await api.getPRReviewResults(1, 100);
+        if (active) setPRReviewResults(results);
+      } catch {
+        // The aggregate projection is additive; keep the last good result if
+        // an older server or a transient request cannot provide it.
+      } finally {
+        if (active) timer = window.setTimeout(refreshPRResults, 15_000);
+      }
+    };
+    void refreshPRResults();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
 
   const [isWide, setIsWide] = useState(() => window.innerWidth >= 1280);
   useEffect(() => {
@@ -301,7 +364,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'superseded', 'failed'];
+  const statusOptions = ['pending', 'in_progress', 'executing', 'waiting_capability', 'delivery_waiting', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -320,6 +383,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'Pending',
     in_progress: 'In Progress',
     executing: 'Executing',
+    waiting_capability: 'Waiting Capability',
+    delivery_waiting: 'Delivery Waiting',
     plan_review: 'Plan Review',
     completed: 'Completed',
     superseded: 'Superseded',
@@ -330,6 +395,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'bg-yellow-500',
     in_progress: 'bg-blue-500',
     executing: 'bg-blue-400',
+    waiting_capability: 'bg-violet-400',
+    delivery_waiting: 'bg-indigo-500',
     plan_review: 'bg-purple-500',
     completed: 'bg-green-500',
     superseded: 'bg-gray-500',
@@ -338,7 +405,15 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
 
   const activeFilterCount = statusFilters.length + (starredFilter ? 1 : 0) + (unreadFilter ? 1 : 0) + (showArchived ? 1 : 0) + tagFilters.length;
 
-  const visibleProjects = projects.filter((p) => p.show_in_selector);
+  // PR-Monitor was historically created as an internal grouping Project and
+  // older rows may still carry show_in_selector=false. Keep that grouping
+  // available in the ordinary Task filter without making other internal
+  // Projects user-selectable.
+  const visibleProjects = projects.filter((p) => (
+    p.show_in_selector
+    || p.name === 'PR-Monitor'
+    || p.tags.includes('ccm:internal:pr-monitor')
+  ));
 
   // Collect all unique tags from visible projects + tag registry
   const allProjectTags = Array.from(new Set([...visibleProjects.flatMap((p) => p.tags), ...tagItems.map((t) => t.name)])).sort();
@@ -362,6 +437,13 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       })
     : tasks;
   const filteredSearchResults = searchResults;
+  const prResultsByTask = useMemo(() => {
+    const map = new Map<number, PRReviewResult>();
+    for (const result of prReviewResults) {
+      if (result.display_task_id != null) map.set(result.display_task_id, result);
+    }
+    return map;
+  }, [prReviewResults]);
 
   // 侧边栏拖拽排序（与主列表同一套逻辑）
   const sidebarTasks = filteredSearchResults ?? filteredTasks;
@@ -517,14 +599,6 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           )}
         </div>
 
-        <ProjectSelect
-          projects={tagFilteredProjects}
-          value={projectFilter}
-          onChange={(v) => setProjectFilter(v ? Number(v) : undefined)}
-          placeholder="Projects"
-          tagColorMap={tagColorMap}
-        />
-
         <button
           onClick={() => {
             setShowSearch((s) => {
@@ -565,6 +639,14 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         {filteredSearchResults !== null && (
           <span className="text-xs text-gray-500 whitespace-nowrap">{filteredSearchResults.length} match{filteredSearchResults.length === 1 ? '' : 'es'}</span>
         )}
+
+        <ProjectSelect
+          projects={tagFilteredProjects}
+          value={projectFilter}
+          onChange={(v) => setProjectFilter(v ? Number(v) : undefined)}
+          placeholder="Projects"
+          tagColorMap={tagColorMap}
+        />
       </div>
   );
 
@@ -583,6 +665,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         autoSortOnAccess={autoSortOnAccess}
         onBeforeArchive={() => { skipFreezeOnce.current = true; }}
         onReorder={reorderRefresh}
+        prResults={prResultsByTask}
       />
 
       {totalPages > 1 && searchResults === null && (
@@ -613,7 +696,14 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   );
 
   const chatPanel = chatTask && (
-    chatTask.mode === 'loop'
+    isPRMonitorDisplayTask(chatTask)
+      ? <PRMonitorTaskDetail
+          key={chatTask.id}
+          task={chatTask}
+          result={prResultsByTask.get(chatTask.id)}
+          onBack={() => setChatTaskWrapped(null)}
+        />
+      : chatTask.mode === 'loop'
       ? <LoopChatView key={chatTask.id} task={chatTask} onBack={() => setChatTaskWrapped(null)} inline={isWide} />
       : <ChatView
           key={chatTask.id}
@@ -666,12 +756,25 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     document.addEventListener('mouseup', onUp);
   }, [sidebarWidth]);
 
+  const teamShareModal = teamSharingTask && (
+    <TeamShareModal
+      type="task"
+      itemId={teamSharingTask.id}
+      itemTitle={teamSharingTask.title || `Task #${teamSharingTask.id}`}
+      onClose={() => setTeamSharingTask(null)}
+    />
+  );
+
   if (splitMode) {
+    const currentUserIdentity = readStoredUserIdentity();
     const sidebarStatusColors: Record<string, string> = {
       pending: 'bg-yellow-500',
       in_progress: 'bg-blue-500',
       executing: 'bg-blue-400 animate-pulse',
+      waiting_capability: 'bg-violet-400 animate-pulse',
       background: 'bg-teal-400 animate-pulse',
+      delivery_waiting: 'bg-indigo-400',
+      delivery_paused: 'bg-amber-400',
       plan_review: 'bg-purple-500',
       superseded: 'bg-gray-500',
       completed: 'bg-green-500',
@@ -679,7 +782,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       cancelled: 'bg-gray-500',
     };
     return (
-      <div className="flex h-[calc(100vh-49px)] -m-4">
+      <>
+        <div className="flex h-[calc(100vh-49px)] -m-4">
         {sidebarOpen && (
           <div className="shrink-0 flex flex-col border-r border-gray-800 bg-gray-900/50" style={{ width: sidebarWidth }}>
             <div className="px-3 py-2 border-b border-gray-800 flex items-center justify-between shrink-0">
@@ -700,10 +804,19 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 .map((t, idx) => {
                 const proj = t.project_id ? projects.find((p) => p.id === t.project_id) : undefined;
                 const colorDef = proj ? TAG_COLOR_OPTIONS.find((c) => c.key === proj.badge_color) : undefined;
+                const deliveryOwned = isDeliveryOwnedTask(t);
+                const prDisplay = isPRMonitorDisplayTask(t);
+                const prResult = prResultsByTask.get(t.id);
+                const taskControlAllowed = canControlTask(t);
                 return (
                 <div
                   key={t.id}
-                  {...sidebarReorder.itemProps(t, idx)}
+                  {...(prDisplay
+                    ? {}
+                    : deliveryOwned || !taskControlAllowed
+                      ? sidebarReorder.dropTargetProps(t, idx)
+                      : sidebarReorder.itemProps(t, idx))}
+                  data-testid={`task-sidebar-row-${t.id}`}
                   onClick={() => handleOpenChat(t)}
                   className={`w-full text-left px-3 py-2.5 transition-colors border-b border-gray-800/50 cursor-pointer ${
                     sidebarReorder.draggingId === t.id ? 'opacity-40' : ''
@@ -716,7 +829,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                   <div className="flex items-center gap-2">
                     {/* 状态只靠圆点颜色表达（绿=完成 红=失败 蓝=运行 黄=等待） */}
                     <span
-                      className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`}
+                      data-testid={`task-sidebar-status-${t.id}`}
+                      className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[taskStatusColorKey(t)] || 'bg-gray-500'}`}
                       title={getTaskStatusLabel(t)}
                     />
                     <span className={`text-xs truncate flex-1 ${chatTask?.id === t.id ? 'text-foreground font-medium' : 'text-gray-300'}`}>
@@ -743,31 +857,41 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-1.5 mt-1 ml-4" onClick={(e) => e.stopPropagation()}>
-                    <PluginsBadge task={t} onRefresh={refresh} />
-                    <SubAgentsBadge task={t} />
+                  <div
+                    className="flex items-center gap-1.5 mt-1 ml-4"
+                    onClick={prDisplay ? undefined : (event) => event.stopPropagation()}
+                  >
+                    {taskControlAllowed && !deliveryOwned && !prDisplay && <PluginsBadge task={t} onRefresh={refresh} />}
+                    {!prDisplay && <SubAgentsBadge task={t} />}
+                    {prDisplay && <PRMonitorTaskSummary task={t} result={prResult} compact />}
                     <span className="flex-1" />
-                    <button
+                    {!prDisplay && taskControlAllowed && <button
                       onClick={async () => { await api.starTask(t.id); refresh(); }}
                       className={`p-1 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
                       title={t.starred ? 'Unstar' : 'Star'}
                     >
                       <Star size={13} fill={t.starred ? 'currentColor' : 'none'} />
-                    </button>
-                    <button
-                      onClick={() => window.dispatchEvent(new CustomEvent('ccm-share-task', { detail: { task: t } }))}
-                      className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
-                      title="Share"
-                    >
-                      <Share2 size={13} />
-                    </button>
-                    <button
-                      onClick={async () => { await api.archiveTask(t.id); skipFreezeOnce.current = true; refresh(); }}
-                      className="p-1 text-gray-600 hover:text-amber-400 transition-colors"
-                      title={t.archived ? 'Unarchive' : 'Archive'}
-                    >
-                      {t.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
-                    </button>
+                    </button>}
+                    {!prDisplay && taskControlAllowed && !deliveryOwned && (
+                      <>
+                        {canManageTaskShare(t, currentUserIdentity) && (
+                          <button
+                            onClick={() => window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }))}
+                            className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
+                            title="Team Share"
+                          >
+                            <Share2 size={13} />
+                          </button>
+                        )}
+                        <button
+                          onClick={async () => { await api.archiveTask(t.id); skipFreezeOnce.current = true; refresh(); }}
+                          className="p-1 text-gray-600 hover:text-amber-400 transition-colors"
+                          title={t.archived ? 'Unarchive' : 'Archive'}
+                        >
+                          {t.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               );})}
@@ -813,7 +937,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         <div className="flex-1 min-w-0">
           {chatPanel}
         </div>
-      </div>
+        </div>
+        {teamShareModal}
+      </>
     );
   }
 
@@ -822,14 +948,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       {taskListContent}
       {chatPanel}
 
-      {teamSharingTask && (
-        <TeamShareModal
-          type="task"
-          itemId={teamSharingTask.id}
-          itemTitle={teamSharingTask.title || `Task #${teamSharingTask.id}`}
-          onClose={() => setTeamSharingTask(null)}
-        />
-      )}
+      {teamShareModal}
     </div>
   );
 }

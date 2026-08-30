@@ -4,13 +4,13 @@ import json
 import os
 import signal
 import sys
-import tempfile
-import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import backend.services.goal_evaluator as goal_evaluator_module
 from backend.services.codex_app_server import CodexTurnProcess
 from backend.services.goal_evaluator import (
     GoalEvaluationError,
@@ -29,6 +29,78 @@ from backend.services.goal_evaluator import (
     has_unreaped_goal_evaluator_for_task,
     reap_unreaped_goal_evaluators,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_zero_tool_preflight(monkeypatch, tmp_path):
+    """Unit tests inspect admission args without invoking installed CLIs."""
+
+    # Goal evaluation is an Agent workload and therefore requires an explicit
+    # service-token boundary.  Never inherit this security precondition from
+    # the developer's .env or from mutable state left by an earlier API test.
+    monkeypatch.setattr(
+        goal_evaluator_module.settings,
+        "auth_token",
+        "goal-evaluator-test-token",
+    )
+    probe = MagicMock()
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "validate_claude_zero_tool_isolation_settings",
+        probe,
+    )
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "manager_secret_protected_paths",
+        MagicMock(return_value=("/manager-secret",)),
+    )
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "generate_claude_zero_tool_isolation_settings",
+        MagicMock(return_value=tmp_path / "goal-zero-tool.json"),
+    )
+    clean_home = tmp_path / "goal-clean-home"
+    clean_home.mkdir()
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "prepare_claude_auth_projection",
+        MagicMock(
+            return_value=SimpleNamespace(
+                config_dir=clean_home,
+                oauth_access_token=None,
+            )
+        ),
+    )
+
+    def apply_projection(env, projection):
+        env["CLAUDE_CONFIG_DIR"] = str(projection.config_dir)
+
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "apply_claude_auth_projection",
+        apply_projection,
+    )
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "remove_claude_auth_projection",
+        MagicMock(),
+    )
+
+    def project_cloudrouter(env, _store, _home):
+        for key in (
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            env.pop(key, None)
+        return True
+
+    monkeypatch.setattr(
+        goal_evaluator_module,
+        "inject_cloudrouter_claude_direct_auth",
+        MagicMock(side_effect=project_cloudrouter),
+    )
+    return probe
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -63,6 +135,33 @@ async def _wait_for_child_pid(path, task: asyncio.Task, timeout: float = 2.0) ->
             raise AssertionError("Evaluator exited before spawning its child")
         await asyncio.sleep(0.01)
     raise AssertionError("Timed out waiting for evaluator child PID")
+
+
+async def _wait_for_event_or_task(
+    event: asyncio.Event,
+    task: asyncio.Task,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for a launch event while surfacing an early evaluator failure."""
+
+    event_waiter = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {event_waiter, task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            await task
+            raise AssertionError("Evaluator exited before the expected event")
+        if event_waiter not in done:
+            raise AssertionError("Timed out waiting for evaluator event")
+        await event_waiter
+    finally:
+        if not event_waiter.done():
+            event_waiter.cancel()
+        await asyncio.gather(event_waiter, return_exceptions=True)
 
 
 async def _wait_until_not_running(pid: int, timeout: float = 2.0) -> None:
@@ -267,7 +366,7 @@ async def test_active_claude_runtime_user_matches_exact_canonical_home(
                 config_dir=str(alias_home),
                 task_id=901,
             ))
-            await communicate_started.wait()
+            await _wait_for_event_or_task(communicate_started, evaluation)
 
             expected = ["goal-evaluator:claude:task=901:pid=55101"]
             assert goal_evaluator_runtime_users(
@@ -350,63 +449,28 @@ async def test_cleanup_failed_runtime_user_remains_until_reaper_proves_terminal(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failed_codex_evaluator_keeps_home_admission_blocked(
+async def test_codex_standard_refuses_direct_exec_without_audited_registry(
     tmp_path,
 ):
-    from backend.services.codex_app_server import CodexAppServerBusyError
-    from backend.services.instance_manager import InstanceManager
-
     evaluator = GoalEvaluator()
     provider_home = str((tmp_path / "codex-retained").resolve())
-    manager = InstanceManager(MagicMock(), MagicMock())
-    mock_proc = MagicMock(pid=55_103, returncode=0)
-    mock_proc.communicate = AsyncMock(return_value=(b"{}", b""))
-
-    try:
-        with (
-            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch(
-                "backend.services.goal_evaluator._terminate_process",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("terminal proof unavailable"),
-            ),
-        ):
-            with pytest.raises(GoalEvaluatorCleanupError):
-                async with manager.codex_home_exec_guard(
-                    provider_home
-                ) as admitted_home:
-                    await evaluator.evaluate(
-                        condition="cond",
-                        conversation_summary="conv",
-                        provider="codex",
-                        config_dir=admitted_home,
-                        task_id=903,
-                    )
-
-        assert manager._codex_ephemeral_home_users == {}
-        assert codex_goal_evaluator_runtime_homes() == {provider_home}
-        assert provider_home in manager.busy_codex_homes()
+    with patch(
+        "asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as spawn:
         with pytest.raises(
-            CodexAppServerBusyError,
-            match="retained ephemeral exec",
+            GoalEvaluationError,
+            match="exact app-server account route",
         ):
-            async with manager.codex_home_app_server_guard(provider_home):
-                pytest.fail("retained evaluator must block app-server admission")
-
-        with patch(
-            "backend.services.goal_evaluator._terminate_process",
-            new_callable=AsyncMock,
-        ):
-            await reap_unreaped_goal_evaluators()
-
-        assert codex_goal_evaluator_runtime_homes() == set()
-        async with manager.codex_home_exec_guard(provider_home):
-            pass
-    finally:
-        process_token = id(mock_proc)
-        _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
-        _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
-        _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+            await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="codex",
+                config_dir=provider_home,
+                task_id=903,
+            )
+    spawn.assert_not_awaited()
+    assert codex_goal_evaluator_runtime_homes() == set()
 
 
 class TestParseResponse:
@@ -483,6 +547,96 @@ class TestBuildEvalPrompt:
 
 
 class TestEvaluateIntegration:
+    @pytest.mark.asyncio
+    async def test_security_admission_requires_auth_before_provider_effect(
+        self,
+        monkeypatch,
+    ):
+        evaluator = GoalEvaluator()
+        claude_pool = MagicMock()
+        claude_pool.ensure_oauth_access_token = AsyncMock()
+        monkeypatch.setattr(goal_evaluator_module.settings, "auth_token", "")
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn:
+            with pytest.raises(GoalEvaluationError, match="AUTH_TOKEN"):
+                await evaluator.evaluate(
+                    condition="cond",
+                    conversation_summary="conv",
+                    task_id=71,
+                    claude_pool=claude_pool,
+                )
+        spawn.assert_not_awaited()
+        claude_pool.ensure_oauth_access_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_security_admission_precedes_codex_app_server_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        registry = MagicMock()
+        registry.start_turn = AsyncMock()
+        monkeypatch.setattr(goal_evaluator_module.settings, "auth_token", "")
+
+        with pytest.raises(GoalEvaluationError, match="AUTH_TOKEN"):
+            await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="codex",
+                codex_home=str(tmp_path / "codex-home"),
+                task_id=72,
+                codex_app_server_registry=registry,
+            )
+
+        registry.start_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_claude_evaluator_is_zero_tool_and_scrubs_unknown_secret(
+        self,
+        monkeypatch,
+    ):
+        evaluator = GoalEvaluator()
+        monkeypatch.setenv(
+            "CCM_TEST_UNKNOWN_MANAGER_SECRET",
+            "must-not-reach-provider",
+        )
+        process = MagicMock(pid=55_000, returncode=0)
+        process.communicate = AsyncMock(return_value=(
+            json.dumps({"achieved": True, "reason": "safe"}).encode(),
+            b"",
+        ))
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process) as spawn,
+            patch(
+                "backend.services.goal_evaluator.os.killpg",
+                side_effect=ProcessLookupError,
+            ),
+        ):
+            result = await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                task_id=71,
+            )
+
+        assert result.achieved is True
+        argv = list(spawn.call_args.args)
+        assert "--dangerously-skip-permissions" not in argv
+        assert argv[argv.index("--tools") + 1] == ""
+        assert argv[argv.index("--allowedTools") + 1] == ""
+        assert argv[argv.index("--setting-sources") + 1] == ""
+        assert "--strict-mcp-config" in argv
+        assert "--no-session-persistence" in argv
+        child_env = spawn.call_args.kwargs["env"]
+        assert "CCM_TEST_UNKNOWN_MANAGER_SECRET" not in child_env
+        goal_evaluator_module.generate_claude_zero_tool_isolation_settings.assert_called_once_with(
+            "goal-evaluator",
+            71,
+            ("/manager-secret",),
+        )
+
     """Test the evaluate method with mocked subprocess."""
 
     @pytest.mark.asyncio
@@ -902,29 +1056,38 @@ class TestEvaluateIntegration:
     @pytest.mark.asyncio
     async def test_nonzero_exit_exposes_stderr_for_pool_classification(self):
         evaluator = GoalEvaluator()
-        mock_proc = MagicMock()
-        mock_proc.pid = 55_005
-        mock_proc.communicate = AsyncMock(return_value=(
-            b'{"type":"turn.failed"}\n',
-            b"You have hit your usage limit. Try again later.",
+        process = CodexTurnProcess(
+            55_005,
+            AsyncMock(),
+            thread_id="failed-standard-evaluator",
+        )
+        process.feed({"type": "turn.failed"})
+        process.finish(
+            1,
+            stderr="You have hit your usage limit. Try again later.",
+        )
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "failed-standard-evaluator",
         ))
-        mock_proc.returncode = 1
+        registry.abort_unclaimed_turn = AsyncMock()
+        registry.delete_thread = AsyncMock()
 
-        with (
-            patch("asyncio.create_subprocess_exec", return_value=mock_proc),
-            patch(
-                "backend.services.goal_evaluator.os.killpg",
-                side_effect=ProcessLookupError,
-            ),
-        ):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn:
             with pytest.raises(GoalEvaluationError) as exc_info:
                 await evaluator.evaluate(
                     condition="cond",
                     conversation_summary="conv",
                     provider="codex",
                     codex_home="/tmp/codex-a",
+                    codex_app_server_registry=registry,
                 )
 
+        spawn.assert_not_awaited()
         error = exc_info.value
         assert error.provider == "codex"
         assert error.returncode == 1
@@ -997,43 +1160,47 @@ class TestEvaluateIntegration:
     async def test_codex_evaluation_sets_explicit_codex_home(self, tmp_path):
         evaluator = GoalEvaluator()
         agent_text = json.dumps({"achieved": True, "reason": "ok"})
-        stdout = json.dumps(
-            {"item": {"type": "agent_message", "text": agent_text}}
-        ).encode()
-        mock_proc = MagicMock()
-        mock_proc.pid = 55_008
-        mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
-        mock_proc.returncode = 0
+        process = CodexTurnProcess(
+            55_008,
+            AsyncMock(),
+            thread_id="standard-evaluator-thread",
+        )
+        process.feed({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": agent_text},
+        })
+        process.finish(0)
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "standard-evaluator-thread",
+        ))
+        registry.abort_unclaimed_turn = AsyncMock()
+        registry.delete_thread = AsyncMock()
         codex_home = tmp_path / "codex-account-2"
 
-        with (
-            patch(
-                "asyncio.create_subprocess_exec",
-                return_value=mock_proc,
-            ) as mock_exec,
-            patch(
-                "backend.services.goal_evaluator.os.killpg",
-                side_effect=ProcessLookupError,
-            ),
-        ):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn:
             result = await evaluator.evaluate(
                 condition="cond",
                 conversation_summary="conv",
                 provider="codex",
                 codex_home=str(codex_home),
+                codex_app_server_registry=registry,
             )
 
         assert result.achieved is True
-        assert mock_exec.call_args.kwargs["env"]["CODEX_HOME"] == str(codex_home)
-        assert "cwd" not in mock_exec.call_args.kwargs
-        assert mock_exec.call_args.args[1] == "exec"
-        command = list(mock_exec.call_args.args)
-        configs = [
-            tomllib.loads(command[index + 1])
-            for index, value in enumerate(command[:-1])
-            if value == "-c"
-        ]
-        assert configs == [{"service_tier": "default"}]
+        spawn.assert_not_awaited()
+        kwargs = registry.start_turn.await_args.kwargs
+        assert kwargs["codex_home"] == str(codex_home)
+        assert kwargs["codex_service_tier"] == "default"
+        assert kwargs["tools_disabled"] is True
+        assert kwargs["disable_project_config"] is True
+        assert kwargs["disable_user_mcp"] is True
+        assert kwargs["disable_autonomous_features"] is True
+        assert kwargs["sandbox_mode"] == "read-only"
 
     @pytest.mark.asyncio
     async def test_active_codex_standard_runtime_user_matches_exact_home(
@@ -1041,62 +1208,61 @@ class TestEvaluateIntegration:
     ):
         evaluator = GoalEvaluator()
         codex_home = tmp_path / "codex-standard"
-        communicate_started = asyncio.Event()
-        release_communicate = asyncio.Event()
         agent_text = json.dumps({"achieved": True, "reason": "ok"})
-        stdout = json.dumps({
-            "item": {"type": "agent_message", "text": agent_text},
-        }).encode()
-        mock_proc = MagicMock(pid=55_103, returncode=None)
-
-        async def communicate():
-            communicate_started.set()
-            await release_communicate.wait()
-            mock_proc.returncode = 0
-            return stdout, b""
-
-        mock_proc.communicate = AsyncMock(side_effect=communicate)
+        process = CodexTurnProcess(
+            55_103,
+            AsyncMock(),
+            thread_id="active-standard-evaluator",
+        )
+        registry = MagicMock()
+        registry.start_turn = AsyncMock(return_value=(
+            process,
+            "active-standard-evaluator",
+        ))
+        registry.abort_unclaimed_turn = AsyncMock()
+        registry.delete_thread = AsyncMock()
         evaluation = None
         try:
-            with (
-                patch("asyncio.create_subprocess_exec", return_value=mock_proc),
-                patch(
-                    "backend.services.goal_evaluator.os.killpg",
-                    side_effect=ProcessLookupError,
-                ),
-            ):
-                evaluation = asyncio.create_task(evaluator.evaluate(
-                    condition="cond",
-                    conversation_summary="conv",
-                    provider="codex",
-                    codex_home=str(codex_home),
-                    task_id=903,
-                ))
-                await communicate_started.wait()
-
-                assert goal_evaluator_runtime_users(
+            evaluation = asyncio.create_task(evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="codex",
+                codex_home=str(codex_home),
+                task_id=903,
+                codex_app_server_registry=registry,
+            ))
+            expected = [
+                "goal-evaluator:codex:"
+                "task=903:thread=active-standard-evaluator"
+            ]
+            for _ in range(100):
+                if goal_evaluator_runtime_users(
                     "codex", str(codex_home),
-                ) == ["goal-evaluator:codex:task=903:pid=55103"]
-                assert goal_evaluator_runtime_users(
-                    "claude", str(codex_home),
-                ) == []
+                ) == expected:
+                    break
+                await asyncio.sleep(0.01)
+            assert goal_evaluator_runtime_users(
+                "codex", str(codex_home),
+            ) == expected
 
-                release_communicate.set()
-                result = await evaluation
+            process.feed({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": agent_text},
+            })
+            process.finish(0)
+            result = await evaluation
 
             assert result.achieved is True
             assert goal_evaluator_runtime_users(
                 "codex", str(codex_home),
             ) == []
         finally:
-            release_communicate.set()
+            if process.returncode is None:
+                process.finish(1, stderr="test cleanup")
             if evaluation is not None and not evaluation.done():
                 evaluation.cancel()
                 await asyncio.gather(evaluation, return_exceptions=True)
-            process_token = id(mock_proc)
-            _UNREAPED_GOAL_EVALUATOR_PROCESSES.pop(process_token, None)
-            _GOAL_EVALUATOR_TASK_IDS.pop(process_token, None)
-            _GOAL_EVALUATOR_RUNTIME_ROUTES.pop(process_token, None)
+            _UNREAPED_CODEX_GOAL_EVALUATOR_TURNS.pop(id(process), None)
 
     @pytest.mark.asyncio
     async def test_codex_fast_requires_exact_app_server_route_before_execution(
@@ -1399,9 +1565,7 @@ class TestEvaluateIntegration:
         if provider == "codex":
             store.account_for_codex_home.return_value = object()
             agent_text = json.dumps({"achieved": True, "reason": "ok"})
-            stdout = json.dumps({
-                "item": {"type": "agent_message", "text": agent_text},
-            }).encode()
+            stdout = b""
             auth_keys = (
                 "OPENAI_API_KEY",
                 "CODEX_API_KEY",
@@ -1411,8 +1575,27 @@ class TestEvaluateIntegration:
                 "APEXROUTER_API_KEY",
                 "APEXROUTER_CODEX_API_KEY",
             )
-            home_key = "CODEX_HOME"
-            evaluate_home = {"codex_home": str(provider_home)}
+            process = CodexTurnProcess(
+                55_011,
+                AsyncMock(),
+                thread_id="api-standard-evaluator",
+            )
+            process.feed({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": agent_text},
+            })
+            process.finish(0)
+            registry = MagicMock()
+            registry.start_turn = AsyncMock(return_value=(
+                process,
+                "api-standard-evaluator",
+            ))
+            registry.abort_unclaimed_turn = AsyncMock()
+            registry.delete_thread = AsyncMock()
+            evaluate_home = {
+                "codex_home": str(provider_home),
+                "codex_app_server_registry": registry,
+            }
         else:
             store.account_for_claude_config_dir.return_value = object()
             stdout = json.dumps({"achieved": True, "reason": "ok"}).encode()
@@ -1421,20 +1604,17 @@ class TestEvaluateIntegration:
                 "ANTHROPIC_API_KEY",
                 "CLAUDE_CODE_OAUTH_TOKEN",
             )
-            home_key = "CLAUDE_CONFIG_DIR"
             evaluate_home = {"config_dir": str(provider_home)}
 
         for key in auth_keys:
             monkeypatch.setenv(key, f"secret-{key}")
-        mock_proc = MagicMock()
-        mock_proc.pid = 55_010 if provider == "claude" else 55_011
+        mock_proc = MagicMock(pid=55_010, returncode=0)
         mock_proc.communicate = AsyncMock(return_value=(stdout, b""))
-        mock_proc.returncode = 0
 
         with (
             patch(
                 "asyncio.create_subprocess_exec",
-                return_value=mock_proc,
+                return_value=mock_proc if provider == "claude" else None,
             ) as mock_exec,
             patch(
                 "backend.services.goal_evaluator.os.killpg",
@@ -1449,30 +1629,26 @@ class TestEvaluateIntegration:
                 **evaluate_home,
             )
 
-        child_env = mock_exec.call_args.kwargs["env"]
-        command = list(mock_exec.call_args.args)
         assert result.achieved is True
-        assert child_env[home_key] == str(provider_home)
-        assert not set(auth_keys) & child_env.keys()
         if provider == "codex":
-            assert mock_exec.call_args.kwargs["cwd"] == tempfile.gettempdir()
-            configs = [
-                tomllib.loads(command[index + 1])
-                for index, value in enumerate(command[:-1])
-                if value == "-c"
-            ]
-            assert {"service_tier": "default"} in configs
-            assert {
-                "projects": {
-                    str(Path(tempfile.gettempdir()).resolve()): {
-                        "trust_level": "untrusted",
-                    },
-                },
-            } in configs
-            assert command.index("-c") < len(command) - 2
+            mock_exec.assert_not_awaited()
+            kwargs = registry.start_turn.await_args.kwargs
+            assert kwargs["codex_home"] == str(provider_home)
+            assert kwargs["tools_disabled"] is True
+            assert kwargs["disable_project_config"] is True
+            assert kwargs["disable_user_mcp"] is True
         else:
-            assert "cwd" not in mock_exec.call_args.kwargs
+            child_env = mock_exec.call_args.kwargs["env"]
+            command = list(mock_exec.call_args.args)
+            clean_home = (
+                goal_evaluator_module.prepare_claude_auth_projection
+                .return_value.config_dir
+            )
+            assert child_env["CLAUDE_CONFIG_DIR"] == str(clean_home)
+            assert not set(auth_keys) & child_env.keys()
+            assert mock_exec.call_args.kwargs["cwd"] == os.path.abspath(os.sep)
             assert "-c" not in command
+            goal_evaluator_module.inject_cloudrouter_claude_direct_auth.assert_called()
         store._read_api_key.assert_not_called()
 
     @pytest.mark.asyncio

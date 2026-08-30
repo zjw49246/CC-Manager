@@ -15,6 +15,370 @@ export interface PRFindingDiffDownload extends TaskArtifactDownload {
   confirmationToken: string;
 }
 
+export type BrowserReviewStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface BrowserReviewTelemetry {
+  console?: Record<string, unknown>[];
+  page_errors?: Record<string, unknown>[];
+  request_failures?: Record<string, unknown>[];
+  http_errors?: Record<string, unknown>[];
+  blocked_navigations?: Record<string, unknown>[];
+}
+
+export interface BrowserReviewTraceEvent {
+  id: number;
+  kind: 'decision' | 'tool';
+  title: string;
+  detail: string | null;
+  tool_name?: string;
+  timestamp: string | null;
+}
+
+export interface BrowserReviewJob {
+  id: string;
+  task_id: number | null;
+  owner_task_id?: number | null;
+  harness_run_id?: string | null;
+  inline_tool: boolean;
+  status: BrowserReviewStatus;
+  stage: string;
+  url: string | null;
+  network_policy: 'external_public' | 'managed_preview';
+  goal: string;
+  provider: 'claude' | 'codex' | 'capture' | 'openai-responses';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  allow_actions: boolean;
+  capture_only: boolean;
+  browser_channel: 'chrome' | 'chromium';
+  viewport_width: number;
+  viewport_height: number;
+  max_steps: number;
+  max_actions: number;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  response_id: string | null;
+  steps: number;
+  actions: number;
+  latest_screenshot: string | null;
+  telemetry: BrowserReviewTelemetry;
+  action_batches: { step: number; actions: Record<string, unknown>[] }[];
+  trace: BrowserReviewTraceEvent[];
+  verdict: 'passed' | 'failed' | 'inconclusive' | null;
+  findings: TestHarnessFinding[];
+  coverage: Record<string, unknown>;
+  artifacts: string[];
+  report: string | null;
+}
+
+export interface WorkspacePreviewCommand {
+  command: string[];
+  cwd: string;
+  env?: Record<string, string>;
+  timeout_seconds?: number;
+  name?: string;
+}
+
+export interface WorkspacePreviewConfig {
+  version: 1;
+  name: string;
+  setup: WorkspacePreviewCommand[];
+  processes: WorkspacePreviewCommand[];
+  url: string;
+  health_url: string;
+  startup_timeout_seconds: number;
+  sandbox?: {
+    setup: WorkspacePreviewCommand[];
+    processes: WorkspacePreviewCommand[];
+    allowed_hosts: string[];
+  } | null;
+}
+
+export interface ProjectPreviewProfile extends WorkspacePreviewConfig {
+  id: string;
+  match_paths: string[];
+  enabled: boolean;
+}
+
+export interface ProjectPreviewProfilesConfig {
+  version: 2;
+  default_profile: string | null;
+  profiles: ProjectPreviewProfile[];
+}
+
+export type ProjectPreviewConfig = WorkspacePreviewConfig | ProjectPreviewProfilesConfig;
+
+export interface WorkspaceReviewCapabilities {
+  available: boolean;
+  reason: string | null;
+  repo_path: string | null;
+  configured: boolean;
+  config: WorkspacePreviewConfig | null;
+  suggested_config: WorkspacePreviewConfig | null;
+}
+
+export type WorkspaceReviewStatus = 'queued' | 'preparing' | 'ready' | 'reviewing' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+export interface WorkspaceReviewRun {
+  id: string;
+  task_id: number;
+  project_id: number | null;
+  agent_task_id: number | null;
+  browser_review_job_id: string | null;
+  mode: 'review_only' | 'fix_loop';
+  profile: 'quick' | 'standard' | 'exhaustive';
+  goal: string;
+  status: WorkspaceReviewStatus;
+  stage: string;
+  workspace_path: string | null;
+  git_head: string;
+  workspace_fingerprint: string;
+  preview_config: WorkspacePreviewConfig | null;
+  preview_url: string | null;
+  stale: boolean;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string;
+  cleanup_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export type TestHarnessTargetKind = 'current_workspace' | 'fixed_url' | 'pull_request' | 'git_ref';
+export type TestHarnessStatus = 'queued' | 'resolving_target' | 'preparing_environment' | 'preview_ready' | 'running' | 'collecting_evidence' | 'evaluating' | 'cleaning' | 'cancelling' | 'completed' | 'failed' | 'cancelled' | 'stale';
+
+export interface TestHarnessEvent {
+  id: number;
+  sequence: number;
+  event_type: string;
+  stage: string | null;
+  title: string;
+  detail: string | null;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TestHarnessFinding {
+  id?: string;
+  fingerprint?: string;
+  scenario_id: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  category: string;
+  title: string;
+  route: string | null;
+  locator: string | null;
+  expected: string | null;
+  actual: string | null;
+  reproduction: string[];
+  evidence: string[];
+  confidence: number | null;
+}
+
+export interface TestHarnessEvidence {
+  id: string;
+  kind: string;
+  name: string;
+  content_type: string;
+  sha256: string;
+  byte_size: number;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface TestHarnessAttempt {
+  id: string;
+  ordinal: number;
+  status: string;
+  stage: string;
+  provider: string;
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  agent_task_id: number | null;
+  browser_review_job_id: string | null;
+  archive_state: 'staging' | 'archiving' | 'complete' | 'retryable_error' | 'incomplete';
+  archive_error: string | null;
+  archive_manifest: {
+    version: number;
+    expected: string[];
+    archived: string[];
+    terminal_status: string | null;
+  };
+  archived_at: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface TestHarnessRun {
+  id: string;
+  task_id: number | null;
+  project_id: number | null;
+  workspace_review_run_id: string | null;
+  browser_review_job_id: string | null;
+  agent_task_id: number | null;
+  target_kind: TestHarnessTargetKind;
+  target: Record<string, unknown>;
+  resolved_target: Record<string, unknown> | null;
+  test_plan: Record<string, unknown> & { objective?: string; profile?: string };
+  runtime: Record<string, unknown>;
+  request_fingerprint: string;
+  parent_run_id: string | null;
+  root_run_id: string;
+  attempt_number: number;
+  status: TestHarnessStatus;
+  stage: string;
+  verdict: 'passed' | 'failed' | 'inconclusive' | 'error' | 'cancelled' | 'stale' | null;
+  source_git_head: string | null;
+  source_fingerprint: string | null;
+  stale: boolean;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string;
+  cleanup_error: string | null;
+  evidence_archive_state: TestHarnessAttempt['archive_state'] | null;
+  evidence_archive_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  attempts: TestHarnessAttempt[];
+  events: TestHarnessEvent[];
+  evidence: TestHarnessEvidence[];
+  findings: TestHarnessFinding[];
+  workspace_review: WorkspaceReviewRun | null;
+  browser_review: BrowserReviewJob | null;
+}
+
+export interface TestHarnessRunStart {
+  target_kind?: TestHarnessTargetKind;
+  target?: Record<string, unknown>;
+  goal: string;
+  profile?: 'quick' | 'standard' | 'exhaustive';
+  allow_actions?: boolean;
+  browser_channel?: 'chrome' | 'chromium';
+  viewport_width?: number;
+  viewport_height?: number;
+  max_steps?: number;
+  max_actions?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+  test_plan?: Record<string, unknown>;
+  parent_run_id?: string;
+  idempotency_key?: string;
+}
+
+export interface TestHarnessRuntimeSelection {
+  provider: 'claude' | 'codex';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+}
+
+export interface TestHarnessRuntimeConfig extends TestHarnessRuntimeSelection {
+  inherit_task: boolean;
+  source: 'task' | 'browser_review_config' | 'run_override';
+  task_runtime: TestHarnessRuntimeSelection;
+  default_provider: 'claude' | 'codex';
+  providers: ('claude' | 'codex')[];
+  default_models: Record<'claude' | 'codex', string>;
+  models_by_provider: Record<'claude' | 'codex', string[]>;
+  default_effort: string;
+  effort_options: Record<'claude' | 'codex', string[]>;
+  model_efforts: Record<'claude' | 'codex', Record<string, string[]>>;
+  codex_service_tiers: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+}
+
+export interface TestHarnessRuntimeConfigUpdate {
+  inherit_task: boolean;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+}
+
+export interface TestHarnessCapabilities {
+  contract_version: number;
+  available: boolean;
+  reason: string | null;
+  provider: string;
+  task_provider: string;
+  provider_browser_capability: boolean;
+  runtime_configurable: boolean;
+  runtime: TestHarnessRuntimeConfig;
+  context_policy: string;
+  targets: Record<TestHarnessTargetKind, boolean>;
+  target_reasons: Partial<Record<TestHarnessTargetKind, string | null>>;
+  sandbox: {
+    available: boolean;
+    backend: string | null;
+    reason: string | null;
+    image: string | null;
+    image_id: string | null;
+  };
+  preview: WorkspaceReviewCapabilities;
+  supports_repeat: boolean;
+  supports_compare: boolean;
+}
+
+export interface WorkspaceReviewStart {
+  goal: string;
+  mode?: 'review_only' | 'fix_loop';
+  profile?: 'quick' | 'standard' | 'exhaustive';
+  allow_actions?: boolean;
+  browser_channel?: 'chrome' | 'chromium';
+  viewport_width?: number;
+  viewport_height?: number;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  reasoning_effort?: string;
+  codex_service_tier?: CodexServiceTier;
+}
+
+export interface BrowserReviewConfig {
+  default_goal: string;
+  default_provider: 'claude' | 'codex';
+  providers: ('claude' | 'codex')[];
+  default_models: Record<'claude' | 'codex', string>;
+  models_by_provider: Record<'claude' | 'codex', string[]>;
+  default_effort: string;
+  effort_options: Record<'claude' | 'codex', string[]>;
+  model_efforts: Record<'claude' | 'codex', Record<string, string[]>>;
+  codex_service_tiers: CodexServiceTier[];
+  codex_model_service_tiers: Record<string, CodexServiceTier[]>;
+  browser_channels: ('chrome' | 'chromium')[];
+  max_concurrent_jobs: number;
+  execution: 'ccm_task_account_pool';
+}
+
+export interface BrowserReviewCreate {
+  url: string;
+  goal: string;
+  provider: 'claude' | 'codex';
+  model: string;
+  reasoning_effort: string;
+  codex_service_tier: CodexServiceTier;
+  allow_actions: boolean;
+  browser_channel: 'chrome' | 'chromium';
+  viewport_width: number;
+  viewport_height: number;
+  max_steps: number;
+  max_actions: number;
+}
+
+export interface FrontendReviewGoalCapabilities {
+  available: boolean;
+  reason: string | null;
+  repo_path: string | null;
+}
+
 export function isApiRequestError(error: unknown): error is ApiRequestError {
   return error instanceof Error
     && typeof (error as { status?: unknown }).status === 'number';
@@ -119,6 +483,27 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+async function blobRequest(path: string): Promise<Blob> {
+  const token = getToken();
+  const res = await fetch(`${getBase()}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (res.status === 401) {
+    clearToken();
+    window.location.reload();
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(
+      typeof error.detail === 'string' ? error.detail : res.statusText,
+    );
+  }
+  const refreshedToken = res.headers.get('X-Refreshed-Token');
+  if (refreshedToken) setToken(refreshedToken);
+  return res.blob();
+}
+
 async function formRequest<T>(path: string, formData: FormData): Promise<T> {
   const token = getToken();
   const res = await fetch(`${getBase()}${path}`, {
@@ -133,7 +518,16 @@ async function formRequest<T>(path: string, formData: FormData): Promise<T> {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(typeof err.detail === 'string' ? err.detail : res.statusText);
+    const detail = err.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && typeof detail.message === 'string'
+        ? detail.message
+        : res.statusText;
+    const requestError = new Error(message) as ApiRequestError;
+    requestError.status = res.status;
+    requestError.detail = detail;
+    throw requestError;
   }
   const refreshedToken = res.headers.get('X-Refreshed-Token');
   if (refreshedToken) setToken(refreshedToken);
@@ -151,6 +545,16 @@ export interface RuntimeSettings {
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;
+}
+
+export interface CapacitySettings {
+  max_concurrent_instances: number;
+  configured_override: number | null;
+  env_default: number;
+  min_idle_instances: number;
+  active_instances: number;
+  live_instances: number;
+  pending_tasks: number;
 }
 
 export interface GlobalSettings {
@@ -176,6 +580,7 @@ export interface Project {
   sort_order: number;
   tags: string[];
   env_files: string[];
+  preview_config?: ProjectPreviewConfig | null;
   git_author_name: string | null;
   git_author_email: string | null;
   git_credential_type: string | null;  // "ssh" | "https" | null
@@ -185,6 +590,90 @@ export interface Project {
   badge_color: string | null;
   created_at: string;
   location?: string;  // "local" or worker name
+}
+
+export interface SSHProfile {
+  id: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_path_hint: string;
+  public_key_fingerprint: string;
+  host_key_type: string;
+  host_key_fingerprint: string;
+  revision: number;
+  enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
+  created_by: number | null;
+  last_tested_at: string | null;
+  last_test_ok: boolean | null;
+  last_error_code: string | null;
+  last_error_detail: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SSHProfileInput {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  key_upload_token?: string;
+  host_key_value: string;
+  enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
+}
+
+export interface SSHPrivateKeyUpload {
+  upload_token: string;
+  filename: string;
+  public_key_fingerprint: string;
+}
+
+export interface SSHHostKeyProbe {
+  key_type: string;
+  host_key_value: string;
+  fingerprint: string;
+}
+
+export interface SSHProfileTestResult {
+  ok: boolean;
+  error_code: string | null;
+  detail: string | null;
+}
+
+export type TaskSSHCapability = 'exec' | 'read' | 'write';
+
+export interface TaskSSHGrantInput {
+  profile_id: number;
+  capabilities: TaskSSHCapability[];
+}
+
+export interface TaskSSHGrant {
+  id: number;
+  task_id: number;
+  profile_id: number;
+  profile_name: string;
+  host: string;
+  port: number;
+  username: string;
+  host_key_fingerprint: string;
+  profile_revision: number;
+  current_profile_revision: number;
+  capabilities: TaskSSHCapability[];
+  profile_task_access_enabled: boolean;
+  profile_task_capabilities: TaskSSHCapability[];
+  profile_allowed_roots: string[];
+  valid: boolean;
+  invalid_reason: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export type ProjectTodoStatus = 'open' | 'done' | 'archived';
@@ -202,6 +691,12 @@ export interface ProjectTodo {
 }
 
 export type CodexServiceTier = 'default' | 'priority';
+
+export interface FrontendReviewConfig {
+  mode: 'goal';
+  profile: 'standard' | 'exhaustive';
+  max_iterations: number;
+}
 
 export interface PlanModelRoute {
   provider: 'claude' | 'codex';
@@ -243,12 +738,26 @@ export interface SystemConfig {
   codex_service_tier_options?: CodexServiceTier[];
   codex_model_service_tiers: Record<string, CodexServiceTier[]>;
   versioned_plan_worker_protocol?: number;
+  plan_cascade_protocol?: number;
   /** Manager/Worker capability fences; absent on older deployments. */
   pr_review_snapshot_context_version?: number;
   pr_review_terminal_chat_version?: number;
   task_artifact_scope_version?: number;
   /** Absent when the UI is connected to an older Manager/Worker. */
   plan_pipeline_defaults?: PlanPipelineConfig;
+  /** Side-effecting mode stays hidden unless both server feature gates are on. */
+  capability_core_enabled?: boolean;
+  /** Server gate defaults on; each ordinary Task still needs explicit policy. */
+  auto_capability_enabled?: boolean;
+  delivery_loop_enabled?: boolean;
+}
+
+export type AutoCapabilityKey = 'plan' | 'code_review';
+
+export interface AutoCapabilityPolicy {
+  version: 1;
+  max_invocations: number;
+  capabilities: Partial<Record<AutoCapabilityKey, number>>;
 }
 
 export interface TaskRoutingExpectation {
@@ -259,41 +768,53 @@ export interface TaskRoutingExpectation {
 
 export interface Task {
   id: number;
-  worker_id: number | null;
-  created_by: number | null;
+  worker_id?: number | null;
+  created_by?: number | null;
   title: string;
   description: string | null;
   status: string;
   priority: number;
   project_id: number | null;
-  target_repo: string | null;
+  target_repo?: string | null;
   target_branch: string;
   result_branch: string | null;
   merge_status: string;
-  instance_id: number | null;
   retry_count: number;
-  max_retries: number;
+  turn_generation: number;
+  max_retries?: number;
   mode: string;
-  todo_file_path: string | null;
+  capability_policy?: AutoCapabilityPolicy | null;
+  delivery_run_id?: number | null;
+  delivery_role?: string | null;
+  delivery_phase?: string | null;
+  delivery_activity?: string | null;
+  delivery_outcome?: string | null;
+  delivery_terminal?: 'ready_to_merge' | 'merged' | null;
+  todo_file_path?: string | null;
   loop_progress: string | null;
   max_iterations: number;
   must_complete: boolean;
-  goal_condition: string | null;
-  goal_evaluator_model: string | null;
+  goal_condition?: string | null;
+  goal_evaluator_model?: string | null;
   goal_max_turns: number;
   goal_turns_used: number;
   goal_last_reason: string | null;
+  pr_loop_url: string | null;
+  pr_loop_number: number | null;
+  pr_loop_repo: string | null;
+  pr_loop_state: string | null;
+  pr_loop_max_turns: number;
+  pr_loop_turns_used: number;
+  pr_loop_poll_interval: number;
   plan_content: string | null;
   plan_approved: boolean | null;
   plan_target_task_id: number | null;
   supersedes_plan_task_id: number | null;
   plan_approved_at: string | null;
-  plan_approved_by: number | null;
   plan_applied_at: string | null;
-  plan_applied_to_session_id: string | null;
   plan_execution_task_id: number | null;
   canonical_plan_id: number | null;
-  plan_pipeline_config: PlanPipelineConfig | null;
+  plan_pipeline_config?: PlanPipelineConfig | null;
   plan_stage?: string | null;
   plan_stage_round?: number | null;
   plan_stage_provider?: string | null;
@@ -303,8 +824,10 @@ export interface Task {
   starred: boolean;
   archived: boolean;
   has_unread: boolean;
-  session_id: string | null;
-  error_message: string | null;
+  has_session: boolean;
+  access_scope: 'control' | 'chat';
+  is_worker_managed: boolean;
+  error_message?: string | null;
   provider: string;
   model: string | null;
   effort_level: string | null;
@@ -314,20 +837,16 @@ export interface Task {
   timeout_hours?: number | null;
   last_accessed_at?: string | null;
   sort_order?: number | null;
-  enable_workflows: boolean;
-  enabled_skills: Record<string, boolean> | null;
-  selected_user_skills: number[] | null;
+  enable_workflows?: boolean;
+  enabled_skills?: Record<string, boolean> | null;
+  selected_user_skills?: number[] | null;
   shared_from_id: number | null;
   active_sub_agents: number;
   background_active?: boolean;
   tags: string[] | null;
   attention_tag?: string | null;
   metadata_: {
-    file_paths?: string[];
-    image_paths?: string[];
     attachments?: FileAttachment[];
-    secret_ids?: number[];
-    codex_account_id?: string;
     forked_from_task_id?: number;
     forked_from_log_id?: number | null;
     forked_from_turn_id?: string;
@@ -341,8 +860,11 @@ export interface Task {
     plan_review_exhausted?: boolean;
     revised_from_plan_task_id?: number;
     plan_superseded_by_task_id?: number;
-    ccm_worker_managed_task?: boolean;
-    ccm_user_skill_snapshots?: unknown[];
+    frontend_review?: FrontendReviewConfig;
+    /** Stable, read-only PR Monitor display Task marker. */
+    pr_monitor_display?: boolean;
+    pr_monitor_run_id?: number;
+    pr_monitor_review_id?: number;
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -363,6 +885,8 @@ export interface Instance {
   pid: number | null;
   status: string;
   current_task_id: number | null;
+  current_task_retry_count: number | null;
+  current_task_turn_generation: number | null;
   current_plan_run_id: number | null;
   worktree_path: string | null;
   provider: string;
@@ -404,12 +928,18 @@ export interface ChatMessage {
   loop_iteration: number | null;
   /** Exact Task retry generation that persisted this history row. */
   task_retry_count?: number | null;
+  /** Exact logical Task turn that produced this row/live stream item. */
+  task_turn_generation?: number | null;
+  /** Provider-native turn id, when the transport exposes one. */
+  native_turn_id?: string | null;
   timestamp: string | null;
   image_urls: string[] | null;
   attachments: FileAttachment[] | null;
   source?: string | null;
   /** Original user text without the display-only sender prefix. */
   raw_content?: string | null;
+  /** Browser-generated identity used only to reconcile one optimistic send. */
+  client_message_id?: string | null;
   /** Exact approved Plan versions prepended to this user turn. */
   applied_plans?: AppliedPlanSnapshot[] | null;
   /** Live-only app-server item id used to merge streamed deltas into the final message. */
@@ -420,6 +950,13 @@ export interface ChatMessage {
   /** Native item metadata used for narrowly-scoped compatibility filtering. */
   native_item_type?: string | null;
   native_item_status?: string | null;
+  background_lifecycle?: BackgroundLifecycle | null;
+  /** Provider emitted literal legacy tool markup instead of a structured tool call. */
+  protocol_anomaly?: 'legacy_tool_markup' | null;
+  /** Exact retained Claude follow-up correlated with its durable boundary. */
+  followup_operation_id?: string | null;
+  pty_followup_state?: 'completed' | 'uncertain' | null;
+  pty_background_generation?: string | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）
@@ -428,6 +965,15 @@ export interface ChatMessage {
   // ask_user 卡片（event_type === 'ask_user_question' 时存在）
   ask_questions?: AskUserQuestion[] | null;
   ask_status?: 'pending' | 'answered' | 'timed_out' | 'expired' | null;
+}
+
+export interface BackgroundLifecycle {
+  state: 'running' | 'completed';
+  reason: 'waiting_for_descendants' | 'waiting_for_native_goal' | string;
+  active_count: number;
+  active_thread_ids: string[];
+  started_at: string;
+  last_activity_at: string | null;
 }
 
 export interface CodexForkAnchor {
@@ -558,7 +1104,7 @@ export interface PlanRun {
   id: number;
   plan_id: number;
   run_type: string;
-  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'waiting_user' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
   current_stage: string;
   base_version_id: number | null;
   source_run_id: number | null;
@@ -610,6 +1156,9 @@ export interface PlanResource {
   updated_at: string;
   display_state: string;
   legacy: boolean;
+  ownership: 'standard' | 'capability';
+  read_only: boolean;
+  delivery_run_id: number | null;
   latest_run_status: string | null;
   latest_run_error: string | null;
   pipeline_config: PlanPipelineConfig;
@@ -679,6 +1228,9 @@ export interface LogEntry {
   id: number;
   instance_id: number;
   task_id: number | null;
+  task_retry_count: number | null;
+  task_turn_generation: number | null;
+  native_turn_id: string | null;
   event_type: string;
   role: string | null;
   content: string | null;
@@ -826,6 +1378,7 @@ export interface MonitoredRepo {
   id: number;
   repo_full_name: string;
   project_id: number | null;
+  worker_id: number | null;
   enabled: boolean;
   auto_merge: boolean;
   webhook_secret: string;
@@ -846,6 +1399,237 @@ export interface MonitoredRepo {
   updated_at: string;
 }
 
+/** Returned only by create/rotate; webhook_secret is the one-time raw value. */
+export type MonitoredRepoSecretResponse = MonitoredRepo & { webhook_secret: string };
+
+export type DeliveryPhase =
+  | 'planning'
+  | 'coding'
+  | 'pre_review'
+  | 'frontend_review'
+  | 'publishing'
+  | 'monitoring'
+  | 'done';
+
+export type DeliveryActivity = 'ready' | 'running' | 'waiting' | 'paused' | 'terminal';
+
+export interface DeliveryRun {
+  id: number;
+  project_id: number;
+  monitored_repo_id: number | null;
+  source_todo_id: number | null;
+  developer_task_id: number | null;
+  pr_monitor_run_id: number | null;
+  title: string;
+  requirements: string;
+  base_branch: string;
+  delivery_branch: string;
+  base_sha: string | null;
+  head_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  phase: DeliveryPhase;
+  activity: DeliveryActivity;
+  outcome: 'success' | 'failed' | 'cancelled' | 'superseded' | null;
+  terminal: 'ready_to_merge' | 'merged' | null;
+  wait_reason: string | null;
+  pause_reason: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  state_version: number;
+  current_cycle_id: number | null;
+  cycle_count: number;
+  turn_count: number;
+  max_cycles: number;
+  no_progress_count: number;
+  max_no_progress: number;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  allowed_actions: Array<'pause' | 'resume' | 'cancel' | 'retry'>;
+}
+
+export interface DeliveryCycle {
+  id: number;
+  run_id: number;
+  cycle_number: number;
+  status: string;
+  state_version: number;
+  trigger_kind: string;
+  trigger_payload: Record<string, unknown>;
+  base_sha: string | null;
+  start_head_sha: string | null;
+  result_head_sha: string | null;
+  plan_version_id: number | null;
+  review_verdict: string | null;
+  review_summary: string | null;
+  frontend_review_run_id: string | null;
+  frontend_review_profile_ids: string[];
+  frontend_review_profile_index: number;
+  frontend_review_results: Array<Record<string, unknown>>;
+  frontend_review_verdict: string | null;
+  frontend_review_summary: string | null;
+  frontend_review_skip_reason: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface DeliveryTurn {
+  id: number;
+  run_id: number;
+  cycle_id: number;
+  generation: number;
+  purpose: string;
+  trigger_kind: string;
+  status: string;
+  task_id: number | null;
+  task_started_at: string | null;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface DeliveryTransition {
+  id: number;
+  run_id: number;
+  state_version: number;
+  cause: string;
+  actor_kind: string;
+  created_at: string;
+}
+
+export interface DeliveryRunDetail extends DeliveryRun {
+  cycles: DeliveryCycle[];
+  turns: DeliveryTurn[];
+  transitions: DeliveryTransition[];
+}
+
+export type DeliveryStageKey = Exclude<DeliveryPhase, 'done'>;
+
+export interface DeliveryAgentActivity {
+  role: 'planner' | 'plan_reviewer' | 'developer' | 'code_reviewer' | 'browser_reviewer';
+  provider: string | null;
+  model: string | null;
+  effort: string | null;
+  service_tier: string | null;
+  status: string;
+  activity_kind: string;
+  headline: string;
+  detail: string | null;
+  started_at: string | null;
+  first_output_at: string | null;
+  last_activity_at: string | null;
+  output_chars: number;
+}
+
+export interface DeliveryStageProgress {
+  key: DeliveryStageKey;
+  label: string;
+  state: 'pending' | 'ready' | 'running' | 'waiting' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'skipped';
+  summary: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface DeliveryTimelineEvent {
+  id: string;
+  stage: string;
+  kind: string;
+  source: string;
+  title: string;
+  detail: string | null;
+  status: string | null;
+  created_at: string;
+}
+
+export interface DeliveryPlanInputProjection {
+  plan_id: number;
+  run: {
+    id: number;
+    generation: number;
+    status: string;
+    current_stage: string;
+  };
+  request: {
+    id: number;
+    requested_by: string;
+    reason: string | null;
+    questions: PlanQuestion[];
+    status: string;
+  };
+}
+
+export interface DeliveryFrontendReviewProgress {
+  policy: 'auto' | 'required' | 'off';
+  run_id: string | null;
+  status: string | null;
+  stage: string | null;
+  verdict: string | null;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string | null;
+  evidence_archive_state: string | null;
+  finding_count: number;
+  evidence_count: number;
+  skip_reason: string | null;
+}
+
+export interface DeliveryProgress {
+  run_id: number;
+  state_version: number;
+  phase: DeliveryPhase;
+  activity: DeliveryActivity;
+  headline: string;
+  detail: string | null;
+  attention_required: boolean;
+  attention_kind: string | null;
+  last_activity_at: string | null;
+  stages: DeliveryStageProgress[];
+  active_agent: DeliveryAgentActivity | null;
+  events: DeliveryTimelineEvent[];
+  plan_id: number | null;
+  plan_input: DeliveryPlanInputProjection | null;
+  frontend_review: DeliveryFrontendReviewProgress;
+}
+
+export interface DeliveryRunCreate {
+  idempotency_key: string;
+  project_id: number;
+  monitored_repo_id: number;
+  title: string;
+  requirements: string;
+  source_todo_id?: number;
+  base_branch?: string;
+  provider?: 'claude' | 'codex';
+  model?: string;
+  codex_service_tier?: CodexServiceTier;
+  effort_level?: string;
+  timeout_hours?: number | null;
+  max_cycles?: number;
+  max_no_progress?: number;
+  auto_merge?: boolean | null;
+  strict_branch_protection?: boolean;
+  frontend_review?: 'auto' | 'required' | 'off';
+}
+
+export interface DeliveryQuickStartCreate {
+  idempotency_key: string;
+  project_id: number;
+  requirements: string;
+  title?: string;
+  timeout_hours?: number | null;
+  max_cycles?: number;
+  max_no_progress?: number;
+  auto_merge?: boolean;
+  strict_branch_protection?: boolean;
+  frontend_review?: 'auto' | 'required' | 'off';
+}
+
 export interface RequiredCheckPolicy {
   kind: 'check_run' | 'status';
   name: string;
@@ -854,9 +1638,12 @@ export interface RequiredCheckPolicy {
 
 export interface PRReview {
   id: number;
+  attempt: number;
+  rerun_of_review_id: number | null;
   monitor_run_id: number | null;
   repo_id: number;
   pr_number: number;
+  base_ref: string | null;
   base_sha: string | null;
   head_sha: string | null;
   delivery_id: string | null;
@@ -864,9 +1651,37 @@ export interface PRReview {
   pr_author: string;
   pr_url: string;
   task_id: number | null;
+  display_task_id?: number | null;
   status: string;
   review_summary: string | null;
+  /** Additive human-facing projection. Older CCM servers omit these fields. */
+  task_ids?: number[];
+  reviewer_count?: number;
+  reviewer_status_counts?: Record<string, number>;
+  reviewer_verdict_counts?: Record<string, number>;
+  aggregate_verdict?: 'pass' | 'changes_required' | null;
+  verdict_state?: PRVerdictState;
+  publication_state?: PRPublicationState;
+  publication_error?: string | null;
+  lifecycle_state?: PRLifecycleState;
+  failure_stage?: PRFailureStage | null;
+  error_category?: 'unsupported_input_size' | null;
+  error_measured?: number | null;
+  error_limit?: number | null;
+  error_unit?: 'characters' | 'UTF-8 bytes' | null;
+  display_status?: string | null;
+  display_summary?: string | null;
+  outcome_kind?: PRReviewOutcomeKind;
+  /** GitHub publication is always a COMMENT for the current PR Monitor path. */
+  github_event?: 'COMMENT' | null;
+  published_actor?: string | null;
+  published_at?: string | null;
+  github_review_id?: number | null;
+  github_review_url?: string | null;
+  github_state?: string | null;
+  can_rerun?: boolean;
   action_taken: string | null;
+  merge_method: 'merge' | 'squash' | 'fast-forward' | null;
   ci_status: string | null;
   ci_summary: string | null;
   ci_details: {
@@ -896,12 +1711,30 @@ export interface PRMonitorRun {
   pr_number: number;
   status: string;
   current_head_sha: string;
+  current_review_id?: number | null;
+  /** Stable ordinary Task used to display this PR's aggregate result. */
+  display_task_id?: number | null;
   developer_task_id: number | null;
   repair_attempts: number;
   max_repair_attempts: number;
   pause_reason: string | null;
   wakes: PRRepairWake[];
   merge_actions: PRMergeQueueAction[];
+  /** Immutable review attempts for this PR lifecycle, oldest first. */
+  review_history?: PRMonitorReviewAttempt[];
+}
+
+export interface PRMonitorReviewAttempt {
+  id: number;
+  attempt: number;
+  head_sha: string | null;
+  status: string;
+  aggregate_verdict: 'pass' | 'changes_required' | null;
+  publication_state: PRPublicationState;
+  github_review_id: number | null;
+  github_review_url: string | null;
+  created_at: string;
+  completed_at: string | null;
 }
 
 export interface PRMergeQueueAction {
@@ -909,6 +1742,12 @@ export interface PRMergeQueueAction {
   review_id: number;
   trigger_head_sha: string;
   status: string;
+  effect_kind?: 'queue' | 'direct';
+  publishing_actor?: string | null;
+  publishing_started_at?: string | null;
+  merge_method?: string | null;
+  wait_for_ci?: boolean;
+  required_checks?: RequiredCheckPolicy[];
   github_queue_entry_id: string | null;
   merge_group_sha: string | null;
   ci_status: string | null;
@@ -988,10 +1827,79 @@ export interface PRReviewerRun {
   effort: string | null;
   status: string;
   verdict: string | null;
+  result_body?: string | null;
+  outcome_kind?: PRReviewOutcomeKind;
   error_message: string | null;
   created_at: string;
   completed_at: string | null;
   findings: PRFinding[];
+}
+
+export type PRReviewOutcomeKind = 'in_progress' | 'review_result' | 'infrastructure_error' | 'lifecycle';
+
+export type PRVerdictState = 'pending' | 'complete' | 'unavailable';
+export type PRPublicationState = 'not_started' | 'publishing' | 'reconciling' | 'published' | 'failed' | 'not_applicable';
+export type PRLifecycleState = 'unknown' | 'reviewing' | 'superseding' | 'superseded' | 'cancelled' | 'merged' | 'closed' | 'failed';
+export type PRFailureStage = 'reviewer' | 'ci' | 'github_identity' | 'publication' | 'merge' | 'recovery' | 'lifecycle';
+
+/** Minimal receipt returned after an exact-head rerun is accepted. */
+export interface PRReviewRerunReceipt {
+  id: number;
+  attempt: number;
+  rerun_of_review_id: number;
+  monitor_run_id: number | null;
+  status: string;
+  head_sha: string;
+}
+
+/**
+ * Safe, read-only projection used by the ordinary Tasks page. It intentionally
+ * contains no internal Reviewer Task IDs, prompts, sessions, logs, nonces, or
+ * pending GitHub bodies.
+ */
+export interface PRReviewResult {
+  /** Stable UI identity for both Run-backed and historical orphan results. */
+  result_key: string;
+  run_id: number | null;
+  /** Ordinary Task that renders this PR's aggregate result, when provisioned. */
+  display_task_id?: number | null;
+  repo_id: number;
+  repo_full_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  review_id: number | null;
+  base_ref: string | null;
+  base_sha: string | null;
+  head_sha: string | null;
+  verdict_state: PRVerdictState;
+  aggregate_verdict: 'pass' | 'changes_required' | null;
+  publication_state: PRPublicationState;
+  lifecycle_state: PRLifecycleState;
+  failure_stage: PRFailureStage | null;
+  error_category: 'unsupported_input_size' | null;
+  error_measured: number | null;
+  error_limit: number | null;
+  error_unit: 'characters' | 'UTF-8 bytes' | null;
+  display_status: string;
+  display_summary: string | null;
+  published_actor: string | null;
+  published_at: string | null;
+  github_review_id: number | null;
+  github_review_url: string | null;
+  github_state: string | null;
+  github_event: 'COMMENT' | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  can_rerun: boolean;
+}
+
+export interface GitHubPublisherIdentity {
+  available: boolean;
+  actor: string | null;
+  error: string | null;
+  checked_at: string;
 }
 
 export interface PoolUsageWindow {
@@ -1095,18 +2003,37 @@ export interface CloudRouterModelMap {
   codex: string[];
 }
 
-export type ApiAccountProvider = 'cloudrouter' | 'apex';
+export type ApiAccountProvider = 'cloudrouter' | 'apex' | 'apibest';
 
-export interface CloudRouterAccount {
+export interface ApiAccountCleanupDiagnostics {
+  cleanup_pending?: boolean;
+  cleanup_code?: string | null;
+  cleanup_reason?: string | null;
+  /** Unix timestamp in seconds for the most recent cleanup attempt. */
+  cleanup_last_attempt_at?: number | null;
+  /** Unix timestamp in seconds for the most recent failed cleanup attempt. */
+  cleanup_last_error_at?: number | null;
+}
+
+export interface ApiAccountCleanupConflictDetail {
+  message?: string;
+  error?: string;
+  code?: string | null;
+  reason?: string | null;
+  cleanup_pending?: boolean;
+}
+
+export interface CloudRouterAccount extends ApiAccountCleanupDiagnostics {
   id: string;
   name: string;
   api_provider: ApiAccountProvider;
-  auth_kind: 'cloudrouter_api' | 'apex_api';
+  auth_kind: 'cloudrouter_api' | 'apex_api' | 'apibest_api';
   enabled: boolean;
   retired: boolean;
-  cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
+  /** API-advertised service tiers by Codex model. */
+  service_tiers?: Record<string, string[]>;
   providers: string[];
   account_dir: string;
   claude_config_dir: string;
@@ -1120,15 +2047,15 @@ export interface CloudRouterRetireResult extends CloudRouterAccount {
   ok: boolean;
 }
 
-export interface CloudRouterAccountProjection {
+export interface CloudRouterAccountProjection extends ApiAccountCleanupDiagnostics {
   auth_kind?: string | null;
   api_provider?: ApiAccountProvider | null;
   display_name?: string | null;
   api_account_id?: string | null;
   /** A durable tombstone is kept while credential/config cleanup must be retried. */
   retired?: boolean;
-  cleanup_pending?: boolean;
   supported_models?: string[];
+  service_tiers?: Record<string, string[]>;
   api_quota?: CloudRouterApiQuota | null;
 }
 
@@ -1211,7 +2138,16 @@ export interface CodexPoolUsageStatus {
   disabled: number;
   preferred: string | null;
   last_selected?: string | null;
+  settings: CodexPoolSettings;
   accounts: CodexPoolAccountUsage[];
+}
+
+export interface CodexPoolSettings {
+  enabled: boolean;
+  cooldown_seconds: number;
+  quota_switch_threshold_percent: number;
+  routing_policy: 'api_first' | 'native_first';
+  preferred_account_id: string | null;
 }
 
 export type CodexLoginStatusName =
@@ -1236,11 +2172,13 @@ export interface CodexLoginStatus {
 }
 
 
+export type TeamUserRole = 'super_admin' | 'admin' | 'member';
+
 export interface TeamUser {
   id: number;
   email: string;
   name: string;
-  role: string;
+  role: TeamUserRole;
   avatar_url: string;
 }
 
@@ -1472,7 +2410,7 @@ export const api = {
     git_https_token?: string;
   }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(data) }),
-  updateProject: (id: number, data: Partial<Pick<Project, 'name' | 'show_in_selector' | 'sort_order' | 'tags' | 'env_files' | 'badge_color' | 'git_author_name' | 'git_author_email' | 'git_credential_type' | 'git_ssh_key_path' | 'git_https_username' | 'git_https_token'>>) =>
+  updateProject: (id: number, data: Partial<Pick<Project, 'name' | 'show_in_selector' | 'sort_order' | 'tags' | 'env_files' | 'badge_color' | 'git_author_name' | 'git_author_email' | 'git_credential_type' | 'git_ssh_key_path' | 'git_https_username' | 'git_https_token' | 'preview_config'>>) =>
     request<Project>(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   reorderProjects: (orders: { id: number; sort_order: number }[]) =>
     request<Project[]>('/api/projects/reorder', { method: 'PUT', body: JSON.stringify(orders) }),
@@ -1484,7 +2422,7 @@ export const api = {
     request<ProjectTodo[]>(`/api/projects/${projectId}/todos${includeArchived ? '?include_archived=true' : ''}`),
   createProjectTodo: (projectId: number, data: { title: string; prompt: string }) =>
     request<ProjectTodo>(`/api/projects/${projectId}/todos`, { method: 'POST', body: JSON.stringify(data) }),
-  updateProjectTodo: (projectId: number, todoId: number, data: Partial<Pick<ProjectTodo, 'title' | 'prompt' | 'status' | 'sort_order' | 'created_task_id'>>) =>
+  updateProjectTodo: (projectId: number, todoId: number, data: Partial<Pick<ProjectTodo, 'title' | 'prompt' | 'status' | 'sort_order'>>) =>
     request<ProjectTodo>(`/api/projects/${projectId}/todos/${todoId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteProjectTodo: (projectId: number, todoId: number) =>
     request<{ ok: boolean }>(`/api/projects/${projectId}/todos/${todoId}`, { method: 'DELETE' }),
@@ -1545,6 +2483,12 @@ export const api = {
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),
   updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
     request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(data) }),
+  getCapacitySettings: () => request<CapacitySettings>('/api/settings/capacity'),
+  updateCapacitySettings: (maxConcurrentInstances: number | null) =>
+    request<CapacitySettings>('/api/settings/capacity', {
+      method: 'PUT',
+      body: JSON.stringify({ max_concurrent_instances: maxConcurrentInstances }),
+    }),
   getGitSettings: () => request<GlobalSettings>('/api/settings/git'),
   updateGitSettings: (data: Partial<GlobalSettings>) =>
     request<GlobalSettings>('/api/settings/git', { method: 'PUT', body: JSON.stringify(data) }),
@@ -1642,7 +2586,14 @@ export const api = {
   markTaskUnread: (id: number) =>
     request<Task>(`/api/tasks/${id}/unread`, { method: 'POST' }),
   stopTaskSession: (id: number) =>
-    request<{ ok: boolean; stopped?: boolean; cleared_messages?: number; note?: string }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
+    request<{
+      ok: boolean;
+      stopped?: boolean;
+      cleared_messages?: number;
+      note?: string;
+      task_status?: string;
+      background_active?: boolean;
+    }>(`/api/tasks/${id}/stop-session`, { method: 'POST' }),
   listForkAnchors: (id: number) =>
     request<CodexForkAnchor[]>(`/api/tasks/${id}/fork-anchors`),
   forkTask: (
@@ -1658,8 +2609,24 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; capability_policy?: AutoCapabilityPolicy; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; pr_loop_max_turns?: number; pr_loop_poll_interval?: number; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
+  createTaskFromProjectTodo: (
+    projectId: number,
+    todoId: number,
+    data: {
+      title: string;
+      prompt: string;
+      provider?: 'claude' | 'codex';
+      model?: string;
+      codex_service_tier?: CodexServiceTier;
+      effort_level?: string;
+      timeout_hours?: number | null;
+    },
+  ) => request<Task>(`/api/projects/${projectId}/todos/${todoId}/task`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteTask: (id: number) =>
@@ -1728,6 +2695,8 @@ export const api = {
     return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
   },
   getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),
+  getPlanVersion: (versionId: number) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}`),
   resolvePlanApplicationDelivery: (
     planId: number,
     receiptKey: string,
@@ -1835,6 +2804,7 @@ export const api = {
   stopInstance: (
     id: number,
     expectedTaskId: number,
+    expectedTaskTurnGeneration: number,
     expectedPid: number | null,
     expectedStartedAt: string | null,
   ) =>
@@ -1842,6 +2812,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         expected_task_id: expectedTaskId,
+        expected_task_turn_generation: expectedTaskTurnGeneration,
         expected_pid: expectedPid,
         expected_started_at: expectedStartedAt,
       }),
@@ -1872,15 +2843,17 @@ export const api = {
     confirmedStalePlanTaskIds?: number[],
     planVersionIds?: number[],
     confirmedStalePlanVersionIds?: number[],
+    clientMessageId?: string,
   ) =>
     request<{
       ok: boolean;
       pid: number;
-      instance_id: number;
-      session_id: string;
+      has_session: boolean;
       applied_plan_task_ids?: number[];
       applied_plan_version_ids?: number[];
       plan_application_receipt_key?: string;
+      workspace_review_expected: boolean;
+      workspace_review_baseline_run_id: string | null;
     }>(`/api/tasks/${taskId}/chat`, {
       method: 'POST',
       body: JSON.stringify({
@@ -1897,8 +2870,26 @@ export const api = {
         ...(confirmedStalePlanVersionIds?.length
           ? { confirmed_stale_plan_version_ids: confirmedStalePlanVersionIds }
           : {}),
+        ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
       }),
     }),
+  startFrontendReviewGoal: (
+    taskId: number,
+    data: {
+      message: string;
+      file_paths?: string[];
+      secret_ids?: number[];
+      profile?: 'standard' | 'exhaustive';
+      max_iterations?: number;
+      expected_routing?: TaskRoutingExpectation;
+      client_message_id?: string;
+    },
+  ) => request<Task>(`/api/tasks/${taskId}/frontend-review-goal`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  getFrontendReviewGoalCapabilities: (taskId: number) =>
+    request<FrontendReviewGoalCapabilities>(`/api/tasks/${taskId}/frontend-review-goal/capabilities`),
   getInjectCapabilities: (taskId: number) =>
     request<InjectTaskCapabilities>(`/api/tasks/${taskId}/inject-capabilities`),
   injectTaskMessage: (
@@ -1907,7 +2898,12 @@ export const api = {
     expectedRouting?: TaskRoutingExpectation,
     uploads?: InjectTaskAttachments,
   ) =>
-    request<{ ok: boolean; injected: boolean; attachment_count?: number }>(`/api/tasks/${taskId}/inject`, {
+    request<{
+      ok: boolean;
+      injected: boolean;
+      attachment_count?: number;
+      operation_id?: string | null;
+    }>(`/api/tasks/${taskId}/inject`, {
       method: 'POST',
       body: JSON.stringify({
         message,
@@ -1989,6 +2985,68 @@ export const api = {
   },
 
   // Files (SSH)
+  listSSHProfiles: (taskEligibleOnly = false) =>
+    request<SSHProfile[]>(
+      `/api/ssh-profiles${taskEligibleOnly ? '?task_eligible_only=true' : ''}`,
+    ),
+  createSSHProfile: (data: SSHProfileInput) =>
+    request<SSHProfile>('/api/ssh-profiles', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  uploadSSHPrivateKey: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return formRequest<SSHPrivateKeyUpload>('/api/ssh-profiles/upload-key', formData);
+  },
+  cancelSSHPrivateKeyUpload: (uploadToken: string) =>
+    request<{ ok: boolean }>(`/api/ssh-profiles/upload-key/${encodeURIComponent(uploadToken)}`, {
+      method: 'DELETE',
+    }),
+  listTaskSSHGrants: (taskId: number) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`),
+  updateTaskSSHGrants: (taskId: number, grants: TaskSSHGrantInput[]) =>
+    request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`, {
+      method: 'PUT',
+      body: JSON.stringify({ grants }),
+    }),
+  updateSSHProfile: (
+    id: number,
+    data: Partial<SSHProfileInput> & { expected_revision: number },
+  ) =>
+    request<SSHProfile>(`/api/ssh-profiles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteSSHProfile: (id: number, expectedRevision: number) =>
+    request<{ ok: boolean }>(
+      `/api/ssh-profiles/${id}?expected_revision=${expectedRevision}`,
+      { method: 'DELETE' },
+    ),
+  probeSSHHostKey: (data: { host: string; port: number; timeout_seconds?: number }) =>
+    request<SSHHostKeyProbe>('/api/ssh-profiles/probe-host-key', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  testSSHProfile: (id: number) =>
+    request<SSHProfileTestResult>(`/api/ssh-profiles/${id}/test`, { method: 'POST' }),
+  managedSSHListDir: (profileId: number, path: string) =>
+    request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[]; truncated: boolean }>(`/api/files/ssh/${profileId}/list`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHReadFile: (profileId: number, path: string) =>
+    request<{ path: string; content: string; size: number }>(`/api/files/ssh/${profileId}/read`, { method: 'POST', body: JSON.stringify({ path }) }),
+  managedSSHDownloadFile: async (profileId: number, path: string) => {
+    const token = getToken();
+    const res = await fetch(`${getBase()}/api/files/ssh/${profileId}/download`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ path }),
+    });
+    await validateAuthenticatedDownloadResponse(res);
+    return res;
+  },
   sshListDir: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>
     request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[] }>('/api/files/ssh/list', { method: 'POST', body: JSON.stringify({ ...creds, path }) }),
   sshReadFile: (creds: { host: string; port: number; username: string; password?: string; key_path?: string }, path: string) =>
@@ -2084,12 +3142,147 @@ export const api = {
     ),
   getSubAgentSummary: (taskId: number) =>
     request<SubAgentSummary>(`/api/tasks/${taskId}/sub-agents/summary`),
+  listAllSubAgentSessions: (taskId: number) =>
+    request<MonitorSession[]>(`/api/tasks/${taskId}/sub-agents/sessions`),
+  getSubAgentReports: (taskId: number, sessionId: number) =>
+    request<MonitorCheck[]>(
+      `/api/tasks/${taskId}/sub-agents/sessions/${sessionId}/reports`,
+    ),
+
+  // Browser Review demo
+  getBrowserReviewConfig: () =>
+    request<BrowserReviewConfig>('/api/browser-reviews/config'),
+  listBrowserReviews: () =>
+    request<BrowserReviewJob[]>('/api/browser-reviews'),
+  createBrowserReview: (data: BrowserReviewCreate) =>
+    request<BrowserReviewJob>('/api/browser-reviews', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getBrowserReview: (id: string) =>
+    request<BrowserReviewJob>(`/api/browser-reviews/${encodeURIComponent(id)}`),
+  cancelBrowserReview: (id: string) =>
+    request<BrowserReviewJob>(`/api/browser-reviews/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    }),
+  getBrowserReviewArtifact: (id: string, name: string) =>
+    blobRequest(
+      `/api/browser-reviews/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`,
+    ),
+  listTaskBrowserReviews: (taskId: number) =>
+    request<BrowserReviewJob[]>(`/api/tasks/${taskId}/browser-reviews`),
+  getTaskBrowserReviewArtifact: (taskId: number, id: string, name: string) =>
+    blobRequest(
+      `/api/tasks/${taskId}/browser-reviews/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`,
+    ),
+
+  // Durable, provider-neutral frontend Test Harness
+  getTestHarnessCapabilities: (taskId: number) =>
+    request<TestHarnessCapabilities>(`/api/tasks/${taskId}/test-runs/capabilities`),
+  getTestHarnessRuntimeConfig: (taskId: number) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`),
+  updateTestHarnessRuntimeConfig: (taskId: number, data: TestHarnessRuntimeConfigUpdate) =>
+    request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  startTestRun: (taskId: number, data: TestHarnessRunStart) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listTestRuns: (taskId: number) =>
+    request<TestHarnessRun[]>(`/api/tasks/${taskId}/test-runs`),
+  getTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}`),
+  cancelTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
+  repeatTestRun: (taskId: number, runId: string) =>
+    request<TestHarnessRun>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/repeat`, {
+      method: 'POST',
+    }),
+  compareTestRuns: (taskId: number, baseRunId: string, candidateRunId: string) =>
+    request<Record<string, unknown>>(`/api/tasks/${taskId}/test-runs/${encodeURIComponent(baseRunId)}/compare/${encodeURIComponent(candidateRunId)}`),
+  getTestRunEvidence: (taskId: number, runId: string, name: string) =>
+    blobRequest(
+      `/api/tasks/${taskId}/test-runs/${encodeURIComponent(runId)}/evidence/${encodeURIComponent(name)}`,
+    ),
+
+  // Current Task workspace browser verification
+  getWorkspaceReviewCapabilities: (taskId: number) =>
+    request<WorkspaceReviewCapabilities>(`/api/tasks/${taskId}/workspace-reviews/capabilities`),
+  approveWorkspacePreviewConfig: (taskId: number, config: WorkspacePreviewConfig) =>
+    request<WorkspaceReviewCapabilities>(`/api/tasks/${taskId}/workspace-reviews/preview-config`, {
+      method: 'PUT',
+      body: JSON.stringify({ config }),
+    }),
+  startWorkspaceReview: (taskId: number, data: WorkspaceReviewStart) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listWorkspaceReviews: (taskId: number) =>
+    request<WorkspaceReviewRun[]>(`/api/tasks/${taskId}/workspace-reviews`),
+  getWorkspaceReview: (taskId: number, runId: string) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews/${encodeURIComponent(runId)}`),
+  cancelWorkspaceReview: (taskId: number, runId: string) =>
+    request<WorkspaceReviewRun>(`/api/tasks/${taskId}/workspace-reviews/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    }),
+
+  // Autonomous Delivery Loop. Creation is intentionally separate from the
+  // ordinary Task endpoint so the controller-owned Task cannot be claimed
+  // before its Run, cycle, and policy snapshot are committed.
+  createDeliveryRun: (data: DeliveryRunCreate) =>
+    request<DeliveryRun>('/api/delivery-runs', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  quickStartDelivery: (data: DeliveryQuickStartCreate) =>
+    request<DeliveryRun>('/api/delivery-runs/quick-start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listDeliveryRuns: (projectId?: number) =>
+    request<DeliveryRun[]>(
+      `/api/delivery-runs${projectId ? `?project_id=${projectId}` : ''}`,
+    ),
+  getDeliveryRun: (runId: number) =>
+    request<DeliveryRunDetail>(`/api/delivery-runs/${runId}`),
+  getDeliveryProgress: (runId: number) =>
+    request<DeliveryProgress>(`/api/delivery-runs/${runId}/progress`),
+  countDeliveryAttention: () =>
+    request<{ total: number }>('/api/delivery-runs/attention-count'),
+  pauseDeliveryRun: (runId: number, reason: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/pause`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  resumeDeliveryRun: (runId: number, reason?: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/resume`, {
+      method: 'POST', body: JSON.stringify({ reason: reason || null }),
+    }),
+  cancelDeliveryRun: (runId: number, reason: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/cancel`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  retryDeliveryRun: (runId: number, expectedStateVersion: number, reason?: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_state_version: expectedStateVersion,
+        reason: reason?.trim() || null,
+      }),
+    }),
 
   // PR Monitor
   getMonitoredRepos: () =>
     request<MonitoredRepo[]>('/api/pr-monitor/repos'),
+  getMonitoredRepo: (id: number) =>
+    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`),
   createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string; review_effort?: string; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[] }) =>
-    request<MonitoredRepo>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
+    request<MonitoredRepoSecretResponse>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
   updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string | null; review_effort?: string | null; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteMonitoredRepo: (id: number) =>
@@ -2097,11 +3290,25 @@ export const api = {
   toggleMonitoredRepo: (id: number) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/toggle`, { method: 'POST' }),
   regenerateSecret: (id: number) =>
-    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
+    request<MonitoredRepoSecretResponse>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
   getRepoReviews: (repoId: number, page = 1, size = 20) =>
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  getPRReviewResults: (page = 1, size = 50) =>
+    request<PRReviewResult[]>(`/api/pr-monitor/results?page=${page}&size=${size}`),
+  getPRMonitorGitHubIdentity: (repoId: number, refresh = false) =>
+    request<GitHubPublisherIdentity>(
+      `/api/pr-monitor/github-identity?repo_id=${repoId}${refresh ? '&refresh=true' : ''}`,
+    ),
+  rerunPRReview: (reviewId: number, expectedHeadSha: string, idempotencyKey: string) =>
+    request<PRReviewRerunReceipt>(`/api/pr-monitor/reviews/${reviewId}/rerun`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_head_sha: expectedHeadSha,
+        idempotency_key: idempotencyKey,
+      }),
+    }),
   ignoreReviewFinding: (findingId: number, idempotencyKey: string) =>
     request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/ignore`, {
       method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),
@@ -2154,6 +3361,9 @@ export const api = {
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/unbind-developer`, { method: 'POST' }),
   submitPRFindingRebuttal: (findingId: number, evidence: string) =>
     request<PRFindingRebuttal>(`/api/pr-monitor/findings/${findingId}/rebut`, { method: 'POST', body: JSON.stringify({ evidence }) }),
+  mergePRMonitorRun: (runId: number) =>
+    request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/merge`, { method: 'POST' }),
+  /** @deprecated compatibility alias; backend performs direct merge. */
   enqueuePRMonitorMerge: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/enqueue-merge`, { method: 'POST' }),
   getWebhookInfo: () =>
@@ -2198,7 +3408,7 @@ export const api = {
   // Team CCM
   getTeamUsers: () => request<TeamUser[]>('/api/team/users'),
   updateTeamUserRole: (userId: number, role: 'admin' | 'member') =>
-    request<{ ok: boolean; user_id: number; role: string }>(`/api/team/users/${userId}/role`, {
+    request<{ ok: boolean; user_id: number; role: TeamUserRole }>(`/api/team/users/${userId}/role`, {
       method: 'PUT',
       body: JSON.stringify({ role }),
     }),
@@ -2239,6 +3449,9 @@ export const api = {
   // Codex Pool
   getCodexPoolStatus: () => request<CodexPoolUsageStatus>('/api/codex-pool/status'),
   getCodexPoolUsage: (force?: boolean) => request<CodexPoolUsageStatus>('/api/codex-pool/usage' + (force ? '?force=true' : '')),
+  getCodexPoolSettings: () => request<CodexPoolSettings>('/api/codex-pool/settings'),
+  putCodexPoolSettings: (settings: CodexPoolSettings) =>
+    request<CodexPoolSettings>('/api/codex-pool/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   clearCodexPoolCooldown: (accountId: string) =>
     request<{ ok: boolean }>(`/api/codex-pool/accounts/${accountId}/clear-cooldown`, { method: 'POST' }),
   setCodexPoolPreferred: (accountId: string | null) =>
@@ -2272,7 +3485,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/user-skills/${id}`, { method: 'DELETE' }),
 
   // System Update
-  startUpdate: (data: { skip_frontend_build?: boolean; dry_run?: boolean; force?: boolean; branch?: string | null } = {}) =>
+  getUpdateChannel: () => request<{ update_channel: 'stable' | 'main' }>('/api/settings/update-channel'),
+  updateUpdateChannel: (update_channel: 'stable' | 'main') =>
+    request<{ update_channel: 'stable' | 'main' }>('/api/settings/update-channel', {
+      method: 'PUT', body: JSON.stringify({ update_channel }),
+    }),
+  startUpdate: (data: { skip_frontend_build?: boolean; dry_run?: boolean; force?: boolean; branch?: string | null; channel?: 'stable' | 'main' | null } = {}) =>
     request<any>('/api/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getUpdateStatus: () =>
     request<any>('/api/system/update/status'),

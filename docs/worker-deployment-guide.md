@@ -197,7 +197,7 @@ Worker 创建后自动执行以下 Bootstrap 步骤。每个步骤的状态会�
 ```
 ssh-wait        等待 EC2 实例 SSH 可达（最长 3 分钟）
     |
-system-init     安装系统依赖，并校验固定 Codex CLI 0.144.6
+system-init     安装系统依赖，并校验固定 Codex CLI 0.147.0
     |
 ccm-deploy      rsync 部署 CCM 代码（从 Manager 本地仓库）
     |

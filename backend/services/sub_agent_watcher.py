@@ -80,6 +80,10 @@ class SubAgentWatcher:
                 .where(
                     SubAgentSession.source == "native",
                     SubAgentSession.status == "running",
+                    # Codex native children are observed authoritatively from
+                    # app-server thread notifications.  They have no Claude
+                    # transcript path and must not enter the idle-file poller.
+                    SubAgentSession.provider != "codex",
                     SubAgentSession.agent_type.in_(["native-agent", "native-monitor"]),
                 )
             )
@@ -126,6 +130,16 @@ class SubAgentWatcher:
 
                 if summary:
                     async with self.db_factory() as db:
+                        from backend.services.worker_node_control import (
+                            WorkerNodeDrainingConflict,
+                            fence_worker_node_mutation,
+                        )
+
+                        try:
+                            await fence_worker_node_mutation(db)
+                        except WorkerNodeDrainingConflict:
+                            await db.rollback()
+                            continue
                         sa_obj = await db.get(SubAgentSession, sid)
                         if not sa_obj or sa_obj.status != "running":
                             continue
@@ -334,6 +348,16 @@ class SubAgentWatcher:
         final_summary = self._read_latest_summary(tracked["jsonl_path"], 0)
 
         async with self.db_factory() as db:
+            from backend.services.worker_node_control import (
+                WorkerNodeDrainingConflict,
+                fence_worker_node_mutation,
+            )
+
+            try:
+                await fence_worker_node_mutation(db)
+            except WorkerNodeDrainingConflict:
+                await db.rollback()
+                return
             sa = await db.get(SubAgentSession, sid)
             if not sa or sa.status != "running":
                 return

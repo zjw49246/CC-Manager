@@ -1,7 +1,16 @@
 import json
 from datetime import datetime
 
-from sqlalchemy import Integer, String, Text, DateTime, Boolean, Index
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -10,6 +19,18 @@ from backend.database import Base
 class LogEntry(Base):
     __tablename__ = "log_entries"
     __table_args__ = (
+        CheckConstraint(
+            "turn_scope IS NULL OR turn_scope IN "
+            "('source', 'foreground', 'autonomous', 'orphan')",
+            name="ck_log_entries_turn_scope",
+        ),
+        CheckConstraint(
+            "actual_transport IS NULL OR (turn_scope IS NOT NULL "
+            "AND turn_scope = 'source' "
+            "AND actual_transport IN ('claude_pty', 'claude_exec', "
+            "'codex_app_server', 'codex_exec'))",
+            name="ck_log_entries_actual_transport",
+        ),
         # Speeds up chat history query: filter by task_id, order/limit by id
         Index("ix_log_entries_task_id_id", "task_id", "id"),
     )
@@ -23,6 +44,27 @@ class LogEntry(Base):
     # evidence for generation-sensitive workflows such as PR Monitor.
     task_retry_count: Mapped[int | None] = mapped_column(
         Integer,
+        nullable=True,
+    )
+    # Immutable logical/native turn identity captured by the producer. These
+    # remain NULL only for legacy and genuinely non-turn-scoped events.
+    task_turn_generation: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+    native_turn_id: Mapped[str | None] = mapped_column(
+        String(200),
+        nullable=True,
+    )
+    # Role of this row inside terminal arbitration. NULL preserves legacy and
+    # non-turn-scoped logs; only foreground output may authorize an Agent
+    # capability request.
+    turn_scope: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Authoritative runtime route for this exact logical turn.  Only the bound
+    # ``source`` row may receive it, at InstanceManager's final pre-provider
+    # boundary.  A generic/planned transport in raw_json is never evidence.
+    actual_transport: Mapped[str | None] = mapped_column(
+        String(24),
         nullable=True,
     )
     event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)

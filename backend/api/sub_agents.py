@@ -5,9 +5,65 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.api.deps import require_task_access
 from backend.models.task import Task
-from backend.models.sub_agent import SubAgentSession
+from backend.models.sub_agent import SubAgentReport, SubAgentSession
+from backend.schemas.monitor_session import (
+    MonitorCheckResponse,
+    MonitorSessionResponse,
+)
 
 router = APIRouter(prefix="/api/tasks/{task_id}/sub-agents", tags=["sub-agents"])
+
+
+@router.get("/sessions", response_model=list[MonitorSessionResponse])
+async def list_all_sub_agent_sessions(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the generic read model across CCM and provider-native agents."""
+
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+    rows = await db.execute(
+        select(SubAgentSession)
+        .where(SubAgentSession.task_id == task_id)
+        .order_by(SubAgentSession.created_at.desc(), SubAgentSession.id.desc())
+    )
+    return list(rows.scalars())
+
+
+@router.get(
+    "/sessions/{session_id}/reports",
+    response_model=list[MonitorCheckResponse],
+)
+async def list_all_sub_agent_reports(
+    task_id: int,
+    session_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return reports for one row in the generic sub-agent read model."""
+
+    task = await db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_task_access(request, task, db)
+    session = await db.scalar(
+        select(SubAgentSession).where(
+            SubAgentSession.id == session_id,
+            SubAgentSession.task_id == task_id,
+        )
+    )
+    if session is None:
+        raise HTTPException(404, "Sub-agent session not found")
+    rows = await db.execute(
+        select(SubAgentReport)
+        .where(SubAgentReport.session_id == session_id)
+        .order_by(SubAgentReport.created_at.desc(), SubAgentReport.id.desc())
+    )
+    return list(rows.scalars())
 
 
 @router.get("/summary")

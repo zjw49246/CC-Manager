@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import shlex
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
@@ -24,7 +26,32 @@ import backend.api.workers as workers_api
 import backend.main as main_module
 import backend.services.worker_provisioner as worker_provisioner_module
 from backend.models.worker import Worker
-from backend.services.worker_provisioner import WorkerProvisioner
+from backend.services.worker_provisioner import (
+    CLAUDE_LOGIN_IDENTITY_KEY,
+    WorkerProvisioner,
+    worker_claude_login_identity,
+    worker_create_client_token,
+    worker_create_client_token_digest,
+)
+from backend.services.worker_drain_proof import (
+    worker_node_drain_proof_signature,
+)
+from backend.services.worker_proxy import (
+    build_worker_destroy_termination_receipt,
+    capture_worker_destroy_lifecycle_claim,
+    worker_destroy_provision_spec_digest,
+)
+
+
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
+TEST_CLOUD_SCOPE = {
+    "provider": "aws",
+    "partition": "aws",
+    "account_id": "123456789012",
+    "region": "us-east-1",
+}
 
 
 async def _insert_worker(session_factory, **fields) -> Worker:
@@ -44,6 +71,59 @@ async def _insert_worker(session_factory, **fields) -> Worker:
 async def _drain_worker_background_tasks() -> None:
     while workers_api._background_tasks:
         await asyncio.gather(*tuple(workers_api._background_tasks))
+
+
+async def _authorize_direct_destroy(session_factory, worker_id: int):
+    """Install the same final cloud-effect outbox required in production."""
+
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+        worker.status = "destroying"
+        worker.destroy_lifecycle_nonce = secrets.token_hex(16)
+        await db.flush()
+        claim = capture_worker_destroy_lifecycle_claim(worker)
+        worker.provision_spec = {
+            "version": 1,
+            "name": worker.name,
+            "has_fixed_overrides": False,
+            "overrides": {},
+            "cloud_scope": TEST_CLOUD_SCOPE,
+            "client_token_digest": worker_create_client_token_digest(
+                worker.id,
+                worker.auth_token,
+            ),
+        }
+        proof = {
+            "protocol_version": 3,
+            "nonce": "f" * 32,
+            "node_role": "worker",
+            "drain_claim": claim.node_drain_claim,
+            "runtime_sealed": True,
+            "safe_to_destroy": True,
+            "blockers": [],
+            "blocker_count": 0,
+            "task_count": 0,
+        }
+        proof["signature"] = worker_node_drain_proof_signature(
+            proof,
+            auth_token=worker.auth_token,
+        )
+        worker.destroy_termination_receipt = (
+            build_worker_destroy_termination_receipt(
+                claim,
+                proof,
+                cloud_scope=TEST_CLOUD_SCOPE,
+                provision_spec_digest=worker_destroy_provision_spec_digest(
+                    worker.provision_spec
+                ),
+                client_token_digest=worker_create_client_token_digest(
+                    worker.id,
+                    worker.auth_token,
+                ),
+            )
+        )
+        await db.commit()
+        return claim
 
 
 async def test_login_codex_account_posts_credentials_and_polls_to_success(
@@ -244,7 +324,28 @@ async def test_login_codex_account_surfaces_otp_and_terminal_failure(
 async def test_step_account_login_keeps_codex_and_historical_claude_slots_independent(
     db_factory, session_factory,
 ):
-    worker = await _insert_worker(session_factory, status="creating", accounts=[])
+    worker = await _insert_worker(
+        session_factory,
+        status="creating",
+        accounts=[],
+        cloud_instance_id="i-provider-slots",
+    )
+    async with session_factory() as db:
+        current = await db.get(Worker, worker.id)
+        current.provision_spec = {
+            "version": 1,
+            "name": current.name,
+            "has_fixed_overrides": False,
+            "overrides": {},
+            "cloud_scope": TEST_CLOUD_SCOPE,
+            "client_token_digest": worker_create_client_token_digest(
+                current.id,
+                current.auth_token,
+            ),
+        }
+        await db.commit()
+        await db.refresh(current)
+        claude_login_identity = worker_claude_login_identity(current)
     provisioner = WorkerProvisioner(db_factory, cloud=object())
     provisioner._log = AsyncMock()
     provisioner.ensure_codex_account = AsyncMock(return_value="codex-4")
@@ -312,6 +413,7 @@ async def test_step_account_login_keeps_codex_and_historical_claude_slots_indepe
             "login_method": "onet",
             "status": "logged_in",
             "account_id": "default",
+            CLAUDE_LOGIN_IDENTITY_KEY: claude_login_identity,
         },
     ]
 
@@ -690,6 +792,134 @@ async def test_cancelled_dynamic_codex_login_blocks_immediate_second_ensure(
     workers_api._worker_login_state.pop(state_key, None)
 
 
+async def test_manager_restart_recovers_worker_otp_route_from_remote_state(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    email = "restart-otp@example.com"
+    attempt_id = "restart-attempt"
+    challenge_id = "restart-challenge"
+    worker = await _insert_worker(
+        session_factory,
+        accounts=[{
+            "email": email,
+            "provider": "codex",
+            "token": "saved-mail-token",
+            "password": "",
+            "login_method": "",
+            "status": "pending",
+        }],
+    )
+    provisioner = WorkerProvisioner(session_factory, cloud=object())
+    remote_state = {
+        "status": "awaiting_otp",
+        "attempt_id": attempt_id,
+        "challenge_id": challenge_id,
+        "expires_at": 9_999_999_999,
+        "account_id": "codex-1",
+    }
+    provisioner.worker_local_api = AsyncMock(
+        side_effect=[remote_state, remote_state, {
+            "ok": True,
+            "status": "verifying_otp",
+        }]
+    )
+    monkeypatch.setattr(main_module, "worker_provisioner", provisioner)
+    state_key = f"{worker.id}:codex:{email}"
+    workers_api._worker_login_state.pop(state_key, None)
+
+    status = await client.get(
+        f"/api/workers/{worker.id}/pool/add/{email}?provider=codex"
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["challenge_id"] == challenge_id
+
+    # Model another Manager process/restart between status polling and submit.
+    workers_api._worker_login_state.pop(state_key, None)
+    submitted = await client.post(
+        f"/api/workers/{worker.id}/pool/login-attempts/{attempt_id}/otp",
+        json={"challenge_id": challenge_id, "code": "123456"},
+    )
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["status"] == "verifying_otp"
+    assert provisioner.worker_local_api.await_args_list[-1].args[1:] == (
+        "POST",
+        f"/api/codex-pool/login-attempts/{attempt_id}/otp",
+    )
+    assert provisioner.worker_local_api.await_args_list[-1].kwargs == {
+        "payload": {"challenge_id": challenge_id, "code": "123456"},
+        "timeout": 30,
+    }
+    workers_api._worker_login_state.pop(state_key, None)
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "expected_status"),
+    (("success", "logged_in"), ("failed", "failed")),
+)
+async def test_manager_restart_durably_settles_remote_terminal_codex_login(
+    client,
+    session_factory,
+    monkeypatch,
+    remote_status,
+    expected_status,
+):
+    email = f"restart-{remote_status}@example.com"
+    worker = await _insert_worker(
+        session_factory,
+        accounts=[{
+            "email": email,
+            "provider": "codex",
+            "token": "saved-mail-token",
+            "password": "saved-openai-password",
+            "login_method": "mailcatcher",
+            "status": "pending",
+        }],
+    )
+    terminal = {
+        "status": remote_status,
+        "attempt_id": f"attempt-{remote_status}",
+        "account_id": "codex-9",
+        **({"detail": "browser failed"} if remote_status == "failed" else {}),
+    }
+    provisioner = WorkerProvisioner(session_factory, cloud=object())
+    responses = [terminal]
+    if remote_status == "success":
+        responses.append({
+            "accounts": [{"id": "codex-9", "email": email}],
+        })
+    provisioner.worker_local_api = AsyncMock(side_effect=responses)
+    monkeypatch.setattr(main_module, "worker_provisioner", provisioner)
+    state_key = f"{worker.id}:codex:{email}"
+    workers_api._worker_login_state.pop(state_key, None)
+
+    status = await client.get(
+        f"/api/workers/{worker.id}/pool/add/{email}?provider=codex"
+    )
+    assert status.status_code == 200, status.text
+    assert status.json()["status"] == remote_status
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+    assert persisted.accounts == [{
+        "email": email,
+        "provider": "codex",
+        "token": "saved-mail-token",
+        "password": "saved-openai-password",
+        "login_method": "mailcatcher",
+        "status": expected_status,
+        "account_id": "codex-9",
+    }]
+    workers_api._worker_login_state.pop(state_key, None)
+    remote_call_count = provisioner.worker_local_api.await_count
+    durable = await client.get(
+        f"/api/workers/{worker.id}/pool/add/{email}?provider=codex"
+    )
+    assert durable.status_code == 200, durable.text
+    assert durable.json()["status"] == remote_status
+    assert provisioner.worker_local_api.await_count == remote_call_count
+
+
 async def test_destroyed_worker_rejects_late_dynamic_codex_persistence(
     client, session_factory, monkeypatch,
 ):
@@ -699,6 +929,7 @@ async def test_destroyed_worker_rejects_late_dynamic_codex_persistence(
         cloud_instance_id="i-active-login",
     )
     cloud = AsyncMock()
+    cloud.termination_scope.return_value = dict(TEST_CLOUD_SCOPE)
     provisioner = WorkerProvisioner(session_factory, cloud=cloud)
     login_entered = asyncio.Event()
     release_login = asyncio.Event()
@@ -723,7 +954,14 @@ async def test_destroyed_worker_rejects_late_dynamic_codex_persistence(
         },
     )
     await asyncio.wait_for(login_entered.wait(), timeout=1)
-    await provisioner.destroy_worker(worker.id)
+    destroy_claim = await _authorize_direct_destroy(
+        session_factory,
+        worker.id,
+    )
+    await provisioner.destroy_worker(
+        worker.id,
+        destroy_claim=destroy_claim,
+    )
 
     async with session_factory() as db:
         after_destroy = await db.get(Worker, worker.id)
@@ -764,6 +1002,7 @@ async def test_destroy_winning_after_account_snapshot_rejects_stale_secret_write
         cloud_instance_id="i-account-write-race",
     )
     cloud = AsyncMock()
+    cloud.termination_scope.return_value = dict(TEST_CLOUD_SCOPE)
     provisioner = WorkerProvisioner(session_factory, cloud=cloud)
     snapshot_released = asyncio.Event()
     release_stale_write = asyncio.Event()
@@ -794,7 +1033,14 @@ async def test_destroy_winning_after_account_snapshot_rejects_stale_secret_write
         name="stale-account-persist",
     )
     await asyncio.wait_for(snapshot_released.wait(), timeout=1)
-    await provisioner.destroy_worker(worker.id)
+    destroy_claim = await _authorize_direct_destroy(
+        session_factory,
+        worker.id,
+    )
+    await provisioner.destroy_worker(
+        worker.id,
+        destroy_claim=destroy_claim,
+    )
     release_stale_write.set()
 
     with pytest.raises(RuntimeError, match="rejected while terminated"):
@@ -807,6 +1053,93 @@ async def test_destroy_winning_after_account_snapshot_rejects_stale_secret_write
     serialized = json.dumps(persisted.accounts)
     assert "mail-token-must-stay-erased" not in serialized
     assert "password-must-stay-erased" not in serialized
+
+
+async def test_delete_tombstone_winning_after_account_snapshot_rejects_stale_secret_write(
+    session_factory, monkeypatch,
+):
+    account = {
+        "email": "delete-persist-race@example.com",
+        "provider": "codex",
+        "token": "mail-token-must-stay-erased",
+        "password": "password-must-stay-erased",
+        "login_method": "",
+        "account_id": "codex-delete-race",
+        "status": "logged_in",
+    }
+    worker = await _insert_worker(
+        session_factory,
+        accounts=[account],
+        cloud_instance_id="i-delete-persist-race",
+    )
+    provisioner = WorkerProvisioner(session_factory, cloud=object())
+    snapshot_released = asyncio.Event()
+    release_stale_write = asyncio.Event()
+    original_rollback = AsyncSession.rollback
+
+    async def rollback_with_barrier(session):
+        await original_rollback(session)
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "stale-delete-persist":
+            snapshot_released.set()
+            await release_stale_write.wait()
+
+    monkeypatch.setattr(AsyncSession, "rollback", rollback_with_barrier)
+    stale_account = {
+        **account,
+        "token": "late-mail-token-must-not-return",
+        "password": "late-password-must-not-return",
+    }
+    persist_task = asyncio.create_task(
+        workers_api._persist_worker_account_state(
+            provisioner,
+            worker.id,
+            stale_account,
+            status="logged_in",
+            account_id="codex-delete-race",
+        ),
+        name="stale-delete-persist",
+    )
+    await asyncio.wait_for(snapshot_released.wait(), timeout=1)
+
+    delete_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+    async with session_factory() as db:
+        current = await db.get(Worker, worker.id)
+        current.accounts, receipt = (
+            workers_api._prepare_persisted_worker_account_delete(
+                current.accounts,
+                current,
+                delete_request,
+                provider="codex",
+                account_id="codex-delete-race",
+            )
+        )
+        await db.commit()
+    release_stale_write.set()
+
+    with pytest.raises(RuntimeError, match="deletion is awaiting"):
+        await persist_task
+
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+    assert persisted.accounts == [{
+        "email": account["email"],
+        "provider": "codex",
+        "account_id": "codex-delete-race",
+        "status": "deleting",
+        workers_api._WORKER_ACCOUNT_DELETE_RECEIPT_KEY: receipt,
+    }]
+    serialized = json.dumps(persisted.accounts)
+    assert account["token"] not in serialized
+    assert account["password"] not in serialized
+    assert stale_account["token"] not in serialized
+    assert stale_account["password"] not in serialized
 
 
 async def test_destroy_winning_after_delete_snapshot_rejects_stale_account_write(
@@ -838,6 +1171,7 @@ async def test_destroy_winning_after_delete_snapshot_rejects_stale_account_write
         cloud_instance_id="i-delete-write-race",
     )
     cloud = AsyncMock()
+    cloud.termination_scope.return_value = dict(TEST_CLOUD_SCOPE)
     provisioner = WorkerProvisioner(session_factory, cloud=cloud)
     snapshot_released = asyncio.Event()
     release_stale_delete = asyncio.Event()
@@ -876,7 +1210,14 @@ async def test_destroy_winning_after_delete_snapshot_rejects_stale_account_write
         )
         await asyncio.wait_for(snapshot_released.wait(), timeout=1)
         try:
-            await provisioner.destroy_worker(worker.id)
+            destroy_claim = await _authorize_direct_destroy(
+                session_factory,
+                worker.id,
+            )
+            await provisioner.destroy_worker(
+                worker.id,
+                destroy_claim=destroy_claim,
+            )
         finally:
             release_stale_delete.set()
         with pytest.raises(HTTPException) as rejected:
@@ -1158,6 +1499,745 @@ async def test_worker_account_delete_remote_404_still_clears_local_credentials(
     assert response.json() == {"ok": True, "already_absent": True}
     async with session_factory() as db:
         assert (await db.get(Worker, worker.id)).accounts == []
+
+
+async def test_worker_account_delete_ack_loss_replays_exact_tombstone(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    account = {
+        "email": "ack-loss@example.com",
+        "provider": "codex",
+        "token": "mail-token-that-must-be-erased",
+        "password": "password-that-must-be-erased",
+        "login_method": "mailcatcher",
+        "status": "logged_in",
+        "account_id": "codex-ack",
+    }
+    worker = await _insert_worker(session_factory, accounts=[account])
+    provisioner = WorkerProvisioner(session_factory, cloud=object())
+    provisioner.ensure_codex_account = AsyncMock(
+        side_effect=AssertionError("deleting slot must not be revived")
+    )
+    provisioner.create_worker = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_provisioner", provisioner)
+    observed_operations: list[str] = []
+
+    async def ack_loss_then_absent(
+        _worker,
+        method,
+        path,
+        **_kwargs,
+    ):
+        assert method == "DELETE"
+        assert path == "/api/codex-pool/accounts/codex-ack"
+        async with session_factory() as db:
+            persisted = await db.get(Worker, worker.id)
+            tombstone = persisted.accounts[0]
+            receipt = tombstone[
+                workers_api._WORKER_ACCOUNT_DELETE_RECEIPT_KEY
+            ]
+            observed_operations.append(receipt["operation_id"])
+            assert tombstone["status"] == "deleting"
+            assert "token" not in tombstone
+            assert "password" not in tombstone
+            assert "login_method" not in tombstone
+        if len(observed_operations) == 1:
+            raise HTTPException(502, "remote DELETE ACK was lost")
+        return _JSONResponse({"detail": "not found"}, status_code=404)
+
+    remote_delete = AsyncMock(side_effect=ack_loss_then_absent)
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote_delete)
+
+    first = await client.delete(
+        f"/api/workers/{worker.id}/pool/codex-ack?provider=codex"
+    )
+    assert first.status_code == 502
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+        tombstone = persisted.accounts[0]
+        receipt = tombstone[workers_api._WORKER_ACCOUNT_DELETE_RECEIPT_KEY]
+    assert tombstone == {
+        "email": account["email"],
+        "provider": "codex",
+        "account_id": "codex-ack",
+        "status": "deleting",
+        workers_api._WORKER_ACCOUNT_DELETE_RECEIPT_KEY: receipt,
+    }
+    assert receipt["state"] == "prepared"
+    assert receipt["worker_id"] == worker.id
+    assert receipt["worker_owner_user_id"] is None
+    assert receipt["provider"] == "codex"
+    assert receipt["account_id"] == "codex-ack"
+    serialized = json.dumps(tombstone)
+    assert account["token"] not in serialized
+    assert account["password"] not in serialized
+
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        second_admin = User(
+            email="second-delete-admin@example.com",
+            name="second delete admin",
+            password_hash="test",
+            role="admin",
+            is_active=True,
+        )
+        db.add(second_admin)
+        await db.commit()
+        await db.refresh(second_admin)
+        second_admin_id = second_admin.id
+    second_actor_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="jwt",
+            user_id=second_admin_id,
+            user_role="admin",
+        )
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as second_actor:
+            await workers_api.delete_worker_account(
+                worker.id,
+                second_actor_request,
+                "codex-ack",
+                provider="codex",
+                db=db,
+            )
+    assert second_actor.value.status_code == 409
+    assert "另一授权主体" in str(second_actor.value.detail)
+    assert remote_delete.await_count == 1
+
+    assignment_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as blocked_assignment:
+            await workers_api.assign_worker(
+                worker.id,
+                workers_api.AssignWorkerBody(owner_user_id=999_999),
+                assignment_request,
+                db,
+            )
+    assert blocked_assignment.value.status_code == 409
+    assert "账号删除" in str(blocked_assignment.value.detail)
+    async with session_factory() as db:
+        assert (await db.get(Worker, worker.id)).owner_user_id is None
+
+    blocked_add = await client.post(
+        f"/api/workers/{worker.id}/pool/add",
+        json={
+            "email": account["email"],
+            "provider": "codex",
+            "token": "replacement-token-must-not-persist",
+        },
+    )
+    assert blocked_add.status_code == 409
+    provisioner.ensure_codex_account.assert_not_awaited()
+
+    with pytest.raises(RuntimeError, match="deletion is awaiting"):
+        await workers_api._persist_worker_account_state(
+            provisioner,
+            worker.id,
+            {
+                "email": account["email"],
+                "provider": "codex",
+                "token": "late-token-must-not-persist",
+                "password": "late-password-must-not-persist",
+                "login_method": "",
+            },
+            status="logged_in",
+            account_id="codex-ack",
+        )
+
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+        persisted.status = "error"
+        await db.commit()
+    blocked_bootstrap = await client.post(f"/api/workers/{worker.id}/retry")
+    assert blocked_bootstrap.status_code == 409
+    provisioner.create_worker.assert_not_awaited()
+
+    # ``error`` is a health-state drift, not a new lifecycle identity. The
+    # same actor may replay only this exact ready-time receipt; settlement must
+    # not falsely mark the Worker healthy again.
+    retried = await client.delete(
+        f"/api/workers/{worker.id}/pool/codex-ack?provider=codex"
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json() == {"ok": True, "already_absent": True}
+    assert observed_operations == [
+        receipt["operation_id"],
+        receipt["operation_id"],
+    ]
+    async with session_factory() as db:
+        settled = await db.get(Worker, worker.id)
+    assert settled.status == "error"
+    assert settled.accounts == []
+
+
+async def test_worker_account_delete_error_without_tombstone_is_replay_only(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    account = {
+        "email": "error-without-delete@example.com",
+        "provider": "codex",
+        "token": "credential-must-remain",
+        "password": "password-must-remain",
+        "account_id": "codex-error-without-delete",
+        "status": "logged_in",
+    }
+    worker = await _insert_worker(
+        session_factory,
+        status="error",
+        accounts=[account],
+    )
+    remote_delete = AsyncMock()
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote_delete)
+
+    rejected = await client.delete(
+        f"/api/workers/{worker.id}/pool/codex-error-without-delete"
+        "?provider=codex"
+    )
+
+    assert rejected.status_code == 409
+    assert "只允许重放" in rejected.json()["detail"]
+    remote_delete.assert_not_awaited()
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+    assert persisted.status == "error"
+    assert persisted.accounts == [account]
+
+
+@pytest.mark.parametrize(
+    "drift_field",
+    (
+        "owner_user_id",
+        "destroy_lifecycle_nonce",
+        "private_ip",
+        "ccm_port",
+        "auth_token",
+    ),
+)
+async def test_worker_account_delete_error_replay_rejects_identity_drift(
+    client,
+    session_factory,
+    monkeypatch,
+    drift_field,
+):
+    from backend.models.user import User
+
+    worker = await _insert_worker(session_factory, accounts=[{
+        "email": f"error-drift-{drift_field}@example.com",
+        "provider": "codex",
+        "token": "drift-token-must-be-erased",
+        "password": "drift-password-must-be-erased",
+        "account_id": f"codex-error-drift-{drift_field}",
+        "status": "logged_in",
+    }])
+    remote_delete = AsyncMock(
+        side_effect=HTTPException(502, "remote DELETE ACK was lost")
+    )
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote_delete)
+    path = (
+        f"/api/workers/{worker.id}/pool/codex-error-drift-{drift_field}"
+        "?provider=codex"
+    )
+
+    first = await client.delete(path)
+    assert first.status_code == 502
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+        persisted.status = "error"
+        if drift_field == "owner_user_id":
+            new_owner = User(
+                email="delete-drift-owner@example.com",
+                name="delete drift owner",
+                password_hash="test",
+                role="member",
+                is_active=True,
+            )
+            db.add(new_owner)
+            await db.flush()
+            persisted.owner_user_id = new_owner.id
+        elif drift_field == "destroy_lifecycle_nonce":
+            persisted.destroy_lifecycle_nonce = "d" * 32
+        elif drift_field == "private_ip":
+            persisted.private_ip = "10.0.0.250"
+        elif drift_field == "ccm_port":
+            persisted.ccm_port = (persisted.ccm_port or 8002) + 1
+        elif drift_field == "auth_token":
+            persisted.auth_token = "rotated-worker-control-token"
+        await db.commit()
+
+    rejected = await client.delete(path)
+
+    assert rejected.status_code == 409
+    assert remote_delete.await_count == 1
+    async with session_factory() as db:
+        retained = await db.get(Worker, worker.id)
+    assert retained.status == "error"
+    assert workers_api._has_worker_account_delete_outbox(retained.accounts)
+
+
+async def test_worker_account_delete_malformed_top_level_accounts_fail_closed(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _insert_worker(
+        session_factory,
+        accounts={
+            "status": "deleting",
+            workers_api._WORKER_ACCOUNT_DELETE_RECEIPT_KEY: {
+                "operation_id": "malformed",
+            },
+        },
+    )
+    remote_delete = AsyncMock()
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote_delete)
+
+    rejected = await client.delete(
+        f"/api/workers/{worker.id}/pool/codex-malformed?provider=codex"
+    )
+
+    assert rejected.status_code == 409
+    assert "账号列表格式无效" in rejected.json()["detail"]
+    remote_delete.assert_not_awaited()
+    lifecycle_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as blocked_lifecycle:
+            await workers_api._transition_worker_status(
+                db,
+                lifecycle_request,
+                worker.id,
+                allowed_statuses=("ready",),
+                target_status="stopping",
+            )
+        # Even an internal caller which catches the rejection and commits the
+        # same session cannot publish the provisional lifecycle CAS.
+        await db.commit()
+    assert blocked_lifecycle.value.status_code == 409
+    async with session_factory() as db:
+        retained = await db.get(Worker, worker.id)
+    assert retained.status == "ready"
+    assert retained.accounts["status"] == "deleting"
+
+
+async def test_worker_lifecycle_authority_rejection_rolls_back_before_guard_release(
+    session_factory,
+):
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        stale_admin = User(
+            email="lifecycle-stale-admin@example.com",
+            name="lifecycle stale admin",
+            password_hash="test",
+            role="member",
+            is_active=True,
+        )
+        worker = Worker(
+            name="authority rollback worker",
+            status="ready",
+            private_ip="10.0.0.71",
+            auth_token="authority-rollback-token",
+            accounts=[],
+        )
+        db.add_all((stale_admin, worker))
+        await db.commit()
+        stale_admin_id = stale_admin.id
+        worker_id = worker.id
+
+    stale_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="jwt",
+            user_id=stale_admin_id,
+            user_role="admin",
+        )
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException):
+            await workers_api._transition_worker_status(
+                db,
+                stale_request,
+                worker_id,
+                allowed_statuses=("ready",),
+                target_status="stopping",
+            )
+        await db.commit()
+
+    async with session_factory() as db:
+        retained = await db.get(Worker, worker_id)
+    assert retained.status == "ready"
+    assert retained.destroy_lifecycle_nonce is None
+
+
+async def test_worker_assignment_recipient_rejection_rolls_back_before_guard_release(
+    session_factory,
+):
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        disabled_owner = User(
+            email="disabled-worker-owner@example.com",
+            name="disabled worker owner",
+            password_hash="test",
+            role="member",
+            is_active=False,
+        )
+        worker = Worker(
+            name="assignment rollback worker",
+            status="ready",
+            private_ip="10.0.0.72",
+            auth_token="assignment-rollback-token",
+            accounts=[],
+        )
+        db.add_all((disabled_owner, worker))
+        await db.commit()
+        disabled_owner_id = disabled_owner.id
+        worker_id = worker.id
+
+    admin_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as rejected:
+            await workers_api.assign_worker(
+                worker_id,
+                workers_api.AssignWorkerBody(owner_user_id=disabled_owner_id),
+                admin_request,
+                db,
+            )
+        await db.commit()
+    assert rejected.value.status_code == 400
+
+    async with session_factory() as db:
+        retained = await db.get(Worker, worker_id)
+    assert retained.owner_user_id is None
+
+
+async def test_worker_account_delete_rechecks_role_and_owner_before_tombstone(
+    session_factory,
+    monkeypatch,
+):
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        stale_admin = User(
+            email="stale-delete-admin@example.com",
+            name="stale delete admin",
+            password_hash="test",
+            role="member",
+            is_active=True,
+        )
+        old_owner = User(
+            email="old-delete-owner@example.com",
+            name="old delete owner",
+            password_hash="test",
+            role="member",
+            is_active=True,
+        )
+        new_owner = User(
+            email="new-delete-owner@example.com",
+            name="new delete owner",
+            password_hash="test",
+            role="member",
+            is_active=True,
+        )
+        db.add_all((stale_admin, old_owner, new_owner))
+        await db.flush()
+        role_worker = Worker(
+            name="role-fenced account delete",
+            status="ready",
+            private_ip="10.0.0.41",
+            auth_token="role-worker-token",
+            accounts=[{
+                "email": "role-delete@example.com",
+                "provider": "codex",
+                "token": "role-secret",
+                "account_id": "codex-role",
+                "status": "logged_in",
+            }],
+        )
+        owner_worker = Worker(
+            name="owner-fenced account delete",
+            status="ready",
+            private_ip="10.0.0.42",
+            auth_token="owner-worker-token",
+            owner_user_id=new_owner.id,
+            accounts=[{
+                "email": "owner-delete@example.com",
+                "provider": "codex",
+                "token": "owner-secret",
+                "account_id": "codex-owner",
+                "status": "logged_in",
+            }],
+        )
+        db.add_all((role_worker, owner_worker))
+        await db.commit()
+        stale_admin_id = stale_admin.id
+        old_owner_id = old_owner.id
+        role_worker_id = role_worker.id
+        owner_worker_id = owner_worker.id
+
+    monkeypatch.setattr(
+        api_deps,
+        "require_worker_access",
+        AsyncMock(return_value=None),
+    )
+    remote = AsyncMock()
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote)
+    stale_role_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="jwt",
+            user_id=stale_admin_id,
+            user_role="admin",
+        )
+    )
+    stale_owner_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="jwt",
+            user_id=old_owner_id,
+            user_role="member",
+        )
+    )
+
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as stale_role:
+            await workers_api.delete_worker_account(
+                role_worker_id,
+                stale_role_request,
+                "codex-role",
+                provider="codex",
+                db=db,
+            )
+    assert stale_role.value.status_code == 409
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as stale_owner:
+            await workers_api.delete_worker_account(
+                owner_worker_id,
+                stale_owner_request,
+                "codex-owner",
+                provider="codex",
+                db=db,
+            )
+    assert stale_owner.value.status_code == 409
+    remote.assert_not_awaited()
+    async with session_factory() as db:
+        role_accounts = (await db.get(Worker, role_worker_id)).accounts
+        owner_accounts = (await db.get(Worker, owner_worker_id)).accounts
+    assert role_accounts[0]["token"] == "role-secret"
+    assert owner_accounts[0]["token"] == "owner-secret"
+    assert not workers_api._has_worker_account_delete_outbox(role_accounts)
+    assert not workers_api._has_worker_account_delete_outbox(owner_accounts)
+
+
+async def test_worker_account_delete_tombstone_blocks_destroy_race(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _insert_worker(session_factory, accounts=[{
+        "email": "destroy-delete-race@example.com",
+        "provider": "codex",
+        "token": "destroy-race-token",
+        "password": "destroy-race-password",
+        "account_id": "codex-destroy-race",
+        "status": "logged_in",
+    }])
+    remote_entered = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    async def blocked_remote(*_args, **_kwargs):
+        remote_entered.set()
+        await release_remote.wait()
+        return _JSONResponse({"ok": True})
+
+    monkeypatch.setattr(
+        workers_api,
+        "_worker_http_request",
+        AsyncMock(side_effect=blocked_remote),
+    )
+    deleting = asyncio.create_task(client.delete(
+        f"/api/workers/{worker.id}/pool/codex-destroy-race?provider=codex"
+    ))
+    await asyncio.wait_for(remote_entered.wait(), timeout=1)
+
+    lifecycle_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+    try:
+        async with session_factory() as db:
+            with pytest.raises(HTTPException) as blocked_destroy:
+                await workers_api._transition_worker_status(
+                    db,
+                    lifecycle_request,
+                    worker.id,
+                    allowed_statuses=("ready",),
+                    target_status="destroying",
+                    block_active_task_terminations=True,
+                    destroy_lifecycle_nonce=secrets.token_hex(16),
+                )
+        assert blocked_destroy.value.status_code == 409
+        assert "账号删除" in str(blocked_destroy.value.detail)
+    finally:
+        release_remote.set()
+
+    deleted = await deleting
+    assert deleted.status_code == 200, deleted.text
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+    assert persisted.status == "ready"
+    assert persisted.destroy_lifecycle_nonce is None
+    assert persisted.accounts == []
+
+
+async def test_worker_account_delete_prepare_serializes_lifecycle_rollback(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _insert_worker(session_factory, accounts=[{
+        "email": "uncommitted-delete@example.com",
+        "provider": "codex",
+        "token": "uncommitted-token-must-be-erased",
+        "password": "uncommitted-password-must-be-erased",
+        "account_id": "codex-uncommitted-delete",
+        "status": "logged_in",
+    }])
+    prepare_flushed = asyncio.Event()
+    release_prepare_commit = asyncio.Event()
+    lifecycle_requested = asyncio.Event()
+    lifecycle_body_entered = asyncio.Event()
+    original_commit = AsyncSession.commit
+    original_lifecycle_guard = workers_api._worker_lifecycle_transaction_lock
+    original_transition_locked = workers_api._transition_worker_status_locked
+    prepare_commit_seen = False
+
+    async def commit_with_prepare_barrier(session):
+        nonlocal prepare_commit_seen
+        has_delete_tombstone = any(
+            isinstance(obj, Worker)
+            and workers_api._has_worker_account_delete_outbox(obj.accounts)
+            for obj in session.dirty
+        )
+        if not prepare_commit_seen and has_delete_tombstone:
+            prepare_commit_seen = True
+            # Materialize the JSON UPDATE on StaticPool's one connection, then
+            # hold it uncommitted. A competing session rollback used to erase
+            # this outbox while the first session later reported commit success.
+            await session.flush()
+            prepare_flushed.set()
+            await release_prepare_commit.wait()
+        await original_commit(session)
+
+    @asynccontextmanager
+    async def observed_lifecycle_guard(worker_id):
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "competing-destroy":
+            lifecycle_requested.set()
+        async with original_lifecycle_guard(worker_id):
+            yield
+
+    async def observed_transition_locked(*args, **kwargs):
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "competing-destroy":
+            lifecycle_body_entered.set()
+        return await original_transition_locked(*args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_with_prepare_barrier)
+    monkeypatch.setattr(
+        workers_api,
+        "_worker_lifecycle_transaction_lock",
+        observed_lifecycle_guard,
+    )
+    monkeypatch.setattr(
+        workers_api,
+        "_transition_worker_status_locked",
+        observed_transition_locked,
+    )
+    remote_delete = AsyncMock(
+        side_effect=HTTPException(502, "remote DELETE ACK was lost")
+    )
+    monkeypatch.setattr(workers_api, "_worker_http_request", remote_delete)
+
+    deleting = asyncio.create_task(
+        client.delete(
+            f"/api/workers/{worker.id}/pool/codex-uncommitted-delete"
+            "?provider=codex"
+        ),
+        name="uncommitted-account-delete",
+    )
+    await asyncio.wait_for(prepare_flushed.wait(), timeout=1)
+
+    lifecycle_request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_id=None,
+            user_role="super_admin",
+        )
+    )
+
+    async def competing_destroy():
+        async with session_factory() as db:
+            try:
+                await workers_api._transition_worker_status(
+                    db,
+                    lifecycle_request,
+                    worker.id,
+                    allowed_statuses=("ready",),
+                    target_status="destroying",
+                    block_active_task_terminations=True,
+                    destroy_lifecycle_nonce=secrets.token_hex(16),
+                )
+            except HTTPException as exc:
+                return exc
+        raise AssertionError("destroy unexpectedly crossed account delete")
+
+    destroying = asyncio.create_task(
+        competing_destroy(),
+        name="competing-destroy",
+    )
+    await asyncio.wait_for(lifecycle_requested.wait(), timeout=1)
+    assert not lifecycle_body_entered.is_set()
+    release_prepare_commit.set()
+    await asyncio.wait_for(lifecycle_body_entered.wait(), timeout=1)
+
+    deleted = await deleting
+    blocked_destroy = await destroying
+    assert deleted.status_code == 502
+    assert blocked_destroy.status_code == 409
+    assert "账号删除" in str(blocked_destroy.detail)
+    remote_delete.assert_awaited_once()
+    async with session_factory() as db:
+        persisted = await db.get(Worker, worker.id)
+    assert persisted.status == "ready"
+    assert persisted.destroy_lifecycle_nonce is None
+    assert workers_api._has_worker_account_delete_outbox(persisted.accounts)
+    serialized = json.dumps(persisted.accounts)
+    assert "uncommitted-token-must-be-erased" not in serialized
+    assert "uncommitted-password-must-be-erased" not in serialized
 
 
 async def test_worker_add_status_requires_worker_access(

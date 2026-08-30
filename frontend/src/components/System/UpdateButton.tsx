@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowUpCircle, RefreshCw, X } from '../icons';
+import { ArrowUpCircle, RefreshCw } from '../icons';
 import { api } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
 
@@ -52,6 +52,12 @@ interface DeploymentCheck {
   update_blocked?: boolean;
   remote?: string;
   branch?: string;
+  channel?: 'stable' | 'main';
+  latest_version?: string;
+  version?: string;
+  update_kind?: 'stable_upgrade' | 'stable_switch';
+  is_stable_downgrade?: boolean;
+  stable_switch_blocked?: boolean;
   [key: string]: unknown;
 }
 
@@ -64,7 +70,7 @@ interface ActiveTaskSummary {
   instance_claim_count?: number;
 }
 
-type Phase = 'idle' | 'checking' | 'confirming' | 'running' | 'restarting' | 'completed' | 'failed';
+type Phase = 'idle' | 'selecting' | 'checking' | 'confirming' | 'running' | 'restarting' | 'completed' | 'failed';
 type DeploymentAction = 'update' | 'repair' | 'restart' | 'none';
 
 const ACTIVE_UPDATE_KEY = 'ccm-update-active';
@@ -99,20 +105,6 @@ const STATUS_ICON: Record<string, string> = {
   failed: '❌',
   skipped: '⏭',
 };
-
-const INITIAL_UPDATE_CHECK_DELAY_MS = 1_000;
-const UPDATE_CHECK_INTERVAL_MS = 60 * 60_000;
-
-function reminderFingerprint(result: DeploymentCheck): string {
-  if (result.repair_required) {
-    return `repair:${String(result.disk_commit || result.current_commit || '')}`;
-  }
-  if (result.has_updates) return `update:${String(result.latest_commit || '')}`;
-  if (result.needs_restart) {
-    return `restart:${String(result.disk_commit || result.current_commit || '')}`;
-  }
-  return '';
-}
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -166,21 +158,17 @@ export function UpdateButton() {
   const [dryRunResult, setDryRunResult] = useState<DeploymentCheck | null>(null);
   const [skipFrontend, setSkipFrontend] = useState(false);
   const [branch, setBranch] = useState('');
+  const [channel, setChannel] = useState<'stable' | 'main'>('stable');
   const [error, setError] = useState('');
   const [oldCommit, setOldCommit] = useState('');
   const [newCommit, setNewCommit] = useState('');
   const [reconnectCount, setReconnectCount] = useState(0);
   const [reconnectSlow, setReconnectSlow] = useState(false);
-  const [autoPrompt, setAutoPrompt] = useState(false);
-  const [updateAvailable, setUpdateAvailable] = useState(false);
-  const [showUpdateNotice, setShowUpdateNotice] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [reconcileError, setReconcileError] = useState('');
   const [reconcileNotice, setReconcileNotice] = useState('');
   const reconnectTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const autoCheckInFlightRef = useRef(false);
-  const remindedFingerprintsRef = useRef(new Set<string>());
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
 
@@ -212,8 +200,6 @@ export function UpdateButton() {
 
     if (event === 'update_complete') {
       setUpdateActive(false);
-      setUpdateAvailable(false);
-      setShowUpdateNotice(false);
       setPhase('completed');
     }
 
@@ -242,6 +228,17 @@ export function UpdateButton() {
     return () => {
       if (reconnectTimer.current) clearInterval(reconnectTimer.current);
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof api.getUpdateChannel !== 'function') return;
+    void api.getUpdateChannel().then(result => {
+      if (result?.update_channel === 'stable' || result?.update_channel === 'main') {
+        setChannel(result.update_channel);
+      }
+    }).catch(() => {
+      // Older Managers do not expose channel settings; keep the safe default.
+    });
   }, []);
 
   useEffect(() => {
@@ -335,68 +332,6 @@ export function UpdateButton() {
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const schedule = (delay: number) => {
-      if (!disposed) timer = setTimeout(runCheck, delay);
-    };
-
-    const runCheck = async () => {
-      if (disposed) return;
-      if (
-        document.visibilityState !== 'visible'
-        || phaseRef.current !== 'idle'
-        || autoCheckInFlightRef.current
-      ) {
-        schedule(UPDATE_CHECK_INTERVAL_MS);
-        return;
-      }
-
-      autoCheckInFlightRef.current = true;
-      try {
-        const status = await api.getUpdateStatus() as UpdateStatusData | undefined;
-        if (status?.status === 'running' || status?.status === 'restarting') return;
-        if (disposed || phaseRef.current !== 'idle') return;
-
-        // Background checks are deliberately dry-run only: they fetch refs and
-        // notify the user, but never pull code or restart the service.
-        const result = await api.startUpdate({ dry_run: true }) as DeploymentCheck | undefined;
-        if (disposed || phaseRef.current !== 'idle' || !result) return;
-        // A remote fetch error is normally silent, but it must not hide a
-        // locally detected manual pull that still needs a service restart.
-        if (!result.has_updates && !result.needs_restart && !result.repair_required) {
-          if (!result.error) {
-            setUpdateAvailable(false);
-            setShowUpdateNotice(false);
-          }
-          return;
-        }
-
-        setUpdateAvailable(true);
-        const fingerprint = reminderFingerprint(result);
-        if (fingerprint && !remindedFingerprintsRef.current.has(fingerprint)) {
-          remindedFingerprintsRef.current.add(fingerprint);
-          setDryRunResult(result);
-          setAutoPrompt(true);
-          setShowUpdateNotice(true);
-        }
-      } catch {
-        // Automatic checks stay silent on transient network/git failures.
-      } finally {
-        autoCheckInFlightRef.current = false;
-        schedule(UPDATE_CHECK_INTERVAL_MS);
-      }
-    };
-
-    schedule(INITIAL_UPDATE_CHECK_DELAY_MS);
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
-
   const startReconnectPolling = () => {
     if (reconnectTimer.current) clearInterval(reconnectTimer.current);
     let attempts = 0;
@@ -470,24 +405,45 @@ export function UpdateButton() {
 
   const handleCheck = async () => {
     setPhase('checking');
-    setAutoPrompt(false);
-    setShowUpdateNotice(false);
     setError('');
     setReconcileError('');
     setReconcileNotice('');
     try {
-      const result = await api.startUpdate({ dry_run: true, force: true, branch: branch || undefined }) as DeploymentCheck;
+      const result = await api.startUpdate({
+        dry_run: true,
+        force: true,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
+      }) as DeploymentCheck;
       if (result.error && !result.needs_restart && !result.repair_required) {
         throw new Error(result.error);
       }
-      const fingerprint = reminderFingerprint(result);
-      if (fingerprint) remindedFingerprintsRef.current.add(fingerprint);
       setDryRunResult(result);
-      setUpdateAvailable(Boolean(result.has_updates || result.needs_restart || result.repair_required));
       setPhase('confirming');
     } catch (e: unknown) {
       setError(errorMessage(e, '检查更新失败'));
       setPhase('failed');
+    }
+  };
+
+  const handleOpen = () => {
+    setDryRunResult(null);
+    setError('');
+    setPhase('selecting');
+  };
+
+  const handleChannelChange = async (next: 'stable' | 'main') => {
+    setChannel(next);
+    setDryRunResult(null);
+    setError('');
+    if (next === 'stable') setBranch('');
+    if (typeof api.updateUpdateChannel === 'function') {
+      try {
+        await api.updateUpdateChannel(next);
+      } catch {
+        // The visible selection remains usable for this check even if the
+        // preference could not be persisted.
+      }
     }
   };
 
@@ -507,7 +463,8 @@ export function UpdateButton() {
       const result = await api.startUpdate({
         dry_run: true,
         force: true,
-        branch: branch || undefined,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
       }) as DeploymentCheck;
       if (result.error && !result.needs_restart && !result.repair_required) {
         throw new Error(result.error);
@@ -519,14 +476,7 @@ export function UpdateButton() {
         active_task_count: result.active_task_count ?? reconciliation.active_task_count,
         active_tasks: result.active_tasks ?? reconciliation.active_tasks,
       };
-      const fingerprint = reminderFingerprint(refreshedResult);
-      if (fingerprint) remindedFingerprintsRef.current.add(fingerprint);
       setDryRunResult(refreshedResult);
-      setUpdateAvailable(Boolean(
-        refreshedResult.has_updates
-        || refreshedResult.needs_restart
-        || refreshedResult.repair_required
-      ));
 
       const stillBlocked = Boolean(
         refreshedResult.update_blocked
@@ -552,7 +502,6 @@ export function UpdateButton() {
 
   const prepareRunning = () => {
     setPhase('running');
-    setShowUpdateNotice(false);
     setLogs([]);
     setError('');
 
@@ -568,7 +517,11 @@ export function UpdateButton() {
   const handleConfirm = async () => {
     prepareRunning();
     try {
-      const result = await api.startUpdate({ skip_frontend_build: skipFrontend, branch: branch || undefined });
+      const result = await api.startUpdate({
+        skip_frontend_build: skipFrontend,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
+      });
       if (result.update_id) {
         setOldCommit(result.old_commit || '');
       }
@@ -646,18 +599,10 @@ export function UpdateButton() {
     setNewCommit('');
     setReconnectCount(0);
     setReconnectSlow(false);
-    setAutoPrompt(false);
-    setShowUpdateNotice(false);
     setUpdateActive(false);
     setReconciling(false);
     setReconcileError('');
     setReconcileNotice('');
-  };
-
-  const handleOpenUpdateNotice = () => {
-    setShowUpdateNotice(false);
-    setAutoPrompt(true);
-    setPhase('confirming');
   };
 
   const isModalOpen = phase !== 'idle';
@@ -680,59 +625,12 @@ export function UpdateButton() {
 
   return (
     <>
-      {showUpdateNotice && dryRunResult && createPortal(
-        <div
-          className="pointer-events-none fixed inset-x-0 top-3 z-[60] flex justify-center px-4"
-          data-testid="update-available-notice"
-          aria-live="polite"
-        >
-          <div
-            className="pointer-events-auto flex w-full max-w-xl items-center gap-3 rounded-lg border border-amber-500/40 bg-gray-900/95 px-4 py-3 shadow-xl backdrop-blur"
-            role="status"
-          >
-            <ArrowUpCircle size={18} className="shrink-0 text-amber-400" />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-foreground">
-                {(dryRunResult.needs_restart as boolean) ? '检测到待完成的本地更新' : '发现可用更新'}
-              </p>
-              <p className="mt-0.5 truncate text-xs text-gray-400">
-                {(dryRunResult.needs_restart as boolean)
-                  ? '当前服务仍在运行旧版本，可稍后安全完成部署。'
-                  : `有 ${Number(dryRunResult.commits_behind || 0)} 个新提交可用。`}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={handleOpenUpdateNotice}
-              className="shrink-0 rounded bg-amber-500/15 px-2.5 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-500/25"
-            >
-              查看详情
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowUpdateNotice(false)}
-              className="shrink-0 rounded p-1 text-gray-500 hover:bg-gray-800 hover:text-gray-300"
-              aria-label="关闭更新提醒"
-            >
-              <X size={15} />
-            </button>
-          </div>
-        </div>,
-        document.body,
-      )}
-
       <button
-        onClick={handleCheck}
+        onClick={handleOpen}
         className="relative p-2 rounded text-gray-400 hover:text-foreground hover:bg-gray-800 transition-colors"
         title="更新并重启"
       >
         <ArrowUpCircle size={18} />
-        {updateAvailable && (
-          <span
-            data-testid="update-available-dot"
-            className="absolute right-1 top-1 h-2 w-2 rounded-full bg-amber-400 ring-2 ring-gray-900"
-          />
-        )}
       </button>
 
       {isModalOpen && createPortal(
@@ -741,22 +639,80 @@ export function UpdateButton() {
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
               <h3 className="text-sm font-semibold text-foreground">
+                {phase === 'selecting' && '选择更新渠道'}
                 {phase === 'checking' && '检查更新...'}
-                {phase === 'confirming' && (autoPrompt
-                  ? ((dryRunResult?.needs_restart as boolean) ? '检测到待完成的更新' : '发现可用更新')
-                  : '确认更新')}
+                {phase === 'confirming' && '确认更新'}
                 {phase === 'running' && '更新中...'}
                 {phase === 'restarting' && '重启中...'}
                 {phase === 'completed' && '更新完成'}
                 {phase === 'failed' && '更新失败'}
               </h3>
-              {(phase === 'completed' || phase === 'failed' || phase === 'confirming') && (
+              {(phase === 'selecting' || phase === 'completed' || phase === 'failed' || phase === 'confirming') && (
                 <button onClick={handleClose} className="text-gray-400 hover:text-foreground text-lg">✕</button>
               )}
             </div>
 
             {/* Body */}
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {/* Channel selection always precedes a remote update check. */}
+              {phase === 'selecting' && (
+                <div className="space-y-3">
+                  <p className="text-sm text-gray-300">请选择本次要检查的更新渠道。</p>
+                  <div className="grid gap-2">
+                    <label className={`cursor-pointer rounded-lg border p-3 transition-colors ${channel === 'stable' ? 'border-indigo-500 bg-indigo-950/30' : 'border-gray-700 bg-gray-800/40 hover:border-gray-600'}`}>
+                      <span className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="update-channel"
+                          value="stable"
+                          checked={channel === 'stable'}
+                          onChange={() => void handleChannelChange('stable')}
+                        />
+                        <span>
+                          <span className="block text-sm font-medium text-foreground">Stable 正式版</span>
+                          <span className="block text-xs text-gray-500">只接收已发布的正式版本 tag</span>
+                        </span>
+                      </span>
+                    </label>
+                    <label className={`cursor-pointer rounded-lg border p-3 transition-colors ${channel === 'main' ? 'border-amber-500 bg-amber-950/20' : 'border-gray-700 bg-gray-800/40 hover:border-gray-600'}`}>
+                      <span className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="update-channel"
+                          value="main"
+                          checked={channel === 'main'}
+                          onChange={() => void handleChannelChange('main')}
+                        />
+                        <span>
+                          <span className="block text-sm font-medium text-foreground">Main 测试版</span>
+                          <span className="block text-xs text-amber-400">跟随 main 最新代码，可能包含未验证变更</span>
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  {channel === 'main' && (
+                    <>
+                      <div className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 text-xs text-amber-200" role="alert">
+                        <p className="font-medium">切换到测试版前请注意</p>
+                        <p className="mt-1 text-amber-300/90">
+                          如果 Main 包含正式版没有的数据库迁移，更新后将无法一键切回 Stable，需先备份并制定数据库降级方案。
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <label htmlFor="update-branch" className="text-xs text-gray-400 shrink-0">分支:</label>
+                        <input
+                          id="update-branch"
+                          value={branch}
+                          onChange={e => setBranch(e.target.value)}
+                          placeholder="main"
+                          className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1.5 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
               {/* Checking phase */}
               {phase === 'checking' && (
                 <div className="flex items-center gap-2 text-gray-400 text-sm">
@@ -768,15 +724,18 @@ export function UpdateButton() {
               {/* Confirm phase */}
               {phase === 'confirming' && dryRunResult && (
                 <div className="space-y-3">
-                  {/* Branch selector */}
+                  {/* Update channel selector */}
                   <div className="flex items-center gap-2">
-                    <label className="text-xs text-gray-400 shrink-0">分支:</label>
-                    <input
-                      value={branch}
-                      onChange={e => setBranch(e.target.value)}
-                      placeholder="main"
-                      className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
-                    />
+                    <label htmlFor="update-channel" className="text-xs text-gray-400 shrink-0">更新渠道:</label>
+                    <select
+                      id="update-channel"
+                      value={channel}
+                      onChange={e => void handleChannelChange(e.target.value as 'stable' | 'main')}
+                      className="bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="stable">Stable 正式版</option>
+                      <option value="main">Main 测试版</option>
+                    </select>
                     <button
                       onClick={handleCheck}
                       className="px-2 py-1 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700 shrink-0"
@@ -784,6 +743,20 @@ export function UpdateButton() {
                       重新检查
                     </button>
                   </div>
+                  {channel === 'main' && (
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-gray-400 shrink-0">分支:</label>
+                      <input
+                        value={branch}
+                        onChange={e => setBranch(e.target.value)}
+                        placeholder="main"
+                        className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  )}
+                  {channel === 'main' && (
+                    <p className="text-xs text-amber-400">测试渠道会跟随 main 最新代码，可能包含未验证变更。</p>
+                  )}
                   {branch && branch !== 'main' && (
                     <p className="text-xs text-amber-400">⚠️ 将从分支 <span className="font-mono">{branch}</span> 更新（非 main）</p>
                   )}
@@ -848,8 +821,23 @@ export function UpdateButton() {
                     </div>
                   )}
 
+                  {(dryRunResult.latest_version || dryRunResult.version) && (
+                    <p className="text-xs text-gray-400">
+                      正式版本：<span className="font-mono text-indigo-300">{dryRunResult.latest_version || dryRunResult.version}</span>
+                    </p>
+                  )}
+
                   {action === 'none' ? (
-                    <p className="text-sm text-gray-300">已是最新版本，无需更新。</p>
+                    <div className="space-y-1">
+                      <p className="text-sm text-gray-300">
+                        {dryRunResult.channel === 'stable' && dryRunResult.error
+                          ? 'Stable 当前不可切换。'
+                          : '已是最新版本，无需更新。'}
+                      </p>
+                      {dryRunResult.error && (
+                        <p className="text-xs text-red-300">{dryRunResult.error}</p>
+                      )}
+                    </div>
                   ) : action === 'restart' ? (
                     <div className="space-y-1 text-sm text-yellow-300">
                       <p>代码已是最新，但服务正在运行旧版本，需要重启。</p>
@@ -883,7 +871,11 @@ export function UpdateButton() {
                   ) : (
                     <>
                       <div className="text-sm text-gray-300 space-y-1">
-                        <p>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</p>
+                        <p>
+                          {dryRunResult.is_stable_downgrade
+                            ? <>将从测试版切换回正式版 <span className="text-indigo-400 font-medium">{dryRunResult.latest_version || 'Stable'}</span></>
+                            : <>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</>}
+                        </p>
                         <p className="text-xs text-gray-500">{dryRunResult.current_commit} → {dryRunResult.latest_commit}</p>
                         {dryRunResult.remote && (
                           <p className="text-xs text-gray-600">来源：{dryRunResult.remote}/{dryRunResult.branch || 'main'}</p>
@@ -916,10 +908,15 @@ export function UpdateButton() {
                         )}
                       </div>
 
-                      {dryRunResult.has_new_migrations && (
-                        <p className="text-xs text-yellow-400">
-                          ⚠️ 包含数据库迁移，更新时会短暂停服。数据库将自动备份。
-                        </p>
+                  {dryRunResult.has_new_migrations && (
+                        <div className="rounded border border-yellow-700/60 bg-yellow-950/30 p-2 text-xs text-yellow-300" role="alert">
+                          <p>⚠️ 包含数据库迁移，更新时会短暂停服并自动备份数据库。</p>
+                          {channel === 'main' && (
+                            <p className="mt-1 font-medium text-amber-300">
+                              更新后可能无法一键切回 Stable；切回前需要数据库降级方案。
+                            </p>
+                          )}
+                        </div>
                       )}
                     </>
                   )}
@@ -1013,6 +1010,14 @@ export function UpdateButton() {
 
             {/* Footer */}
             <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-700">
+              {phase === 'selecting' && (
+                <>
+                  <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
+                  <button onClick={handleCheck} className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500">
+                    检查所选渠道
+                  </button>
+                </>
+              )}
               {phase === 'confirming' && dryRunResult && action === 'update' && (
                 <>
                   <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
@@ -1021,7 +1026,9 @@ export function UpdateButton() {
                     disabled={actionDisabled}
                     className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {updateBlocked ? '等待任务完成' : '确认更新'}
+                    {updateBlocked
+                      ? '等待任务完成'
+                      : dryRunResult.is_stable_downgrade ? '切换到正式版' : '确认更新'}
                   </button>
                 </>
               )}

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { api } from '../../api/client';
 import type { MonitorSession } from '../../api/client';
@@ -7,9 +7,10 @@ import { MonitorPanel } from './MonitorPanel';
 
 vi.mock('../../api/client', () => ({
   api: {
-    listMonitorSessions: vi.fn(() => Promise.resolve([])),
-    getMonitorChecks: vi.fn(() => Promise.resolve([])),
+    listAllSubAgentSessions: vi.fn(() => Promise.resolve([])),
+    getSubAgentReports: vi.fn(() => Promise.resolve([])),
     deleteMonitorSession: vi.fn(() => Promise.resolve({ ok: true })),
+    deleteSubAgentSession: vi.fn(() => Promise.resolve({ ok: true })),
   },
 }));
 
@@ -179,14 +180,65 @@ describe('MonitorPanel codex annotation', () => {
       />,
     );
     await waitFor(() => {
-      expect(api.listMonitorSessions).toHaveBeenCalled();
+      expect(api.listAllSubAgentSessions).toHaveBeenCalled();
     });
-    vi.mocked(api.listMonitorSessions).mockClear();
+    vi.mocked(api.listAllSubAgentSessions).mockClear();
 
     await userEvent.click(screen.getByTitle('Stop monitor'));
 
     await waitFor(() => {
-      expect(api.listMonitorSessions).toHaveBeenCalledTimes(1);
+      expect(api.listAllSubAgentSessions).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('shows provider-native children and their reports in the unified detail panel', async () => {
+    const session: MonitorSession = {
+      id: 10,
+      task_id: 1,
+      agent_type: 'native-agent',
+      source: 'native',
+      description: 'inspect scheduler',
+      monitor_context: null,
+      interval: 0,
+      max_checks: 0,
+      model: 'gpt-5.6-sol',
+      provider: 'codex',
+      status: 'running',
+      checks_done: 1,
+      last_summary: 'scheduler inspected',
+      next_check_at: null,
+      turn_generation: 0,
+      active_turn_generation: null,
+      consecutive_failures: 0,
+      last_error: null,
+      codex_cleanup_pending: false,
+      codex_cleanup_error: null,
+      created_at: '2026-08-15T00:00:00Z',
+      completed_at: null,
+    };
+    vi.mocked(api.getSubAgentReports).mockResolvedValueOnce([{
+      id: 101,
+      monitor_session_id: 10,
+      check_number: 1,
+      status: 'running',
+      summary: 'scheduler inspected',
+      full_output: null,
+      created_at: '2026-08-15T00:00:01Z',
+    }]);
+
+    render(<MonitorPanel {...baseProps} sessions={[session]} />);
+
+    expect(screen.getByText('native-agent')).toBeInTheDocument();
+    expect(screen.getByText('inspect scheduler')).toBeInTheDocument();
+    expect(screen.getByText(/scheduler inspected/)).toBeInTheDocument();
+    expect(screen.queryByTitle('Stop monitor')).not.toBeInTheDocument();
+
+    const row = screen.getByText('inspect scheduler').closest('.border');
+    expect(row).not.toBeNull();
+    await userEvent.click(within(row as HTMLElement).getAllByRole('button')[0]);
+    await waitFor(() => {
+      expect(api.getSubAgentReports).toHaveBeenCalledWith(1, 10);
+      expect(screen.getByText('#1')).toBeInTheDocument();
     });
   });
 });

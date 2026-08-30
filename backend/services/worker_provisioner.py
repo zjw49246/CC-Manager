@@ -22,11 +22,15 @@ from datetime import datetime
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 
 from backend.config import settings
 from backend.models.worker import Worker
-from backend.services.cloud_provider import CloudProvider
+from backend.services.cancellation import settle_awaitable
+from backend.services.cloud_provider import (
+    CloudProvider,
+    canonical_cloud_termination_scope,
+)
 from backend.services.git_info import REPO_ROOT, git_head_commit
 from backend.services.ssh_executor import (
     SSHExecutor,
@@ -37,6 +41,26 @@ from backend.services.ssh_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def worker_control_plane_enabled() -> bool:
+    """Return whether Worker cloud/SSH effects have an authenticated plane."""
+
+    return bool(
+        settings.ccm_node_role == "manager"
+        and isinstance(settings.auth_token, str)
+        and settings.auth_token.strip()
+    )
+
+
+def require_worker_control_plane_enabled() -> None:
+    """Fail before any Worker DB lifecycle mutation or external effect."""
+
+    if not worker_control_plane_enabled():
+        raise RuntimeError(
+            "Worker control plane requires CCM_NODE_ROLE=manager and "
+            "AUTH_TOKEN to be configured"
+        )
 
 # rsync 部署时排除。.gitignore 经 --filter 自动生效（.venv/node_modules/db 等），
 # 这里只列 .gitignore 之外必须排除的。.git 不带：worktree 的 .git 是指向
@@ -58,10 +82,286 @@ CODEX_TERMINAL_FAILURE_STATUSES = frozenset(
 )
 # Keep Worker app-server/serde behavior identical to the Manager revision.
 # Do not use npm "latest": a retry must not silently upgrade the protocol.
-WORKER_CODEX_CLI_VERSION = "0.144.6"
+WORKER_CODEX_CLI_VERSION = "0.147.0"
+CLAUDE_LOGIN_IDENTITY_KEY = "claude_login_identity_v1"
+CLAUDE_LOGIN_IDENTITY_VERSION = 1
 _DESTROYED_ACCOUNT_AUDIT_FIELDS = (
     "email", "provider", "status", "account_id",
 )
+WORKER_PROVISION_SPEC_VERSION = 1
+WORKER_RENAME_TAG_PROTOCOL_VERSION = 1
+WORKER_RENAMEABLE_STATUSES = frozenset({"ready", "stopped", "error"})
+
+
+def worker_create_client_token(worker_id: int, auth_token: str) -> str:
+    """Return the stable RunInstances idempotency identity for one Worker."""
+
+    if (
+        isinstance(worker_id, bool)
+        or not isinstance(worker_id, int)
+        or worker_id <= 0
+        or not isinstance(auth_token, str)
+        or not auth_token
+    ):
+        raise ValueError("Worker create token identity is invalid")
+    return "ccm-" + hashlib.sha256(
+        f"{worker_id}:{auth_token}".encode("utf-8")
+    ).hexdigest()[:48]
+
+
+def worker_create_client_token_digest(worker_id: int, auth_token: str) -> str:
+    """Return a non-secret receipt binding for the EC2 idempotency token."""
+
+    token = worker_create_client_token(worker_id, auth_token)
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def _canonical_json_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def build_worker_rename_tag_outbox(
+    worker: Worker,
+    *,
+    desired_name: str,
+    generation: int,
+    cloud_scope: dict[str, str],
+    client_token_digest: str,
+) -> dict:
+    """Build exact durable authority for one cloud ``Name`` tag effect."""
+
+    if (
+        worker is None
+        or isinstance(worker.id, bool)
+        or not isinstance(worker.id, int)
+        or worker.id <= 0
+        or not isinstance(worker.cloud_instance_id, str)
+        or not worker.cloud_instance_id
+        or not isinstance(desired_name, str)
+        or not desired_name
+        or len(desired_name) > 200
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or not isinstance(client_token_digest, str)
+        or len(client_token_digest) != 64
+        or any(char not in "0123456789abcdef" for char in client_token_digest)
+    ):
+        raise ValueError("Worker rename tag identity is invalid")
+    spec = _validated_worker_provision_spec(
+        worker.provision_spec,
+        require_cloud_identity=True,
+    )
+    canonical_scope = canonical_cloud_termination_scope(cloud_scope)
+    if spec["cloud_scope"] != canonical_scope:
+        raise ValueError("Worker rename cloud scope differs from provision journal")
+    return {
+        "protocol_version": WORKER_RENAME_TAG_PROTOCOL_VERSION,
+        "operation_id": pysecrets.token_hex(16),
+        "generation": generation,
+        "worker_id": worker.id,
+        "cloud_instance_id": worker.cloud_instance_id,
+        "desired_name": desired_name,
+        "cloud_scope": canonical_scope,
+        "client_token_digest": client_token_digest,
+        "provision_spec_digest": _canonical_json_digest(spec),
+        "prepared_at": datetime.utcnow().isoformat(timespec="microseconds"),
+    }
+
+
+def require_worker_rename_tag_outbox(worker: Worker) -> dict:
+    """Validate one pending rename against the exact current Worker row."""
+
+    receipt = worker.rename_tag_outbox
+    expected_keys = {
+        "protocol_version",
+        "operation_id",
+        "generation",
+        "worker_id",
+        "cloud_instance_id",
+        "desired_name",
+        "cloud_scope",
+        "client_token_digest",
+        "provision_spec_digest",
+        "prepared_at",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise RuntimeError("Worker rename tag outbox has an invalid shape")
+    operation_id = receipt.get("operation_id")
+    generation = receipt.get("generation")
+    desired_name = receipt.get("desired_name")
+    prepared_at = receipt.get("prepared_at")
+    if (
+        receipt.get("protocol_version") != WORKER_RENAME_TAG_PROTOCOL_VERSION
+        or not isinstance(operation_id, str)
+        or len(operation_id) != 32
+        or any(char not in "0123456789abcdef" for char in operation_id)
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or generation != worker.rename_generation
+        or receipt.get("worker_id") != worker.id
+        or receipt.get("cloud_instance_id") != worker.cloud_instance_id
+        or not isinstance(desired_name, str)
+        or not desired_name
+        or len(desired_name) > 200
+        or desired_name != worker.name
+        or not isinstance(prepared_at, str)
+        or not prepared_at
+        or worker.status not in WORKER_RENAMEABLE_STATUSES
+        or worker.bootstrap_step is not None
+        or not isinstance(worker.auth_token, str)
+        or not worker.auth_token
+    ):
+        raise RuntimeError("Worker rename tag outbox differs from the Worker row")
+    scope = canonical_cloud_termination_scope(receipt.get("cloud_scope"))
+    spec = _validated_worker_provision_spec(
+        worker.provision_spec,
+        require_cloud_identity=True,
+    )
+    expected_token_digest = worker_create_client_token_digest(
+        worker.id,
+        worker.auth_token,
+    )
+    if (
+        scope != spec["cloud_scope"]
+        or not pysecrets.compare_digest(
+            str(receipt.get("client_token_digest") or ""),
+            expected_token_digest,
+        )
+        or not pysecrets.compare_digest(
+            str(receipt.get("provision_spec_digest") or ""),
+            _canonical_json_digest(spec),
+        )
+    ):
+        raise RuntimeError("Worker rename tag outbox cloud identity is invalid")
+    return json.loads(json.dumps(receipt))
+
+
+def worker_claude_login_identity(worker: Worker) -> dict:
+    """Build a non-secret binding for one exact Worker login generation."""
+
+    if (
+        worker is None
+        or isinstance(worker.id, bool)
+        or not isinstance(worker.id, int)
+        or worker.id <= 0
+        or not isinstance(worker.cloud_instance_id, str)
+        or not worker.cloud_instance_id
+        or not isinstance(worker.auth_token, str)
+        or not worker.auth_token
+    ):
+        raise ValueError("Worker lacks the identity required for Claude login")
+    spec = _validated_worker_provision_spec(
+        worker.provision_spec,
+        require_cloud_identity=True,
+    )
+    client_token_digest = worker_create_client_token_digest(
+        worker.id,
+        worker.auth_token,
+    )
+    if not pysecrets.compare_digest(
+        spec["client_token_digest"],
+        client_token_digest,
+    ):
+        raise ValueError(
+            "Worker provision journal differs from its Claude login identity"
+        )
+    return {
+        "version": CLAUDE_LOGIN_IDENTITY_VERSION,
+        "worker_id": worker.id,
+        "cloud_instance_id": worker.cloud_instance_id,
+        "client_token_digest": client_token_digest,
+        "provision_spec_digest": _canonical_json_digest(spec),
+    }
+
+
+def claude_login_identity_matches(worker: Worker, account: dict) -> bool:
+    """Return whether a logged-in Claude account belongs to this exact node."""
+
+    if not isinstance(account, dict):
+        return False
+    actual = account.get(CLAUDE_LOGIN_IDENTITY_KEY)
+    if not isinstance(actual, dict):
+        return False
+    try:
+        expected = worker_claude_login_identity(worker)
+    except (TypeError, ValueError):
+        return False
+    if (
+        type(actual.get("version")) is not int
+        or actual.get("version") != CLAUDE_LOGIN_IDENTITY_VERSION
+        or isinstance(actual.get("worker_id"), bool)
+        or not isinstance(actual.get("worker_id"), int)
+        or actual.get("worker_id") != expected["worker_id"]
+        or actual.get("cloud_instance_id") != expected["cloud_instance_id"]
+    ):
+        return False
+    for key in ("client_token_digest", "provision_spec_digest"):
+        value = actual.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+            or not pysecrets.compare_digest(value, expected[key])
+        ):
+            return False
+    return True
+
+
+def _validated_worker_provision_spec(
+    value: object,
+    *,
+    require_cloud_identity: bool,
+) -> dict:
+    """Validate and detach the durable RunInstances request journal.
+
+    Version 1 deliberately permits additive metadata so installations that
+    predate cloud-scope fencing can be upgraded in place.  The request fields
+    themselves remain exact and ``client_token`` is never stored in the JSON;
+    only its SHA-256 binding is retained.
+    """
+
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value.get("version") != WORKER_PROVISION_SPEC_VERSION
+        or not isinstance(value.get("name"), str)
+        or not value["name"].strip()
+        or type(value.get("has_fixed_overrides")) is not bool
+        or not isinstance(value.get("overrides"), dict)
+        or "client_token" in value["overrides"]
+    ):
+        raise ValueError("Worker provision spec has an invalid request journal")
+    detached = json.loads(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    )
+    if require_cloud_identity:
+        detached["cloud_scope"] = canonical_cloud_termination_scope(
+            detached.get("cloud_scope")
+        )
+        digest = detached.get("client_token_digest")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError("Worker provision spec lacks ClientToken identity")
+    return detached
 
 # The helper source is intentionally constant: URL, bearer token and optional
 # JSON payload are all read from stdin, so neither Worker credentials nor
@@ -108,6 +408,7 @@ def _scrub_destroyed_worker_accounts(accounts: list | None) -> list[dict]:
             key: account[key]
             for key in _DESTROYED_ACCOUNT_AUDIT_FIELDS
             if key in account
+            and type(account[key]) in {str, int, float, bool}
         }
         for account in accounts or []
         if isinstance(account, dict)
@@ -228,11 +529,355 @@ class WorkerProvisioner:
                 worker.bootstrap_log = (worker.bootstrap_log or "") + f"[{stamp}] {log_line}\n"
             for k, v in fields.items():
                 setattr(worker, k, v)
+            if "status" in fields:
+                next_status = fields["status"]
+                next_step = fields.get("bootstrap_step", worker.bootstrap_step)
+                if next_status != "destroying" and next_step != "destroy":
+                    worker.destroy_lifecycle_nonce = None
+                    worker.destroy_termination_receipt = None
             await db.commit()
             await db.refresh(worker)
         if broadcast:
             await self._broadcast(worker, log_line)
         return worker
+
+    async def _current_cloud_scope(self) -> dict[str, str]:
+        """Read and strictly canonicalize the provider effect boundary."""
+
+        return canonical_cloud_termination_scope(
+            await self.cloud.termination_scope()
+        )
+
+    async def _persist_worker_provision_identity(
+        self,
+        worker: Worker,
+        *,
+        provision_spec: dict,
+        adopted_instance_id: str | None = None,
+    ) -> Worker:
+        """CAS one legacy cloud-identity backfill under the Worker writer lock."""
+
+        expected_spec_digest = _canonical_json_digest(worker.provision_spec)
+        async with self.db_factory() as db:
+            predicates = [
+                Worker.id == worker.id,
+                Worker.status == worker.status,
+                (
+                    Worker.cloud_instance_id.is_(None)
+                    if worker.cloud_instance_id is None
+                    else Worker.cloud_instance_id == worker.cloud_instance_id
+                ),
+                (
+                    Worker.destroy_lifecycle_nonce.is_(None)
+                    if worker.destroy_lifecycle_nonce is None
+                    else Worker.destroy_lifecycle_nonce
+                    == worker.destroy_lifecycle_nonce
+                ),
+            ]
+            locked = await db.execute(
+                update(Worker)
+                .where(*predicates)
+                .values(status=Worker.status)
+                .execution_options(synchronize_session=False)
+            )
+            if locked.rowcount != 1:
+                await db.rollback()
+                raise RuntimeError(
+                    "Worker lifecycle changed during cloud identity reconciliation"
+                )
+            current = await db.get(Worker, worker.id, populate_existing=True)
+            if (
+                current is None
+                or current.auth_token != worker.auth_token
+                or _canonical_json_digest(current.provision_spec)
+                != expected_spec_digest
+            ):
+                await db.rollback()
+                raise RuntimeError(
+                    "Worker credential or provision journal changed during "
+                    "cloud identity reconciliation"
+                )
+            if adopted_instance_id is not None:
+                if current.cloud_instance_id not in (None, adopted_instance_id):
+                    await db.rollback()
+                    raise RuntimeError(
+                        "Worker instance changed during ClientToken reconciliation"
+                    )
+                current.cloud_instance_id = adopted_instance_id
+            current.provision_spec = provision_spec
+            await db.commit()
+            await db.refresh(current)
+            return current
+
+    async def require_worker_cloud_identity(
+        self,
+        worker: Worker,
+        *,
+        verify_private_ip: bool = False,
+        include_terminated: bool = False,
+    ) -> dict:
+        """Prove one row belongs to the current provider scope and ClientToken.
+
+        Existing version-1 journals created before cloud-scope fencing are
+        backfilled only after the deterministic ClientToken resolves uniquely
+        to the exact row instance.  Missing or ambiguous evidence fails closed.
+        """
+
+        if (
+            worker is None
+            or not isinstance(worker.cloud_instance_id, str)
+            or not worker.cloud_instance_id
+            or not isinstance(worker.auth_token, str)
+            or not worker.auth_token
+        ):
+            raise RuntimeError(
+                "Worker lacks the cloud instance/credential identity required "
+                "for a lifecycle effect"
+            )
+        current_scope = await self._current_cloud_scope()
+        client_token = worker_create_client_token(worker.id, worker.auth_token)
+        client_token_digest = worker_create_client_token_digest(
+            worker.id,
+            worker.auth_token,
+        )
+
+        raw_spec = worker.provision_spec
+        if raw_spec is None:
+            base_spec = {
+                "version": WORKER_PROVISION_SPEC_VERSION,
+                "name": worker.name,
+                "has_fixed_overrides": False,
+                "overrides": {},
+            }
+        else:
+            base_spec = _validated_worker_provision_spec(
+                raw_spec,
+                require_cloud_identity=False,
+            )
+
+        frozen_scope_value = base_spec.get("cloud_scope")
+        frozen_digest = base_spec.get("client_token_digest")
+        needs_backfill = (
+            frozen_scope_value is None
+            or frozen_digest is None
+        )
+        if frozen_scope_value is not None:
+            frozen_scope = canonical_cloud_termination_scope(
+                frozen_scope_value
+            )
+            if frozen_scope != current_scope:
+                raise RuntimeError(
+                    "Worker cloud scope differs from the durable provision journal"
+                )
+        if frozen_digest is not None:
+            if (
+                not isinstance(frozen_digest, str)
+                or len(frozen_digest) != 64
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in frozen_digest
+                )
+                or not pysecrets.compare_digest(
+                    frozen_digest,
+                    client_token_digest,
+                )
+            ):
+                raise RuntimeError(
+                    "Worker ClientToken identity differs from its provision journal"
+                )
+
+        resolved_instance_id = await self.cloud.find_instance_by_create_token(
+            client_token,
+            include_terminated=include_terminated,
+        )
+        if resolved_instance_id != worker.cloud_instance_id:
+            raise RuntimeError(
+                "Worker ClientToken did not resolve to the exact cloud instance"
+            )
+
+        if needs_backfill:
+            base_spec["cloud_scope"] = current_scope
+            base_spec["client_token_digest"] = client_token_digest
+            base_spec["identity_reconciliation"] = {
+                "version": 1,
+                "method": "client_token",
+                "instance_id": worker.cloud_instance_id,
+            }
+            worker = await self._persist_worker_provision_identity(
+                worker,
+                provision_spec=base_spec,
+            )
+        spec = _validated_worker_provision_spec(
+            worker.provision_spec,
+            require_cloud_identity=True,
+        )
+        if spec["cloud_scope"] != current_scope:
+            raise RuntimeError(
+                "Worker cloud scope changed after identity reconciliation"
+            )
+        if not pysecrets.compare_digest(
+            spec["client_token_digest"],
+            client_token_digest,
+        ):
+            raise RuntimeError(
+                "Worker ClientToken changed after identity reconciliation"
+            )
+
+        instance_info = None
+        if verify_private_ip:
+            instance_info = await self.cloud.describe_instance(
+                worker.cloud_instance_id
+            )
+            if (
+                not isinstance(instance_info, dict)
+                or instance_info.get("instance_id")
+                != worker.cloud_instance_id
+                or not isinstance(worker.private_ip, str)
+                or not worker.private_ip
+                or instance_info.get("private_ip") != worker.private_ip
+            ):
+                raise RuntimeError(
+                    "Worker endpoint does not match the exact cloud instance"
+                )
+        return {
+            "worker": worker,
+            "cloud_scope": current_scope,
+            "client_token": client_token,
+            "client_token_digest": client_token_digest,
+            "provision_spec_digest": _canonical_json_digest(spec),
+            "instance_info": instance_info,
+        }
+
+    async def reconcile_worker_rename_tag_outbox(
+        self,
+        worker_id: int,
+        *,
+        expected_operation_id: str | None = None,
+    ) -> Worker | None:
+        """Replay and settle one exact monotonic cloud ``Name`` tag outbox.
+
+        EC2's create_tags API has no conditional generation parameter.  The
+        Worker row is therefore kept writer-locked across the short provider
+        call: a newer generation cannot be admitted while an older request is
+        still able to arrive at AWS.  Process loss releases the database lock
+        while retaining the outbox, and replaying the same Name value is
+        idempotent whether or not the previous response was acknowledged.
+        """
+
+        require_worker_control_plane_enabled()
+        async with self.db_factory() as db:
+            cancellation: asyncio.CancelledError | None = None
+            reconciled_worker: Worker | None = None
+            try:
+                locked = await db.execute(
+                    update(Worker)
+                    .where(
+                        Worker.id == worker_id,
+                        Worker.rename_tag_outbox.is_not(None),
+                    )
+                    .values(rename_generation=Worker.rename_generation)
+                    .execution_options(synchronize_session=False)
+                )
+                if locked.rowcount != 1:
+                    await db.rollback()
+                    return await db.get(Worker, worker_id)
+
+                worker = await db.get(
+                    Worker,
+                    worker_id,
+                    populate_existing=True,
+                )
+                if worker is None:
+                    raise RuntimeError("Worker disappeared during rename replay")
+                receipt = require_worker_rename_tag_outbox(worker)
+                if (
+                    expected_operation_id is not None
+                    and receipt["operation_id"] != expected_operation_id
+                ):
+                    raise RuntimeError(
+                        "Worker rename generation changed before cloud replay"
+                    )
+
+                # Repeat live scope + ClientToken resolution while the row is
+                # locked. No stale receipt can target a replacement instance
+                # or a provider account/region selected after admission.
+                identity = await self.require_worker_cloud_identity(worker)
+                if (
+                    identity["worker"].id != worker.id
+                    or identity["worker"].cloud_instance_id
+                    != receipt["cloud_instance_id"]
+                    or identity["cloud_scope"] != receipt["cloud_scope"]
+                    or not pysecrets.compare_digest(
+                        identity["client_token_digest"],
+                        receipt["client_token_digest"],
+                    )
+                ):
+                    raise RuntimeError(
+                        "Worker cloud identity changed before rename replay"
+                    )
+
+                # boto-backed provider calls run in a thread. Cancelling the
+                # asyncio waiter does not stop that thread, so releasing the
+                # row lock immediately would let a newer generation reach AWS
+                # while this older request was still in flight. Delay caller
+                # cancellation until the provider attempt has actually
+                # settled, keeping the monotonic writer fence intact.
+                async def apply_effect_and_ack() -> Worker:
+                    await self.cloud.update_instance_tags(
+                        receipt["cloud_instance_id"],
+                        {"Name": receipt["desired_name"]},
+                    )
+                    # This attached row is still protected by the same writer
+                    # transaction. Clearing exactly this outbox and committing
+                    # publishes the provider acknowledgement atomically.
+                    worker.rename_tag_outbox = None
+                    await db.commit()
+                    await db.refresh(worker)
+                    return worker
+
+                operation, cancellation = await settle_awaitable(
+                    apply_effect_and_ack()
+                )
+                reconciled_worker = operation.result()
+            except BaseException:
+                rollback, _rollback_cancellation = await settle_awaitable(
+                    db.rollback()
+                )
+                rollback.result()
+                raise
+            if cancellation is not None:
+                raise cancellation
+            return reconciled_worker
+
+    async def recover_worker_rename_tag_outboxes(self) -> tuple[int, int]:
+        """Best-effort startup/health recovery for every pending rename."""
+
+        require_worker_control_plane_enabled()
+        async with self.db_factory() as db:
+            worker_ids = list(
+                (
+                    await db.execute(
+                        select(Worker.id)
+                        .where(Worker.rename_tag_outbox.is_not(None))
+                        .order_by(Worker.id)
+                    )
+                ).scalars()
+            )
+        recovered = 0
+        failed = 0
+        for pending_worker_id in worker_ids:
+            try:
+                await self.reconcile_worker_rename_tag_outbox(
+                    pending_worker_id
+                )
+                recovered += 1
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "worker %s cloud Name tag outbox recovery failed",
+                    pending_worker_id,
+                )
+        return recovered, failed
 
     async def _broadcast(self, worker: Worker, log_line: str | None = None):
         if self.broadcaster:
@@ -271,7 +916,7 @@ class WorkerProvisioner:
         r.raise_for_status()
         return r.json()
 
-    async def _probe_auth(self, worker: Worker, client: httpx.AsyncClient) -> None:
+    async def _probe_auth(self, worker: Worker, client: httpx.AsyncClient) -> dict:
         """验证 auth_token 真的可用。/api/system/health 在 PUBLIC_PATHS 不校验
         token，必须打一个需认证的端点，否则 .env 没写对也会被标 ready。"""
         r = await client.get(
@@ -282,6 +927,65 @@ class WorkerProvisioner:
         if r.status_code == 401:
             raise BootstrapError("health-check", "auth_token 校验失败（worker .env 未生效？）")
         r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, dict):
+            raise BootstrapError("health-check", "Worker stats response is invalid")
+        if payload.get("ccm_node_role") != "worker":
+            raise BootstrapError(
+                "health-check",
+                "Worker node role mismatch: expected CCM_NODE_ROLE=worker, "
+                f"got {payload.get('ccm_node_role')!r}",
+            )
+        from backend.services.task_id_namespace import (
+            TASK_ID_NAMESPACE_PROTOCOL,
+            TASK_ID_WORKER_NAMESPACE_START,
+        )
+
+        if (
+            payload.get("task_id_namespace_protocol")
+            != TASK_ID_NAMESPACE_PROTOCOL
+            or payload.get("task_id_namespace_boundary")
+            != TASK_ID_WORKER_NAMESPACE_START
+        ):
+            raise BootstrapError(
+                "health-check",
+                "Worker Task id namespace protocol is missing or incompatible",
+            )
+        return payload
+
+    @staticmethod
+    def _require_expected_commit(worker: Worker, health: object) -> str:
+        """Verify the remote binary against the Manager's immutable expectation.
+
+        ``Worker.ccm_commit`` is written by the rsync deployment step.  A
+        health response is evidence about the remote node; it must never be
+        allowed to replace that expected value, otherwise a stale or tampered
+        Worker can make itself appear current simply by reporting its own
+        commit.
+        """
+        expected = worker.ccm_commit
+        if not isinstance(expected, str) or not expected or expected != expected.strip():
+            raise BootstrapError(
+                "health-check",
+                "Manager 缺少有效的 Worker 预期 commit；请重新部署该 Worker，"
+                "不能采信远端自报版本",
+            )
+        if not isinstance(health, dict):
+            raise BootstrapError("health-check", "Worker health response is invalid")
+        actual = health.get("commit")
+        if not isinstance(actual, str) or not actual or actual != actual.strip():
+            raise BootstrapError(
+                "health-check",
+                f"Worker 未返回有效 commit（期望 {expected}）；请重新部署该 Worker",
+            )
+        if actual != expected:
+            raise BootstrapError(
+                "health-check",
+                "Worker commit 不匹配："
+                f"Manager 期望 {expected}，远端报告 {actual}；"
+                "必须重新部署后才能启动或接收任务",
+            )
+        return actual
 
     async def worker_local_api(
         self,
@@ -299,6 +1003,7 @@ class WorkerProvisioner:
         debug logs.  This is intentionally used for Codex login rather than
         duplicating the transaction/rollback logic from ``api/codex_pool.py``.
         """
+        require_worker_control_plane_enabled()
         if not path.startswith("/api/") or any(c in path for c in "\r\n"):
             raise ValueError("invalid Worker API path")
         method = method.upper()
@@ -351,6 +1056,7 @@ class WorkerProvisioner:
         on_status=None,
     ) -> str | None:
         """Start and await one Worker-local Codex pool login transaction."""
+        require_worker_control_plane_enabled()
         email = str(account.get("email") or "").strip()
         if not email:
             raise ValueError("Codex account email is required")
@@ -474,6 +1180,7 @@ class WorkerProvisioner:
         already exists: the remote allocator intentionally does not de-dup by
         email and would create codex-2, codex-3, ... on every retry.
         """
+        require_worker_control_plane_enabled()
         persisted_id = str(account.get("account_id") or "").strip()
         if not persisted_id:
             email = str(account.get("email") or "").strip()
@@ -635,6 +1342,7 @@ class WorkerProvisioner:
         worker_id: int,
         accounts: list[dict] | None = None,
     ):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._create_worker_locked(worker_id, accounts)
 
@@ -668,10 +1376,18 @@ class WorkerProvisioner:
                     worker_id, auth_token=pysecrets.token_hex(24),
                 )
 
-            # retry 场景：DB 里已有实例 ID 且实例还在 → 跳过创建直接 bootstrap
+            # retry 场景：DB 里已有实例 ID 且实例还在 → 跳过创建直接 bootstrap。
+            # Before any start/reuse effect, prove that the row still belongs
+            # to this exact provider account/region and deterministic
+            # RunInstances ClientToken.
             existing_iid = worker.cloud_instance_id if worker else None
             if existing_iid:
                 try:
+                    identity = await self.require_worker_cloud_identity(
+                        worker,
+                        include_terminated=True,
+                    )
+                    worker = identity["worker"]
                     info = await self.cloud.describe_instance(existing_iid)
                     if info["state"] in ("pending", "running", "stopped"):
                         await self._log(worker_id, f"reusing existing instance {existing_iid} ({info['state']})")
@@ -719,30 +1435,114 @@ class WorkerProvisioner:
                         "ssh_user": worker.ssh_user,
                         "ccm_port": worker.ccm_port,
                     })
+                    cloud_scope = await self._current_cloud_scope()
+                    client_token_digest = worker_create_client_token_digest(
+                        worker.id,
+                        worker.auth_token,
+                    )
                     spec = {
-                        "version": 1,
+                        "version": WORKER_PROVISION_SPEC_VERSION,
                         "name": worker.name,
                         "has_fixed_overrides": has_fixed_overrides,
                         "overrides": frozen_overrides,
+                        "cloud_scope": cloud_scope,
+                        "client_token_digest": client_token_digest,
                     }
                     # This commit is the create-request journal.  It must land
                     # before RunInstances so every retry after a lost response
                     # reuses byte-equivalent semantic parameters.
-                    worker = await self._update(
-                        worker_id, provision_spec=spec, broadcast=False,
+                    worker = await self._persist_worker_provision_identity(
+                        worker,
+                        provision_spec=spec,
                     )
-                if (
-                    not isinstance(spec, dict)
-                    or spec.get("version") != 1
-                    or not isinstance(spec.get("name"), str)
-                    or not spec["name"].strip()
-                    or not isinstance(spec.get("overrides"), dict)
-                    or "client_token" in spec["overrides"]
-                ):
+                else:
+                    try:
+                        legacy_spec = _validated_worker_provision_spec(
+                            spec,
+                            require_cloud_identity=False,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise BootstrapError(
+                            "provision-config",
+                            "Worker 保存的 EC2 创建请求日志无效；"
+                            "为避免重复实例已停止",
+                        ) from exc
+                    missing_scope = legacy_spec.get("cloud_scope") is None
+                    missing_token_digest = (
+                        legacy_spec.get("client_token_digest") is None
+                    )
+                    if missing_scope or missing_token_digest:
+                        # An old journal may have been committed immediately
+                        # before RunInstances in another account/region.  The
+                        # current scope can be adopted only when ClientToken
+                        # discovery proves the exact already-created instance.
+                        cloud_scope = await self._current_cloud_scope()
+                        client_token = worker_create_client_token(
+                            worker.id,
+                            worker.auth_token,
+                        )
+                        resolved = await self.cloud.find_instance_by_create_token(
+                            client_token
+                        )
+                        if not isinstance(resolved, str) or not resolved:
+                            raise BootstrapError(
+                                "provision-config",
+                                "旧版 EC2 创建请求日志没有冻结云账号/区域，且当前"
+                                " ClientToken 无法认领实例；为避免跨账号重复计费已停止",
+                            )
+                        legacy_spec["cloud_scope"] = cloud_scope
+                        legacy_spec["client_token_digest"] = (
+                            worker_create_client_token_digest(
+                                worker.id,
+                                worker.auth_token,
+                            )
+                        )
+                        legacy_spec["identity_reconciliation"] = {
+                            "version": 1,
+                            "method": "client_token",
+                            "instance_id": resolved,
+                        }
+                        worker = await self._persist_worker_provision_identity(
+                            worker,
+                            provision_spec=legacy_spec,
+                            adopted_instance_id=resolved,
+                        )
+                        spec = legacy_spec
+                        existing_iid = resolved
+                    else:
+                        current_scope = await self._current_cloud_scope()
+                        frozen_scope = canonical_cloud_termination_scope(
+                            legacy_spec["cloud_scope"]
+                        )
+                        expected_token_digest = (
+                            worker_create_client_token_digest(
+                                worker.id,
+                                worker.auth_token,
+                            )
+                        )
+                        if (
+                            frozen_scope != current_scope
+                            or not pysecrets.compare_digest(
+                                legacy_spec["client_token_digest"],
+                                expected_token_digest,
+                            )
+                        ):
+                            raise BootstrapError(
+                                "provision-config",
+                                "Worker EC2 创建请求的云作用域或 ClientToken "
+                                "与当前运行身份不一致",
+                            )
+                        spec = legacy_spec
+                try:
+                    spec = _validated_worker_provision_spec(
+                        spec,
+                        require_cloud_identity=True,
+                    )
+                except (TypeError, ValueError) as exc:
                     raise BootstrapError(
                         "provision-config",
                         "Worker 保存的 EC2 创建请求日志无效；为避免重复实例已停止",
-                    )
+                    ) from exc
                 overrides = dict(spec["overrides"])
                 if overrides.get("ssh_public_key") != key_material.openssh_public_key:
                     raise BootstrapError(
@@ -754,13 +1554,26 @@ class WorkerProvisioner:
                 # EC2 may create the instance even when the API response is
                 # lost. Reusing both the token and the frozen provision_spec
                 # returns that instance instead of creating a billable orphan.
-                overrides["client_token"] = "ccm-" + hashlib.sha256(
-                    f"{worker.id}:{worker.auth_token}".encode("utf-8")
-                ).hexdigest()[:48]
-                src = "fixed config" if has_fixed_overrides else "inherited from manager"
-                await self._log(worker_id, f"creating EC2 instance ({src})")
-                iid = await self.cloud.create_instance(spec["name"], overrides)
-                worker = await self._update(worker_id, cloud_instance_id=iid)
+                overrides["client_token"] = worker_create_client_token(
+                    worker.id,
+                    worker.auth_token,
+                )
+                if existing_iid:
+                    info = await self.cloud.describe_instance(existing_iid)
+                    if info.get("state") not in ("pending", "running", "stopped"):
+                        raise BootstrapError(
+                            step,
+                            f"ClientToken 认领的实例 {existing_iid} 当前为 "
+                            f"{info.get('state') or 'unknown'}",
+                        )
+                    if info.get("state") == "stopped":
+                        await self.cloud.start_instance(existing_iid)
+                    iid = existing_iid
+                else:
+                    src = "fixed config" if has_fixed_overrides else "inherited from manager"
+                    await self._log(worker_id, f"creating EC2 instance ({src})")
+                    iid = await self.cloud.create_instance(spec["name"], overrides)
+                    worker = await self._update(worker_id, cloud_instance_id=iid)
 
             private_ip = await self.cloud.wait_until_running(iid)
             info = await self.cloud.describe_instance(iid)
@@ -770,11 +1583,11 @@ class WorkerProvisioner:
             await self._log(worker_id, f"instance running, private_ip={private_ip}")
             await self._bootstrap(worker_id, accounts or [])
 
+            await self._log(worker_id, "worker ready")
             worker = await self._update(
                 worker_id, status="ready", bootstrap_step=None,
                 last_heartbeat=datetime.utcnow(),
             )
-            await self._log(worker_id, "worker ready")
         except BootstrapError as e:
             await self._update(
                 worker_id, status="error", bootstrap_step=e.step, bootstrap_error=e.detail
@@ -809,6 +1622,7 @@ class WorkerProvisioner:
                 raise BootstrapError(step, str(e))
 
         await run_step("ssh-wait", self._step_ssh_wait(ssh))
+        await run_step("ccm-quiesce", self._step_ccm_quiesce(ssh))
         await run_step("system-init", self._step_system_init(ssh, worker_id))
         await run_step("ccm-deploy", self._step_ccm_deploy(ssh, worker, worker_id))
         await run_step("ccm-config", self._step_ccm_config(ssh, worker_id))
@@ -861,7 +1675,7 @@ if [ ! -f /swapfile ]; then
   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 fi
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl rsync python3-venv > /dev/null
+sudo apt-get install -y -qq git curl rsync python3-venv bubblewrap socat > /dev/null
 if ! command -v node >/dev/null; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - > /dev/null
   sudo apt-get install -y -qq nodejs > /dev/null
@@ -901,6 +1715,16 @@ echo "node=$(node --version) uv=$($HOME/.local/bin/uv --version 2>/dev/null || u
             raise BootstrapError("system-init", out[-2000:])
         await self._log(worker_id, out.strip().splitlines()[-1] if out.strip() else "system-init done")
 
+    async def _step_ccm_quiesce(self, ssh: SSHExecutor) -> None:
+        """Stop an adopted/legacy service before replacing code or config."""
+
+        code, out = await ssh.run(
+            "sudo systemctl stop ccm-worker.service >/dev/null 2>&1 || true",
+            timeout=60,
+        )
+        if code != 0:
+            raise BootstrapError("ccm-quiesce", out[-1000:])
+
     async def _step_ccm_deploy(self, ssh: SSHExecutor, worker: Worker, worker_id: int):
         remote_dir = settings.worker_remote_dir
         commit = git_head_commit(self._repo_dir)
@@ -937,6 +1761,9 @@ echo deploy-ok
             f"PORT={worker.ccm_port}",
             "HOST=0.0.0.0",
             "AUTO_START_DISPATCHER=true",
+            # Worker-local derived Tasks use the disjoint high id namespace;
+            # Manager mirrors continue to retain their low global id.
+            "CCM_NODE_ROLE=worker",
             "WORKER_ENABLED=false",
             f"WORKSPACE_DIR={settings.workspace_dir}",  # 必须与 Manager 一致（session 路径对齐）
             "POOL_ENABLED=true",
@@ -981,6 +1808,8 @@ echo deploy-ok
             raw_token = account.get("token") or ""
             raw_password = account.get("password") or ""
             raw_account_id = account.get("account_id") or ""
+            raw_status = account.get("status")
+            raw_claude_identity = account.get(CLAUDE_LOGIN_IDENTITY_KEY)
             # Missing provider means a historical Worker account, which was
             # always Claude.  New API records explicitly persist "codex".
             provider = str(account.get("provider") or "claude").strip().lower()
@@ -1017,6 +1846,19 @@ echo deploy-ok
                 "provider": provider,
                 "login_method": login_method,
             })
+            if (
+                provider == "claude"
+                and isinstance(raw_status, str)
+                and raw_status in {"logged_in", "failed"}
+            ):
+                normalized_accounts[-1]["status"] = raw_status
+                if raw_status == "logged_in" and isinstance(
+                    raw_claude_identity,
+                    dict,
+                ):
+                    normalized_accounts[-1][CLAUDE_LOGIN_IDENTITY_KEY] = dict(
+                        raw_claude_identity
+                    )
             if raw_account_id.strip():
                 account_id = raw_account_id.strip()
                 slot = (provider, account_id)
@@ -1028,14 +1870,40 @@ echo deploy-ok
                 seen_slots.add(slot)
                 normalized_accounts[-1]["account_id"] = account_id
 
+        claude_login_identity = None
+        if any(account["provider"] == "claude" for account in normalized_accounts):
+            try:
+                claude_login_identity = worker_claude_login_identity(worker)
+            except (TypeError, ValueError) as exc:
+                raise BootstrapError(
+                    "account-login",
+                    "Worker 云实例/创建日志身份不完整，无法安全记录 Claude 登录",
+                ) from exc
+
         results = []
+
+        async def persist_login_progress(snapshot: list[dict]) -> None:
+            """Journal account outcomes around non-idempotent remote effects."""
+
+            updated = await self._update(
+                worker_id,
+                broadcast=False,
+                accounts=[dict(item) for item in snapshot],
+            )
+            if updated is None:
+                raise BootstrapError(
+                    "account-login",
+                    "Worker record disappeared while saving account login state",
+                )
+
         claude_index = 0
-        for acct in normalized_accounts:
+        for account_index, acct in enumerate(normalized_accounts):
             email = acct["email"]
             token = acct["token"]
             password = acct["password"]
             provider = acct["provider"]
             login_method = acct["login_method"]
+            remaining_accounts = normalized_accounts[account_index + 1:]
             account_id = None
             out = ""
             if provider == "codex":
@@ -1057,6 +1925,32 @@ echo deploy-ok
                     "default" if claude_index == 1 else f"account-{claude_index}"
                 )
                 account_id = name
+                if (
+                    acct.get("status") == "logged_in"
+                    and claude_login_identity_matches(worker, acct)
+                ):
+                    results.append({
+                        **acct,
+                        "account_id": name,
+                        CLAUDE_LOGIN_IDENTITY_KEY: dict(claude_login_identity),
+                    })
+                    await self._log(
+                        worker_id,
+                        f"Claude {email} already logged in as pool slot {name}; "
+                        "skipping remote login",
+                    )
+                    await persist_login_progress([
+                        *results,
+                        *remaining_accounts,
+                    ])
+                    continue
+                if acct.get("status") == "logged_in":
+                    acct.pop(CLAUDE_LOGIN_IDENTITY_KEY, None)
+                    await self._log(
+                        worker_id,
+                        f"Claude {email} login belongs to an older Worker "
+                        "generation; running login again",
+                    )
                 await self._log(
                     worker_id,
                     f"login Claude {email} -> pool slot {name} "
@@ -1071,6 +1965,24 @@ echo deploy-ok
                 )
                 remote_script = f"/tmp/ccm_login_{worker_id}_{claude_index}.sh"
                 upload_cmd = _build_script_upload_command(login_script, remote_script)
+
+                # auto_login replaces the remote credential files and drives
+                # an OAuth flow.  A lost SSH result cannot prove whether that
+                # effect committed, so move every retryable/conclusive old
+                # state to a durable non-terminal marker before the first
+                # remote command.  Startup recovery then preserves
+                # account-login and retry admission fails closed on pending.
+                pending_account = {
+                    **acct,
+                    "status": "pending",
+                    "account_id": name,
+                }
+                pending_account.pop(CLAUDE_LOGIN_IDENTITY_KEY, None)
+                await persist_login_progress([
+                    *results,
+                    pending_account,
+                    *remaining_accounts,
+                ])
                 code, out = await ssh.run(upload_cmd, sensitive=True)
                 if code == 0:
                     quoted_script = shlex.quote(remote_script)
@@ -1084,13 +1996,27 @@ echo deploy-ok
 
             status = "logged_in" if code == 0 else "failed"
             result = {**acct, "status": status}
+            if provider == "claude":
+                result.pop(CLAUDE_LOGIN_IDENTITY_KEY, None)
+                if status == "logged_in":
+                    result[CLAUDE_LOGIN_IDENTITY_KEY] = dict(
+                        claude_login_identity
+                    )
             if account_id:
                 result["account_id"] = account_id
             results.append(result)
+            # Publish each known result immediately.  If the process dies
+            # after the remote effect but before this commit, the pre-effect
+            # pending marker remains and blocks an unsafe replay.  If this
+            # commit wins first, retry can safely reuse logged_in or rerun a
+            # deterministically failed attempt.
+            await persist_login_progress([
+                *results,
+                *remaining_accounts,
+            ])
             await self._log(worker_id, f"login {email}: {status}")
             if code != 0:
                 await self._log(worker_id, f"login output: {out[-500:]}")
-        await self._update(worker_id, accounts=results)
         if all(r["status"] == "failed" for r in results):
             raise BootstrapError("account-login", "全部账号登录失败")
 
@@ -1176,7 +2102,13 @@ echo warmup-ok
         last_line = out.strip().splitlines()[-1] if out.strip() else ""
         await self._log(worker_id, f"claude warmup done ({last_line})")
 
-    async def _step_ccm_service(self, ssh: SSHExecutor, worker: Worker):
+    async def _step_ccm_service(
+        self,
+        ssh: SSHExecutor,
+        worker: Worker,
+        *,
+        restart: bool = True,
+    ):
         remote_dir = settings.worker_remote_dir
         unit = f"""
 [Unit]
@@ -1188,6 +2120,8 @@ Type=simple
 User={worker.ssh_user}
 WorkingDirectory={remote_dir}
 EnvironmentFile={remote_dir}/.env
+Environment=CCM_NODE_ROLE=worker
+Environment=WORKER_ENABLED=false
 ExecStart={remote_dir}/.venv/bin/python -m uvicorn backend.main:app --host 0.0.0.0 --port {worker.ccm_port}
 Restart=always
 RestartSec=5
@@ -1205,7 +2139,7 @@ sudo tee /etc/systemd/system/ccm-worker.service > /dev/null << 'UNIT'
 UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable ccm-worker > /dev/null 2>&1
-sudo systemctl restart ccm-worker
+sudo systemctl {"restart" if restart else "stop"} ccm-worker
 """
         code, out = await ssh.run(script, timeout=120)
         if code != 0:
@@ -1222,9 +2156,9 @@ sudo systemctl restart ccm-worker
                     body = await self._probe_health(worker, c)
                     # health 是 PUBLIC 路径不校验 token——必须再打一个需认证端点
                     await self._probe_auth(worker, c)
-                    # 顺手记录 worker 自报 commit（应与部署 commit 一致）
-                    if body.get("commit"):
-                        await self._update(worker_id, ccm_commit=body["commit"], broadcast=False)
+                    # ccm_commit 是部署时冻结的期望值；远端 health 只能作为
+                    # 比对证据，绝不能反向覆盖期望值。
+                    self._require_expected_commit(worker, body)
                     return
                 except BootstrapError:
                     raise
@@ -1241,11 +2175,32 @@ sudo systemctl restart ccm-worker
     # ------------------------------------------------------------------
 
     async def stop_worker(self, worker_id: int):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._stop_worker_locked(worker_id)
 
     async def _stop_worker_locked(self, worker_id: int):
         worker = await self._update(worker_id, status="stopping")
+        if worker is None:
+            return
+        if worker.cloud_instance_id:
+            try:
+                identity = await self.require_worker_cloud_identity(
+                    worker,
+                    verify_private_ip=True,
+                )
+                worker = identity["worker"]
+            except Exception as exc:
+                await self._update(
+                    worker_id,
+                    status="error",
+                    bootstrap_step=None,
+                    bootstrap_error=(
+                        "关机失败: Worker 云账号/区域/ClientToken 身份无法确认: "
+                        f"{exc}"
+                    ),
+                )
+                return
         # 必须先断 relay 再关机，否则触发约 17 分钟的指数退避重连风暴
         if self.relay is not None:
             try:
@@ -1264,18 +2219,28 @@ sudo systemctl restart ccm-worker
                 # bootstrap 在开机前就失败过的 worker：没有实例可停
                 await self._update(worker_id, status="stopped")
                 return
-            try:
-                ssh = self._ssh(worker)
-                await ssh.run("sudo systemctl stop ccm-worker", timeout=60)
-            except Exception as e:
-                logger.warning("worker %s: graceful service stop failed: %s", worker_id, e)
+            ssh = self._ssh(worker)
+            # Persist the node role in both .env and the unit before EC2 is
+            # stopped.  Failure is not best-effort: powering off without this
+            # durable convergence would let the next boot run upgraded code as
+            # a Manager and permanently bind the Worker's Task namespace wrong.
+            await self._step_ccm_config(ssh, worker_id)
+            await self._step_ccm_service(ssh, worker, restart=False)
             await self.cloud.stop_instance(worker.cloud_instance_id)
-            # 等到真正 stopped
+            # 等到真正 stopped。API 接受 stop 请求不代表 EC2 已进入终态；
+            # 超时或未知结果都必须保留为 error，不能伪造 stopped 证明。
+            final_state: str | None = None
             for _ in range(60):
                 info = await self.cloud.describe_instance(worker.cloud_instance_id)
-                if info["state"] == "stopped":
+                final_state = info.get("state") if isinstance(info, dict) else None
+                if final_state == "stopped":
                     break
                 await asyncio.sleep(5)
+            if final_state != "stopped":
+                raise RuntimeError(
+                    "云平台在关机轮询结束后仍未确认实例 stopped"
+                    f"（最后状态: {final_state or 'unknown'}）"
+                )
             await self._update(worker_id, status="stopped")
         except Exception as e:
             # 不留 "stopping" 终态卡死——回 error 让用户可 stop/start/destroy
@@ -1285,12 +2250,17 @@ sudo systemctl restart ccm-worker
             )
 
     async def start_worker(self, worker_id: int):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._start_worker_locked(worker_id)
 
     async def _start_worker_locked(self, worker_id: int):
         worker = await self._update(worker_id, status="starting")
         try:
+            if worker is None:
+                return
+            identity = await self.require_worker_cloud_identity(worker)
+            worker = identity["worker"]
             await self.cloud.start_instance(worker.cloud_instance_id)
             private_ip = await self.cloud.wait_until_running(worker.cloud_instance_id)
             info = await self.cloud.describe_instance(worker.cloud_instance_id)
@@ -1299,7 +2269,12 @@ sudo systemctl restart ccm-worker
             )
             ssh = self._ssh(worker)
             await self._step_ssh_wait(ssh)
-            # systemd enable 过，等服务自启
+            # A legacy enabled unit may have auto-started with a stale .env.
+            # Quiesce it, atomically converge the role, replace the unit with
+            # an explicit role override, then perform the only trusted start.
+            await self._step_ccm_quiesce(ssh)
+            await self._step_ccm_config(ssh, worker_id)
+            await self._step_ccm_service(ssh, worker)
             await self._step_health_check(worker_id, timeout=180)
             # Keep the Worker unavailable to dynamic account mutations until
             # the startup snapshot has been verified and merged.  Publishing
@@ -1325,47 +2300,277 @@ sudo systemctl restart ccm-worker
                 worker_id, status="error", bootstrap_step=None, bootstrap_error=str(e),
             )
 
-    async def destroy_worker(self, worker_id: int):
-        async with self._lifecycle_lock(worker_id):
-            await self._destroy_worker_locked(worker_id)
+    @staticmethod
+    def _destroy_claim_identity_predicates(destroy_claim) -> tuple:
+        """Return claim predicates without hard-coding one transient status."""
 
-    async def _destroy_worker_locked(self, worker_id: int):
-        """销毁实例。任务迁移由调用方先行完成（Phase 3 接 TaskMigrator）。"""
-        worker = await self._update(worker_id, status="destroying")
-        if worker is None:
-            return
-        if self.relay is not None:
-            try:
-                await self.relay.stop_worker(worker_id)
-            except Exception as e:
-                # Relay cleanup is best-effort and must not strand a billable
-                # instance.  Terminating EC2 also makes the relay unusable.
-                logger.warning(
-                    "worker %s destroy: relay stop failed: %s", worker_id, e,
+        from backend.services.worker_proxy import (
+            _worker_destroy_lifecycle_predicates,
+        )
+
+        predicates = _worker_destroy_lifecycle_predicates(destroy_claim)
+        # The helper's second predicate is ``status == destroying``.  Outcome
+        # CAS operations need the same sealed identity while allowing an exact
+        # same-receipt error to converge monotonically to terminated.
+        return (predicates[0], *predicates[2:])
+
+    @staticmethod
+    def _destroy_receipt_digest_predicate(receipt_digest: str):
+        return (
+            Worker.destroy_termination_receipt["receipt_digest"].as_string()
+            == receipt_digest
+        )
+
+    async def _load_destroy_effect_authority(
+        self,
+        destroy_claim,
+        *,
+        cloud_scope: dict[str, str],
+    ) -> tuple[Worker, str]:
+        """Writer-fence and validate the exact durable cloud outbox."""
+
+        from backend.services.worker_proxy import (
+            worker_destroy_termination_receipt_matches,
+        )
+
+        identity_predicates = self._destroy_claim_identity_predicates(
+            destroy_claim
+        )
+        async with self.db_factory() as db:
+            locked = await db.execute(
+                update(Worker)
+                .where(
+                    *identity_predicates,
+                    Worker.status == "destroying",
                 )
-        try:
-            if worker.cloud_instance_id:
-                await self.cloud.terminate_instance(worker.cloud_instance_id)
-        except Exception as e:
-            logger.warning("worker %s destroy: %s", worker_id, e)
-            await self._update(
+                .values(status=Worker.status)
+                .execution_options(synchronize_session=False)
+            )
+            if locked.rowcount != 1:
+                await db.rollback()
+                current = await db.get(Worker, destroy_claim.worker_id)
+                if current is not None and current.status == "terminated":
+                    raise FileExistsError(
+                        "Worker cloud termination already reached terminal state"
+                    )
+                raise RuntimeError(
+                    "Worker destroy lifecycle changed before the cloud effect"
+                )
+            worker = await db.get(
+                Worker,
+                destroy_claim.worker_id,
+                populate_existing=True,
+            )
+            if worker is None or worker.auth_token != destroy_claim.auth_token:
+                await db.rollback()
+                raise RuntimeError(
+                    "Worker credential changed before the cloud effect"
+                )
+            token_digest = worker_create_client_token_digest(
+                worker.id,
+                worker.auth_token,
+            )
+            if not worker_destroy_termination_receipt_matches(
+                worker,
+                cloud_scope=cloud_scope,
+                client_token_digest=token_digest,
+            ):
+                await db.rollback()
+                raise RuntimeError(
+                    "missing or malformed durable cloud termination authority"
+                )
+            receipt_digest = worker.destroy_termination_receipt.get(
+                "receipt_digest"
+            )
+            if (
+                not isinstance(receipt_digest, str)
+                or len(receipt_digest) != 64
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in receipt_digest
+                )
+            ):
+                await db.rollback()
+                raise RuntimeError(
+                    "Worker cloud termination receipt digest is invalid"
+                )
+            # No state change is needed; rollback releases the writer barrier
+            # without advancing updated_at merely because authority was read.
+            db.expunge(worker)
+            await db.rollback()
+            return worker, receipt_digest
+
+    async def _mark_destroy_effect_error(
+        self,
+        destroy_claim,
+        *,
+        detail: str,
+        receipt_digest: str | None,
+    ) -> Worker | None:
+        """Record a retryable exact-claim failure without reviving terminal."""
+
+        predicates = [
+            *self._destroy_claim_identity_predicates(destroy_claim),
+            Worker.status == "destroying",
+        ]
+        if receipt_digest is not None:
+            predicates.append(
+                self._destroy_receipt_digest_predicate(receipt_digest)
+            )
+        async with self.db_factory() as db:
+            result = await db.execute(
+                update(Worker)
+                .where(*predicates)
+                .values(
+                    status="error",
+                    bootstrap_step="destroy",
+                    bootstrap_error=detail,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await db.rollback()
+                return None
+            await db.commit()
+            worker = await db.get(
+                Worker,
+                destroy_claim.worker_id,
+                populate_existing=True,
+            )
+        if worker is not None:
+            await self._broadcast(worker)
+        return worker
+
+    async def _commit_destroy_effect_success(
+        self,
+        destroy_claim,
+        *,
+        receipt_digest: str,
+        accounts: list | None,
+    ) -> Worker | None:
+        """Monotonically terminalize only the exact nonce/receipt identity."""
+
+        async with self.db_factory() as db:
+            result = await db.execute(
+                update(Worker)
+                .where(
+                    *self._destroy_claim_identity_predicates(destroy_claim),
+                    or_(
+                        Worker.status == "destroying",
+                        and_(
+                            Worker.status == "error",
+                            Worker.bootstrap_step == "destroy",
+                        ),
+                    ),
+                    self._destroy_receipt_digest_predicate(receipt_digest),
+                )
+                .values(
+                    status="terminated",
+                    bootstrap_step=None,
+                    bootstrap_error=None,
+                    auth_token=None,
+                    accounts=_scrub_destroyed_worker_accounts(accounts),
+                    destroy_lifecycle_nonce=None,
+                    destroy_termination_receipt=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                await db.rollback()
+                current = await db.get(Worker, destroy_claim.worker_id)
+                if current is not None and current.status == "terminated":
+                    return current
+                raise RuntimeError(
+                    "Cloud termination succeeded but the exact Worker receipt "
+                    "could not be terminalized"
+                )
+            await db.commit()
+            worker = await db.get(
+                Worker,
+                destroy_claim.worker_id,
+                populate_existing=True,
+            )
+        if worker is not None:
+            await self._broadcast(worker)
+        return worker
+
+    async def destroy_worker(self, worker_id: int, *, destroy_claim):
+        require_worker_control_plane_enabled()
+        if destroy_claim.worker_id != worker_id:
+            raise ValueError("Worker destroy claim does not match worker_id")
+        async with self._lifecycle_lock(worker_id):
+            await self._destroy_worker_locked(
                 worker_id,
-                status="error",
-                bootstrap_step="destroy",
-                bootstrap_error=f"销毁失败: {e}",
+                destroy_claim=destroy_claim,
+            )
+
+    async def _destroy_worker_locked(self, worker_id: int, *, destroy_claim):
+        """Terminate only an exact durable destroy claim and receipt."""
+
+        receipt_digest: str | None = None
+        try:
+            cloud_scope = await self._current_cloud_scope()
+            worker, receipt_digest = await self._load_destroy_effect_authority(
+                destroy_claim,
+                cloud_scope=cloud_scope,
+            )
+        except FileExistsError:
+            return
+        except Exception as exc:
+            logger.warning("worker %s destroy authority: %s", worker_id, exc)
+            await self._mark_destroy_effect_error(
+                destroy_claim,
+                detail=f"销毁失败: {exc}",
+                receipt_digest=receipt_digest,
             )
             return
 
-        # The cloud provider confirmed termination (or that the instance was
-        # already absent).  Only now hide the row and erase every credential
-        # that could authenticate to the former Worker or recreate its pools.
-        await self._update(
-            worker_id,
-            status="terminated",
-            bootstrap_step=None,
-            bootstrap_error=None,
-            auth_token=None,
-            accounts=_scrub_destroyed_worker_accounts(worker.accounts),
+        if self.relay is not None:
+            try:
+                await self.relay.stop_worker(worker_id)
+            except Exception as exc:
+                # Relay cleanup is best-effort and must not strand a billable
+                # instance.  Terminating EC2 also makes the relay unusable.
+                logger.warning(
+                    "worker %s destroy: relay stop failed: %s",
+                    worker_id,
+                    exc,
+                )
+
+        try:
+            # The relay await above is an intentional scheduling point.  Repeat
+            # both live STS scope and DB receipt CAS immediately before the
+            # irreversible provider call.
+            cloud_scope = await self._current_cloud_scope()
+            worker, receipt_digest = await self._load_destroy_effect_authority(
+                destroy_claim,
+                cloud_scope=cloud_scope,
+            )
+            await self.cloud.terminate_instance(
+                worker.cloud_instance_id,
+                allow_not_found=True,
+            )
+        except FileExistsError:
+            return
+        except asyncio.CancelledError:
+            # A cancellation may hide an accepted cloud response.  Preserve the
+            # destroying state and exact outbox for restart replay.
+            raise
+        except Exception as exc:
+            logger.warning("worker %s destroy: %s", worker_id, exc)
+            await self._mark_destroy_effect_error(
+                destroy_claim,
+                detail=f"销毁失败: {exc}",
+                receipt_digest=receipt_digest,
+            )
+            return
+
+        # The provider confirmed termination—or absence in the already matched
+        # exact scope.  A late failure coordinator cannot overwrite this CAS.
+        await self._commit_destroy_effect_success(
+            destroy_claim,
+            receipt_digest=receipt_digest,
+            accounts=worker.accounts,
         )
 
     # ------------------------------------------------------------------
@@ -1373,15 +2578,23 @@ sudo systemctl restart ccm-worker
     # ------------------------------------------------------------------
 
     async def health_check_loop(self, interval: int = 30):
+        if not worker_control_plane_enabled():
+            logger.warning(
+                "Worker health checks disabled: control plane requires "
+                "CCM_NODE_ROLE=manager and a non-empty AUTH_TOKEN"
+            )
+            return
         fail_counts: dict[int, int] = {}
         while True:
             try:
+                await self.recover_worker_rename_tag_outboxes()
                 await self._health_check_once(fail_counts)
             except Exception:
                 logger.exception("worker health check loop error")
             await asyncio.sleep(interval)
 
     async def _health_check_once(self, fail_counts: dict[int, int]):
+        require_worker_control_plane_enabled()
         async with self.db_factory() as db:
             result = await db.execute(
                 select(Worker).where(Worker.status.in_(["ready", "error"]))
@@ -1401,11 +2614,10 @@ sudo systemctl restart ccm-worker
     ):
         try:
             body = await self._probe_health(worker, client)
+            await self._probe_auth(worker, client)
+            self._require_expected_commit(worker, body)
             fail_counts.pop(worker.id, None)
             fields = {"last_heartbeat": datetime.utcnow()}
-            commit = body.get("commit")
-            if commit:
-                fields["ccm_commit"] = commit
             # The probe runs against a detached snapshot.  Every lifecycle
             # change below must therefore be compare-and-set: an in-flight
             # probe must never turn starting/stopping/destroying back into
@@ -1469,7 +2681,11 @@ sudo systemctl restart ccm-worker
             async with self.db_factory() as db:
                 degraded = await db.execute(
                     update(Worker)
-                    .where(Worker.id == worker.id, Worker.status == "ready")
+                    .where(
+                        Worker.id == worker.id,
+                        Worker.status == "ready",
+                        Worker.bootstrap_step.is_(None),
+                    )
                     .values(
                         status="error",
                         bootstrap_step=None,

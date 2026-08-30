@@ -124,6 +124,9 @@ class TestTransientOverloadDetection:
     def test_case_insensitive(self):
         assert is_transient_overload("SERVER IS TEMPORARILY LIMITING REQUESTS")
 
+    def test_pty_jsonl_inactivity_timeout_does_not_replay_same_session(self):
+        assert not is_transient_overload("Response timed out after 900.0s")
+
     # --- precedence: account usage-limit / auth-failure must rotate, not wait ---
     def test_usage_limit_takes_precedence(self):
         # A genuine usage-limit banner must NOT be treated as transient.
@@ -222,6 +225,40 @@ class TestClaudePool:
     def test_select_returns_config_dir(self, pool, tmp_path):
         result = pool.select()
         assert result in [str(tmp_path / "claude-1"), str(tmp_path / "claude-2")]
+
+    @pytest.mark.asyncio
+    async def test_access_token_projection_refresh_uses_exact_pool_account(
+        self,
+        pool,
+        tmp_path,
+    ):
+        pool._refresh_oauth = AsyncMock(return_value={"accessToken": "fresh"})
+
+        refreshed = await pool.ensure_oauth_access_token(
+            tmp_path / "claude-1",
+            minimum_remaining_seconds=300.0,
+        )
+
+        assert refreshed is True
+        pool._refresh_oauth.assert_awaited_once()
+        account, credential_path = pool._refresh_oauth.await_args.args
+        assert account.id == "acc-1"
+        assert credential_path == tmp_path / "claude-1" / ".credentials.json"
+        assert pool._refresh_oauth.await_args.kwargs == {
+            "minimum_remaining_seconds": 300.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_access_token_projection_rejects_unmanaged_or_disabled_home(
+        self,
+        pool,
+        tmp_path,
+    ):
+        pool._refresh_oauth = AsyncMock(return_value={"accessToken": "fresh"})
+
+        assert not await pool.ensure_oauth_access_token(tmp_path / "unknown")
+        assert not await pool.ensure_oauth_access_token(tmp_path / "claude-3")
+        pool._refresh_oauth.assert_not_awaited()
 
     def test_select_excludes_disabled(self, pool, tmp_path):
         # acc-3 is disabled, should never be selected
@@ -767,6 +804,11 @@ class TestChatPoolRotationRegression:
         im._launch_params[1] = {"prompt": "hello"}
         im.get_recent_log_contents = AsyncMock(return_value=["You've hit your limit"])
         im.launch = AsyncMock()
+        # This regression isolates account/session migration after admission.
+        # Exact pre-provider replay fencing is covered by
+        # test_service_instance_manager; bypass it here rather than relying on
+        # the old source-less MagicMock Task shape, which now fails closed.
+        im._chat_automatic_relaunch_is_blocked = AsyncMock(return_value=False)
 
         ok = await im._try_chat_pool_rotation(1, 42, 1, "You've hit your limit")
 
@@ -1469,6 +1511,10 @@ class TestChatTransientRetryCodex:
         im._launch_params[1] = {"prompt": "hello", "provider": provider}
         im.get_recent_log_contents = AsyncMock(return_value=[log_text])
         im.launch = AsyncMock()
+        # These provider-routing tests intentionally isolate the relaunch
+        # arguments. Source/transport admission safety has its own exact-turn
+        # matrix in test_service_instance_manager.
+        im._chat_automatic_relaunch_is_blocked = AsyncMock(return_value=False)
         return im
 
     @pytest.mark.asyncio
@@ -1590,6 +1636,34 @@ class TestCloudRouterClaudeProjection:
 
         assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
         assert pool.status()["last_selected"] is None
+
+    def test_unknown_api_health_uses_native_until_probe_settles(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+        }
+        pool, native_dir = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="claude-sonnet-5") == str(native_dir)
+
+    def test_unknown_api_health_remains_api_only_fallback(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
 
     def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")

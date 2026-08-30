@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GlobalSettingsUpdate(BaseModel):
@@ -35,6 +35,31 @@ class RuntimeSettingsResponse(BaseModel):
 
 
 class RuntimeSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     use_pty_mode: bool | None = None
     auto_sort_on_access: bool | None = None
     context_compact_threshold: float | None = Field(default=None, ge=0.3, le=0.95)
+
+
+class CapacitySettingsResponse(BaseModel):
+    max_concurrent_instances: int
+    configured_override: int | None
+    env_default: int
+    min_idle_instances: int
+    active_instances: int
+    live_instances: int
+    pending_tasks: int
+
+
+class CapacitySettingsUpdate(BaseModel):
+    # ``None`` deliberately clears the DB override and restores the env default.
+    max_concurrent_instances: int | None = Field(default=None, ge=1, le=64)
+
+
+class UpdateChannelResponse(BaseModel):
+    update_channel: str
+
+
+class UpdateChannelUpdate(BaseModel):
+    update_channel: str = Field(pattern="^(stable|main)$")

@@ -1,3 +1,6 @@
+from typing import Literal
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -31,18 +34,36 @@ class Settings(BaseSettings):
     effort_options: str = "low,medium,high,xhigh,max"  # comma-separated
     host: str = "0.0.0.0"
     port: int = 8000
+    # Optional fixed Manager-local origin for MCP servers/hooks. When empty,
+    # the live ASGI listening address is learned from incoming requests.
+    internal_api_base_url: str = ""
     # Public base URL of this deployment (e.g. https://ccm.example.com),
     # used to display the GitHub webhook URL on the PR Monitor page.
     public_base_url: str = ""
     workspace_dir: str = "~/Projects"
+    # Persistent chat attachments share one Manager-owned directory. Bound its
+    # aggregate regular-file footprint so repeated valid uploads cannot fill
+    # the host disk between age-based cleanup passes.
+    upload_max_total_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        gt=0,
+    )
+    upload_max_total_files: int = Field(default=10_000, gt=0)
     auto_start_dispatcher: bool = True
     merge_push_retries: int = 3
     auto_push_to_origin: bool = True
     task_timeout_seconds: int = 7200  # 2 hours
+    # Bound foreground PTY silence separately from the task-wide timeout.
+    # Main JSONL and tracked sub-agent progress refresh this deadline, while a
+    # genuinely silent turn is failed instead of holding a Task executing for
+    # two hours. Known long-running tools can opt into a larger value through
+    # CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS.
+    claude_pty_response_idle_timeout_seconds: float = 900.0
     # 会话上下文利用率达到该比例即自动摘要+换新 session。超大 context 的请求
     # 在服务端易挂起（2026-07-08 task 22/27 连环 stall 均发生在 ~90% 区间），
     # 故不要设回 0.9 让 session 在重灾区长时间工作。
-    context_compact_threshold: float = 0.80
+    # Leave headroom for the next message, tool output, and provider framing.
+    context_compact_threshold: float = 0.70
     default_goal_evaluator_model: str = "claude-haiku-4-5"
     goal_evaluation_timeout: int = 120
     # --- Independent Plan Agent pipeline ---
@@ -61,11 +82,17 @@ class Settings(BaseSettings):
     plan_reviewer_fallback_provider: str = "claude"
     plan_reviewer_fallback_model: str = "claude-sonnet-5"
     plan_reviewer_fallback_effort: str = "high"
-    plan_max_revision_cycles: int = 2
+    plan_max_revision_cycles: int = 3
     # Pause/resume rounds per PlanRun. This never limits questions per request.
     plan_max_interactions: int = 3
     plan_planner_timeout: int = 1800
     plan_reviewer_timeout: int = 900
+    # Claude CLI has no max-turns flag. Bound read-only exploration so a
+    # Planner cannot silently spend dozens of tool rounds before producing
+    # its structured result. Exceeding this budget is a typed route timeout,
+    # allowing the configured fallback provider to take over immediately.
+    plan_planner_tool_call_limit: int = 12
+    plan_reviewer_tool_call_limit: int = 8
     # Once a Codex Reviewer has started streaming agent/reasoning deltas, a
     # longer silent interval indicates a stuck Responses stream. Initial
     # xhigh reasoning is deliberately governed by plan_reviewer_timeout.
@@ -75,9 +102,44 @@ class Settings(BaseSettings):
     plan_structured_output_whitespace_limit: int = 4_096
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
+    # Generic Plan/review capability admission. Enabled by default; disabling
+    # it blocks only new admission, while already accepted work still recovers.
+    capability_core_enabled: bool = True
+    capability_coordinator_poll_interval_seconds: float = 2.0
+    capability_coordinator_max_concurrency: int = 4
+    capability_coordinator_scan_limit: int = 64
+    capability_coordinator_initial_backoff_seconds: float = 1.0
+    capability_coordinator_max_backoff_seconds: float = 60.0
+    # Model-requested Plan/Review admission has an independent global gate;
+    # each ordinary Task still requires an explicit capability policy.
+    auto_capability_enabled: bool = True
+    # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
+    # enabled by default; each Run freezes the Monitor's ready/merged terminal.
+    delivery_loop_enabled: bool = True
+    delivery_controller_poll_interval_seconds: float = 2.0
+    delivery_controller_lease_seconds: int = 30
+    delivery_controller_scan_limit: int = 32
+    delivery_controller_reconcile_interval_seconds: float = 5.0
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
+    # Browser-uploaded SSH Profile keys. Files are private host credentials;
+    # only opaque one-time upload tokens are returned to the frontend.
+    ssh_key_storage_dir: str = "~/.ccm/ssh-keys"
+    ssh_sftp_max_concurrency: int = 8
+    ssh_sftp_queue_timeout_seconds: float = 5.0
+    ssh_sftp_operation_timeout_seconds: float = 30.0
+    ssh_sftp_download_timeout_seconds: float = 120.0
+    ssh_sftp_channel_timeout_seconds: float = 15.0
+    # Task-scoped MCP credentials and Claude security settings live outside
+    # world-readable/shared temporary directories. Agent sandboxes deny this
+    # complete root after the trusted CLI has loaded its own files.
+    task_runtime_secret_dir: str = "~/.ccm/task-runtime-secrets"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
+    # This is a durable database identity, not a runtime feature toggle.
+    # Manager databases own the low Task-id namespace; provisioned Workers
+    # are bootstrapped with ``worker`` and allocate local derived Tasks only
+    # from the disjoint high namespace.
+    ccm_node_role: Literal["manager", "worker"] = "manager"
     worker_enabled: bool = True
     worker_cloud_provider: str = "aws"  # 目前仅 aws
     worker_ssh_key_path: str = ""       # Manager 自己密钥对的私钥 .pem 路径
@@ -162,6 +224,32 @@ class Settings(BaseSettings):
     tmp_cleanup_interval_seconds: int = 3 * 3600
     tmp_cleanup_min_age_seconds: int = 6 * 3600
 
+    # --- Frontend Test Harness evidence ---
+    # Evidence is never stored in /tmp. Files are archived beneath this private
+    # Manager-owned root and referenced by relative storage keys in the DB.
+    test_harness_artifact_root: str = "~/.ccm/test-harness-artifacts"
+    test_harness_artifact_max_file_bytes: int = 20 * 1024 * 1024
+    test_harness_artifact_max_run_bytes: int = 256 * 1024 * 1024
+    test_harness_artifact_max_task_bytes: int = 2 * 1024 * 1024 * 1024
+    test_harness_artifact_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    test_harness_artifact_retention_days: int = 30
+    test_harness_artifact_cleanup_interval_seconds: int = 6 * 3600
+    browser_review_job_history_limit: int = 100
+
+    # --- Untrusted Git Test Harness sandbox ---
+    # Disabled by default. Capability is advertised only after the Docker
+    # daemon and the administrator-built image both pass an identity probe.
+    test_harness_sandbox_enabled: bool = False
+    test_harness_sandbox_docker_binary: str = "docker"
+    test_harness_sandbox_image: str = "ccm-test-harness-sandbox:local"
+    test_harness_sandbox_memory: str = "4g"
+    test_harness_sandbox_cpus: float = 2.0
+    test_harness_sandbox_pids_limit: int = 256
+    test_harness_sandbox_workspace_bytes: int = 3 * 1024 * 1024 * 1024
+    test_harness_sandbox_tmp_bytes: int = 512 * 1024 * 1024
+    test_harness_sandbox_preview_port: int = 4173
+    test_harness_sandbox_proxy_max_bytes: int = 1024 * 1024 * 1024
+
     # --- Backup service (auto-backup) ---
     backup_enabled: bool = False        # Set true to enable periodic DB backups
     backup_type: str = "local"          # local | s3 | oss
@@ -186,6 +274,16 @@ class Settings(BaseSettings):
     service_scope: str = "auto"        # auto | user | system
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def require_worker_control_credential(self):
+        """A headless Worker must never fall back to legacy open auth."""
+
+        if self.ccm_node_role == "worker" and not self.auth_token.strip():
+            raise ValueError(
+                "CCM_NODE_ROLE=worker requires a non-empty AUTH_TOKEN"
+            )
+        return self
 
 
 settings = Settings()

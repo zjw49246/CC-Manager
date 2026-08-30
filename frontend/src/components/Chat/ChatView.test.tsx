@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { Task, Project, ChatMessage, PlanResource, PlanVersion, UploadResult } from '../../api/client';
+import type { ChatMessage, MonitorSession, PlanResource, PlanVersion, Project, Task, TestHarnessRun, UploadResult, WorkspaceReviewRun } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
@@ -12,13 +12,76 @@ vi.mock('../../api/client', () => ({
   ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
+    getTask: vi.fn(),
     sendTaskChat: vi.fn().mockResolvedValue({}),
+    startFrontendReviewGoal: vi.fn().mockResolvedValue({
+      status: 'pending',
+      goal_max_turns: 5,
+    }),
+    getFrontendReviewGoalCapabilities: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+    }),
+    getWorkspaceReviewCapabilities: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+      configured: true,
+      config: {},
+      suggested_config: null,
+    }),
+    approveWorkspacePreviewConfig: vi.fn().mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+      configured: true,
+      config: {},
+      suggested_config: null,
+    }),
+    startTestRun: vi.fn().mockResolvedValue({ id: 'test-harness-run-1' }),
+    getTestHarnessRuntimeConfig: vi.fn().mockResolvedValue({
+      inherit_task: true,
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'medium',
+      codex_service_tier: 'default',
+      source: 'task',
+      task_runtime: {
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        reasoning_effort: 'medium',
+        codex_service_tier: 'default',
+      },
+      default_provider: 'codex',
+      providers: ['claude', 'codex'],
+      default_models: { claude: 'claude-opus-4-6', codex: 'gpt-5.6-sol' },
+      models_by_provider: { claude: ['claude-opus-4-6'], codex: ['gpt-5.6-sol'] },
+      default_effort: 'medium',
+      effort_options: { claude: ['medium'], codex: ['medium'] },
+      model_efforts: { claude: {}, codex: {} },
+      codex_service_tiers: ['default', 'priority'],
+      codex_model_service_tiers: { 'gpt-5.6-sol': ['default', 'priority'] },
+    }),
+    updateTestHarnessRuntimeConfig: vi.fn(),
+    listTestRuns: vi.fn().mockResolvedValue([]),
+    getTestRunEvidence: vi.fn().mockResolvedValue(new Blob()),
+    cancelTestRun: vi.fn().mockResolvedValue({}),
+    listWorkspaceReviews: vi.fn().mockResolvedValue([]),
+    cancelWorkspaceReview: vi.fn().mockResolvedValue({}),
     updateTask: vi.fn().mockResolvedValue({}),
-    stopTaskSession: vi.fn().mockResolvedValue({}),
+    stopTaskSession: vi.fn().mockResolvedValue({
+      ok: true,
+      stopped: true,
+      task_status: 'completed',
+      background_active: false,
+    }),
     listForkAnchors: vi.fn().mockResolvedValue([]),
     forkTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
-    listMonitorSessions: vi.fn().mockResolvedValue([]),
+    listAllSubAgentSessions: vi.fn().mockResolvedValue([]),
+    listTaskBrowserReviews: vi.fn().mockResolvedValue([]),
+    getTaskBrowserReviewArtifact: vi.fn().mockResolvedValue(new Blob()),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
@@ -45,8 +108,9 @@ vi.mock('../../api/client', () => ({
     updateQuickPhrase: vi.fn().mockResolvedValue({}),
     deleteQuickPhrase: vi.fn().mockResolvedValue({}),
     getMessageDetail: vi.fn().mockResolvedValue({}),
-    getMonitorChecks: vi.fn().mockResolvedValue([]),
+    getSubAgentReports: vi.fn().mockResolvedValue([]),
     deleteMonitorSession: vi.fn().mockResolvedValue({}),
+    deleteSubAgentSession: vi.fn().mockResolvedValue({}),
     resolvePermission: vi.fn().mockResolvedValue({}),
     submitAskUser: vi.fn().mockResolvedValue({}),
     starTask: vi.fn().mockResolvedValue({}),
@@ -76,6 +140,26 @@ vi.mock('../../api/client', () => ({
       blob: new Blob(['artifact']),
       filename: '汇报稿.md',
     }),
+    getDeliveryRun: vi.fn().mockResolvedValue({
+      id: 42,
+      phase: 'monitoring',
+      activity: 'waiting',
+      outcome: null,
+      cycle_count: 2,
+      max_cycles: 10,
+      turn_count: 2,
+      delivery_branch: 'ccm/delivery/42-controlled-delivery',
+      wait_reason: 'pr_monitor',
+      pause_reason: null,
+      error_code: null,
+      error_message: null,
+      pr_number: 123,
+      pr_url: 'https://github.com/acme/repo/pull/123',
+      allowed_actions: [],
+    }),
+    pauseDeliveryRun: vi.fn(),
+    resumeDeliveryRun: vi.fn(),
+    cancelDeliveryRun: vi.fn(),
   },
 }));
 
@@ -102,14 +186,19 @@ vi.mock('../Secrets/SecretPicker', () => ({
 }));
 
 vi.mock('./SubAgentIndicator', () => ({
-  SubAgentIndicator: ({ onNavigate }: { onNavigate?: () => void }) => (
-    <button onClick={onNavigate}>Open monitors</button>
+  SubAgentIndicator: ({ onNavigate, count }: { onNavigate?: () => void; count: number }) => (
+    <button aria-label="Open monitors" onClick={onNavigate}>
+      Open monitors
+      <span data-testid="sub-agent-indicator-count">{count}</span>
+    </button>
   ),
 }));
 
 import { api } from '../../api/client';
 
-function makeTask(overrides: Partial<Task> = {}): Task {
+type LegacyTaskFixture = Task & { session_id?: string | null };
+
+function makeTask(overrides: Partial<LegacyTaskFixture> = {}): LegacyTaskFixture {
   return {
     id: 1,
     title: '',
@@ -123,6 +212,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     merge_status: 'pending',
     instance_id: null,
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 3,
     mode: 'auto',
     todo_file_path: null,
@@ -135,6 +225,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     archived: false,
     has_unread: false,
     session_id: 'session-123',
+    has_session: true,
+    access_scope: 'control',
+    is_worker_managed: false,
     error_message: null,
     provider: 'claude',
     model: null,
@@ -245,6 +338,13 @@ describe('ChatView', () => {
     localStorage.clear();
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getTask as ReturnType<typeof vi.fn>).mockReset();
+    (api.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 'executing',
+      background_active: false,
+      retry_count: 0,
+      turn_generation: 0,
+    } as Task);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
@@ -273,6 +373,70 @@ describe('ChatView', () => {
       injected: true,
     });
     (api.sendTaskChat as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (api.stopTaskSession as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      stopped: true,
+      task_status: 'completed',
+      background_active: false,
+    });
+    (api.startFrontendReviewGoal as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 'pending',
+      goal_max_turns: 5,
+    });
+    (api.getFrontendReviewGoalCapabilities as ReturnType<typeof vi.fn>).mockResolvedValue({
+      available: true,
+      reason: null,
+      repo_path: '/repo',
+    });
+  });
+
+  it('refreshes the Task projection when a native sub-agent changes state', async () => {
+    render(
+      <ChatView
+        task={makeTask({ id: 73, active_sub_agents: 0 })}
+        projects={projects}
+        onBack={onBack}
+        onTaskUpdated={onTaskUpdated}
+      />,
+    );
+
+    await waitFor(() => expect(capturedOnMessage).toBeTypeOf('function'));
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'task:73',
+        data: {
+          event_type: 'sub_agent_session_created',
+          sub_agent_session_id: 9,
+          source: 'native',
+          provider: 'codex',
+          status: 'running',
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(api.listAllSubAgentSessions).toHaveBeenCalledWith(73);
+      expect(onTaskUpdated).toHaveBeenCalled();
+    });
+  });
+
+  it('counts provider-native children in the chat header indicator', async () => {
+    (api.listAllSubAgentSessions as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce([
+        { status: 'running', source: 'native' } as MonitorSession,
+      ]);
+
+    render(
+      <ChatView
+        task={makeTask({ id: 74, active_sub_agents: 1 })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-agent-indicator-count')).toHaveTextContent('1');
+    });
   });
 
   it('fits full-screen chat to the iOS visual viewport but leaves inline chat alone', () => {
@@ -312,6 +476,281 @@ describe('ChatView', () => {
       }
     }
   });
+
+  it.each([
+    ['send button', 'click'],
+    ['Command+Enter', 'keyboard'],
+  ] as const)('submits a follow-up through the same composer form with the %s', async (_label, method) => {
+    const task = makeTask({ id: method === 'click' ? 75 : 76, status: 'completed' });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/follow-up message/i);
+    await userEvent.type(textbox, `follow up via ${method}`);
+    const sendButton = screen.getByTitle('Send (Ctrl+Enter)');
+    expect(sendButton.textContent).toBe('');
+
+    if (method === 'click') {
+      await userEvent.click(sendButton);
+    } else {
+      fireEvent.keyDown(textbox, { key: 'Enter', code: 'Enter', metaKey: true });
+    }
+
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+    expect(vi.mocked(api.sendTaskChat).mock.calls[0]?.slice(0, 2)).toEqual([
+      task.id,
+      `follow up via ${method}`,
+    ]);
+  });
+
+  it('queues a follow-up while an active task is rebuilding its session', async () => {
+    const task = makeTask({
+      id: 79,
+      status: 'executing',
+      session_id: null,
+      has_session: false,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/next message to queue/i);
+    await userEvent.type(textbox, 'queue during context recovery');
+    const queueButton = screen.getByTitle('Add to queue (Ctrl+Enter)');
+    expect(queueButton).not.toBeDisabled();
+    await userEvent.click(queueButton);
+
+    expect(await screen.findByText('Queued messages (1)')).toBeInTheDocument();
+    expect(screen.getByText('queue during context recovery')).toBeInTheDocument();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['queue button', 'click'],
+    ['Command+Enter', 'keyboard'],
+  ] as const)('queues an active-task follow-up through the same composer form with the %s', async (_label, method) => {
+    const task = makeTask({ id: method === 'click' ? 77 : 78, status: 'executing' });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    const textbox = screen.getByPlaceholderText(/next message to queue/i);
+    await userEvent.type(textbox, `queue via ${method}`);
+    const queueButton = screen.getByTitle('Add to queue (Ctrl+Enter)');
+    expect(queueButton.textContent).toBe('');
+
+    if (method === 'click') {
+      await userEvent.click(queueButton);
+    } else {
+      fireEvent.keyDown(textbox, { key: 'Enter', code: 'Enter', metaKey: true });
+    }
+
+    expect(await screen.findByText('Queued messages (1)')).toBeInTheDocument();
+    expect(screen.getByText(`queue via ${method}`)).toBeInTheDocument();
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
+  it('renders Delivery-owned developer conversations as read-only', async () => {
+    render(
+      <ChatView
+        task={makeTask({
+          mode: 'delivery_loop',
+          delivery_run_id: 42,
+          delivery_role: 'developer',
+          status: 'in_progress',
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+        })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    expect(screen.getByTestId('delivery-read-only')).toHaveTextContent(
+      'Delivery Run #42 owns this Developer Task',
+    );
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Plans' })).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit title')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Distill skill from conversation')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Add attention tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Delivery Run #42' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(screen.getByText(/observation-only/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'PR #123' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/repo/pull/123',
+    );
+    expect(screen.getByTitle('Star')).toBeInTheDocument();
+  });
+
+  it('keeps chat-only shares conversational while withholding control capabilities', async () => {
+    const task = makeTask({
+      id: 88,
+      access_scope: 'chat',
+      provider: 'codex',
+      session_id: undefined,
+      has_session: true,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    await waitFor(() => {
+      expect(api.getTaskChatHistory).toHaveBeenCalledWith(88, true, 200, 0, false);
+    });
+    expect(api.getRuntimeSettings).not.toHaveBeenCalled();
+    expect(api.getWorkerRuntimeSettings).not.toHaveBeenCalled();
+    expect(api.getTestHarnessRuntimeConfig).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Distill skill from conversation')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Toggle Frontend Review panel')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Star')).not.toBeInTheDocument();
+
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'Shared follow-up',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledWith(
+      88,
+      'Shared follow-up',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      expect.any(String),
+    ));
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'system',
+        data: {
+          event: 'runtime_settings_changed',
+          codex_main_mcp_enabled: true,
+        },
+      });
+      capturedOnMessage?.({
+        channel: 'task:88',
+        data: {
+          event_type: 'permission_request',
+          request_id: 'permission-1',
+          tool_name: 'Bash',
+          description: 'Run a command?',
+        },
+      });
+      capturedOnMessage?.({
+        channel: 'task:88',
+        data: {
+          event_type: 'ask_user_question',
+          request_id: 'ask-1',
+          questions: [{
+            question: 'Proceed?',
+            options: [{ label: 'Yes' }, { label: 'No' }],
+          }],
+        },
+      });
+    });
+
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(screen.getByText('等待 Task 控制者处理')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
+    await userEvent.click(screen.getByRole('button', { name: '提交' }));
+    await waitFor(() => expect(api.submitAskUser).toHaveBeenCalled());
+    expect(api.resolvePermission).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open monitors' }));
+    expect(screen.queryByText('Sub-Agents')).not.toBeInTheDocument();
+    expect(api.deleteMonitorSession).not.toHaveBeenCalled();
+  });
+
+  it('does not mount Delivery controls for a chat-only Delivery conversation', async () => {
+    render(
+      <ChatView
+        task={makeTask({
+          access_scope: 'chat',
+          mode: 'delivery_loop',
+          delivery_run_id: 42,
+        })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+    expect(screen.queryByRole('region', { name: 'Delivery Run #42' })).not.toBeInTheDocument();
+    expect(api.getDeliveryRun).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a control draft or fork uploads into a chat-only share', () => {
+    const task = makeTask({ id: 89, access_scope: 'chat' });
+    const ownerUpload = makeUpload('owner-private', 'owner-private.txt');
+    localStorage.setItem(`ccm-chat-draft-${task.id}`, 'owner unsent draft');
+    localStorage.setItem(
+      `ccm-fork-seed-uploads-${task.id}`,
+      JSON.stringify([ownerUpload]),
+    );
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.queryByText('owner-private.txt')).not.toBeInTheDocument();
+  });
+
+  it('isolates queued messages by both browser user and access scope', () => {
+    const task = makeTask({ id: 90, access_scope: 'chat' });
+    localStorage.setItem('cc_user', JSON.stringify({ id: 8, role: 'member' }));
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}`,
+      JSON.stringify([{ text: 'legacy owner queue' }]),
+    );
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}-control-user-7`,
+      JSON.stringify([{ text: 'other user control queue' }]),
+    );
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}-chat-user-8`,
+      JSON.stringify([{ text: 'my shared queue' }]),
+    );
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(screen.getByText('my shared queue')).toBeInTheDocument();
+    expect(screen.queryByText('legacy owner queue')).not.toBeInTheDocument();
+    expect(screen.queryByText('other user control queue')).not.toBeInTheDocument();
+  });
+
+  it('keeps mobile header badges and compact actions on one row', async () => {
+    render(
+      <ChatView
+        task={makeTask({ provider: 'codex', project_id: 7 })}
+        projects={[{ id: 7, name: 'A long mobile project name' } as Project]}
+        onBack={onBack}
+      />,
+    );
+
+    await screen.findByTestId('codex-main-mcp-status');
+
+    const header = screen.getByTestId('chat-header-primary');
+    expect(header.className).toContain('items-center');
+    expect(header.className).not.toContain('flex-col');
+
+    const badges = screen.getByTestId('chat-task-badges');
+    expect(badges.className).toContain('flex-nowrap');
+    expect(badges.className).toContain('overflow-hidden');
+
+    const projectBadge = screen.getByTestId('chat-project-badge');
+    expect(projectBadge).toHaveAttribute('title', 'A long mobile project name');
+    expect(projectBadge).toHaveClass('w-fit', 'max-w-full', 'shrink', 'truncate');
+    expect(projectBadge).not.toHaveClass('flex-1', 'grow', 'w-full');
+
+    const actions = screen.getByTestId('chat-header-actions');
+    expect(actions.className).toContain('shrink-0');
+    expect(screen.getByText('Plans').className).toContain('hidden');
+    expect(screen.getByText('Plans').className).toContain('sm:inline');
+  }, 15_000);
 
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {
@@ -357,6 +796,109 @@ describe('ChatView', () => {
   });
 
   describe('optimistic user-message reconciliation', () => {
+    it('reconciles an HTTP history row before the WS echo across thread.started', async () => {
+      let resolveSend!: (value: Record<string, unknown>) => void;
+      vi.mocked(api.sendTaskChat).mockReturnValueOnce(
+        new Promise((resolve) => { resolveSend = resolve; }),
+      );
+      localStorage.setItem('cc_user', JSON.stringify({ name: 'Admin' }));
+      const task = makeTask({
+        id: 18,
+        status: 'completed',
+        retry_count: 1,
+        turn_generation: 8,
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+      await userEvent.type(screen.getByRole('textbox'), 'same text');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledTimes(1));
+      const clientMessageId = vi.mocked(api.sendTaskChat).mock.calls[0][10];
+      expect(clientMessageId).toEqual(expect.any(String));
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 502,
+            event_type: 'system_event',
+            content: 'thread.started',
+            timestamp: '2026-08-23T03:11:58Z',
+            task_retry_count: 1,
+            task_turn_generation: 8,
+          },
+        });
+      });
+
+      vi.mocked(api.getTaskChatHistory).mockResolvedValueOnce([{
+        id: 501,
+        role: 'user',
+        event_type: 'user_message',
+        content: '[Admin] same text',
+        raw_content: 'same text',
+        client_message_id: clientMessageId,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-23T03:11:56Z',
+        image_urls: null,
+        attachments: null,
+        task_retry_count: 1,
+        task_turn_generation: 8,
+      }, {
+        id: 502,
+        role: 'system',
+        event_type: 'system_event',
+        content: 'thread.started',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-23T03:11:58Z',
+        image_urls: null,
+        attachments: null,
+        task_retry_count: 1,
+        task_turn_generation: 8,
+      }]);
+      act(() => capturedOnSubscribed?.(['task:18']));
+
+      await waitFor(() => {
+        expect(screen.getAllByText('[Admin] same text')).toHaveLength(1);
+      });
+      expect(screen.getAllByText('— thread.started —')).toHaveLength(1);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 501,
+            event_type: 'user_message',
+            role: 'user',
+            content: '[Admin] same text',
+            raw_content: 'same text',
+            client_message_id: clientMessageId,
+            timestamp: '2026-08-23T03:11:56Z',
+            task_retry_count: 1,
+            task_turn_generation: 8,
+          },
+        });
+      });
+      expect(screen.getAllByText('[Admin] same text')).toHaveLength(1);
+
+      await act(async () => resolveSend({ ok: true, queued: true }));
+    });
+
     it('removes the optimistic bubble when an id-less WS echo precedes HTTP failure', async () => {
       let rejectSend!: (reason: Error) => void;
       vi.mocked(api.sendTaskChat).mockReturnValueOnce(
@@ -687,6 +1229,71 @@ describe('ChatView', () => {
       },
     );
 
+    it('queues follow-ups and disables live injection while waiting on a capability', async () => {
+      const task = makeTask({
+        id: 303,
+        provider: 'codex',
+        status: 'waiting_capability',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Waiting for requested capability...')).toBeInTheDocument();
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+      expect(screen.queryByTitle(/Codex turn\/steer/)).not.toBeInTheDocument();
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        'continue after the review',
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('does not auto-dequeue a queued message when the yielding source process exits', async () => {
+      const task = makeTask({
+        id: 304,
+        status: 'waiting_capability',
+        retry_count: 2,
+        turn_generation: 7,
+      });
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'wait for durable resume' }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+      });
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -848,19 +1455,100 @@ describe('ChatView', () => {
       }
     });
 
-    it('treats an ownerless background tail as processing and keeps Interrupt usable', async () => {
+    it('keeps an ownerless background tail visible and drains one queued follow-up after the boundary', async () => {
       const task = makeTask({
         id: 34,
         status: 'completed',
         background_active: true,
       });
+      vi.mocked(api.getRuntimeSettings).mockResolvedValueOnce({
+        use_pty_mode: true,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        codex_monitor_enabled: true,
+      });
       const { rerender } = render(
         <ChatView task={task} projects={projects} onBack={onBack} />,
       );
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
 
-      const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
-      fireEvent.change(textarea, { target: { value: 'wait behind background work' } });
-      expect(screen.getByTitle(/Add to queue/)).toBeInTheDocument();
+      const textarea = screen.getByPlaceholderText(/Type a follow-up message/i);
+      fireEvent.change(textarea, { target: { value: 'continue alongside background work' } });
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          34,
+          'continue alongside background work',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+        operation_id: 'retained-34-followup',
+      });
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:34',
+          data: {
+            event_type: 'user_message',
+            content: 'continue alongside background work',
+            followup_operation_id: 'retained-34-followup',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      expect(screen.getByText('后台子 Agent 仍在运行')).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'queued after retained follow-up' } },
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:34',
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            state: 'completed',
+            followup_operation_id: 'retained-34-followup',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+            background_generation: 'retained-34',
+          },
+        });
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+        expect(screen.getByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+      });
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          34,
+          'queued after retained follow-up',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
 
       const interrupt = screen.getByTitle('Interrupt session');
       expect(interrupt).toBeEnabled();
@@ -880,14 +1568,311 @@ describe('ChatView', () => {
       expect(screen.getByTitle(/Send \(Ctrl\+Enter\)/)).toBeInTheDocument();
     });
 
-    it('shows an Interrupt failure and keeps the control available', async () => {
-      (api.stopTaskSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+    it('does not race a retained-tail follow-up onto /chat before runtime settings load', async () => {
+      const task = makeTask({
+        id: 340,
+        status: 'completed',
+        background_active: true,
+      });
+      vi.mocked(api.getRuntimeSettings).mockReturnValueOnce(
+        new Promise<Awaited<ReturnType<typeof api.getRuntimeSettings>>>(() => {}),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'send before settings resolve',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'send before settings resolve',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('holds the queue until an out-of-order Claude boundary has an HTTP receipt', async () => {
+      const task = makeTask({
+        id: 342,
+        status: 'completed',
+        background_active: true,
+      });
+      let resolveFirst!: (value: {
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }) => void;
+      const firstInjection = new Promise<{
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }>((resolve) => { resolveFirst = resolve; });
+      vi.mocked(api.injectTaskMessage)
+        .mockReturnValueOnce(firstInjection)
+        .mockResolvedValue({
+          ok: true,
+          injected: true,
+          operation_id: 'out-of-order-next',
+        });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'first retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      // The provider boundary can be committed before the API's user-message
+      // audit reaches this browser. It must not unlock a second send yet.
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            followup_operation_id: 'out-of-order-first',
+            pty_followup_state: 'completed',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'user_message',
+            content: 'first retained follow-up',
+            followup_operation_id: 'out-of-order-first',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'second queued follow-up' } },
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      resolveFirst({
+        ok: true,
+        injected: true,
+        operation_id: 'out-of-order-first',
+      });
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'second queued follow-up',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+    });
+
+    it('does not let a late reconciled audit clear a newer Claude follow-up', async () => {
+      const task = makeTask({
+        id: 343,
+        status: 'completed',
+        background_active: true,
+      });
+      vi.mocked(api.injectTaskMessage)
+        .mockResolvedValueOnce({
+          ok: true,
+          injected: true,
+          operation_id: 'late-audit-followup',
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          injected: true,
+          operation_id: 'new-followup',
+        });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'first retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            state: 'completed',
+            followup_operation_id: 'late-audit-followup',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+
+      // The audit can arrive after the boundary. It must not recreate the
+      // completed operation or interfere with the next retained follow-up.
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'user_message',
+            content: 'first retained follow-up',
+            followup_operation_id: 'late-audit-followup',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'second retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledTimes(2);
+        expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      });
+    });
+
+    it('does not clear the new composer when an old injection resolves after a turn change', async () => {
+      const task = makeTask({
+        id: 344,
+        status: 'completed',
+        background_active: true,
+      });
+      let resolveInjection!: (value: {
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }) => void;
+      vi.mocked(api.injectTaskMessage).mockReturnValueOnce(
+        new Promise((resolve) => { resolveInjection = resolve; }),
+      );
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'old turn input',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      const nextTask = {
+        ...task,
+        status: 'executing' as const,
+        background_active: false,
+        turn_generation: task.turn_generation + 1,
+      };
+      rerender(<ChatView task={nextTask} projects={projects} onBack={onBack} />);
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Type next message to queue/i)).toBeInTheDocument();
+      });
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'new turn input' } },
+      );
+
+      resolveInjection({
+        ok: true,
+        injected: true,
+        operation_id: 'old-turn-operation',
+      });
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Type next message to queue/i)).toHaveValue(
+          'new turn input',
+        );
+      });
+    });
+
+    it('auto-dequeues a locally restored message on an initial Claude retained tail', async () => {
+      const task = makeTask({
+        id: 341,
+        status: 'completed',
+        background_active: true,
+      });
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'restored Claude follow-up' }]),
+      );
+      vi.mocked(api.getRuntimeSettings).mockResolvedValueOnce({
+        use_pty_mode: true,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        codex_monitor_enabled: true,
+      });
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'restored Claude follow-up',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      }, { timeout: 1800 });
+      expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      });
+    });
+
+    it('clears thinking immediately after an authoritative Interrupt response', async () => {
+      const task = makeTask({ id: 38, status: 'executing' });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      await userEvent.click(screen.getByTitle('Interrupt session'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+      expect(onTaskUpdated).toHaveBeenCalled();
+    });
+
+    it('keeps thinking and exposes the backend reason when Interrupt fails', async () => {
+      vi.mocked(api.stopTaskSession).mockRejectedValueOnce(
         new Error('Task process cleanup could not be confirmed for instance(s): 9, 10'),
       );
-      const task = makeTask({
-        id: 38,
-        status: 'executing',
-      });
+      const task = makeTask({ id: 39, status: 'executing' });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
 
       await userEvent.click(screen.getByTitle('Interrupt session'));
@@ -895,6 +1880,7 @@ describe('ChatView', () => {
       expect(await screen.findByText(
         'Interrupt failed: Task process cleanup could not be confirmed for instance(s): 9, 10',
       )).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
       expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
     });
 
@@ -921,14 +1907,15 @@ describe('ChatView', () => {
       )).toBeInTheDocument();
       expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
     });
-
-    it('does not finish or dequeue at terminal/process_exit until the marker clears', async () => {
+    it('auto-dequeues through exact injection when foreground exits into a retained background tail', async () => {
       const task = makeTask({
         id: 35,
+        provider: 'codex',
         status: 'executing',
         background_active: false,
       });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
 
       act(() => {
         capturedOnMessage?.({
@@ -939,7 +1926,7 @@ describe('ChatView', () => {
           },
         });
       });
-      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
 
       const textarea = screen.getByPlaceholderText(/Type next message to queue/i);
       fireEvent.change(textarea, { target: { value: 'queued follow-up' } });
@@ -948,54 +1935,914 @@ describe('ChatView', () => {
 
       act(() => {
         capturedOnMessage?.({
-          channel: 'tasks',
+          channel: 'task:35',
           data: {
-            event: 'status_change',
-            task_id: 35,
-            new_status: 'completed',
-            background_active: true,
+            event_type: 'background_lifecycle',
+            background_state: 'running',
+            background_reason: 'waiting_for_descendants',
+            background_active_count: 1,
+            background_active_thread_ids: ['child-35'],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
           },
         });
       });
       expect(screen.getByText('后台运行中')).toBeInTheDocument();
-      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(screen.getByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+        expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+      }, { timeout: 1500 });
+
+      await waitFor(
+        () => expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          35,
+          'queued follow-up',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        ),
+        { timeout: 2500 },
+      );
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      });
+    });
+
+    it('keeps a Codex retained follow-up active from the HTTP admission before its audit event', async () => {
+      const task = makeTask({
+        id: 345,
+        provider: 'codex',
+        status: 'completed',
+        background_active: true,
+      });
+      vi.mocked(api.injectTaskMessage).mockResolvedValueOnce({
+        ok: true,
+        injected: true,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'steer Codex while child runs',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'steer Codex while child runs',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+        expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+      });
+    });
+
+    it('requeues text and attachments when background auto-injection is not confirmed', async () => {
+      const task = makeTask({
+        id: 305,
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+      });
+      const attachment = makeUpload('queued-evidence', 'queued-evidence.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{
+          text: 'queued with evidence',
+          uploadResults: [attachment],
+        }]),
+      );
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: false,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
       expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'running',
+            background_reason: 'waiting_for_descendants',
+            background_active_count: 1,
+            background_active_thread_ids: ['child-305'],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'queued with evidence',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          {
+            file_paths: [attachment.path],
+            image_paths: [],
+            attachments: [{
+              url: attachment.url,
+              name: attachment.filename,
+              is_image: false,
+            }],
+          },
+        );
+      });
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await waitFor(() => {
+        expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      });
+      expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+      expect(screen.getByRole('textbox')).toHaveValue('queued with evidence');
+      expect(screen.getByText('queued-evidence.txt')).toBeInTheDocument();
+    });
+
+    it('never auto-replays a queued message when the injection acknowledgement is uncertain', async () => {
+      const task = makeTask({
+        id: 307,
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+      });
+      const attachment = makeUpload('uncertain-evidence', 'uncertain-evidence.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{
+          text: 'possibly accepted follow-up',
+          uploadResults: [attachment],
+        }]),
+      );
+      vi.mocked(api.injectTaskMessage).mockRejectedValueOnce(
+        new TypeError('Failed to fetch'),
+      );
+
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'running',
+            background_reason: 'waiting_for_descendants',
+            background_active_count: 1,
+            background_active_thread_ids: ['child-307'],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+        expect(screen.getByText('需确认')).toBeInTheDocument();
+        expect(screen.getByText(/注入结果不确定/)).toBeInTheDocument();
+      });
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'completed',
+            background_reason: 'descendants_completed',
+            background_active_count: 0,
+            background_active_thread_ids: [],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: task.id,
+            new_status: 'completed',
+            background_active: false,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      });
+      expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(screen.getByText('需确认')).toBeInTheDocument();
+
+      await userEvent.click(screen.getByTitle('Edit in input'));
+      expect(screen.getByRole('textbox')).toHaveValue('possibly accepted follow-up');
+      expect(screen.getByText('uncertain-evidence.txt')).toBeInTheDocument();
+    });
+
+    it('never auto-retries a queued follow-up after an ambiguous injection failure', async () => {
+      const task = makeTask({
+        id: 307,
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+      });
+      const attachment = makeUpload('uncertain-evidence', 'uncertain.txt');
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{
+          text: 'send at most once',
+          uploadResults: [attachment],
+        }]),
+      );
+      vi.mocked(api.injectTaskMessage).mockRejectedValueOnce(
+        Object.assign(
+          new Error('Codex follow-up admission is uncertain'),
+          { status: 503, detail: 'delivery uncertain' },
+        ),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'running',
+            background_reason: 'waiting_for_descendants',
+            background_active_count: 1,
+            background_active_thread_ids: ['child-307'],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+        expect(screen.getByText('需确认')).toBeInTheDocument();
+        expect(screen.getByText(/不会自动重试/)).toBeInTheDocument();
+      }, { timeout: 2500 });
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'completed',
+            background_reason: 'descendants_completed',
+            background_active_count: 0,
+            background_active_thread_ids: [],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: task.id,
+            new_status: 'completed',
+            background_active: false,
+          },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      });
+
+      expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(screen.getByText('需确认')).toBeInTheDocument();
+
+      await userEvent.click(screen.getByTitle('Edit in input'));
+      expect(screen.getByRole('textbox')).toHaveValue('send at most once');
+      expect(screen.getByText('uncertain.txt')).toBeInTheDocument();
+    });
+
+    it('keeps queued Plan metadata for the ordinary next turn instead of injecting it', async () => {
+      const task = makeTask({
+        id: 306,
+        provider: 'codex',
+        status: 'executing',
+        background_active: false,
+      });
+      const version = makePlanVersion({
+        id: 502,
+        plan_id: 82,
+        human_decision: 'approved',
+        display_state: 'approved',
+      });
+      const plan = makePlan({
+        id: 82,
+        title: 'Queued Plan',
+        display_state: 'approved',
+        current_version_id: version.id,
+        current_version: version,
+      });
+      vi.mocked(api.listPlans).mockResolvedValue([plan]);
+      vi.mocked(api.listPlanVersions).mockResolvedValue([version]);
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+
+      await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+      await userEvent.click(await screen.findByRole('button', { name: /#82 Queued Plan/ }));
+      await userEvent.click(await screen.findByRole('button', { name: 'Attach to next message' }));
+      expect(await screen.findByText('Plan #82 · v1 · Queued Plan')).toBeInTheDocument();
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        'apply the approved plan',
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'running',
+            background_reason: 'waiting_for_descendants',
+            background_active_count: 1,
+            background_active_thread_ids: ['child-306'],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      // The background-only handoff schedules one dequeue (200ms + 300ms).
+      // Wait past it before asserting that Plan metadata prevented injection.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+      });
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
       expect(api.sendTaskChat).not.toHaveBeenCalled();
 
       act(() => {
         capturedOnMessage?.({
-          channel: 'task:35',
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'background_lifecycle',
+            background_state: 'completed',
+            background_reason: 'descendants_completed',
+            background_active_count: 0,
+            background_active_thread_ids: [],
+            background_started_at: new Date().toISOString(),
+            background_last_activity_at: new Date().toISOString(),
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: task.id,
+            new_status: 'completed',
+            background_active: false,
+          },
+        });
+      });
+
+      await waitFor(() => {
+        expect(api.sendTaskChat).toHaveBeenCalledWith(
+          task.id,
+          'apply the approved plan',
+          undefined,
+          undefined,
+          null,
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+          undefined,
+          [502],
+          [],
+          expect.any(String),
+        );
+      }, { timeout: 1800 });
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('follow-up 循环审查模式', () => {
+    it('keeps the right-side test entry visible and opens the standby page without runs', async () => {
+      const task = makeTask({
+        id: 406,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      vi.mocked(api.listTestRuns).mockResolvedValue([]);
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const testPanelButton = screen.getByRole('button', { name: 'Toggle Frontend Review panel' });
+      expect(testPanelButton).toBeInTheDocument();
+      await userEvent.click(testPanelButton);
+      expect(await screen.findByText('尚未启动前端测试')).toBeInTheDocument();
+    });
+
+    it('普通对话识别为前端验收后立即打开右栏等待新的浏览器 run', async () => {
+      const task = makeTask({
+        id: 407,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      vi.mocked(api.sendTaskChat).mockResolvedValueOnce({
+        ok: true,
+        queued: true,
+        session_id: task.session_id!,
+        workspace_review_expected: true,
+        workspace_review_baseline_run_id: 'older-workspace-run',
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const input = screen.getByPlaceholderText(/follow-up message/i);
+      await userEvent.type(input, '审查一下pr99分支的前端内容是否实现');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+      expect(await screen.findByText('正在创建新的前端测试')).toBeInTheDocument();
+      expect(screen.getByLabelText('Frontend Review progress')).toBeInTheDocument();
+    });
+
+    it('从已完成 Task 单次黑盒审查当前分支，不发送普通 follow-up', async () => {
+      const task = makeTask({
+        id: 408,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      const workspaceRun: WorkspaceReviewRun = {
+        id: 'workspace-review-1',
+        task_id: 408,
+        project_id: 1,
+        agent_task_id: null,
+        browser_review_job_id: null,
+        mode: 'review_only',
+        profile: 'standard',
+        goal: '验证设置页保存和窄屏布局',
+        status: 'preparing',
+        stage: 'validating_workspace',
+        workspace_path: '/repo',
+        git_head: '1234567890abcdef1234567890abcdef12345678',
+        workspace_fingerprint: 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+        preview_config: {
+          version: 1,
+          name: 'Vite preview',
+          setup: [],
+          processes: [],
+          url: 'http://127.0.0.1:{preview_port}/',
+          health_url: 'http://127.0.0.1:{preview_port}/',
+          startup_timeout_seconds: 90,
+        },
+        preview_url: null,
+        stale: false,
+        report: null,
+        error: null,
+        cleanup_status: 'pending',
+        cleanup_error: null,
+        evidence_archive_state: 'staging',
+        evidence_archive_error: null,
+        created_at: '2026-08-06T00:00:00Z',
+        started_at: null,
+        completed_at: null,
+      };
+      const startedRun: TestHarnessRun = {
+        id: 'test-harness-run-1',
+        task_id: 408,
+        project_id: 1,
+        workspace_review_run_id: workspaceRun.id,
+        browser_review_job_id: null,
+        agent_task_id: null,
+        target_kind: 'current_workspace',
+        target: {},
+        test_plan: { objective: workspaceRun.goal },
+        runtime: { context_policy: 'isolated_black_box_v1' },
+        request_fingerprint: 'f'.repeat(64),
+        parent_run_id: null,
+        root_run_id: 'test-harness-run-1',
+        attempt_number: 1,
+        status: 'preparing_environment',
+        stage: 'validating_workspace',
+        verdict: null,
+        source_git_head: workspaceRun.git_head,
+        source_fingerprint: workspaceRun.workspace_fingerprint,
+        stale: false,
+        report: null,
+        error: null,
+        cleanup_status: 'pending',
+        cleanup_error: null,
+        created_at: workspaceRun.created_at,
+        started_at: null,
+        completed_at: null,
+        attempts: [],
+        events: [],
+        evidence: [],
+        findings: [],
+        workspace_review: workspaceRun,
+        browser_review: null,
+      };
+      vi.mocked(api.startTestRun).mockResolvedValueOnce(startedRun);
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '单次审查当前分支' });
+      await waitFor(() => expect(modeButton).toBeEnabled());
+      await userEvent.click(modeButton);
+      const input = screen.getByPlaceholderText(/无需提供 URL/);
+      await userEvent.type(input, '验证设置页保存和窄屏布局');
+      await userEvent.click(screen.getByTitle('启动单次审查 (Ctrl+Enter)'));
+
+      await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(
+        408,
+        {
+          target_kind: 'current_workspace',
+          target: {},
+          goal: '验证设置页保存和窄屏布局',
+          profile: 'standard',
+          allow_actions: true,
+          browser_channel: 'chromium',
+          viewport_width: 1440,
+          viewport_height: 900,
+        },
+      ));
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
+      expect(await screen.findByText('Test Harness · 当前工作区')).toBeInTheDocument();
+      expect(screen.getAllByText('正在校验本地仓库').length).toBeGreaterThan(0);
+    });
+
+    it('从已完成 Task 的输入工具栏启动同 session Goal，而不发送普通 follow-up', async () => {
+      const task = makeTask({
+        id: 409,
+        status: 'completed',
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+      });
+      let resolveGoalStart!: (task: Task) => void;
+      vi.mocked(api.startFrontendReviewGoal).mockReturnValueOnce(new Promise<Task>((resolve) => {
+        resolveGoalStart = resolve;
+      }));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '循环审查' });
+      await waitFor(() => expect(modeButton).toBeEnabled());
+      await userEvent.click(modeButton);
+      expect(modeButton).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByText(/当前 Task\/session/)).toBeInTheDocument();
+
+      const input = screen.getByPlaceholderText(/描述这次要循环审查/);
+      await userEvent.type(input, '审查设置页桌面和窄屏，修复后重新验证');
+      await userEvent.click(screen.getByTitle('启动循环审查 (Ctrl+Enter)'));
+
+      expect(await screen.findByText('Goal 循环审查正在启动')).toBeInTheDocument();
+      expect(screen.getAllByText('审查设置页桌面和窄屏，修复后重新验证').length).toBeGreaterThan(0);
+      expect(screen.getByText(/审查报告不会结束本轮/)).toBeInTheDocument();
+      await waitFor(() => expect(api.startFrontendReviewGoal).toHaveBeenCalledWith(
+        409,
+        {
+          message: '审查设置页桌面和窄屏，修复后重新验证',
+          file_paths: undefined,
+          secret_ids: undefined,
+          profile: 'standard',
+          max_iterations: 5,
+          expected_routing: {
+            provider: 'codex',
+            model: 'gpt-5.6-sol',
+            codex_service_tier: 'default',
+          },
+          client_message_id: expect.any(String),
+        },
+      ));
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      await act(async () => {
+        resolveGoalStart(makeTask({
+          ...task,
+          status: 'pending',
+          mode: 'goal',
+          goal_max_turns: 5,
+          metadata_: {
+            frontend_review: {
+              mode: 'goal',
+              profile: 'standard',
+              max_iterations: 5,
+            },
+          },
+        }));
+      });
+      await waitFor(() => expect(onTaskUpdated).toHaveBeenCalled());
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: '循环审查' }))
+          .toHaveAttribute('aria-pressed', 'false');
+      });
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:409',
+          data: {
+            event_type: 'tool_use',
+            role: 'assistant',
+            tool_name: 'ccm_workspace_review.test_current_changes',
+            tool_input: JSON.stringify({ goal: '修改后重新检查设置页键盘流程' }),
+            item_id: 'workspace-review-start-1',
+            timestamp: '2026-08-06T02:00:00Z',
+          },
+        });
+      });
+      expect(await screen.findByText('正在创建本轮浏览器复查')).toBeInTheDocument();
+      expect(screen.getByText('修改后重新检查设置页键盘流程')).toBeInTheDocument();
+    });
+
+    it('Goal 已终态时不再显示运行提示，后续输入保持普通对话', async () => {
+      const task = makeTask({
+        id: 411,
+        status: 'completed',
+        mode: 'goal',
+        goal_turns_used: 2,
+        goal_max_turns: 5,
+        metadata_: {
+          frontend_review: {
+            mode: 'goal',
+            profile: 'standard',
+            max_iterations: 5,
+          },
+          frontend_review_activation: {
+            message: '旧版残留的循环审查',
+          },
+        },
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.queryByText(/Goal 审查 · 第/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+      const input = screen.getByPlaceholderText(/follow-up message/i);
+      await userEvent.type(input, 'Goal 已结束后的普通问题');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
+    });
+
+    it('终态 status_change 不会被随后到达的 process_exit 恢复成 thinking', async () => {
+      render(
+        <ChatView
+          task={makeTask({
+            id: 412,
+            status: 'executing',
+            mode: 'goal',
+            metadata_: {
+              frontend_review: {
+                mode: 'goal',
+                profile: 'standard',
+                max_iterations: 5,
+              },
+            },
+          })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+      expect(screen.getByText(/Goal Agent 第 1 轮正在执行/)).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'tasks',
+          data: {
+            event: 'status_change',
+            task_id: 412,
+            new_status: 'completed',
+            background_active: false,
+          },
+        });
+      });
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:412',
           data: { event_type: 'process_exit', exit_code: 0 },
         });
       });
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 650));
       });
-      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
-      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
-      expect(api.sendTaskChat).not.toHaveBeenCalled();
+      expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/is thinking/)).not.toBeInTheDocument();
+    });
 
+    it('reconciles a terminal task when process_exit arrives without status_change', async () => {
+      const task = makeTask({
+        id: 413,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      const terminalTask = {
+        ...task,
+        status: 'completed',
+        background_active: false,
+      } as Task;
+      let resolveTerminalTask!: (value: Task) => void;
+      const terminalTaskRequest = new Promise<Task>((resolve) => {
+        resolveTerminalTask = resolve;
+      });
+      vi.mocked(api.getTask).mockImplementation((taskId) => (
+        taskId === 413
+          ? terminalTaskRequest
+          : Promise.resolve({ ...task, id: taskId, status: 'executing' } as Task)
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
       act(() => {
         capturedOnMessage?.({
-          channel: 'tasks',
+          channel: 'task:413',
           data: {
-            event: 'background_activity',
-            task_id: 35,
-            background_active: false,
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
           },
         });
       });
 
-      await waitFor(
-        () => expect(api.sendTaskChat).toHaveBeenCalled(),
-        { timeout: 2000 },
-      );
-      expect(
-        (api.sendTaskChat as ReturnType<typeof vi.fn>).mock.calls[0][1],
-      ).toBe('queued follow-up');
-      await waitFor(() => {
-        expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(413), {
+        timeout: 1500,
       });
+      await act(async () => {
+        resolveTerminalTask(terminalTask);
+        await terminalTaskRequest;
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+      expect(onTaskUpdated).toHaveBeenCalledWith(expect.objectContaining({
+        id: 413,
+        status: 'completed',
+      }));
+    });
+
+    it('does not apply process_exit reconciliation from an older generation', async () => {
+      const task = makeTask({
+        id: 414,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+        taskId === 414
+          ? {
+              ...task,
+              status: 'completed',
+              turn_generation: 12,
+              background_active: false,
+            }
+          : { ...task, id: taskId, status: 'executing' }
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:414',
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
+          },
+        });
+      });
+
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(414), {
+        timeout: 1500,
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('正在确认任务状态...')).not.toBeInTheDocument();
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(onTaskUpdated).not.toHaveBeenCalled();
+    });
+
+    it('Task 运行时显示但禁用循环审查按钮', () => {
+      render(
+        <ChatView
+          task={makeTask({ id: 410, status: 'executing' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(screen.getByRole('button', { name: '循环审查' })).toBeDisabled();
+    });
+
+    it('未确认本地 Git 仓库时禁用并显示后端原因', async () => {
+      (api.getFrontendReviewGoalCapabilities as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        available: false,
+        reason: 'Task 工作目录不是有效的 Git 仓库或 worktree',
+        repo_path: null,
+      });
+      render(
+        <ChatView
+          task={makeTask({ id: 411, status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      const modeButton = screen.getByRole('button', { name: '循环审查' });
+      await waitFor(() => expect(modeButton).toBeDisabled());
+      await waitFor(() => expect(modeButton).toHaveAttribute(
+        'title',
+        'Task 工作目录不是有效的 Git 仓库或 worktree',
+      ));
+      expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
     });
   });
 
@@ -1023,7 +2870,7 @@ describe('ChatView', () => {
       expect(screen.getByText('report.md')).toBeInTheDocument();
       await waitFor(() => {
         expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`) || '[]',
+          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`) || '[]',
         )).toEqual([attachment]);
       });
 
@@ -1048,6 +2895,11 @@ describe('ChatView', () => {
             model: null,
             codex_service_tier: 'default',
           },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          expect.any(String),
         );
       });
     });
@@ -1065,7 +2917,7 @@ describe('ChatView', () => {
 
       await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
       await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`)).not.toBeNull();
       });
       first.unmount();
 
@@ -1111,7 +2963,9 @@ describe('ChatView', () => {
       expect(screen.getByText('after edit')).toBeInTheDocument();
       await waitFor(() => {
         expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-queue-${task.id}`) || '[]',
+          localStorage.getItem(
+            `ccm-chat-queue-${task.id}-control-anonymous`,
+          ) || '[]',
         )).toEqual([{
           text: 'after edit',
           uploadResults: [attachment],
@@ -1188,7 +3042,7 @@ describe('ChatView', () => {
       expect(screen.getByRole('textbox')).toHaveValue('retry this');
       expect(screen.getByText('retry.txt')).toBeInTheDocument();
       await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`)).not.toBeNull();
       });
     });
 
@@ -1220,7 +3074,7 @@ describe('ChatView', () => {
       const toggle = await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/);
       await userEvent.click(toggle);
       await userEvent.type(screen.getByRole('textbox'), 'change direction');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
 
       await waitFor(() => {
         expect(api.injectTaskMessage).toHaveBeenCalledWith(
@@ -1268,7 +3122,7 @@ describe('ChatView', () => {
       ]);
       await waitFor(() => expect(api.uploadImages).toHaveBeenCalledTimes(2));
       await screen.findByText('notes.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
 
       await waitFor(() => {
         expect(api.getInjectCapabilities).toHaveBeenCalledWith(task.id);
@@ -1334,7 +3188,7 @@ describe('ChatView', () => {
         new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
       );
       await screen.findByText('evidence.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
 
       expect(await screen.findByText(/HTTP 404/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1371,7 +3225,7 @@ describe('ChatView', () => {
         new File(['evidence'], 'evidence.txt', { type: 'text/plain' }),
       );
       await screen.findByText('evidence.txt');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
 
       expect(await screen.findByText(/没有确认全部附件均已注入/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1402,7 +3256,7 @@ describe('ChatView', () => {
       await userEvent.click(await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/));
       const textbox = screen.getByRole('textbox');
       await userEvent.type(textbox, 'snapshot');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
       await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalled());
 
       expect(textbox).toBeDisabled();
@@ -1445,7 +3299,7 @@ describe('ChatView', () => {
       );
       await screen.findByText('evidence.txt');
       await userEvent.type(screen.getByRole('textbox'), '请结合附件继续');
-      await userEvent.click(screen.getByTitle('注入到运行中的 turn (Ctrl+Enter)'));
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
 
       expect(await screen.findByText(/服务器没有确认消息已注入/)).toHaveTextContent(
         '消息和附件已保留',
@@ -1669,7 +3523,7 @@ describe('ChatView', () => {
       const first = render(<ChatView task={task} projects={projects} onBack={onBack} />);
       expect(screen.getByRole('textbox')).toHaveValue('editable fork prompt');
       first.unmount();
-      localStorage.removeItem(`ccm-chat-draft-${task.id}`);
+      localStorage.removeItem(`ccm-chat-draft-${task.id}-control-anonymous`);
 
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
       expect(screen.getByRole('textbox')).toHaveValue('');
@@ -1708,6 +3562,11 @@ describe('ChatView', () => {
           model: null,
           codex_service_tier: 'default',
         },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        expect.any(String),
       ));
     });
 
@@ -1743,6 +3602,11 @@ describe('ChatView', () => {
           model: null,
           codex_service_tier: 'default',
         },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        expect.any(String),
       ));
     });
   });
@@ -1926,6 +3790,69 @@ describe('ChatView', () => {
       });
     });
 
+    it('renders persisted legacy tool markup as an unexecuted protocol warning', async () => {
+      const leakedMarkup = 'card\n<invoke name="Bash">\n<parameter name="command">touch /tmp/never-ran</parameter>\n</invoke>';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValueOnce([{
+        id: 133,
+        role: 'assistant',
+        event_type: 'message',
+        content: leakedMarkup,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-19T10:25:00Z',
+        image_urls: null,
+        attachments: null,
+        protocol_anomaly: 'legacy_tool_markup',
+      }]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 133, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByText('工具协议异常')).toBeInTheDocument();
+      expect(screen.getByText('以下内容是模型输出的未解析工具标记，未作为工具调用执行。')).toBeInTheDocument();
+      const rawDetails = screen.getByText('查看未执行原文').parentElement;
+      expect(rawDetails?.tagName).toBe('DETAILS');
+      expect(rawDetails).toBeInTheDocument();
+      expect(rawDetails).not.toHaveAttribute('open');
+      expect(screen.getByLabelText('未执行的工具标记原文').textContent).toBe(leakedMarkup);
+    });
+
+    it('preserves the protocol anomaly marker on live assistant messages', async () => {
+      const leakedMarkup = '<invoke name="Bash"><parameter name="command">false</parameter></invoke>';
+      const task = makeTask({ id: 134, description: null });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:134',
+          data: {
+            event_type: 'message',
+            role: 'assistant',
+            content: leakedMarkup,
+            protocol_anomaly: 'legacy_tool_markup',
+          },
+        });
+      });
+
+      expect(screen.getByText('工具协议异常')).toBeInTheDocument();
+      const rawDetails = screen.getByText('查看未执行原文').parentElement;
+      expect(rawDetails?.tagName).toBe('DETAILS');
+      expect(rawDetails).toBeInTheDocument();
+      expect(rawDetails).not.toHaveAttribute('open');
+      const original = screen.getByLabelText('未执行的工具标记原文');
+      expect(original.textContent).toBe(leakedMarkup);
+      expect(original.closest('.markdown-body')).toBeNull();
+    });
+
     it('re-fetches chat history on WebSocket reconnect', async () => {
       const msgs: ChatMessage[] = [
         { id: 1, role: 'assistant', event_type: 'message', content: 'Hello', tool_name: null, tool_input: null, tool_output: null, is_error: false, loop_iteration: null, timestamp: '2024-01-01T00:00:00Z' },
@@ -2066,7 +3993,7 @@ describe('ChatView', () => {
       await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalledTimes(2));
     });
 
-    it('does not revive an answered ask-user card from a stale pending snapshot', async () => {
+    it('removes a resolved ask-user card and does not revive it from stale events', async () => {
       let resolvePending!: (value: {
         pending: { request_id: string; questions: {
           question: string;
@@ -2109,7 +4036,22 @@ describe('ChatView', () => {
           },
         });
       });
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:14',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-1',
+            questions: [{
+              question: 'Proceed?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
 
       await act(async () => {
         resolvePending({
@@ -2123,12 +4065,11 @@ describe('ChatView', () => {
         });
       });
 
-      expect(screen.getAllByText('Proceed?')).toHaveLength(1);
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
       expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
     });
 
-    it('tombstones a locally submitted answer before a stale pending snapshot returns', async () => {
+    it('removes a submitted ask-user card before a stale pending snapshot returns', async () => {
       let resolvePending!: (value: {
         pending: { request_id: string; questions: {
           question: string;
@@ -2162,7 +4103,7 @@ describe('ChatView', () => {
       await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
       await userEvent.click(screen.getByRole('button', { name: '提交' }));
       await waitFor(() => expect(api.submitAskUser).toHaveBeenCalled());
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByText('Ship it?')).not.toBeInTheDocument());
 
       await act(async () => {
         resolvePending({
@@ -2176,9 +4117,43 @@ describe('ChatView', () => {
         });
       });
 
-      expect(screen.getAllByText('Ship it?')).toHaveLength(1);
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Ship it?')).not.toBeInTheDocument();
       expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
+    });
+
+    it('keeps an ask-user card when answer delivery is uncertain', async () => {
+      (api.submitAskUser as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        Object.assign(new Error('network failed'), { status: 503 }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ id: 16, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:16',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-uncertain',
+            questions: [{
+              question: 'Deploy?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
+      await userEvent.click(screen.getByRole('button', { name: '提交' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        '回答提交结果未确认，卡片已保留，请重试。',
+      );
+      expect(screen.getByText('Deploy?')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '提交' })).toBeEnabled();
     });
 
     it('copies a user message without its sender prefix', async () => {
@@ -2460,7 +4435,7 @@ describe('ChatView', () => {
   });
 
   describe('Draft buffering (localStorage)', () => {
-    const draftKey = (id: number) => `ccm-chat-draft-${id}`;
+    const draftKey = (id: number) => `ccm-chat-draft-${id}-control-anonymous`;
 
     beforeEach(() => {
       localStorage.clear();
@@ -2830,6 +4805,507 @@ describe('Codex app-server 增量消息', () => {
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   });
 
+  it('丢弃缺少 retry 或 turn generation 的 delta', async () => {
+    const task = makeTask({
+      id: 20,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 3,
+      turn_generation: 8,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:20',
+        data: {
+          event_type: 'message_delta', item_id: 'missing-retry',
+          content: 'must not render without retry', task_turn_generation: 8,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:20',
+        data: {
+          event_type: 'message_delta', item_id: 'missing-turn',
+          content: 'must not render without turn', task_retry_count: 3,
+        },
+      });
+    });
+
+    expect(screen.queryByText('must not render without retry')).not.toBeInTheDocument();
+    expect(screen.queryByText('must not render without turn')).not.toBeInTheDocument();
+  });
+
+  it('does not let an old process_exit stop a newer logical turn during the terminal delay', async () => {
+    const task = makeTask({
+      id: 201,
+      provider: 'codex',
+      // A retained native descendant does not terminalize the owning Codex
+      // Task: its adapter remains executing while the lifecycle is running.
+      status: 'executing',
+      retry_count: 2,
+      turn_generation: 40,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: {
+          event_type: 'message_delta', item_id: 'next-turn', content: 'working',
+          task_retry_count: 2, task_turn_generation: 41,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: { event_type: 'transient_retry', attempt: 1, delay: 1 },
+      });
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: {
+          event_type: 'process_exit', exit_code: 0,
+          task_retry_count: 2, task_turn_generation: 40,
+        },
+      });
+    });
+
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+    });
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+  });
+
+  it('replaces the thinking spinner with a retained Codex background lifecycle', async () => {
+    const task = makeTask({
+      id: 203,
+      provider: 'codex',
+      status: 'executing',
+      // Codex descendants are represented by background_lifecycle rather
+      // than the PTY-only Task.background_active projection.
+      background_active: false,
+      retry_count: 1,
+      turn_generation: 7,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:203',
+        data: {
+          id: 9001,
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 2,
+          background_active_thread_ids: ['child-a', 'child-b'],
+          background_started_at: new Date().toISOString(),
+          background_last_activity_at: new Date().toISOString(),
+          task_retry_count: 1,
+          task_turn_generation: 7,
+        },
+      });
+    });
+
+    expect(screen.getByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+    expect(screen.getByText(/正在等待2 个子 Agent/)).toBeInTheDocument();
+    expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+
+    // A normal follow-up must take the injectable route while the retained
+    // native descendants are running, not enqueue behind the executing Task.
+    await screen.findByTitle(/Codex turn\/steer.*插入运行中的 turn/);
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'continue while the children finish',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+    await waitFor(() => {
+      expect(api.injectTaskMessage).toHaveBeenCalledWith(
+        203,
+        'continue while the children finish',
+        {
+          provider: 'codex',
+          model: null,
+          codex_service_tier: 'default',
+        },
+        undefined,
+      );
+    });
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+  });
+
+  it('labels a retained background lifecycle stalled after 30 silent minutes', async () => {
+    const task = makeTask({
+      id: 204,
+      provider: 'codex',
+      status: 'executing',
+      background_active: false,
+      retry_count: 0,
+      turn_generation: 3,
+    });
+    const oldActivity = new Date(Date.now() - 31 * 60_000).toISOString();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 9002,
+      role: 'system',
+      event_type: 'background_lifecycle',
+      content: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: oldActivity,
+      image_urls: null,
+      attachments: null,
+      task_retry_count: 0,
+      task_turn_generation: 3,
+      background_lifecycle: {
+        state: 'running',
+        reason: 'waiting_for_native_goal',
+        active_count: 0,
+        active_thread_ids: [],
+        started_at: oldActivity,
+        last_activity_at: oldActivity,
+      },
+    }]);
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('后台任务可能停滞')).toBeInTheDocument();
+    expect(screen.getByText(/正在等待原生 Goal/)).toBeInTheDocument();
+  });
+
+  it('does not flash a stale completed lifecycle while a retained Codex follow-up is being admitted', async () => {
+    const task = makeTask({
+      id: 206,
+      provider: 'codex',
+      status: 'executing',
+      background_active: false,
+      retry_count: 1,
+      turn_generation: 12,
+    });
+    const backgroundStartedAt = new Date().toISOString();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 9004,
+      role: 'system',
+      event_type: 'background_lifecycle',
+      content: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: backgroundStartedAt,
+      image_urls: null,
+      attachments: null,
+      task_retry_count: 1,
+      task_turn_generation: 12,
+      background_lifecycle: {
+        state: 'running',
+        reason: 'waiting_for_descendants',
+        active_count: 1,
+        active_thread_ids: ['child-206'],
+        started_at: backgroundStartedAt,
+        last_activity_at: backgroundStartedAt,
+      },
+    }]);
+
+    let resolveInjection!: (result: { ok: boolean; injected: boolean }) => void;
+    vi.mocked(api.injectTaskMessage).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveInjection = resolve; }),
+    );
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'start the next turn',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+    await waitFor(() => {
+      expect(api.injectTaskMessage).toHaveBeenCalledWith(
+        206,
+        'start the next turn',
+        {
+          provider: 'codex',
+          model: null,
+          codex_service_tier: 'default',
+        },
+        undefined,
+      );
+    });
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: `task:${task.id}`,
+        data: {
+          event_type: 'background_lifecycle',
+          background_state: 'completed',
+          background_reason: 'descendants_completed',
+          background_active_count: 0,
+          background_active_thread_ids: [],
+          background_started_at: backgroundStartedAt,
+          background_last_activity_at: backgroundStartedAt,
+          task_retry_count: task.retry_count,
+          task_turn_generation: task.turn_generation,
+        },
+      });
+    });
+
+    expect(api.sendTaskChat).not.toHaveBeenCalled();
+    expect(screen.queryByText('后台任务已完成，正在收尾…')).not.toBeInTheDocument();
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+
+    await act(async () => {
+      resolveInjection({ ok: true, injected: true });
+    });
+    // A periodic/late running lifecycle can belong to the retained root
+    // generation even after this follow-up has been admitted. It must not
+    // clear the newer follow-up's foreground indicator.
+    act(() => {
+      capturedOnMessage?.({
+        channel: `task:${task.id}`,
+        data: {
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 1,
+          background_active_thread_ids: ['child-206'],
+          background_started_at: backgroundStartedAt,
+          background_last_activity_at: backgroundStartedAt,
+          task_retry_count: task.retry_count,
+          task_turn_generation: task.turn_generation,
+        },
+      });
+    });
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+    expect(screen.queryByText('后台任务已完成，正在收尾…')).not.toBeInTheDocument();
+  });
+
+  it('ignores a retained background lifecycle from an older task turn', async () => {
+    const task = makeTask({
+      id: 205,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 2,
+      turn_generation: 9,
+    });
+    const now = new Date().toISOString();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 9003,
+      role: 'system',
+      event_type: 'background_lifecycle',
+      content: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: now,
+      image_urls: null,
+      attachments: null,
+      task_retry_count: 1,
+      task_turn_generation: 8,
+      background_lifecycle: {
+        state: 'running',
+        reason: 'waiting_for_descendants',
+        active_count: 1,
+        active_thread_ids: ['old-child'],
+        started_at: now,
+        last_activity_at: now,
+      },
+    }]);
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('Codex is thinking...')).toBeInTheDocument();
+    expect(screen.queryByText('主回复已完成，后台仍在运行')).not.toBeInTheDocument();
+  });
+
+  it('drops old exact status, background, and context events after observing a newer turn', async () => {
+    const task = makeTask({
+      id: 202,
+      provider: 'codex',
+      status: 'completed',
+      retry_count: 3,
+      turn_generation: 50,
+    });
+    const view = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'tasks',
+        data: {
+          event: 'status_change', task_id: 202, new_status: 'executing',
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'tasks',
+        data: {
+          event: 'status_change', task_id: 202, new_status: 'completed',
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event_type: 'context_usage', input_tokens: 50,
+          cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+          output_tokens: 0, total_input_tokens: 50, context_window: 100,
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event_type: 'context_usage', input_tokens: 1,
+          cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+          output_tokens: 0, total_input_tokens: 1, context_window: 100,
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+    });
+
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+    expect(screen.getByText('50%')).toBeInTheDocument();
+    expect(screen.queryByText('1%')).not.toBeInTheDocument();
+
+    view.unmount();
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event: 'background_activity', background_active: true,
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event: 'background_activity', background_active: false,
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+    });
+    expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+  });
+
+  it('advances within one retry, drops late old-turn deltas, and only replaces the matching generation', async () => {
+    const task = makeTask({
+      id: 211,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 4,
+      turn_generation: 10,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: 'old provisional',
+          task_retry_count: 4, task_turn_generation: 10,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: 'new provisional',
+          task_retry_count: 4, task_turn_generation: 11,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: ' late old suffix',
+          task_retry_count: 4, task_turn_generation: 10,
+        },
+      });
+    });
+
+    expect(screen.queryByText('old provisional')).not.toBeInTheDocument();
+    expect(screen.queryByText(/late old suffix/)).not.toBeInTheDocument();
+    expect(screen.getByText('new provisional')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          id: 710,
+          event_type: 'message', item_id: 'reused-item', role: 'assistant',
+          content: 'old persisted final', task_retry_count: 4,
+          task_turn_generation: 10,
+        },
+      });
+    });
+    expect(screen.getByText('old persisted final')).toBeInTheDocument();
+    expect(screen.getByText('new provisional')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          id: 711,
+          event_type: 'message', item_id: 'reused-item', role: 'assistant',
+          content: 'new persisted final', task_retry_count: 4,
+          task_turn_generation: 11,
+        },
+      });
+    });
+    expect(screen.queryByText('new provisional')).not.toBeInTheDocument();
+    expect(screen.getByText('new persisted final')).toBeInTheDocument();
+    expect(screen.getByText('old persisted final')).toBeInTheDocument();
+  });
+
+  it('does not restore a cached provisional after the Task advances to another turn', async () => {
+    const firstTurn = makeTask({
+      id: 212,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 1,
+      turn_generation: 20,
+    });
+    const first = render(<ChatView task={firstTurn} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:212',
+        data: {
+          event_type: 'thinking_delta', item_id: 'cached-old-turn',
+          content: 'cached old reasoning', task_retry_count: 1,
+          task_turn_generation: 20,
+        },
+      });
+    });
+    expect(screen.getByText('cached old reasoning')).toBeInTheDocument();
+    first.unmount();
+
+    const second = render(
+      <ChatView
+        task={{ ...firstTurn, turn_generation: 21 }}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+    expect(screen.queryByText('cached old reasoning')).not.toBeInTheDocument();
+    second.unmount();
+
+    render(<ChatView task={firstTurn} projects={projects} onBack={onBack} />);
+    expect(screen.queryByText('cached old reasoning')).not.toBeInTheDocument();
+  });
+
   it('按 item_id 合并 delta，并用最终消息原位替换而不重复', async () => {
     const task = makeTask({ id: 21, provider: 'codex' });
     render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -2838,11 +5314,17 @@ describe('Codex app-server 增量消息', () => {
     await act(async () => {
       capturedOnMessage!({
         channel: 'task:21',
-        data: { event_type: 'message_delta', item_id: 'msg-1', content: 'Hel' },
+        data: {
+          event_type: 'message_delta', item_id: 'msg-1', content: 'Hel',
+          task_retry_count: 0, task_turn_generation: 0,
+        },
       });
       capturedOnMessage!({
         channel: 'task:21',
-        data: { event_type: 'message_delta', item_id: 'msg-1', content: 'lo' },
+        data: {
+          event_type: 'message_delta', item_id: 'msg-1', content: 'lo',
+          task_retry_count: 0, task_turn_generation: 0,
+        },
       });
     });
     expect(screen.getAllByText('Hello')).toHaveLength(1);
@@ -2852,7 +5334,8 @@ describe('Codex app-server 增量消息', () => {
         channel: 'task:21',
         data: {
           event_type: 'message', item_id: 'msg-1', role: 'assistant',
-          content: 'Hello', is_error: false,
+          content: 'Hello', is_error: false, task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2871,6 +5354,8 @@ describe('Codex app-server 增量消息', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: 'first half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2887,6 +5372,8 @@ describe('Codex app-server 增量消息', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: ' second half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2901,6 +5388,8 @@ describe('Codex app-server 增量消息', () => {
           item_id: 'reasoning-1',
           role: 'assistant',
           content: 'first half second half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2919,7 +5408,7 @@ describe('failed attachment sending', () => {
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
   });
 
-  it('keeps Send disabled instead of posting an empty attachment placeholder', async () => {
+  it('keeps Send safe while allowing the button to explain the failed attachment', async () => {
     (api.uploadImages as ReturnType<typeof vi.fn>)
       .mockRejectedValueOnce(new Error('upload failed'));
     render(<ChatView task={makeTask()} projects={[]} onBack={vi.fn()} />);
@@ -2929,9 +5418,12 @@ describe('failed attachment sending', () => {
       target: { files: [new File(['evidence'], 'evidence.txt', { type: 'text/plain' })] },
     });
     await screen.findByTitle('Click to retry');
+    await userEvent.type(screen.getByRole('textbox'), 'send with the attachment');
 
     const send = screen.getByTitle('Retry or remove failed attachments before sending');
-    expect(send).toBeDisabled();
+    expect(send).not.toBeDisabled();
+    await userEvent.click(send);
+    expect(await screen.findByText('Retry or remove failed attachments before sending.')).toBeInTheDocument();
     expect(api.sendTaskChat).not.toHaveBeenCalled();
   });
 });
@@ -3019,7 +5511,7 @@ describe('independent Plan attachments', () => {
 
     expect(selectedButton).toHaveAttribute('aria-current', 'true');
     expect(selectedButton).toHaveClass('border-indigo-500/70', 'bg-indigo-500/15');
-    expect(within(selectedButton).getByText('Awaiting review'))
+    expect(within(selectedButton).getByText('Needs approval'))
       .toHaveClass('text-indigo-300', 'ring-indigo-500/30');
     expect(otherButton).not.toHaveAttribute('aria-current');
   });
@@ -3347,6 +5839,7 @@ describe('independent Plan attachments', () => {
       undefined,
       [503, 504],
       [],
+      expect.any(String),
     ));
   }, 15_000);
 

@@ -303,14 +303,60 @@ class FullMirrorCCMBackend(CCMBackend):
         )
         return sid
 
-    async def on_event(self, key: Any, event_dict: dict, **context) -> None:
+    async def on_event(
+        self,
+        key: Any,
+        event_dict: dict,
+        **context,
+    ) -> bool | None:
         """Forward a foreground event with its immutable PTY turn identity."""
 
+        # Follow-up boundaries are audit receipts, not ordinary provider
+        # output. Route them through the strict idempotent writer before the
+        # compatibility callback below, which intentionally swallows ordinary
+        # autonomous-mirror failures.
+        if event_dict.get("pty_followup_boundary"):
+            return await self._im.persist_pty_followup_boundary(
+                instance_id=int(key),
+                task_id=int(context["task_id"]),
+                task_retry_count=int(context["expected_task_retry_count"]),
+                task_turn_generation=int(
+                    context["expected_task_turn_generation"]
+                ),
+                session_id=str(context["expected_session_id"]),
+                background_generation=str(
+                    context["expected_background_generation"]
+                ),
+                followup_operation_id=str(
+                    event_dict["followup_operation_id"]
+                ),
+                state=str(
+                    event_dict.get("pty_followup_state")
+                    or event_dict.get("state")
+                ),
+            )
+
         await self._im.wait_for_pty_launch_metadata(key)
+        background_followup = bool(context.get("background_followup"))
         consumer = asyncio.current_task()
         record = getattr(
             consumer, "_ccm_output_consumer_record", None
         )
+        if (
+            record is None
+            and self._consumers.get(key) is consumer
+        ):
+            candidate = self._im._consumer_records.get(key)
+            if (
+                candidate is not None
+                and getattr(candidate, "task", None) is consumer
+            ):
+                # Some pinned claude-pty builds begin consuming before CCM can
+                # attach the immutable record to the asyncio Task. The exact
+                # instance registry is safe only when it still points back to
+                # this same consumer; recover that identity so a structured
+                # API fatal event cannot be lost and later exit 0 as success.
+                record = candidate
         process = getattr(record, "process", None)
         session = getattr(process, "session", None)
         if session is None and self._consumers.get(key) is consumer:
@@ -324,6 +370,27 @@ class FullMirrorCCMBackend(CCMBackend):
             # Therefore the structured backgroundTaskId is an authoritative
             # foreground-exit barrier, not a heuristic transcript scan.
             background_tracker.observe(event_dict)
+        # Persist the semantic terminal outcome on the exact PTY generation
+        # before entering the generic event pipeline.  That pipeline may
+        # legitimately decline or fail a stale DB write, but a foreground
+        # provider timeout/API failure must still control ``on_exit``.  A
+        # persistent Claude process otherwise reports OS exit code 0 and the
+        # failed turn is incorrectly finalized as completed (production task
+        # 322).
+        fatal_provider_error = self._im._fatal_provider_error_for_event(
+            event_dict
+        )
+        if (
+            fatal_provider_error
+            and record is not None
+            and not background_followup
+        ):
+            if getattr(record, "fatal_provider_error", None) is None:
+                object.__setattr__(
+                    record,
+                    "fatal_provider_error",
+                    fatal_provider_error[:2000],
+                )
         raw = event_dict.get("raw_json")
         if raw:
             try:
@@ -345,12 +412,12 @@ class FullMirrorCCMBackend(CCMBackend):
                     not hard_limit
                     or event_dict.get("orphan")
                     or event_dict.get("autonomous")
+                    or background_followup
                 ):
-                    # Pinned claude-pty marks every structured quota event as
-                    # terminal before yielding it. on_event is awaited before
-                    # Session checks that latch, so clear soft events and hard
-                    # events proven to belong to stale/autonomous turns. Only
-                    # a hard signal from this foreground turn may abort it.
+                    # Keep the compatibility clear for older claude-pty
+                    # sessions that latched every structured quota event, and
+                    # for hard events proven stale/autonomous. Only a hard
+                    # signal from this foreground turn may abort it.
                     process = getattr(record, "process", None)
                     session = getattr(process, "session", None)
                     if (
@@ -361,13 +428,42 @@ class FullMirrorCCMBackend(CCMBackend):
                     if session is not None:
                         session._rate_limited_turn = False
         try:
-            await self._im._process_event(
-                key,
-                context.get("task_id"),
-                event_dict,
-                context.get("loop_iteration"),
-                consumer_record=record,
-            )
+            event_context = {
+                "background_followup": background_followup,
+                "expected_session_id": context.get("expected_session_id"),
+                "expected_background_generation": context.get(
+                    "expected_background_generation"
+                ),
+                "expected_task_retry_count": context.get(
+                    "expected_task_retry_count"
+                ),
+                "expected_task_turn_generation": context.get(
+                    "expected_task_turn_generation"
+                ),
+            }
+            # Keep the historical callback shape for ordinary foreground
+            # events. Besides avoiding needless kwargs on older adapters, this
+            # preserves compatibility with integrations that wrap
+            # ``_process_event`` and only accept the original arguments. Any
+            # background follow-up or generation context uses the strict
+            # proof-aware call below.
+            if not background_followup and not any(event_context.values()):
+                await self._im._process_event(
+                    key,
+                    context.get("task_id"),
+                    event_dict,
+                    context.get("loop_iteration"),
+                    consumer_record=record,
+                )
+            else:
+                await self._im._process_event(
+                    key,
+                    context.get("task_id"),
+                    event_dict,
+                    context.get("loop_iteration"),
+                    consumer_record=record,
+                    **event_context,
+                )
         except Exception:
             logger.exception(
                 "PTY on_event failed for instance %s task %s",
@@ -455,6 +551,39 @@ class FullMirrorCCMBackend(CCMBackend):
             # A PTY process is intentionally persistent. Its OS-level success
             # cannot override a failed API turn recorded in JSONL.
             ec = 1
+
+        context_preflight_requeued = False
+        if (
+            chat_initiated
+            and task_id
+            and owns_record
+            and not stop_owns_terminal
+            and ec not in (0, -2, 130)
+        ):
+            # PTY keeps the native process alive, so its consumer does not
+            # pass through InstanceManager's direct-exec cleanup path. Reuse
+            # the same durable proof/compaction authority here before any
+            # transient or account retry can classify the provider error.
+            params = self._im._launch_params.get(key) or {}
+            try:
+                from backend.main import dispatcher
+
+                context_preflight_requeued = (
+                    await self._im._try_chat_context_compaction_retry(
+                        task_id,
+                        params,
+                        instance_id=int(key),
+                        expected_retry_count=record.task_retry_count,
+                        expected_turn_generation=record.task_turn_generation,
+                        expected_started_at=record.instance_started_at,
+                        dispatcher=dispatcher,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "PTY context-window recovery check failed for instance %s",
+                    key,
+                )
 
         if (
             chat_initiated
@@ -544,6 +673,8 @@ class FullMirrorCCMBackend(CCMBackend):
                             session_id,
                             background_generation,
                             session,
+                            task_retry_count=record.task_retry_count,
+                            task_turn_generation=record.task_turn_generation,
                         )
                     )
                 else:
@@ -576,6 +707,7 @@ class FullMirrorCCMBackend(CCMBackend):
                         record,
                         background_generation=None,
                         background_session_id=session_id,
+                        context_preflight_requeued=context_preflight_requeued,
                     )
                 )
                 if final_status == "background_armed":
@@ -604,6 +736,25 @@ class FullMirrorCCMBackend(CCMBackend):
                 final_status, background_generation, background_state = (
                     await _commit_terminal(allow_background=True)
                 )
+                if (
+                    chat_initiated
+                    and background_generation is not None
+                    and background_state is not None
+                    and record is not None
+                    and session is not None
+                    and session_id is not None
+                ):
+                    # Keep the exact chat generation injectable before
+                    # releasing the transition lock.  on_exit waits below for
+                    # native children, so retaining only after that wait leaves
+                    # the whole background tail without a routable Session.
+                    self._im.retain_pty_post_exit_generation(
+                        key,
+                        task_id,
+                        session_id,
+                        session,
+                        record,
+                    )
         else:
             (
                 final_status,
@@ -696,19 +847,20 @@ class FullMirrorCCMBackend(CCMBackend):
         ):
             await self._maybe_retry_empty_reply(key, task_id)
 
-        # Dispatcher/Ralph own non-chat Task finalization. Completing the proxy
-        # below wakes them before their DB result CAS, and the normal
-        # instance-keyed consumer maps are then released. Retain one immutable
-        # generation proof so an autonomous callback already arriving in that
-        # narrow gap can pre-arm only this exact Task/session/consumer epoch.
+        # Completing the proxy below wakes dispatcher/Ralph and releases the
+        # normal instance-keyed consumer maps. Retain one immutable generation
+        # proof for every successful PTY turn, including chat: a late native
+        # child can arm the detached background epoch after this cleanup, and a
+        # user follow-up must still address the exact retained Session/record.
         if (
-            not chat_initiated
-            and transition_eligible
+            transition_eligible
             and background_generation is None
             and record is not None
             and session is not None
             and session_id is not None
         ):
+            # Idempotent while the early proof is current; if background-state
+            # cleanup retired it, this restores the ordinary post-exit grace.
             self._im.retain_pty_post_exit_generation(
                 key,
                 task_id,
@@ -754,13 +906,25 @@ class FullMirrorCCMBackend(CCMBackend):
                 "no response needed",
             }:
                 return
-            params["_retried"] = True
-            logger.warning(
-                "Task %d got empty/non-response (%r), re-enqueueing",
-                task_id,
-                combined[:80],
-            )
             from backend.main import dispatcher
+
+            retry_fence = await self._im._chat_automatic_relaunch_fence(
+                task_id,
+                params,
+                dispatcher=dispatcher,
+            )
+            if retry_fence is None:
+                # PTY completion proves only that this proxy settled, not that
+                # the model performed no tools before producing an empty final
+                # message.  The durable source/transport admission fence wins
+                # over this legacy one-shot convenience retry.
+                logger.error(
+                    "Task %d got empty/non-response (%r) after PTY provider "
+                    "admission; automatic replay was blocked",
+                    task_id,
+                    combined[:80],
+                )
+                return
             from backend.services.dispatcher import PRIORITY_USER
 
             current_message = (
@@ -773,6 +937,7 @@ class FullMirrorCCMBackend(CCMBackend):
                 priority=PRIORITY_USER,
                 source="retry",
                 current_message=current_message,
+                queue_admission_fence=retry_fence,
             )
             if isinstance(params.get("enabled_skills"), dict):
                 retry_kwargs["command_skills"] = dict(
@@ -786,7 +951,38 @@ class FullMirrorCCMBackend(CCMBackend):
                 retry_kwargs["queue_timestamp"] = params[
                     "queue_timestamp"
                 ]
-            await dispatcher.enqueue_message(**retry_kwargs)
+            retry_kwargs.update({
+                "initiating_user_id": params.get("initiating_user_id"),
+                "initiating_user_role": params.get(
+                    "initiating_user_role", "member"
+                ),
+                "execution_mode": params.get(
+                    "execution_mode", "sandbox"
+                ),
+                "execution_principal_kind": params.get(
+                    "execution_principal_kind", "system"
+                ),
+                "attachment_paths": tuple(
+                    params.get("attachment_paths") or ()
+                ),
+                "ssh_agent_socket_snapshot": params.get(
+                    "ssh_agent_socket_snapshot"
+                ),
+            })
+            admitted = await dispatcher.enqueue_message(**retry_kwargs)
+            if admitted is False:
+                logger.info(
+                    "Discarded stale PTY empty-reply retry for task %d after "
+                    "a queue clear",
+                    task_id,
+                )
+                return
+            params["_retried"] = True
+            logger.warning(
+                "Task %d got empty/non-response (%r), re-enqueued",
+                task_id,
+                combined[:80],
+            )
         except Exception:
             logger.exception(
                 "Empty-reply retry check failed for task %s", task_id
@@ -827,7 +1023,14 @@ class FullMirrorCCMBackend(CCMBackend):
         async def _full_autonomous_mirror(event, **ctx):
             nonlocal autonomous_generation, activity_handoff
             generation = None
+            completion_state = None
             event_data = event.to_dict()
+            # A retained follow-up may hand pre-echo child records back to
+            # this callback. They were marked ``orphan`` by Session only
+            # because the follow-up prompt had not echoed yet; once routed
+            # through the autonomous mirror they are authoritative child
+            # lifecycle events, not stale foreground backlog.
+            event_data.pop("orphan", None)
             event_data["autonomous"] = True
             background_tracker = _background_work_tracker(
                 session, create=True
@@ -895,6 +1098,13 @@ class FullMirrorCCMBackend(CCMBackend):
                         if generation is None:
                             return
                         autonomous_generation = generation
+                    state = im.pty_background_state_for(
+                        task_id,
+                        expected_session_id,
+                        generation,
+                    )
+                    if state is None:
+                        return
                     await im._process_event(
                         key,
                         task_id,
@@ -903,12 +1113,30 @@ class FullMirrorCCMBackend(CCMBackend):
                         detached_autonomous=True,
                         expected_session_id=expected_session_id,
                         expected_background_generation=generation,
+                        expected_task_retry_count=state.task_retry_count,
+                        expected_task_turn_generation=(
+                            state.task_turn_generation
+                        ),
                     )
-                    await im._finish_pty_autonomous_activity_locked(
+                    completion_state = await im._finish_pty_autonomous_activity_locked(
                         task_id,
                         expected_session_id,
                         generation,
                         event_data,
+                    )
+                # Owner cleanup is globally outer to the PTY transition lock.
+                # Mark the sentinel while serialized above, then take the
+                # durable Harness fence before clearing the background epoch.
+                if (
+                    completion_state is not None
+                    and getattr(completion_state, "task_id", None) == task_id
+                    and getattr(completion_state, "session_id", None)
+                    == expected_session_id
+                    and getattr(completion_state, "generation", None)
+                    == generation
+                ):
+                    await im._try_complete_pty_background_generation(
+                        completion_state
                     )
             except Exception:
                 logger.exception(

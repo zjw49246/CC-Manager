@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import {
   Bot, Menu, X, PanelLeftClose, PanelLeftOpen, LayoutDashboard, ListTodo, FolderGit2, KeyRound,
   FolderOpen, MessagesSquare, GitPullRequest, Server, Sparkles, Users, Globe,
-  ScrollText, Settings,
+  ScrollText, Settings, GitBranch,
 } from '../icons';
 import type { ComponentType } from 'react';
 import { api } from '../../api/client';
@@ -14,7 +14,6 @@ import { getThemeOption } from '../../config/theme';
 import { getNavIcon } from '../../config/iconSets';
 import { PoolDrawer } from './PoolDrawer';
 import { UpdateButton } from '../System/UpdateButton';
-import { PrefsMenu } from './PrefsMenu';
 
 interface AppShellProps {
   currentPage: string;
@@ -91,6 +90,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [hasWorker, setHasWorker] = useState(isAdmin);
   const [hasPlanActions, setHasPlanActions] = useState(false);
+  const [hasDeliveryActions, setHasDeliveryActions] = useState(false);
 
   const refreshWorkerStatus = useCallback(() => {
     if (!isAdmin) {
@@ -124,10 +124,24 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
   }, [refreshPlanAttention]);
   useWebSocket(['plans'], refreshPlanAttention);
 
+  const refreshDeliveryAttention = useCallback(() => {
+    void api.countDeliveryAttention()
+      .then((result) => setHasDeliveryActions(result.total > 0))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshDeliveryAttention();
+    const timer = window.setInterval(refreshDeliveryAttention, 30000);
+    return () => window.clearInterval(timer);
+  }, [refreshDeliveryAttention]);
+  useWebSocket(['deliveries'], refreshDeliveryAttention);
+
   const allPages: NavItem[] = [
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, show: isAdmin },
     { key: 'tasks', label: 'Tasks', icon: ListTodo, show: true },
     { key: 'plans', label: 'Plans', icon: ScrollText, show: true },
+    { key: 'delivery', label: 'Delivery', icon: GitBranch, show: true },
     { key: 'projects', label: 'Projects', icon: FolderGit2, show: true },
     // These pages expose Manager-host data rather than per-tenant resources.
     // Their backend routers are admin-only, so do not advertise dead links to
@@ -139,7 +153,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'workers', label: 'Workers', icon: Server, show: isAdmin || hasWorker },
     { key: 'skills', label: 'Skills', icon: Sparkles, show: true },
     { key: 'team', label: 'Team', icon: Users, show: true },
-    { key: 'settings', label: 'Settings', icon: Settings, show: isAdmin },
+    { key: 'settings', label: 'Settings', icon: Settings, show: true },
     ...(isCapacitor() ? [{ key: 'server', label: 'Server', icon: Globe, show: true }] : []),
   ];
   const pages = allPages.filter(p => p.show);
@@ -199,6 +213,12 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
                 <span
                   aria-label="Plans requiring action"
                   className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500 ring-2 ring-red-500/20"
+                />
+              )}
+              {p.key === 'delivery' && hasDeliveryActions && (
+                <span
+                  aria-label="Deliveries requiring action"
+                  className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-amber-400 ring-2 ring-amber-400/20"
                 />
               )}
             </span>
@@ -319,7 +339,6 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
               )}
               {isAdmin && <UpdateButton />}
               {isAdmin && <PoolDrawer />}
-              <PrefsMenu isAdmin={isAdmin} />
             </div>
           </div>
         </header>

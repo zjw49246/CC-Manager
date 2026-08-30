@@ -2,7 +2,7 @@
 import os
 import pytest
 from pathlib import Path
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 from backend.api.projects import _scan_env_files, _safe_resolve
 from fastapi import HTTPException
@@ -136,6 +136,71 @@ def test_safe_resolve_absolute_path_raises(tmp_path):
 
 
 # ── API: list env files ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("list", "get", "update", "scan"))
+async def test_env_file_effects_reject_stale_cached_admin_role(
+    session_factory,
+    tmp_path,
+    operation,
+):
+    """A concurrent demotion wins before any env secret filesystem effect."""
+
+    import backend.api.projects as projects_api
+    from backend.models.project import Project
+    from backend.models.user import User
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SECRET=unchanged\n")
+    async with session_factory() as db:
+        user = User(
+            email=f"stale-env-admin-{operation}@example.com",
+            name="stale env admin",
+            password_hash="test",
+            role="member",
+            is_active=True,
+        )
+        project = Project(
+            name=f"stale env project {operation}",
+            local_path=str(tmp_path),
+            status="ready",
+            env_files=[".env"],
+        )
+        db.add_all((user, project))
+        await db.commit()
+        await db.refresh(user)
+        await db.refresh(project)
+        user_id = user.id
+        project_id = project.id
+
+    request = MagicMock()
+    request.state.auth_type = "jwt"
+    request.state.user_id = user_id
+    request.state.user_role = "admin"
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as rejected:
+            if operation == "list":
+                await projects_api.list_env_files(project_id, request, db)
+            elif operation == "get":
+                await projects_api.get_env_file(
+                    project_id,
+                    ".env",
+                    request,
+                    db,
+                )
+            elif operation == "update":
+                await projects_api.update_env_file(
+                    project_id,
+                    ".env",
+                    projects_api.EnvFileContent(content="SECRET=changed\n"),
+                    request,
+                    db,
+                )
+            else:
+                await projects_api.scan_env_files(project_id, request, db)
+
+    assert rejected.value.status_code == 409
+    assert env_path.read_text() == "SECRET=unchanged\n"
 
 @pytest.mark.asyncio
 async def test_list_env_files_empty(client, mock_bg_tasks, session_factory, tmp_path):

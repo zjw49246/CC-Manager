@@ -31,8 +31,15 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
 )
 from backend.models.task import Task
+from backend.services.cancellation import settle_awaitable
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
+from backend.services.task_creation import (
+    stage_task_record,
+    system_task_execution_principal_values,
+)
 from backend.services.pr_review_actions import (
     FindingActionConflict,
+    PREffectAuthorizer,
     is_current_review_snapshot,
     lock_pr_repo_action_boundary,
 )
@@ -45,6 +52,9 @@ from backend.services.pr_review_service import (
     _gh_pr_view,
     _validated_pr_snapshot,
     verify_pr_review_snapshot_current,
+)
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
 )
 
 
@@ -433,6 +443,7 @@ async def _verify_current_snapshot(
                 "base_sha": review.base_sha,
                 "head_sha": review.head_sha,
             },
+            base_ref=review.base_ref,
         )
     except GhError as exc:
         # These messages are emitted only after a fully validated GitHub
@@ -466,6 +477,7 @@ async def _load_current_head_route(
     )
     current_ref = head.get("ref") if isinstance(head, dict) else None
     current_sha = head.get("sha") if isinstance(head, dict) else None
+    current_base_ref = base.get("ref") if isinstance(base, dict) else None
     current_base_sha = base.get("sha") if isinstance(base, dict) else None
     if (
         not isinstance(payload, dict)
@@ -488,11 +500,16 @@ async def _load_current_head_route(
     ):
         raise PRHeadDriftError("PR source repository no longer exists")
     if (
-        not isinstance(current_base_sha, str)
+        not isinstance(current_base_ref, str)
+        or not current_base_ref
+        or not isinstance(current_base_sha, str)
         or _GITHUB_SHA_RE.fullmatch(current_base_sha.lower()) is None
     ):
         raise GhError("GitHub PR base snapshot response is malformed")
-    if current_base_sha.lower() != review.base_sha.lower():
+    if (
+        current_base_ref != review.base_ref
+        or current_base_sha.lower() != review.base_sha.lower()
+    ):
         raise PRHeadDriftError("PR base snapshot changed")
     if (
         not isinstance(current_repo, str)
@@ -801,6 +818,7 @@ async def create_fix_task(
     repo_id: int,
     idempotency_key: str,
     actor_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Capture exact-head input and enqueue one isolated patch-generation Task."""
 
@@ -818,7 +836,9 @@ async def create_fix_task(
         # repo fence in a fresh transaction first so SQLite cannot attempt to
         # upgrade the idempotency read snapshot after a concurrent writer.
         await db.rollback()
-        await lock_pr_repo_action_boundary(db, repo_id)
+        locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, locked_repo)
         existing = (
             await db.execute(
                 select(PRFindingAction)
@@ -835,6 +855,23 @@ async def create_fix_task(
         if existing.finding_id != finding_id or existing.action_type != "ai_fix":
             await db.rollback()
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         existing_id = existing.id
         expired = await _expire_creation_reservation(db, existing)
         if expired:
@@ -860,6 +897,8 @@ async def create_fix_task(
     # fails to upgrade.
     await db.rollback()
     repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        await effect_authorizer(db, repo)
     # A concurrent request may have committed this idempotency key between
     # the optimistic probe and our writer fence.  Resolve that winner before
     # interpreting its active slot as an unrelated repair conflict.
@@ -876,6 +915,23 @@ async def create_fix_task(
             or fenced_existing.action_type != "ai_fix"
         ):
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         return fenced_existing
     review = (
         await db.execute(
@@ -905,6 +961,10 @@ async def create_fix_task(
         finding_id=finding_id,
     ):
         raise FindingActionConflict("Finding is not available for AI repair")
+    if await legacy_pr_effect_is_forbidden(db, review=review):
+        raise FindingActionConflict(
+            "Delivery-owned PR findings cannot use legacy AI repair"
+        )
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"
@@ -935,6 +995,8 @@ async def create_fix_task(
         # CAS must not let this creator continue after its fence was released.
         await db.rollback()
         repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, repo)
         review = (
             await db.execute(
                 select(PRReview)
@@ -970,6 +1032,10 @@ async def create_fix_task(
         ):
             raise FindingActionConflict(
                 "Finding is no longer available for AI repair"
+            )
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
             )
     active_action = (
         await db.execute(
@@ -1084,19 +1150,17 @@ async def create_fix_task(
         )
     except BaseException as exc:
         message = str(exc) or f"PR fix capture interrupted by {type(exc).__name__}"
-        cleanup = asyncio.create_task(_abort_creation_reservation(
-            db,
-            repo_id=repo_id,
-            action_id=reserved_action_id,
-            finding_id=finding_id,
-            reservation_token=reservation_token,
-            error=message,
-        ))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
-            raise
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _abort_creation_reservation(
+                db,
+                repo_id=repo_id,
+                action_id=reserved_action_id,
+                finding_id=finding_id,
+                reservation_token=reservation_token,
+                error=message,
+            )
+        )
+        cleanup.result()
         raise
 
     # Network capture and reservation-expiry recovery may have committed and
@@ -1105,6 +1169,25 @@ async def create_fix_task(
     # before creating the Task.
     await db.rollback()
     locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        try:
+            await effect_authorizer(db, locked_repo)
+        except BaseException as exc:
+            cleanup, _cleanup_cancel = await settle_awaitable(
+                _abort_creation_reservation(
+                    db,
+                    repo_id=repo_id,
+                    action_id=reserved_action_id,
+                    finding_id=finding_id,
+                    reservation_token=reservation_token,
+                    error=(
+                        "PR fix authorization was revoked before Task creation: "
+                        f"{exc}"
+                    ),
+                )
+            )
+            cleanup.result()
+            raise
     locked_review = (
         await db.execute(
             select(PRReview)
@@ -1186,7 +1269,8 @@ async def create_fix_task(
 
         model = app_settings.default_codex_model
     try:
-        task = Task(
+        task = await stage_task_record(
+            db,
             title=(
                 f"PR Fix: {repo.repo_full_name}#{review.pr_number} / "
                 f"{finding.title}"
@@ -1204,9 +1288,8 @@ async def create_fix_task(
             effort_level=repo.review_effort,
             project_id=await _get_or_create_pr_monitor_project(db),
             worker_id=repo.worker_id,
+            **system_task_execution_principal_values(),
         )
-        db.add(task)
-        await db.flush()
         action_result = dict(action.result or {})
         action_result.update({
             "head_repo_full_name": source_repo,
@@ -1233,20 +1316,19 @@ async def create_fix_task(
             raise FindingActionConflict("PR fix Task creation ownership changed")
         await db.commit()
     except BaseException as exc:
-        await db.rollback()
-        cleanup = asyncio.create_task(_abort_creation_reservation(
-            db,
-            repo_id=repo_id,
-            action_id=reserved_action_id,
-            finding_id=finding_id,
-            reservation_token=reservation_token,
-            error=f"PR fix Task creation failed: {exc}",
-        ))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
-            raise
+        rollback, _rollback_cancel = await settle_awaitable(db.rollback())
+        rollback.result()
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _abort_creation_reservation(
+                db,
+                repo_id=repo_id,
+                action_id=reserved_action_id,
+                finding_id=finding_id,
+                reservation_token=reservation_token,
+                error=f"PR fix Task creation failed: {exc}",
+            )
+        )
+        cleanup.result()
         raise
     await db.refresh(action)
     try:
@@ -1277,7 +1359,7 @@ async def _run_git(
 ) -> tuple[bytes, bytes]:
     """Run bounded git argv with cancellation-safe process-group cleanup."""
 
-    spawn = asyncio.create_task(
+    spawn, delayed_cancel = await settle_awaitable(
         asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -1289,17 +1371,12 @@ async def _run_git(
             env=env,
         )
     )
-    delayed_cancel: asyncio.CancelledError | None = None
-    while not spawn.done():
-        try:
-            await asyncio.shield(spawn)
-        except asyncio.CancelledError as exc:
-            delayed_cancel = exc
-        except BaseException:
-            break
     process = spawn.result()
     if delayed_cancel is not None:
-        await asyncio.shield(_stop_git_process(process))
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _stop_git_process(process)
+        )
+        cleanup.result()
         raise delayed_cancel
 
     communicate = asyncio.create_task(process.communicate(input_bytes))
@@ -1309,10 +1386,16 @@ async def _run_git(
             timeout=timeout,
         )
     except BaseException:
-        await asyncio.shield(_stop_git_process(process))
-        if not communicate.done():
-            communicate.cancel()
-        await asyncio.gather(communicate, return_exceptions=True)
+        async def cleanup_failed_communication() -> None:
+            await _stop_git_process(process)
+            if not communicate.done():
+                communicate.cancel()
+            await asyncio.gather(communicate, return_exceptions=True)
+
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            cleanup_failed_communication()
+        )
+        cleanup.result()
         raise
     if len(stdout) + len(stderr) > 1024 * 1024:
         raise error_type("git validation output exceeds 1 MiB")
@@ -1477,12 +1560,14 @@ async def _read_patch_terminal_output(
     task: Task,
     retry_count: int,
     allowed_files: set[str],
+    expected_background_generation: str | None = None,
 ) -> str:
     if (
         task.status != "completed"
         or task.retry_count != retry_count
         or task.started_at is None
-        or task.pty_background_generation is not None
+        or task.pty_background_generation
+        != expected_background_generation
     ):
         raise PatchProtocolError("PR fix Task generation is not terminal")
     result = await db.execute(
@@ -1954,23 +2039,110 @@ async def _commit_task_transition(
     *,
     action: PRFindingAction,
     finding: PRFinding,
+    task: Task,
     action_values: dict,
     finding_status: str,
+    expected_background_generation: str | None = None,
 ) -> bool:
     """Commit a model-Task terminal state only while no push owner exists."""
 
+    task_identity = {
+        "id": task.id,
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "turn_source_log_id": task.turn_source_log_id,
+        "worker_id": task.worker_id,
+        "instance_id": task.instance_id,
+        "session_id": task.session_id,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+    action_identity = {
+        "id": action.id,
+        "task_id": action.task_id,
+    }
     values = dict(action_values)
     values["updated_at"] = datetime.utcnow()
     if values.get("status") not in {
         "pending", "running", "awaiting_confirmation", "cancelling",
     }:
         values["active_fix_finding_id"] = None
+    # Patch parsing and GitHub validation may span a SQLite WAL read snapshot.
+    # Make the Task proof the first statement of a fresh writer transaction so
+    # a concurrently committed receipt becomes a clean CAS miss, never a
+    # SQLITE_BUSY_SNAPSHOT upgrade failure.
+    await db.rollback()
+    from backend.services.worker_node_control import (
+        fence_worker_node_mutation,
+    )
+
+    await fence_worker_node_mutation(db)
+    task_guard = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task_identity["id"],
+            (
+                Task.incarnation_id.is_(None)
+                if task_identity["incarnation_id"] is None
+                else Task.incarnation_id == task_identity["incarnation_id"]
+            ),
+            Task.status == task_identity["status"],
+            Task.retry_count == task_identity["retry_count"],
+            Task.turn_generation == task_identity["turn_generation"],
+            (
+                Task.turn_source_log_id.is_(None)
+                if task_identity["turn_source_log_id"] is None
+                else Task.turn_source_log_id
+                == task_identity["turn_source_log_id"]
+            ),
+            (
+                Task.worker_id.is_(None)
+                if task_identity["worker_id"] is None
+                else Task.worker_id == task_identity["worker_id"]
+            ),
+            (
+                Task.instance_id.is_(None)
+                if task_identity["instance_id"] is None
+                else Task.instance_id == task_identity["instance_id"]
+            ),
+            (
+                Task.session_id.is_(None)
+                if task_identity["session_id"] is None
+                else Task.session_id == task_identity["session_id"]
+            ),
+            (
+                Task.started_at.is_(None)
+                if task_identity["started_at"] is None
+                else Task.started_at == task_identity["started_at"]
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task_identity["completed_at"] is None
+                else Task.completed_at == task_identity["completed_at"]
+            ),
+            (
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            ),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        await db.rollback()
+        return False
+
     changed = await db.execute(
         update(PRFindingAction)
         .where(
-            PRFindingAction.id == action.id,
+            PRFindingAction.id == action_identity["id"],
             PRFindingAction.status == "running",
-            PRFindingAction.task_id == action.task_id,
+            PRFindingAction.task_id == action_identity["task_id"],
             PRFindingAction.operation_token.is_(None),
             PRFindingAction.confirmed_at.is_(None),
         )
@@ -1989,6 +2161,7 @@ async def handle_fix_task_completion(
     action_id: int,
     task_id: int,
     retry_count: int,
+    expected_background_generation: str | None = None,
 ) -> None:
     """Validate one exact fix Task generation and stage its canonical diff."""
 
@@ -2037,12 +2210,16 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": "PR fix action state is invalid",
                 "completed_at": datetime.utcnow(),
             },
             finding_status="failed",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     try:
@@ -2051,6 +2228,9 @@ async def handle_fix_task_completion(
             task=task,
             retry_count=retry_count,
             allowed_files=set(allowed),
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         await _verify_current_snapshot(repo, review)
         await _validate_patch_applies(
@@ -2060,36 +2240,39 @@ async def handle_fix_task_completion(
             allowed_files=set(allowed),
         )
     except (GitInfrastructureError, GhError) as exc:
-        now = await _database_now(db)
-        await db.execute(
-            update(PRFindingAction)
-            .where(
-                PRFindingAction.id == action.id,
-                PRFindingAction.status == "running",
-                PRFindingAction.confirmed_at.is_(None),
-                PRFindingAction.operation_token.is_(None),
-            )
-            .values(
-                error_message=(
+        await _commit_task_transition(
+            db,
+            action=action,
+            finding=finding,
+            task=task,
+            action_values={
+                "status": "running",
+                "error_message": (
                     "PR fix validation infrastructure is unavailable; "
                     "recovery will retry: " + str(exc)
                 )[:2000],
-                updated_at=now,
-            )
+            },
+            finding_status="open",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
-        await db.commit()
         return
     except PRHeadDriftError as exc:
         await _commit_task_transition(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "stale",
                 "error_message": str(exc)[:2000],
                 "completed_at": datetime.utcnow(),
             },
             finding_status="stale",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     except PatchProtocolError as exc:
@@ -2097,12 +2280,16 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": str(exc)[:2000],
                 "completed_at": datetime.utcnow(),
             },
             finding_status="failed",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
@@ -2123,6 +2310,7 @@ async def handle_fix_task_completion(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "result": result_data,
             "patch_sha256": patch_sha256,
@@ -2130,6 +2318,7 @@ async def handle_fix_task_completion(
             "error_message": None,
         },
         finding_status="diff_ready",
+        expected_background_generation=expected_background_generation,
     )
 
 
@@ -2169,6 +2358,7 @@ async def handle_fix_task_failure(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "status": "failed",
             "error_message": (
@@ -2188,6 +2378,7 @@ async def confirm_fix(
     patch_sha256: str,
     download_receipt: str,
     confirmed_by_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Confirm, exact-head CAS push, and verify one SHA/patch-bound repair."""
 
@@ -2200,6 +2391,10 @@ async def confirm_fix(
         repo = await db.get(MonitoredRepo, review.repo_id) if review else None
         if finding is None or review is None or repo is None:
             raise FixConfirmationError("PR fix action is not available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             return action
         recovering_push = (
@@ -2215,6 +2410,8 @@ async def confirm_fix(
         repo_id = repo.id
         await db.rollback()
         repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, repo)
         action = await db.get(PRFindingAction, action_id, populate_existing=True)
         finding = (
             await db.get(PRFinding, action.finding_id, populate_existing=True)
@@ -2234,6 +2431,11 @@ async def confirm_fix(
         ):
             await db.rollback()
             raise FixConfirmationError("PR fix action is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            await db.rollback()
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             await db.rollback()
             completed = await db.get(
@@ -2653,6 +2855,7 @@ async def _finish_cancelled_fix_action(
                 task_id,
                 db,
                 reason="PR finding fix action cancelled",
+                allow_delivery_effect_stop=True,
             )
         except TaskTerminationConflict as exc:
             raise FixConfirmationError(
@@ -2717,6 +2920,7 @@ async def cancel_fix_action(
     *,
     action_id: int,
     cancelled_by_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Durably cancel an unconfirmed AI-fix action and its exact Task."""
 
@@ -2734,7 +2938,9 @@ async def cancel_fix_action(
             raise FixConfirmationError("PR fix action is not available")
         repo_id = review.repo_id
         await db.rollback()
-        await lock_pr_repo_action_boundary(db, repo_id)
+        locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, locked_repo)
         action = await db.get(PRFindingAction, action_id, populate_existing=True)
         if action is None or action.action_type != "ai_fix":
             raise FixConfirmationError("PR fix action is not available")
@@ -2837,8 +3043,36 @@ async def reconcile_finding_action(
     action_id: int,
     *,
     worker_relay=None,
+    operation_lock_held: bool = False,
 ) -> bool:
     """Converge one incomplete model, cancellation, or push generation."""
+
+    if not operation_lock_held:
+        async with db_factory() as discovery_db:
+            discovery = await discovery_db.get(
+                PRFindingAction,
+                action_id,
+                populate_existing=True,
+            )
+            lock_task_id = (
+                discovery.task_id
+                if discovery is not None
+                and discovery.action_type == "ai_fix"
+                and discovery.status == "running"
+                and discovery.confirmed_at is None
+                and type(discovery.task_id) is int
+                else None
+            )
+        if lock_task_id is not None:
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(lock_task_id):
+                return await reconcile_finding_action(
+                    db_factory,
+                    action_id,
+                    worker_relay=worker_relay,
+                    operation_lock_held=True,
+                )
 
     async with db_factory() as db:
         action = await db.get(PRFindingAction, action_id, populate_existing=True)

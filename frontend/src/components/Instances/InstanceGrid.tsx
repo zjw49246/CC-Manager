@@ -71,13 +71,20 @@ export function InstanceGrid({ instances, onRefresh, onViewLogs }: InstanceGridP
       setActionError('Instance has no current task owner; refresh before stopping.');
       return;
     }
+    if (instance.current_task_turn_generation == null) {
+      setActionError('Instance task turn cannot be verified; refresh before stopping.');
+      return;
+    }
+    const expectedTaskId = instance.current_task_id;
+    const expectedTaskTurnGeneration = instance.current_task_turn_generation;
     if (!window.confirm(
       `Stop instance "${instance.name}"? Its current task will be interrupted and returned to the queue when safe.`,
     )) return;
     await runAction(`stop:${instance.id}`, async () => {
       await api.stopInstance(
         instance.id,
-        instance.current_task_id!,
+        expectedTaskId,
+        expectedTaskTurnGeneration,
         instance.pid,
         instance.started_at,
       );
@@ -202,7 +209,7 @@ export function InstanceGrid({ instances, onRefresh, onViewLogs }: InstanceGridP
               {inst.status === 'running' && (
                 <button
                   onClick={() => handleStop(inst)}
-                  disabled={pendingAction !== null || !inst.current_task_id}
+                  disabled={pendingAction !== null || !inst.current_task_id || inst.current_task_turn_generation == null}
                   className="p-1 text-gray-400 hover:text-yellow-400 disabled:opacity-40 disabled:cursor-not-allowed"
                   title="Stop current task"
                   aria-label={`Stop ${inst.name}`}

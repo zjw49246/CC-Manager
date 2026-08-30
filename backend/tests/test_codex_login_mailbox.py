@@ -705,6 +705,98 @@ async def test_backend_rejects_invalid_or_stale_otp_without_writing_stdin():
     assert stdin.writes == []
 
 
+async def test_backend_closes_otp_gate_before_awaiting_stdin_ack():
+    attempt_id = "attempt-concurrent-otp"
+    challenge_id = "challenge-concurrent-otp"
+    email = "concurrent@example.com"
+    drain_entered = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    class BlockingStdin(_OtpStdin):
+        async def drain(self):
+            drain_entered.set()
+            await release_drain.wait()
+
+    stdin = BlockingStdin()
+    proc = SimpleNamespace(returncode=None, stdin=stdin)
+    codex_pool_api._add_state.clear()
+    codex_pool_api._login_attempts.clear()
+    codex_pool_api._add_state[email] = {
+        "status": "awaiting_otp",
+        "attempt_id": attempt_id,
+    }
+    codex_pool_api._login_attempts[attempt_id] = {
+        "kind": "add",
+        "state_key": email,
+        "proc": proc,
+        "challenge_id": challenge_id,
+        "expires_at": codex_pool_api.time.time() + 60,
+    }
+    request = codex_pool_api.SubmitCodexOtpRequest(
+        challenge_id=challenge_id,
+        code="123456",
+    )
+    first = asyncio.create_task(
+        codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, request,
+        )
+    )
+    await asyncio.wait_for(drain_entered.wait(), timeout=1)
+
+    with pytest.raises(HTTPException) as duplicate:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, request,
+        )
+    assert duplicate.value.status_code == 409
+    assert codex_pool_api._add_state[email]["status"] == "verifying_otp"
+
+    release_drain.set()
+    assert await first == {"ok": True, "status": "verifying_otp"}
+    assert len(stdin.writes) == 1
+
+
+async def test_backend_does_not_reopen_otp_gate_after_ambiguous_pipe_failure():
+    attempt_id = "attempt-uncertain-otp"
+    challenge_id = "challenge-uncertain-otp"
+    email = "uncertain@example.com"
+
+    class FailingStdin(_OtpStdin):
+        async def drain(self):
+            raise ConnectionError("ack lost")
+
+    stdin = FailingStdin()
+    codex_pool_api._add_state.clear()
+    codex_pool_api._login_attempts.clear()
+    codex_pool_api._add_state[email] = {
+        "status": "awaiting_otp",
+        "attempt_id": attempt_id,
+    }
+    codex_pool_api._login_attempts[attempt_id] = {
+        "kind": "add",
+        "state_key": email,
+        "proc": SimpleNamespace(returncode=None, stdin=stdin),
+        "challenge_id": challenge_id,
+        "expires_at": codex_pool_api.time.time() + 60,
+    }
+    body = codex_pool_api.SubmitCodexOtpRequest(
+        challenge_id=challenge_id,
+        code="123456",
+    )
+
+    with pytest.raises(HTTPException) as uncertain:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, body,
+        )
+    assert uncertain.value.status_code == 409
+    assert codex_pool_api._add_state[email]["status"] == "verifying_otp"
+    with pytest.raises(HTTPException) as replay:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, body,
+        )
+    assert replay.value.status_code == 409
+    assert len(stdin.writes) == 1
+
+
 def test_login_detail_redacts_oauth_authorize_url():
     detail = codex_pool_api._sanitize_login_detail(
         "open https://auth.openai.com/oauth/authorize?client_id=secret&state=private now"
@@ -1298,6 +1390,57 @@ async def test_stop_unfinished_login_rejects_unsafe_group_without_signal(
     killpg.assert_not_called()
     proc.kill.assert_not_called()
     proc.wait.assert_not_awaited()
+
+
+async def test_stop_unfinished_login_does_not_spin_under_anyio_cancellation(
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    wait_started = asyncio.Event()
+    allow_exit = asyncio.Event()
+    wait_calls = 0
+    real_wait = asyncio.wait
+    proc = SimpleNamespace(pid=54_344, returncode=None, kill=Mock())
+
+    async def delayed_wait():
+        wait_started.set()
+        await allow_exit.wait()
+        proc.returncode = -9
+        return -9
+
+    async def counting_wait(*args, **kwargs):
+        nonlocal wait_calls
+        if kwargs.get("timeout") is not None:
+            wait_calls += 1
+        return await real_wait(*args, **kwargs)
+
+    proc.wait = AsyncMock(side_effect=delayed_wait)
+    monkeypatch.setattr(codex_pool_api.os, "killpg", Mock())
+    monkeypatch.setattr(codex_pool_api.asyncio, "wait", counting_wait)
+
+    async def release_process():
+        await wait_started.wait()
+        await asyncio.sleep(0)
+        allow_exit.set()
+
+    releaser = asyncio.create_task(release_process())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            result = await codex_pool_api._stop_unfinished_login_process(
+                proc,
+                operation="AnyIO cancellation regression",
+            )
+        await releaser
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+
+    assert result is True
+    assert proc.returncode == -9
+    assert wait_calls == 1
 
 
 @pytest.mark.parametrize("watcher_kind", ["add", "relogin"])

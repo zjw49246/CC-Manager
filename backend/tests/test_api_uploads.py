@@ -1,5 +1,11 @@
 """Tests for image upload API endpoints."""
+import asyncio
 import io
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import pytest
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -298,6 +304,182 @@ async def test_multi_upload_total_limit_is_atomic(client, tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_upload_global_quota_counts_existing_files_and_is_atomic(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    """Existing storage plus the whole request must fit before any write."""
+
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_bytes", 6)
+    existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"1234")
+
+    response = await client.post(
+        "/api/uploads",
+        files=[
+            ("files", _file_tuple("first.txt", b"a", "text/plain")),
+            ("files", _file_tuple("second.txt", b"bc", "text/plain")),
+        ],
+    )
+
+    assert response.status_code == 507
+    assert response.json() == {"detail": "Upload storage quota exceeded"}
+    assert existing.read_bytes() == b"1234"
+    assert list(tmp_path.iterdir()) == [existing]
+
+
+@pytest.mark.asyncio
+async def test_upload_global_quota_allows_exact_boundary(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_bytes", 6)
+    existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"1234")
+
+    response = await client.post(
+        "/api/uploads",
+        files=[("files", _file_tuple("fits.txt", b"ab", "text/plain"))],
+    )
+
+    assert response.status_code == 200, response.text
+    saved = tmp_path / response.json()[0]["path"].rsplit("/", 1)[-1]
+    assert saved.read_bytes() == b"ab"
+    assert sum(path.stat().st_size for path in tmp_path.iterdir()) == 6
+
+
+@pytest.mark.asyncio
+async def test_upload_global_file_quota_rejects_zero_byte_batch(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_bytes", 100)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_files", 1)
+
+    response = await client.post(
+        "/api/uploads",
+        files=[
+            ("files", _file_tuple("empty-a.txt", b"", "text/plain")),
+            ("files", _file_tuple("empty-b.txt", b"", "text/plain")),
+        ],
+    )
+
+    assert response.status_code == 507
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_concurrent_uploads_share_one_atomic_global_quota(
+    tmp_path,
+    monkeypatch,
+):
+    """Two threads cannot both consume the same remaining capacity."""
+
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_bytes", 6)
+    ready = threading.Barrier(2)
+    probe_lock = threading.Lock()
+    active_scans = 0
+    max_active_scans = 0
+    real_storage_usage = uploads_mod._upload_storage_usage_locked
+
+    def tracked_storage_usage(upload_dir):
+        nonlocal active_scans, max_active_scans
+        with probe_lock:
+            active_scans += 1
+            max_active_scans = max(max_active_scans, active_scans)
+        try:
+            # If quota scan/write were outside the shared lock, both threads
+            # would observe the empty directory during this overlap window.
+            time.sleep(0.05)
+            return real_storage_usage(upload_dir)
+        finally:
+            with probe_lock:
+                active_scans -= 1
+
+    monkeypatch.setattr(
+        uploads_mod,
+        "_upload_storage_usage_locked",
+        tracked_storage_usage,
+    )
+
+    class FakeUpload:
+        def __init__(self, filename: str):
+            self.filename = filename
+
+        async def read(self, _size: int) -> bytes:
+            ready.wait(timeout=5)
+            return b"1234"
+
+    def upload(name: str) -> int:
+        try:
+            asyncio.run(uploads_mod.upload_files([FakeUpload(name)]))
+        except uploads_mod.HTTPException as exc:
+            return exc.status_code
+        return 200
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(executor.map(upload, ("one.txt", "two.txt")))
+
+    assert sorted(statuses) == [200, 507]
+    assert max_active_scans == 1
+    saved = list(tmp_path.iterdir())
+    assert len(saved) == 1
+    assert saved[0].read_bytes() == b"1234"
+
+
+def test_upload_write_failure_removes_partial_file(tmp_path, monkeypatch):
+    import backend.api.uploads as uploads_mod
+
+    monkeypatch.setattr(uploads_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(uploads_mod.settings, "upload_max_total_bytes", 100)
+    real_open = Path.open
+
+    class FailingDestination:
+        def __init__(self, path: Path):
+            self._handle = real_open(path, "xb")
+
+        def __enter__(self):
+            return self
+
+        def write(self, data: bytes):
+            self._handle.write(data[:1])
+            self._handle.flush()
+            raise OSError("simulated partial write")
+
+        def __exit__(self, *_args):
+            self._handle.close()
+
+    def failing_open(path: Path, mode="r", *args, **kwargs):
+        if path.parent == tmp_path and mode == "xb":
+            return FailingDestination(path)
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    with pytest.raises(OSError, match="simulated partial write"):
+        uploads_mod._commit_uploaded_files(
+            [("partial.txt", ".txt", b"payload", "a" * 32, f"{'a' * 32}.txt")],
+            len(b"payload"),
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_upload_saves_file_to_disk(client, tmp_path, monkeypatch):
     """Uploaded file actually exists on disk after upload."""
     import backend.api.uploads as uploads_mod
@@ -310,7 +492,6 @@ async def test_upload_saves_file_to_disk(client, tmp_path, monkeypatch):
     )
     assert resp.status_code == 200
     path = resp.json()[0]["path"]
-    from pathlib import Path
     assert Path(path).exists()
     assert Path(path).read_bytes() == data
 

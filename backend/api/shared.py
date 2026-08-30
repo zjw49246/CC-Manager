@@ -44,10 +44,12 @@ async def receive_share(payload: ReceiveSharePayload, db: AsyncSession = Depends
     from backend.models.task import Task
 
     result = await db.execute(
-        select(SharedTaskReceived).where(
+        select(SharedTaskReceived)
+        .where(
             SharedTaskReceived.owner_ccm_url == payload.owner_ccm_url,
             SharedTaskReceived.remote_task_id == payload.remote_task_id,
         )
+        .with_for_update()
     )
     existing = result.scalar_one_or_none()
     if existing:
@@ -58,14 +60,43 @@ async def receive_share(payload: ReceiveSharePayload, db: AsyncSession = Depends
         existing.owner_name = payload.owner_name
         existing.owner_feishu_open_id = payload.owner_feishu_open_id
         existing.status = "active"
+
+        # ``local_task_id`` is only a hint until the Task proves the reverse
+        # owner.  Repair legacy/deleted shadows instead of attaching a relay to
+        # an unrelated Task that happens to have the same integer id.
+        shadow = None
+        if existing.local_task_id is not None:
+            shadow = (
+                await db.execute(
+                    select(Task).where(
+                        Task.id == existing.local_task_id,
+                        Task.shared_from_id == existing.id,
+                    )
+                )
+            ).scalar_one_or_none()
+        if shadow is None:
+            from backend.services.task_creation import stage_task_record
+
+            shadow = await stage_task_record(
+                db,
+                title=payload.task_title or "",
+                description=payload.task_description,
+                status="pending",
+                shared_from_id=existing.id,
+            )
+            existing.local_task_id = shadow.id
         await db.commit()
         await db.refresh(existing)
-        # Start relay if shadow task exists
+        # Replace any connection carrying the previous token before the new
+        # detached identity is allowed to write.
         if existing.local_task_id:
             try:
                 from backend.main import shared_relay
                 if shared_relay:
-                    await shared_relay.start_relay(existing)
+                    await shared_relay.stop_relay(existing.id)
+                    asyncio.create_task(
+                        _start_relay_and_backfill(shared_relay, existing)
+                    )
             except Exception:
                 pass
         return {"ok": True}
@@ -75,15 +106,17 @@ async def receive_share(payload: ReceiveSharePayload, db: AsyncSession = Depends
     db.add(shared)
     await db.flush()
 
-    # Create shadow task
-    shadow = Task(
+    # Create the shadow through the canonical boundary so a reused SQLite id
+    # cannot inherit stale TaskShare/TeamTaskShare authority.
+    from backend.services.task_creation import stage_task_record
+
+    shadow = await stage_task_record(
+        db,
         title=payload.task_title or "",
         description=payload.task_description,
         status="pending",
         shared_from_id=shared.id,
     )
-    db.add(shadow)
-    await db.flush()
     shared.local_task_id = shadow.id
     await db.commit()
     await db.refresh(shared)
@@ -107,9 +140,11 @@ async def _start_relay_and_backfill(relay, shared: SharedTaskReceived):
         from backend.database import async_session
         config = await proxy_config(shared.owner_ccm_url, shared.remote_task_id, shared.share_token)
         async with async_session() as db:
-            from backend.models.task import Task
-            shadow = await db.get(Task, shared.local_task_id)
-            if shadow and config:
+            from backend.services.shared_shadow import lock_owned_shadow
+
+            owned = await lock_owned_shadow(db, shared)
+            if owned is not None and config:
+                _, shadow = owned
                 shadow.status = config.get("status", "pending")
                 shadow.title = config.get("title") or shadow.title
                 shadow.description = config.get("description") or shadow.description
@@ -230,13 +265,28 @@ async def _cleanup_shared(record: SharedTaskReceived, db: AsyncSession):
             await shared_relay.stop_relay(record.id)
     except Exception:
         pass
-    if record.local_task_id:
-        from backend.models.task import Task
-        shadow = await db.get(Task, record.local_task_id)
-        if shadow:
+    from backend.models.task import Task
+    from backend.services.shared_shadow import lock_shared_record
+
+    current = await lock_shared_record(db, record, require_active=False)
+    if current is None:
+        await db.rollback()
+        return
+    if current.local_task_id:
+        shadow = (
+            await db.execute(
+                select(Task)
+                .where(
+                    Task.id == current.local_task_id,
+                    Task.shared_from_id == current.id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if shadow is not None:
             shadow.status = "cancelled"
             shadow.error_message = "Share revoked"
-    await db.delete(record)
+    await db.delete(current)
     await db.commit()
 
 

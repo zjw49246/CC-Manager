@@ -5,6 +5,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import logging
 import sys
 
@@ -412,7 +413,11 @@ async def ccm_enable_skill(skill_name: str) -> str:
             if skills.get(skill_name):
                 return json.dumps({"success": True, "message": f"{skill_name} 已经是启用状态"}, ensure_ascii=False)
             skills[skill_name] = True
-            resp = await client.put(_api_url(""), headers=_headers(), json={"enabled_skills": skills})
+            resp = await client.put(
+                _api_url("/internal/enabled-skills"),
+                headers=_headers(),
+                json={"enabled_skills": skills},
+            )
             resp.raise_for_status()
             return json.dumps({"success": True, "message": f"已启用 {skill_name}"}, ensure_ascii=False)
     except Exception as e:
@@ -439,7 +444,11 @@ async def ccm_disable_skill(skill_name: str) -> str:
             if not skills.get(skill_name):
                 return json.dumps({"success": True, "message": f"{skill_name} 已经是禁用状态"}, ensure_ascii=False)
             skills.pop(skill_name, None)
-            resp = await client.put(_api_url(""), headers=_headers(), json={"enabled_skills": skills})
+            resp = await client.put(
+                _api_url("/internal/enabled-skills"),
+                headers=_headers(),
+                json={"enabled_skills": skills},
+            )
             resp.raise_for_status()
             return json.dumps({"success": True, "message": f"已禁用 {skill_name}"}, ensure_ascii=False)
     except Exception as e:
@@ -655,6 +664,6 @@ if __name__ == "__main__":
 
     _TASK_ID = args.task_id
     _API_BASE = args.api_base
-    _AUTH_TOKEN = args.auth_token
+    _AUTH_TOKEN = os.environ.get("CCM_INTERNAL_SERVICE_TOKEN", "") or args.auth_token
 
     mcp.run(transport="stdio")

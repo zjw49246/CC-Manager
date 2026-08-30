@@ -23,6 +23,9 @@ function instance(overrides: Partial<Instance> = {}): Instance {
     pid: null,
     status: 'idle',
     current_task_id: null,
+    current_task_retry_count: null,
+    current_task_turn_generation: null,
+    current_plan_run_id: null,
     worktree_path: null,
     provider: 'codex',
     model: 'gpt-5.6-sol',
@@ -82,7 +85,10 @@ describe('InstanceGrid safety controls', () => {
     const user = userEvent.setup();
     render(
       <InstanceGrid
-        instances={[instance({ status: 'running', pid: 123, current_task_id: 9 })]}
+        instances={[instance({
+          status: 'running', pid: 123, current_task_id: 9,
+          current_task_retry_count: 2, current_task_turn_generation: 7,
+        })]}
         onRefresh={vi.fn()}
         onViewLogs={vi.fn()}
       />,
@@ -129,7 +135,10 @@ describe('InstanceGrid safety controls', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     render(
       <InstanceGrid
-        instances={[instance({ status: 'running', pid: 123, current_task_id: 9 })]}
+        instances={[instance({
+          status: 'running', pid: 123, current_task_id: 9,
+          current_task_retry_count: 2, current_task_turn_generation: 7,
+        })]}
         onRefresh={vi.fn()}
         onViewLogs={vi.fn()}
       />,
@@ -144,7 +153,10 @@ describe('InstanceGrid safety controls', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(
       <InstanceGrid
-        instances={[instance({ status: 'running', pid: 123, current_task_id: 9 })]}
+        instances={[instance({
+          status: 'running', pid: 123, current_task_id: 9,
+          current_task_retry_count: 2, current_task_turn_generation: 7,
+        })]}
         onRefresh={vi.fn()}
         onViewLogs={vi.fn()}
       />,
@@ -152,8 +164,29 @@ describe('InstanceGrid safety controls', () => {
 
     await user.click(screen.getByRole('button', { name: 'Stop worker-1' }));
     await waitFor(() =>
-      expect(apiMock.stopInstance).toHaveBeenCalledWith(1, 9, 123, null),
+      expect(apiMock.stopInstance).toHaveBeenCalledWith(1, 9, 7, 123, null),
     );
+  });
+
+  it('fails closed when the current task turn observation is unavailable', async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    render(
+      <InstanceGrid
+        instances={[instance({
+          status: 'running', pid: 123, current_task_id: 9,
+          current_task_retry_count: 2, current_task_turn_generation: null,
+        })]}
+        onRefresh={vi.fn()}
+        onViewLogs={vi.fn()}
+      />,
+    );
+
+    const stop = screen.getByRole('button', { name: 'Stop worker-1' });
+    expect(stop).toBeDisabled();
+    await user.click(stop);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(apiMock.stopInstance).not.toHaveBeenCalled();
   });
 
   it('reuses the first free default worker name instead of the array length', async () => {

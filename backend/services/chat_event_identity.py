@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.models.log_entry import LogEntry
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 
 
 def _utc_isoformat(value: datetime) -> str:
@@ -22,6 +23,8 @@ def _utc_isoformat(value: datetime) -> str:
 def persisted_chat_event(
     entry: LogEntry,
     payload: Mapping[str, Any],
+    *,
+    provider: object = "claude",
 ) -> dict[str, Any]:
     """Attach the local committed LogEntry identity to a WS payload.
 
@@ -35,8 +38,22 @@ def persisted_chat_event(
             "Persisted chat events require a flushed LogEntry id, task_id, "
             "and timestamp"
         )
+    normalized_payload = dict(payload)
+    anomaly = detect_assistant_protocol_anomaly(
+        entry.event_type,
+        entry.role,
+        entry.content,
+        provider=provider,
+    )
+    if anomaly:
+        # The marker is derived from the committed local row.  A remote relay
+        # may omit it or provide an arbitrary value, but neither can override
+        # this canonical result.
+        normalized_payload["protocol_anomaly"] = anomaly
+    else:
+        normalized_payload.pop("protocol_anomaly", None)
     return {
-        **payload,
+        **normalized_payload,
         "id": entry.id,
         "task_id": entry.task_id,
         "timestamp": _utc_isoformat(entry.timestamp),

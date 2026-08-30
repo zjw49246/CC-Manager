@@ -8,7 +8,6 @@ import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPane
 import { usePlanEvents } from '../components/PlanReview/usePlanEvents';
 import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
 import { ProjectSelect } from '../components/ProjectSelect';
-import { useDialogA11y } from '../hooks/useDialogA11y';
 import { Archive, ChevronLeft, ChevronRight, Search, X } from '../components/icons';
 
 const PAGE_SIZE = 20;
@@ -30,7 +29,7 @@ const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
   all: undefined,
   waiting_user: 'waiting_user',
   awaiting_review: 'awaiting_review',
-  running: 'planner,reviewer,queued,running',
+  running: 'planner,reviewer,queued,running,cancelling',
   approved: 'approved',
   applied: 'applied',
   failed: 'failed',
@@ -52,10 +51,11 @@ interface Props {
   selectedPlanId: number | null;
   onSelectedPlanChange: (planId: number | null) => void;
   onNavigateTask: (taskId: number) => void;
+  onNavigateDelivery?: (runId: number) => void;
   onNavigateSettings: () => void;
 }
 
-export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask, onNavigateSettings }: Props) {
+export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask, onNavigateDelivery, onNavigateSettings }: Props) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedPlan, setSelectedPlan] = useState<PlanResource | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -70,18 +70,15 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   const [statusCounts, setStatusCounts] = useState(EMPTY_STATUS_COUNTS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
   const [needsInputVisible, setNeedsInputVisible] = useState(false);
   const [reviewVisible, setReviewVisible] = useState(false);
   const loadedOnceRef = useRef(false);
   const refreshRequestRef = useRef(0);
   const close = useCallback(() => {
     refreshRequestRef.current += 1;
-    setExpanded(false);
     setSelectedPlan(null);
     onSelectedPlanChange(null);
   }, [onSelectedPlanChange]);
-  const dialogRef = useDialogA11y(selectedPlanId != null, close);
 
   const baseQuery = useMemo(() => ({
     ...(kind !== 'all' ? { kind } : {}),
@@ -174,6 +171,11 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   };
 
   return <div className="space-y-6">
+    {selectedPlan ? (
+      <section aria-label={`Plan #${selectedPlan.id}`} className="min-h-[calc(100dvh-8rem)] overflow-hidden rounded-lg border border-gray-800 bg-gray-900/60">
+        <PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} embedded />
+      </section>
+    ) : <>
     <PlanCreateForm onCreated={created} onNavigateSettings={onNavigateSettings} />
 
     <section className={needsInputVisible || reviewVisible ? 'space-y-4' : ''} aria-label={needsInputVisible || reviewVisible ? 'Plans requiring action' : undefined}>
@@ -195,10 +197,10 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
       </div>
       <div className="flex gap-1 overflow-x-auto pb-1">{STATUS_OPTIONS.map((option) => <button key={option.value} type="button" onClick={() => setStatus(option.value)} aria-pressed={status === option.value} className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs ${status === option.value ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'}`}>{option.label} <span className="tabular-nums">{statusCounts[option.value]}</span></button>)}</div>
       {error && <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {loading ? <div className="py-12 text-center text-sm text-gray-500">Loading Plans…</div> : <PlanCatalog plans={plans} projects={projects} selectedPlanId={selectedPlanId} onSelectPlan={selectPlan} onNavigateTask={onNavigateTask} onSetArchived={setArchived} />}
+      {loading ? <div className="py-12 text-center text-sm text-gray-500">Loading Plans…</div> : <PlanCatalog plans={plans} projects={projects} selectedPlanId={selectedPlanId} onSelectPlan={selectPlan} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} onSetArchived={setArchived} />}
       {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
     </section>
 
-    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`min-w-0 w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 transition-colors hover:bg-gray-500 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} /></div></div>}
+    </>}
   </div>;
 }

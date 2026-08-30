@@ -69,4 +69,8 @@ class SharedTaskReceived(Base):
 
     __table_args__ = (
         UniqueConstraint("owner_ccm_url", "remote_task_id", name="uq_shared_received_owner_task"),
+        # Received-share ids escape into shadow Tasks and HTTP routes.  SQLite
+        # must never recycle one after leave/revoke, or an old shadow could
+        # resolve a different remote share through the reused integer id.
+        {"sqlite_autoincrement": True},
     )

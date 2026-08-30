@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { Project, GlobalSettings, TagItem } from '../api/client';
+import type { Project, GlobalSettings, TagItem, ProjectPreviewProfilesConfig, WorkspacePreviewConfig } from '../api/client';
 import { Trash2, RotateCcw, FolderGit2, Globe, HardDrive, Plus, Settings, X, ChevronDown, ChevronUp, GripVertical, Tag, FileKey, Palette, Server, UserPlus } from '../components/icons';
 import { TeamShareModal } from '../components/TeamShareModal';
 import { resolveTagColor, TAG_COLOR_OPTIONS } from '../components/TagColors';
@@ -676,6 +676,118 @@ function GitConfigModal({ project, onClose, onSaved }: { project: Project; onClo
   );
 }
 
+// ── Trusted Preview Profiles Modal ───────────────────────────────────────────
+
+function previewProfilesForProject(project: Project): ProjectPreviewProfilesConfig {
+  const existing = project.preview_config;
+  if (existing?.version === 2) return existing;
+  if (existing?.version === 1) {
+    return {
+      version: 2,
+      default_profile: 'default',
+      profiles: [{ ...existing, id: 'default', match_paths: ['**'], enabled: true }],
+    };
+  }
+  const starter: WorkspacePreviewConfig = {
+    version: 1,
+    name: 'Web preview',
+    setup: [],
+    processes: [{
+      name: 'web',
+      command: ['npm', 'run', 'dev', '--', '--host', '127.0.0.1', '--port', '{preview_port}'],
+      cwd: '.',
+      env: {},
+    }],
+    url: 'http://127.0.0.1:{preview_port}/',
+    health_url: 'http://127.0.0.1:{preview_port}/',
+    startup_timeout_seconds: 90,
+    sandbox: null,
+  };
+  return {
+    version: 2,
+    default_profile: 'web',
+    profiles: [{ ...starter, id: 'web', match_paths: ['web/**'], enabled: true }],
+  };
+}
+
+function PreviewProfilesModal({ project, onClose, onSaved }: { project: Project; onClose: () => void; onSaved: () => void }) {
+  const initial = previewProfilesForProject(project);
+  const [text, setText] = useState(() => JSON.stringify(initial, null, 2));
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  let parsed: ProjectPreviewProfilesConfig | null = null;
+  try {
+    const candidate = JSON.parse(text) as ProjectPreviewProfilesConfig;
+    if (candidate?.version === 2 && Array.isArray(candidate.profiles)) parsed = candidate;
+  } catch {
+    parsed = null;
+  }
+
+  const save = async () => {
+    if (!parsed) {
+      setError('Preview Profiles JSON is invalid.');
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.updateProject(project.id, { preview_config: parsed });
+      onSaved();
+      onClose();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <div className="bg-gray-800 rounded-xl shadow-2xl w-full max-w-4xl max-h-[92vh] overflow-y-auto">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
+          <div>
+            <h3 className="text-foreground font-semibold">Trusted Preview Profiles — {project.name}</h3>
+            <p className="text-xs text-gray-400 mt-1">Delivery matches the final changed paths and runs every matching enabled profile.</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-200"><X size={18} /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          {parsed && (
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {parsed.profiles.map((profile) => (
+                <div key={profile.id} className="rounded-lg border border-gray-700 bg-gray-900/40 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium text-sm text-foreground">{profile.name}</span>
+                    <span className={`text-[11px] ${profile.enabled ? 'text-emerald-400' : 'text-gray-500'}`}>{profile.enabled ? 'Enabled' : 'Disabled'}</span>
+                  </div>
+                  <div className="text-xs text-gray-400 mt-1">ID: {profile.id}{parsed.default_profile === profile.id ? ' · default' : ''}</div>
+                  <div className="text-xs text-sky-400 mt-2 break-all">{profile.match_paths.join(', ')}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="rounded-lg border border-amber-700/50 bg-amber-950/20 px-4 py-3 text-xs text-amber-200">
+            These commands are an administrator-owned trust boundary. Delivery Agents may select profiles, but cannot replace their commands from PR code.
+          </div>
+          {error && <p className="text-red-400 text-sm">{error}</p>}
+          <textarea
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            spellCheck={false}
+            className="w-full min-h-[420px] font-mono text-xs bg-gray-950 text-gray-200 rounded-lg border border-gray-700 px-4 py-3 outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-gray-300 hover:text-foreground">Cancel</button>
+            <button onClick={save} disabled={submitting || !parsed} className="px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500 disabled:opacity-50">
+              {submitting ? 'Saving...' : 'Save trusted profiles'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export function ProjectsPage() {
@@ -686,11 +798,11 @@ export function ProjectsPage() {
   const [loading, setLoading] = useState<Record<number, boolean>>({});
   const [showCreate, setShowCreate] = useState(false);
   const [editingGit, setEditingGit] = useState<Project | null>(null);
+  const [editingPreviewProfiles, setEditingPreviewProfiles] = useState<Project | null>(null);
   const [editingEnvFiles, setEditingEnvFiles] = useState<Project | null>(null);
   const [teamSharingProject, setTeamSharingProject] = useState<Project | null>(null);
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
-  const [hasWorker, setHasWorker] = useState(isAdmin);
   const [showGlobalGit, setShowGlobalGit] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
@@ -729,7 +841,6 @@ export function ProjectsPage() {
       setAllTags(Array.from(merged).sort());
       setTagItems(tagList);
       setError(null);
-      if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -938,7 +1049,7 @@ export function ProjectsPage() {
               <Tag size={14} /> Tags
             </button>
           )}
-          {hasWorker && (
+          {isAdmin && (
             <button
               onClick={() => setShowCreate(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500"
@@ -1012,11 +1123,11 @@ export function ProjectsPage() {
             <div
               key={p.id}
               ref={setCardRef(p.id)}
-              draggable
-              onDragStart={handleDragStart(p.id)}
-              onDragOver={handleDragOver(p.id)}
-              onDrop={handleDrop(p.id)}
-              onDragEnd={handleDragEnd}
+              draggable={isAdmin}
+              onDragStart={isAdmin ? handleDragStart(p.id) : undefined}
+              onDragOver={isAdmin ? handleDragOver(p.id) : undefined}
+              onDrop={isAdmin ? handleDrop(p.id) : undefined}
+              onDragEnd={isAdmin ? handleDragEnd : undefined}
               className={`bg-gray-800 rounded-lg p-3 sm:p-4 space-y-2 transition-opacity ${
                 draggingId === p.id ? 'opacity-40' : 'opacity-100'
               } ${
@@ -1027,7 +1138,7 @@ export function ProjectsPage() {
             >
               <div className="flex items-start gap-3">
                 {/* Drag handle */}
-                <div
+                {isAdmin && <div
                   className="mt-1 text-gray-600 hover:text-gray-400 cursor-grab active:cursor-grabbing select-none touch-none"
                   title="Drag to reorder"
                   onTouchStart={handleTouchStart(p.id)}
@@ -1035,7 +1146,7 @@ export function ProjectsPage() {
                   onTouchEnd={handleTouchEnd}
                 >
                   <GripVertical size={18} />
-                </div>
+                </div>}
 
                 {/* Icon */}
                 <div className="mt-1 text-gray-400">
@@ -1046,7 +1157,7 @@ export function ProjectsPage() {
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-foreground font-medium">{p.name}</span>
-                    <BadgeColorPicker value={p.badge_color} onChange={(c) => handleBadgeColor(p, c)} />
+                    {isAdmin && <BadgeColorPicker value={p.badge_color} onChange={(c) => handleBadgeColor(p, c)} />}
                     <span className={`inline-block w-2 h-2 rounded-full ${statusColor[p.status] || 'bg-gray-500'}`} title={p.status} />
                     <span className="text-xs text-gray-500 capitalize">{p.status}</span>
                     {p.has_remote ? (
@@ -1083,23 +1194,32 @@ export function ProjectsPage() {
                   </div>
 
                   {/* Tags row */}
-                  <div className="pt-0.5">
-                    <TagEditor
-                      tags={p.tags}
-                      allTags={allTags}
-                      onSave={(tags) => handleTagSave(p, tags)}
-                      tagColorMap={tagColorMap}
-                    />
-                  </div>
+                  {isAdmin ? (
+                    <div className="pt-0.5">
+                      <TagEditor
+                        tags={p.tags}
+                        allTags={allTags}
+                        onSave={(tags) => handleTagSave(p, tags)}
+                        tagColorMap={tagColorMap}
+                      />
+                    </div>
+                  ) : p.tags.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5 pt-0.5">
+                      {p.tags.map((tag) => {
+                        const color = resolveTagColor(tag, tagColorMap[tag]);
+                        return <span key={tag} className={`rounded border px-1.5 py-0.5 text-xs ${color.bg} ${color.text} ${color.border}`}>{tag}</span>;
+                      })}
+                    </div>
+                  ) : null}
 
-                  <ProjectTodoList projectId={p.id} />
+                  <ProjectTodoList projectId={p.id} project={p} />
                 </div>
               </div>
 
               {/* Actions */}
               <div className="flex items-center gap-3 pl-10 sm:pl-0 sm:justify-end">
                 {/* Show in selector toggle */}
-                <label className="flex items-center gap-2 cursor-pointer select-none" title="Show in task project dropdown">
+                {isAdmin && <label className="flex items-center gap-2 cursor-pointer select-none" title="Show in task project dropdown">
                   <span className="text-xs text-gray-400">Selector</span>
                   <button
                     onClick={() => toggleSelector(p)}
@@ -1114,11 +1234,18 @@ export function ProjectsPage() {
                       }`}
                     />
                   </button>
-                </label>
+                </label>}
 
-                {/* Project management: admin or Worker owner */}
-                {(isAdmin || hasWorker) && (
+                {/* Project configuration and sharing are administrator-only. */}
+                {isAdmin && (
                   <>
+                    <button
+                      onClick={() => setEditingPreviewProfiles(p)}
+                      className="p-2 text-gray-400 hover:text-cyan-400 hover:bg-gray-700 rounded transition-colors"
+                      title="Manage trusted Preview profiles"
+                    >
+                      <Globe size={16} />
+                    </button>
                     <button
                       onClick={() => setEditingGit(p)}
                       className="p-2 text-gray-400 hover:text-indigo-400 hover:bg-gray-700 rounded transition-colors"
@@ -1133,7 +1260,7 @@ export function ProjectsPage() {
                     >
                       <FileKey size={16} />
                     </button>
-                    {p.has_remote && (
+                    {p.has_remote && p.worker_id == null && (
                       <button
                         onClick={async () => {
                           try {
@@ -1177,6 +1304,13 @@ export function ProjectsPage() {
 
       {showCreate && <CreateModal onClose={() => setShowCreate(false)} onCreated={refresh} />}
       {editingGit && <GitConfigModal project={editingGit} onClose={() => setEditingGit(null)} onSaved={refresh} />}
+      {editingPreviewProfiles && (
+        <PreviewProfilesModal
+          project={editingPreviewProfiles}
+          onClose={() => setEditingPreviewProfiles(null)}
+          onSaved={refresh}
+        />
+      )}
       {editingEnvFiles && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-xl shadow-2xl w-full max-w-xl max-h-[85vh] flex flex-col">

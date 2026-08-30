@@ -26,6 +26,39 @@ IMDS_BASE = "http://169.254.169.254/latest"
 DEFAULT_WORKER_CCM_PORT = 8000
 _SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _MANAGED_SG_NAME_PREFIX = "ccm-worker-"
+_CLOUD_SCOPE_KEYS = frozenset({
+    "provider",
+    "partition",
+    "account_id",
+    "region",
+})
+
+
+def canonical_cloud_termination_scope(value: object) -> dict[str, str]:
+    """Validate the provider scope frozen beside an irreversible effect."""
+
+    if not isinstance(value, dict) or set(value) != _CLOUD_SCOPE_KEYS:
+        raise ValueError("cloud termination scope has an invalid shape")
+    provider = value.get("provider")
+    partition = value.get("partition")
+    account_id = value.get("account_id")
+    region = value.get("region")
+    if (
+        provider != "aws"
+        or not isinstance(partition, str)
+        or re.fullmatch(r"[a-z0-9-]{3,32}", partition) is None
+        or not isinstance(account_id, str)
+        or re.fullmatch(r"[0-9]{12}", account_id) is None
+        or not isinstance(region, str)
+        or re.fullmatch(r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+", region) is None
+    ):
+        raise ValueError("cloud termination scope identity is invalid")
+    return {
+        "provider": provider,
+        "partition": partition,
+        "account_id": account_id,
+        "region": region,
+    }
 
 
 def _validate_ssh_user(ssh_user: str) -> str:
@@ -115,13 +148,38 @@ class CloudProvider(ABC):
     async def start_instance(self, instance_id: str) -> None: ...
 
     @abstractmethod
-    async def terminate_instance(self, instance_id: str) -> None: ...
+    async def terminate_instance(
+        self,
+        instance_id: str,
+        *,
+        allow_not_found: bool = False,
+    ) -> None:
+        """Terminate one exact instance.
+
+        ``allow_not_found`` is intentionally opt-in.  A provider-side absence
+        is safe to treat as success only after the caller has matched a
+        durable account/partition/region receipt for the irreversible effect.
+        """
+
+    @abstractmethod
+    async def termination_scope(self) -> dict[str, str]:
+        """Return the immutable provider/account/region effect boundary."""
+
+    @abstractmethod
+    async def find_instance_by_create_token(
+        self,
+        client_token: str,
+        *,
+        include_terminated: bool = False,
+    ) -> str | None:
+        """Resolve the unique live instance created by an idempotency token."""
 
 
 class AWSProvider(CloudProvider):
     def __init__(self, region: str | None = None):
         self._region = region
         self._client: Any = None
+        self._boto_session: Any = None
         self._self_info: dict | None = None
 
     # -- 内部工具 ---------------------------------------------------------
@@ -145,10 +203,78 @@ class AWSProvider(CloudProvider):
                 self._region = await self._imds("placement/region")
             import boto3  # 延迟导入：未装 boto3 时其余功能不受影响
 
+            self._boto_session = await asyncio.to_thread(
+                boto3.Session,
+                region_name=self._region,
+            )
             self._client = await asyncio.to_thread(
-                boto3.client, "ec2", region_name=self._region
+                self._boto_session.client,
+                "ec2",
+                region_name=self._region,
             )
         return self._client
+
+    async def termination_scope(self) -> dict[str, str]:
+        """Bind EC2 effects to the same boto session, account, and region."""
+
+        await self._ec2()
+        if self._boto_session is None:
+            # Tests may inject an EC2 client directly. Production always
+            # reaches the branch in ``_ec2`` above.
+            import boto3
+
+            self._boto_session = await asyncio.to_thread(
+                boto3.Session,
+                region_name=self._region,
+            )
+        sts = await asyncio.to_thread(
+            self._boto_session.client,
+            "sts",
+            region_name=self._region,
+        )
+        identity = await asyncio.to_thread(sts.get_caller_identity)
+        account_id = identity.get("Account") if isinstance(identity, dict) else None
+        arn = identity.get("Arn") if isinstance(identity, dict) else None
+        partition = (
+            arn.split(":", 2)[1]
+            if isinstance(arn, str) and arn.startswith("arn:") and ":" in arn[4:]
+            else None
+        )
+        if (
+            not isinstance(account_id, str)
+            or len(account_id) != 12
+            or not account_id.isdigit()
+            or not isinstance(partition, str)
+            or not partition
+            or not isinstance(self._region, str)
+            or not self._region
+        ):
+            raise RuntimeError("AWS termination scope identity is malformed")
+        return canonical_cloud_termination_scope({
+            "provider": "aws",
+            "partition": partition,
+            "account_id": account_id,
+            "region": self._region,
+        })
+
+    async def find_instance_by_create_token(
+        self,
+        client_token: str,
+        *,
+        include_terminated: bool = False,
+    ) -> str | None:
+        ec2 = await self._ec2()
+        if (
+            not isinstance(client_token, str)
+            or re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", client_token) is None
+        ):
+            raise ValueError("client_token must be 1-64 safe ASCII characters")
+        return await asyncio.to_thread(
+            self._find_instance_by_client_token_sync,
+            ec2,
+            client_token,
+            include_terminated,
+        )
 
     @staticmethod
     def _parse(inst: dict) -> dict:
@@ -418,6 +544,7 @@ class AWSProvider(CloudProvider):
     def _find_instance_by_client_token_sync(
         ec2: Any,
         client_token: str,
+        include_terminated: bool = False,
     ) -> str | None:
         """Adopt a RunInstances result whose response was lost.
 
@@ -440,12 +567,13 @@ class AWSProvider(CloudProvider):
             if (instance.get("State") or {}).get("Name")
             not in {"terminated", "shutting-down"}
         ]
-        if len(live) > 1:
+        candidates = instances if include_terminated else live
+        if len(candidates) > 1:
             raise RuntimeError(
                 "Multiple EC2 instances share the Worker ClientToken; refusing an ambiguous adoption"
             )
-        if len(live) == 1:
-            instance_id = live[0].get("InstanceId")
+        if len(candidates) == 1:
+            instance_id = candidates[0].get("InstanceId")
             if not isinstance(instance_id, str) or not instance_id:
                 raise RuntimeError("EC2 ClientToken lookup returned an instance without id")
             return instance_id
@@ -514,6 +642,7 @@ class AWSProvider(CloudProvider):
                 self._find_instance_by_client_token_sync,
                 ec2,
                 client_token,
+                False,
             )
             if adopted_instance_id is not None:
                 logger.warning(
@@ -579,7 +708,14 @@ class AWSProvider(CloudProvider):
         ec2 = await self._ec2()
         await asyncio.to_thread(ec2.start_instances, InstanceIds=[instance_id])
 
-    async def terminate_instance(self, instance_id: str) -> None:
+    async def terminate_instance(
+        self,
+        instance_id: str,
+        *,
+        allow_not_found: bool = False,
+    ) -> None:
+        if type(allow_not_found) is not bool:
+            raise ValueError("allow_not_found must be an exact boolean")
         ec2 = await self._ec2()
         try:
             await asyncio.to_thread(
@@ -590,7 +726,10 @@ class AWSProvider(CloudProvider):
             # a record whose instance no longer exists is already destroyed.
             # Every other AWS/IAM/network failure must propagate so the Worker
             # stays visible and the administrator can retry destruction.
-            if _aws_error_code(exc) == "InvalidInstanceID.NotFound":
+            if (
+                allow_not_found
+                and _aws_error_code(exc) == "InvalidInstanceID.NotFound"
+            ):
                 logger.info("worker instance %s is already absent", instance_id)
                 return
             raise

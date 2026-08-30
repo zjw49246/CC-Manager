@@ -10,8 +10,16 @@ from sqlalchemy import func, select, update
 from backend.api.plans import _plan_upload_fields
 from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanLegacyTaskLink,
+    PlanVersion,
+)
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.sub_agent import SubAgentSession
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
 
@@ -220,8 +228,8 @@ async def test_related_plan_preserves_validated_uploads(
 
     assert response.status_code == 201, response.text
     metadata = response.json()["metadata_"]
-    assert metadata["file_paths"] == [upload["path"]]
-    assert metadata["image_paths"] == []
+    assert "file_paths" not in metadata
+    assert "image_paths" not in metadata
     assert metadata["attachments"] == [{
         "url": upload["url"],
         "name": "design notes.txt",
@@ -241,7 +249,8 @@ async def test_related_plan_preserves_validated_uploads(
     )
     assert revision.status_code == 201, revision.text
     revised_metadata = revision.json()["metadata_"]
-    assert revised_metadata["file_paths"] == [upload["path"]]
+    assert "file_paths" not in revised_metadata
+    assert "image_paths" not in revised_metadata
     assert revised_metadata["attachments"] == metadata["attachments"]
 
 
@@ -379,6 +388,8 @@ async def test_related_plan_revision_creates_successor_and_retires_source(
     client,
     session_factory,
 ):
+    import backend.main
+
     target_id, _ = await _target_with_session(client, session_factory)
     created = await client.post(
         f"/api/tasks/{target_id}/plans",
@@ -393,6 +404,7 @@ async def test_related_plan_revision_creates_successor_and_retires_source(
             .values(status="plan_review", plan_content="Original proposal")
         )
         await db.commit()
+    queue_fence = await backend.main.dispatcher.snapshot_queue_admission(source_id)
 
     revised = await client.post(
         f"/api/tasks/{source_id}/plan/revise",
@@ -415,6 +427,16 @@ async def test_related_plan_revision_creates_successor_and_retires_source(
     assert source.status == "superseded"
     assert source.completed_at is not None
     assert source.metadata_["plan_superseded_by_task_id"] == successor["id"]
+    assert (
+        backend.main.dispatcher._task_queue_generations[source_id]
+        >= queue_fence.generation + 2
+    )
+    assert not await backend.main.dispatcher.enqueue_message(
+        source_id,
+        "late related Plan report",
+        source="monitor:complete",
+        queue_admission_fence=queue_fence,
+    )
 
     stale_approval = await client.post(f"/api/tasks/{source_id}/plan/approve")
     stale_rejection = await client.post(f"/api/tasks/{source_id}/plan/reject")
@@ -435,6 +457,8 @@ async def test_standalone_plan_revision_preserves_independent_version_history(
     client,
     session_factory,
 ):
+    import backend.main
+
     source_id = await _legacy_plan_task(
         session_factory,
         title="Standalone v1",
@@ -447,6 +471,7 @@ async def test_standalone_plan_revision_preserves_independent_version_history(
             .values(status="plan_review", plan_content="Migration v1")
         )
         await db.commit()
+    queue_fence = await backend.main.dispatcher.snapshot_queue_admission(source_id)
 
     revised = await client.post(
         f"/api/tasks/{source_id}/plan/revise",
@@ -462,6 +487,16 @@ async def test_standalone_plan_revision_preserves_independent_version_history(
         source = await db.get(Task, source_id)
     assert source.status == "superseded"
     assert source.metadata_["plan_superseded_by_task_id"] == successor["id"]
+    assert (
+        backend.main.dispatcher._task_queue_generations[source_id]
+        >= queue_fence.generation + 2
+    )
+    assert not await backend.main.dispatcher.enqueue_message(
+        source_id,
+        "late standalone Plan report",
+        source="sub-agent:result",
+        queue_admission_fence=queue_fence,
+    )
 
 
 @pytest.mark.asyncio
@@ -493,6 +528,98 @@ async def test_generic_plan_create_supersedes_worker_side_source_atomically(
         source = await db.get(Task, source_id)
     assert source.status == "plan_review"
     assert not source.metadata_ or source.metadata_.get("plan_superseded_by_task_id") is None
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_related_plan_creation(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    async with session_factory() as db:
+        worker = Worker(name="legacy-related-plan-worker", status="destroying")
+        db.add(worker)
+        await db.flush()
+        target = await db.get(Task, target_id)
+        target.worker_id = worker.id
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Must not cross Worker destruction"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == target_id,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_standalone_plan_revision(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(name="legacy-plan-revision-worker", status="destroying")
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+    source_id = await _legacy_plan_task(
+        session_factory,
+        status="plan_review",
+        plan_content="Original Worker Plan",
+        worker_id=worker_id,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{source_id}/plan/revise",
+        json={"feedback": "Must not cross Worker destruction"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+        assert source.status == "plan_review"
+        assert await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.supersedes_plan_task_id == source_id,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_plan_execution_materialization(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(name="legacy-plan-execution-worker", status="destroying")
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        status="completed",
+        plan_content="Approved Worker Plan",
+        plan_approved=True,
+        worker_id=worker_id,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{plan_id}/plan/create-execution-task",
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        assert plan.plan_execution_task_id is None
 
 
 @pytest.mark.asyncio
@@ -531,6 +658,381 @@ async def test_plan_approval_and_revision_are_serialized(
         assert source.status == "completed"
         assert source.plan_approved is True
         assert successor_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "terminal_status", "plan_approved"),
+    [
+        ("approve", "completed", True),
+        ("reject", "cancelled", False),
+    ],
+)
+async def test_plan_terminal_decision_quiesces_late_auxiliary_producer(
+    client,
+    session_factory,
+    action,
+    terminal_status,
+    plan_approved,
+):
+    """A producer that committed before G advances cannot revive the Plan."""
+
+    import backend.main
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title=f"Terminal {action}",
+        description="Review this Plan",
+        status="plan_review",
+        plan_content="Safe terminal proposal",
+    )
+    async with session_factory() as db:
+        monitor = SubAgentSession(
+            task_id=plan_id,
+            agent_type="monitor",
+            source="ccm",
+            description="late monitor",
+            status="running",
+            next_check_at=None,
+        )
+        already_cancelled = SubAgentSession(
+            task_id=plan_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="retryable cancelled child",
+            status="cancelled",
+            next_check_at=None,
+        )
+        db.add_all([monitor, already_cancelled])
+        await db.commit()
+        await db.refresh(monitor)
+        await db.refresh(already_cancelled)
+        monitor_id = monitor.id
+        sub_agent_id = already_cancelled.id
+
+    dispatcher = backend.main.dispatcher
+    fence = await dispatcher.snapshot_queue_admission(plan_id)
+    events = []
+    late_admissions = []
+
+    async def observe_terminal_commit(label):
+        assert plan_id in dispatcher._cancel_durable_queue_tasks
+        assert dispatcher._task_queue_generations[plan_id] > fence.generation
+        async with session_factory() as db:
+            stored = await db.get(Task, plan_id)
+            sessions = list(
+                (
+                    await db.execute(
+                        select(SubAgentSession).where(
+                            SubAgentSession.id.in_((monitor_id, sub_agent_id))
+                        )
+                    )
+                ).scalars()
+            )
+        assert stored.status == terminal_status
+        assert {session.status for session in sessions} == {"cancelled"}
+        events.append(label)
+
+    async def stop_monitor(session_id, *, terminal=False):
+        assert session_id == monitor_id
+        assert terminal is True
+        await observe_terminal_commit("monitor-stopped")
+        late_admissions.append(
+            await dispatcher.enqueue_message(
+                plan_id,
+                "late terminal report",
+                source="monitor:complete",
+                queue_admission_fence=fence,
+            )
+        )
+
+    async def stop_sub_agent(session_id):
+        assert session_id == sub_agent_id
+        await observe_terminal_commit("sub-agent-stopped")
+
+    async def observe_broadcast(channel, payload):
+        assert channel == "tasks"
+        assert payload["task_id"] == plan_id
+        assert payload["new_status"] == terminal_status
+        assert plan_id in dispatcher._cancel_durable_queue_tasks
+        assert (
+            dispatcher._task_queue_generations[plan_id]
+            >= fence.generation + 2
+        )
+        events.append("broadcast")
+
+    with (
+        patch.object(
+            dispatcher,
+            "stop_monitor_session_process",
+            new=AsyncMock(side_effect=stop_monitor),
+        ) as monitor_stop,
+        patch.object(
+            dispatcher,
+            "stop_sub_agent_session_process",
+            new=AsyncMock(side_effect=stop_sub_agent),
+        ) as sub_agent_stop,
+        patch.object(
+            backend.main.broadcaster,
+            "broadcast",
+            new=AsyncMock(side_effect=observe_broadcast),
+        ),
+    ):
+        response = await client.post(f"/api/tasks/{plan_id}/plan/{action}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == terminal_status
+    assert response.json()["plan_approved"] is plan_approved
+    assert late_admissions == [False]
+    assert events[-1] == "broadcast"
+    monitor_stop.assert_awaited_once_with(monitor_id, terminal=True)
+    sub_agent_stop.assert_awaited_once_with(sub_agent_id)
+    assert plan_id not in dispatcher._cancel_durable_queue_tasks
+    assert dispatcher._task_queue_generations[plan_id] >= fence.generation + 2
+    queue = dispatcher._task_queues.get(plan_id)
+    assert queue is None or queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_plan_terminal_cleanup_failure_still_drains_and_publishes(
+    client,
+    session_factory,
+):
+    import backend.main
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Cleanup failure",
+        description="Reject safely",
+        status="plan_review",
+        plan_content="Proposal",
+    )
+    async with session_factory() as db:
+        monitor = SubAgentSession(
+            task_id=plan_id,
+            agent_type="monitor",
+            source="ccm",
+            description="unreapable monitor",
+            status="running",
+            next_check_at=None,
+        )
+        db.add(monitor)
+        await db.commit()
+        await db.refresh(monitor)
+        monitor_id = monitor.id
+
+    dispatcher = backend.main.dispatcher
+    fence = await dispatcher.snapshot_queue_admission(plan_id)
+    abort_spy = AsyncMock(wraps=dispatcher.abort_task_queue)
+    broadcast = AsyncMock()
+    with (
+        patch.object(dispatcher, "abort_task_queue", new=abort_spy),
+        patch.object(
+            dispatcher,
+            "stop_monitor_session_process",
+            new=AsyncMock(side_effect=RuntimeError("reap failed")),
+        ) as stop_monitor,
+        patch.object(backend.main.broadcaster, "broadcast", new=broadcast),
+    ):
+        response = await client.post(f"/api/tasks/{plan_id}/plan/reject")
+
+    assert response.status_code == 409
+    assert "terminal state was committed" in response.json()["detail"]
+    assert abort_spy.await_count == 2
+    stop_monitor.assert_awaited_once_with(monitor_id, terminal=True)
+    broadcast.assert_awaited_once_with(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": plan_id,
+            "new_status": "cancelled",
+        },
+    )
+    async with session_factory() as db:
+        stored = await db.get(Task, plan_id)
+        stored_monitor = await db.get(SubAgentSession, monitor_id)
+    assert stored.status == "cancelled"
+    assert stored.plan_approved is False
+    assert stored_monitor.status == "cancelled"
+    assert plan_id not in dispatcher._cancel_durable_queue_tasks
+    assert dispatcher._task_queue_generations[plan_id] >= fence.generation + 2
+    assert not await dispatcher.enqueue_message(
+        plan_id,
+        "late report after failed reap",
+        source="monitor:complete",
+        queue_admission_fence=fence,
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_terminal_caller_cancellation_waits_for_settlement(
+    client,
+    session_factory,
+):
+    import backend.main
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Cancelled HTTP request",
+        description="Finish terminal settlement",
+        status="plan_review",
+        plan_content="Proposal",
+    )
+    async with session_factory() as db:
+        monitor = SubAgentSession(
+            task_id=plan_id,
+            agent_type="monitor",
+            source="ccm",
+            description="slow stop",
+            status="running",
+            next_check_at=None,
+        )
+        db.add(monitor)
+        await db.commit()
+        await db.refresh(monitor)
+        monitor_id = monitor.id
+
+    dispatcher = backend.main.dispatcher
+    fence = await dispatcher.snapshot_queue_admission(plan_id)
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    broadcast = AsyncMock()
+    abort_spy = AsyncMock(wraps=dispatcher.abort_task_queue)
+
+    async def slow_stop(session_id, *, terminal=False):
+        assert session_id == monitor_id
+        assert terminal is True
+        assert plan_id in dispatcher._cancel_durable_queue_tasks
+        async with session_factory() as db:
+            stored = await db.get(Task, plan_id)
+        assert stored.status == "cancelled"
+        stop_started.set()
+        await release_stop.wait()
+        assert plan_id in dispatcher._cancel_durable_queue_tasks
+
+    with (
+        patch.object(dispatcher, "abort_task_queue", new=abort_spy),
+        patch.object(
+            dispatcher,
+            "stop_monitor_session_process",
+            new=AsyncMock(side_effect=slow_stop),
+        ),
+        patch.object(backend.main.broadcaster, "broadcast", new=broadcast),
+    ):
+        request_task = asyncio.create_task(
+            client.post(f"/api/tasks/{plan_id}/plan/reject")
+        )
+        try:
+            await asyncio.wait_for(stop_started.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+        finally:
+            release_stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    assert abort_spy.await_count == 2
+    broadcast.assert_awaited_once_with(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": plan_id,
+            "new_status": "cancelled",
+        },
+    )
+    async with session_factory() as db:
+        stored = await db.get(Task, plan_id)
+        stored_monitor = await db.get(SubAgentSession, monitor_id)
+    assert stored.status == "cancelled"
+    assert stored_monitor.status == "cancelled"
+    assert plan_id not in dispatcher._cancel_durable_queue_tasks
+    assert dispatcher._task_queue_generations[plan_id] >= fence.generation + 2
+
+
+@pytest.mark.asyncio
+async def test_plan_terminal_decision_rejects_detached_pty_generation(
+    client,
+    session_factory,
+):
+    import backend.main
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Detached legacy Plan",
+        description="Do not publish over live output",
+        status="plan_review",
+        plan_content="Proposal",
+        pty_background_generation="legacy-detached-generation",
+    )
+    dispatcher = backend.main.dispatcher
+    fence = await dispatcher.snapshot_queue_admission(plan_id)
+    broadcast = AsyncMock()
+    with patch.object(backend.main.broadcaster, "broadcast", new=broadcast):
+        response = await client.post(f"/api/tasks/{plan_id}/plan/approve")
+
+    assert response.status_code == 409
+    assert "detached PTY output" in response.json()["detail"]
+    broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = await db.get(Task, plan_id)
+    assert stored.status == "plan_review"
+    assert stored.plan_approved is None
+    assert stored.pty_background_generation == "legacy-detached-generation"
+    assert plan_id not in dispatcher._cancel_durable_queue_tasks
+    assert dispatcher._task_queue_generations[plan_id] > fence.generation
+
+
+@pytest.mark.asyncio
+async def test_plan_supersede_rolls_back_if_detached_pty_appears_precommit(
+    client,
+    session_factory,
+):
+    from backend.services.plan_tasks import mark_plan_superseded as real_mark
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="PTY race",
+        description="Revise atomically",
+        status="plan_review",
+        plan_content="Original proposal",
+    )
+
+    async def mark_then_attach_pty(db, source, *, successor_id, **kwargs):
+        changed = await real_mark(
+            db,
+            source,
+            successor_id=successor_id,
+            **kwargs,
+        )
+        await db.execute(
+            update(Task)
+            .where(Task.id == source.id)
+            .values(pty_background_generation="raced-detached-generation")
+        )
+        return changed
+
+    with patch(
+        "backend.api.plans.mark_plan_superseded",
+        new=mark_then_attach_pty,
+    ):
+        response = await client.post(
+            f"/api/tasks/{plan_id}/plan/revise",
+            json={"feedback": "Add a rollback section"},
+        )
+
+    assert response.status_code == 409
+    assert "before its terminal decision could commit" in response.json()["detail"]
+    async with session_factory() as db:
+        source = await db.get(Task, plan_id)
+        successor_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.supersedes_plan_task_id == plan_id
+            )
+        )
+    assert source.status == "plan_review"
+    assert source.pty_background_generation is None
+    assert not source.metadata_ or "plan_superseded_by_task_id" not in source.metadata_
+    assert successor_count == 0
 
 
 @pytest.mark.asyncio
@@ -573,6 +1075,68 @@ async def test_plan_tasks_never_silently_downgrade_codex_fast(
 
 
 @pytest.mark.asyncio
+async def test_repo_fingerprint_cancel_reaps_git_process_under_anyio(
+    monkeypatch,
+    tmp_path,
+):
+    from anyio import CancelScope
+
+    scope_holder: dict[str, CancelScope] = {}
+    communicate_started = asyncio.Event()
+    killed = asyncio.Event()
+    reaped = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+        communicate_owner = None
+
+        async def communicate(self):
+            self.communicate_owner = asyncio.current_task()
+            communicate_started.set()
+            await asyncio.Future()
+
+        async def wait(self):
+            await asyncio.sleep(0)
+            self.returncode = -9
+            reaped.set()
+            return self.returncode
+
+        def kill(self):
+            killed.set()
+            assert self.communicate_owner is not None
+            self.communicate_owner.cancel()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    async def cancel_capture():
+        await communicate_started.wait()
+        scope_holder["scope"].cancel()
+
+    monkeypatch.setattr(
+        "backend.services.plan_tasks.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    canceller = asyncio.create_task(cancel_capture())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await capture_repo_revision(str(tmp_path))
+        await canceller
+    finally:
+        if not canceller.done():
+            canceller.cancel()
+        await asyncio.gather(canceller, return_exceptions=True)
+
+    assert killed.is_set()
+    assert reaped.is_set()
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
 async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
     tmp_path,
 ):
@@ -596,6 +1160,9 @@ async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
         check=True,
     )
 
+    clean = await capture_repo_revision(str(tmp_path))
+    assert clean["dirty"] is False
+
     tracked.write_text("edit-one\n", encoding="utf-8")
     first_mtime = tracked.stat().st_mtime_ns
     first = await capture_repo_revision(str(tmp_path))
@@ -609,6 +1176,8 @@ async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
     )
     second = await capture_repo_revision(str(tmp_path))
 
+    assert first["dirty"] is True
+    assert second["dirty"] is True
     assert first["head"] == second["head"]
     assert first["dirty_sha256"] != second["dirty_sha256"]
 
@@ -618,6 +1187,8 @@ async def test_related_plan_approval_requires_stale_confirmation_and_no_turn(
     client,
     session_factory,
 ):
+    import backend.main
+
     target_id, session_id = await _target_with_session(
         client,
         session_factory,
@@ -653,7 +1224,14 @@ async def test_related_plan_approval_requires_stale_confirmation_and_no_turn(
     assert stale.status_code == 409
     assert "conversation_changed" in stale.json()["detail"]["staleness"]["reasons"]
 
-    with patch("backend.main.dispatcher") as dispatcher:
+    with (
+        patch.object(
+            backend.main.dispatcher,
+            "enqueue_message",
+            new_callable=AsyncMock,
+        ) as enqueue_message,
+        patch.object(backend.main.dispatcher, "wake") as wake,
+    ):
         approved = await client.post(
             f"/api/tasks/{plan_id}/plan/approve",
             json={"confirm_stale": True},
@@ -661,8 +1239,8 @@ async def test_related_plan_approval_requires_stale_confirmation_and_no_turn(
     assert approved.status_code == 200
     assert approved.json()["status"] == "completed"
     assert approved.json()["plan_approved"] is True
-    dispatcher.enqueue_message.assert_not_called()
-    dispatcher.wake.assert_not_called()
+    enqueue_message.assert_not_awaited()
+    wake.assert_not_called()
 
     async with session_factory() as db:
         target = await db.get(Task, target_id)
@@ -703,6 +1281,7 @@ async def test_approved_plan_is_applied_only_with_selected_user_message(
         await db.commit()
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_plan_queue_admission = AsyncMock(return_value=None)
     dispatcher.enqueue_message = AsyncMock()
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
@@ -784,6 +1363,7 @@ async def test_plan_application_is_restored_when_dispatcher_is_shutting_down(
         await db.commit()
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_plan_queue_admission = AsyncMock(return_value=None)
     dispatcher.enqueue_message = AsyncMock(
         side_effect=RuntimeError(
             "Dispatcher is shutting down; message admission is closed"
@@ -896,6 +1476,68 @@ async def test_standalone_plan_creates_one_idempotent_execution_task(
     assert first_task["id"] == second_task["id"]
     assert first_task["mode"] == "auto"
     assert "Migration plan" in first_task["description"]
+
+
+@pytest.mark.asyncio
+async def test_migrated_plan_carrier_cannot_create_duplicate_execution_task(
+    client,
+    session_factory,
+):
+    carrier_id = await _legacy_plan_task(
+        session_factory,
+        title="Migrated approved carrier",
+        description="Execute exactly once",
+        status="pending",
+        plan_content="# Approved migrated Plan",
+        plan_approved=True,
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Canonical migrated Plan",
+            initial_request="Execute exactly once",
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            content="# Approved migrated Plan",
+            human_decision="approved",
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        db.add_all(
+            [
+                PlanLegacyTaskLink(
+                    legacy_task_id=carrier_id,
+                    plan_id=plan.id,
+                    plan_version_id=version.id,
+                ),
+                PlanApplication(
+                    plan_id=plan.id,
+                    plan_version_id=version.id,
+                    application_type="execution_task",
+                    execution_task_id=carrier_id,
+                ),
+            ]
+        )
+        before = await db.scalar(select(func.count(Task.id)))
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{carrier_id}/plan/create-execution-task"
+    )
+
+    assert response.status_code == 409, response.text
+    assert "exact execution application" in response.json()["detail"]
+    async with session_factory() as db:
+        after = await db.scalar(select(func.count(Task.id)))
+        carrier = await db.get(Task, carrier_id)
+        assert after == before
+        assert carrier.plan_execution_task_id is None
+        assert carrier.status == "pending"
 
 
 @pytest.mark.asyncio

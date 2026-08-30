@@ -3,13 +3,17 @@ import { createPortal } from 'react-dom';
 import { Eye, EyeOff, Plus, RefreshCw, X, Users, Settings } from '../icons';
 import { api, isApiRequestError } from '../../api/client';
 import type {
+  ApiAccountCleanupConflictDetail,
+  ApiAccountCleanupDiagnostics,
   ApiAccountProvider,
+  CloudRouterAccount,
   CloudRouterApiQuota,
   CloudRouterUsageBreakdown,
   CloudRouterUsageMetrics,
   CodexLoginMethod,
   CodexLoginStatus,
   CodexPoolAccountUsage,
+  CodexPoolSettings,
   CodexPoolUsageStatus,
   PoolAccountUsage,
   PoolUsageStatus,
@@ -20,7 +24,7 @@ const ACTIVE_CODEX_LOGIN_STATUSES = new Set([
   'running', 'awaiting_otp', 'verifying_otp', 'finalizing',
 ]);
 
-const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api']);
+const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api', 'apibest_api']);
 
 function isApiAuthKind(authKind: string | null | undefined): boolean {
   return authKind != null && API_AUTH_KINDS.has(authKind);
@@ -31,7 +35,68 @@ function resolveApiProvider(
   provider: ApiAccountProvider | null | undefined,
 ): ApiAccountProvider {
   if (provider) return provider;
-  return authKind === 'apex_api' ? 'apex' : 'cloudrouter';
+  if (authKind === 'apex_api') return 'apex';
+  if (authKind === 'apibest_api') return 'apibest';
+  return 'cloudrouter';
+}
+
+function isApiCleanupPending(
+  projection: ApiAccountCleanupDiagnostics,
+  catalog?: ApiAccountCleanupDiagnostics,
+): boolean {
+  return projection.cleanup_pending === true || catalog?.cleanup_pending === true;
+}
+
+function mergeApiCleanupDiagnostics(
+  projection: ApiAccountCleanupDiagnostics,
+  catalog?: ApiAccountCleanupDiagnostics,
+): ApiAccountCleanupDiagnostics {
+  return {
+    cleanup_pending: isApiCleanupPending(projection, catalog),
+    cleanup_code: catalog?.cleanup_code ?? projection.cleanup_code ?? null,
+    cleanup_reason: catalog?.cleanup_reason ?? projection.cleanup_reason ?? null,
+    cleanup_last_attempt_at: catalog?.cleanup_last_attempt_at
+      ?? projection.cleanup_last_attempt_at
+      ?? null,
+    cleanup_last_error_at: catalog?.cleanup_last_error_at
+      ?? projection.cleanup_last_error_at
+      ?? null,
+  };
+}
+
+const API_CLEANUP_CODE_SUMMARIES: Record<string, string> = {
+  credential_busy: '账号仍有额度或凭据请求正在进行，请等待请求结束后重试。',
+  runtime_busy: '账号仍被运行中的任务或监控使用，请先停止相关运行再重试。',
+  migration_busy: '账号正在参与任务上下文迁移，请等待迁移完成后重试。',
+  runtime_verification_failed: '系统暂时无法安全确认账号是否空闲，请检查运行服务后重试。',
+  cleanup_blocked: '账号清理仍被后台运行状态阻塞，请根据后端详情解除阻塞后重试。',
+};
+
+function apiCleanupSummary(code: string | null | undefined): string {
+  if (code && API_CLEANUP_CODE_SUMMARIES[code]) {
+    return API_CLEANUP_CODE_SUMMARIES[code];
+  }
+  return '账号删除仍受阻，请确认相关任务与运行服务状态后重试。';
+}
+
+function apiCleanupConflictDiagnostics(error: unknown): ApiAccountCleanupDiagnostics | null {
+  if (!isApiRequestError(error) || error.status !== 409) return null;
+  const detail = error.detail as ApiAccountCleanupConflictDetail | null;
+  if (detail && typeof detail === 'object') {
+    const reason = typeof detail.reason === 'string' ? detail.reason.trim() : '';
+    const message = typeof detail.message === 'string' ? detail.message.trim() : '';
+    const fallback = typeof detail.error === 'string' ? detail.error.trim() : '';
+    const code = typeof detail.code === 'string' ? detail.code.trim() : '';
+    return {
+      cleanup_pending: detail.cleanup_pending === true,
+      cleanup_code: code || null,
+      cleanup_reason: reason || message || fallback || error.message.trim() || null,
+    };
+  }
+  return {
+    cleanup_pending: true,
+    cleanup_reason: error.message.trim() || null,
+  };
 }
 
 function barColor(utilization: number): string {
@@ -468,6 +533,60 @@ function ApiAccountModels({ models }: { models?: string[] }) {
   );
 }
 
+function formatApiCleanupTime(epochSeconds: number | null | undefined): string | null {
+  if (epochSeconds == null || !Number.isFinite(epochSeconds)) return null;
+  const value = new Date(epochSeconds * 1000);
+  if (Number.isNaN(value.getTime())) return null;
+  return value.toLocaleString(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function ApiAccountCleanupBlocked({ diagnostics }: {
+  diagnostics: ApiAccountCleanupDiagnostics;
+}) {
+  const summary = apiCleanupSummary(diagnostics.cleanup_code);
+  const backendDetail = diagnostics.cleanup_reason?.trim() || null;
+  const failedAt = formatApiCleanupTime(diagnostics.cleanup_last_error_at);
+  const attemptedAt = failedAt
+    ? null
+    : formatApiCleanupTime(diagnostics.cleanup_last_attempt_at);
+
+  return (
+    <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-100 space-y-1.5">
+      <div className="font-semibold text-amber-300">删除受阻</div>
+      <div>
+        账号已停用，新的 Claude/Codex 任务不会再使用它；API Key 与配置尚未删除。
+      </div>
+      <div className="rounded bg-black/15 px-2 py-1.5 space-y-0.5">
+        <div><span className="text-amber-300">原因：</span>{summary}</div>
+        {backendDetail && backendDetail !== summary && (
+          <div className="text-amber-200/75"><span>后端详情：</span>{backendDetail}</div>
+        )}
+        {diagnostics.cleanup_code && (
+          <div className="text-amber-200/60">
+            诊断代码：<span className="font-mono">{diagnostics.cleanup_code}</span>
+          </div>
+        )}
+        {failedAt && <div><span className="text-amber-300">最近失败：</span>{failedAt}</div>}
+        {attemptedAt && <div><span className="text-amber-300">最近尝试：</span>{attemptedAt}</div>}
+      </div>
+      <div>
+        活跃任务不会被强制终止。确认阻塞原因已解除后，可点击“重试清理”。
+        Claude projects 与 Codex sessions 会保留。
+      </div>
+      <div className="border-t border-amber-500/20 pt-1 text-amber-200/80">
+        同一共享 API 账号会投影到 Claude 与 Codex 页签；两处显示和清理的是同一个账号。
+      </div>
+    </div>
+  );
+}
+
 // --- Codex quota helpers ---
 function formatResetCountdown(epochSec: number | null): string {
   if (!epochSec) return '';
@@ -491,11 +610,11 @@ function formatWindowName(minutes: number | null): string {
   return `${hours}小时窗口`;
 }
 
-function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, deleting, reloginState }: {
+function AccountCard({ account, preferred, lastSelected, apiAccount, onClearCooldown, onSetPreferred, onRelogin, onRetryUsage, onDelete, deleting, reloginState }: {
   account: PoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
-  apiKeyHint?: string;
+  apiAccount?: CloudRouterAccount;
   onClearCooldown: (id: string) => void;
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
@@ -505,10 +624,11 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
   reloginState?: { status: string; message?: string };
 }) {
   const isApi = isApiAuthKind(account.auth_kind);
-  const cleanupPending = isApi && account.cleanup_pending === true;
+  const cleanupPending = isApi && isApiCleanupPending(account, apiAccount);
+  const cleanupDiagnostics = mergeApiCleanupDiagnostics(account, apiAccount);
   const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
   const statusDot = cleanupPending
-    ? { cls: 'bg-amber-500', label: '待清理' }
+    ? { cls: 'bg-amber-500', label: '删除受阻' }
     : !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
@@ -528,12 +648,12 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
           </span>
         )}
         {cleanupPending && (
           <span className="px-1.5 py-0.5 rounded bg-amber-600/25 text-amber-300 text-[10px] font-semibold">
-            待清理
+            已停用
           </span>
         )}
         {!isApi && account.subscription_type && (
@@ -561,7 +681,7 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
               解除冷却
             </button>
           )}
-          {account.enabled && (
+          {!cleanupPending && account.enabled && (
             isPreferred ? (
               <button
                 onClick={() => onSetPreferred(null)}
@@ -587,19 +707,19 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
               className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500 disabled:opacity-50"
               title={isApi
                 ? cleanupPending
-                  ? '账号已停用；继续安全清理 API Key 与配置'
+                  ? '账号已停用；重试安全清理 API Key 与配置'
                   : '同时从 Claude 与 Codex 视图删除此 API 账号'
                 : '从号池删除'}
             >
-              {deleting ? '处理中…' : cleanupPending ? '继续清理' : isApi ? '删除 API 账号' : '删除'}
+              {deleting ? '处理中…' : cleanupPending ? '重试清理' : isApi ? '删除 API 账号' : '删除'}
             </button>
           )}
         </div>
       </div>
       {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
-      {isApi && apiKeyHint && (
+      {isApi && apiAccount?.key_hint && (
         <div className="text-[10px] text-sky-300/80 font-mono" title="来自管理员 API 账号目录的脱敏 Key 指纹">
-          Key 指纹：{apiKeyHint}
+          Key 指纹：{apiAccount.key_hint}
         </div>
       )}
       {isApi && (
@@ -609,10 +729,7 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
       )}
       {isApi && <ApiAccountModels models={account.supported_models} />}
       {cleanupPending ? (
-        <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-200">
-          账号已停用，新的 Claude/Codex 任务不会再使用它。API Key 与配置仍在等待安全清理；
-          活跃任务不会被强制终止，任务结束后可点击“继续清理”。Claude projects 与 Codex sessions 会保留。
-        </div>
+        <ApiAccountCleanupBlocked diagnostics={cleanupDiagnostics} />
       ) : isApi ? (
         <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
       ) : account.usage ? (
@@ -711,11 +828,11 @@ function CodexOtpPrompt({ state, onSubmit }: {
   );
 }
 
-function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
+function CodexAccountCard({ account, preferred, lastSelected, apiAccount, onClearCooldown, onSetPreferred, onRelogin, onSubmitOtp, onDelete, deleting, onRetryUsage, reloginState }: {
   account: CodexPoolAccountUsage;
   preferred: string | null;
   lastSelected: string | null;
-  apiKeyHint?: string;
+  apiAccount?: CloudRouterAccount;
   onClearCooldown: (id: string) => void;
   onSetPreferred: (id: string | null) => void;
   onRelogin: (id: string) => void;
@@ -726,10 +843,11 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
   reloginState?: CodexLoginStatus;
 }) {
   const isApi = isApiAuthKind(account.auth_kind);
-  const cleanupPending = isApi && account.cleanup_pending === true;
+  const cleanupPending = isApi && isApiCleanupPending(account, apiAccount);
+  const cleanupDiagnostics = mergeApiCleanupDiagnostics(account, apiAccount);
   const apiProvider = resolveApiProvider(account.auth_kind, account.api_provider);
   const statusDot = cleanupPending
-    ? { cls: 'bg-amber-500', label: '待清理' }
+    ? { cls: 'bg-amber-500', label: '删除受阻' }
     : !account.enabled
     ? { cls: 'bg-gray-500', label: '已禁用' }
     : account.available
@@ -751,12 +869,12 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
           </span>
         )}
         {cleanupPending && (
           <span className="px-1.5 py-0.5 rounded bg-amber-600/25 text-amber-300 text-[10px] font-semibold">
-            待清理
+            已停用
           </span>
         )}
         {!isApi && account.plan_type && (
@@ -785,7 +903,7 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
               解除冷却
             </button>
           )}
-          {account.enabled && (
+          {!cleanupPending && account.enabled && (
             isPreferred ? (
               <button
                 onClick={() => onSetPreferred(null)}
@@ -820,19 +938,19 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
               className="text-[10px] px-1.5 py-0.5 rounded border border-gray-600 text-gray-400 hover:text-red-400 hover:border-red-500 disabled:opacity-50"
               title={isApi
                 ? cleanupPending
-                  ? '账号已停用；继续安全清理 API Key 与配置'
+                  ? '账号已停用；重试安全清理 API Key 与配置'
                   : '同时从 Claude 与 Codex 视图删除此 API 账号'
                 : '从号池删除'}
             >
-              {deleting ? '处理中…' : cleanupPending ? '继续清理' : isApi ? '删除 API 账号' : '删除'}
+              {deleting ? '处理中…' : cleanupPending ? '重试清理' : isApi ? '删除 API 账号' : '删除'}
             </button>
           )}
         </div>
       </div>
       {!isApi && account.email && <div className="text-xs text-gray-500 truncate">{account.email}</div>}
-      {isApi && apiKeyHint && (
+      {isApi && apiAccount?.key_hint && (
         <div className="text-[10px] text-sky-300/80 font-mono" title="来自管理员 API 账号目录的脱敏 Key 指纹">
-          Key 指纹：{apiKeyHint}
+          Key 指纹：{apiAccount.key_hint}
         </div>
       )}
       <div className="text-[10px] text-gray-500 font-mono truncate" title={account.codex_home}>
@@ -840,10 +958,7 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
       </div>
       {isApi && <ApiAccountModels models={account.supported_models} />}
       {cleanupPending ? (
-        <div className="rounded border border-amber-500/30 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-200">
-          账号已停用，新的 Claude/Codex 任务不会再使用它。API Key 与配置仍在等待安全清理；
-          活跃任务不会被强制终止，任务结束后可点击“继续清理”。Claude projects 与 Codex sessions 会保留。
-        </div>
+        <ApiAccountCleanupBlocked diagnostics={cleanupDiagnostics} />
       ) : isApi ? (
         <ApiQuotaDisclosure quota={account.api_quota} onRefresh={onRetryUsage} />
       ) : q ? (
@@ -940,7 +1055,9 @@ function AddApiAccountModal({ onClose, onAdded }: {
   const [apiKey, setApiKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const providerName = apiProvider === 'apex' ? 'ApexRouter' : 'CloudRouter';
+  const providerName = apiProvider === 'apex'
+    ? 'ApexRouter'
+    : apiProvider === 'apibest' ? 'APIBest' : 'CloudRouter';
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -987,6 +1104,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
             >
               <option value="cloudrouter">CloudRouter</option>
               <option value="apex">ApexRouter</option>
+              <option value="apibest">APIBest</option>
             </select>
           </div>
           <div>
@@ -996,7 +1114,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder={apiProvider === 'apex' ? '例如：ApexRouter Codex' : '例如：CloudRouter Claude'}
+              placeholder={apiProvider === 'apex' ? '例如：ApexRouter' : apiProvider === 'apibest' ? '例如：APIBest' : '例如：CloudRouter Claude'}
               autoComplete="off"
               required
             />
@@ -1009,7 +1127,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder={apiProvider === 'apex' ? 'lck_...' : 'cr-...'}
+              placeholder={apiProvider === 'apex' ? 'lck_...' : apiProvider === 'apibest' ? 'sk-...' : 'cr-...'}
               autoComplete="new-password"
               required
             />
@@ -1018,12 +1136,14 @@ function AddApiAccountModal({ onClose, onAdded }: {
             <p>每把 Key 建立一个独立 API 账号目录，Key 会以 0600 权限持久保存，不会显示在账号列表或日志中。</p>
             {apiProvider === 'cloudrouter' ? (
               <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
-            ) : (
+            ) : apiProvider === 'apex' ? (
               <>
-                <p>ApexRouter 仅用于 Codex；系统会通过 /v1/models 验证 Key 并读取支持的模型。</p>
+                <p>系统通过 ApexRouter /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者，并分别配置 Anthropic Messages 与 OpenAI Responses 协议。</p>
                 <p>额度通过 /v1/usage 获取：“已用”为当前 Key 用量，剩余、上限与并发限制由同组 Key 共享。</p>
                 <p>ApexRouter 当前不返回到期时间，因此到期时间和剩余天数会显示为无法确认。</p>
               </>
+            ) : (
+              <p>系统先通过 APIBest /v1/models 验证 Key，再从公开价格目录识别可用的 Claude 与 Codex 模型；该渠道暂不展示额度。</p>
             )}
             <p>API 账号会直接加入现有账号池，任务、换模型、会话与自动轮换方式不变。</p>
           </div>
@@ -1354,13 +1474,117 @@ function CcSettingsModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+function CodexPoolSettingsModal({
+  initial,
+  onClose,
+  onSaved,
+}: {
+  initial: CodexPoolSettings;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [form, setForm] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.putCodexPoolSettings(form);
+      await onSaved();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="absolute inset-0 bg-gray-900/80 z-10 flex items-start justify-center pt-12">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-xs">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+          <h3 className="text-sm font-semibold text-foreground">Codex 号池设置</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-foreground"><X size={14} /></button>
+        </div>
+        <div className="p-4 space-y-4">
+          <label className="flex items-start justify-between gap-3 text-xs text-gray-300">
+            <span>
+              <span className="block font-medium text-foreground">启用账号路由</span>
+              <span className="mt-1 block text-[10px] text-gray-500">关闭后阻止新的 Codex 回合，不会中断正在执行的回合。</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={form.enabled}
+              onChange={(e) => setForm((value) => ({ ...value, enabled: e.target.checked }))}
+              className="mt-0.5 accent-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            撞限冷却时间（秒）
+            <input
+              type="number"
+              min={1}
+              max={691200}
+              value={form.cooldown_seconds}
+              onChange={(e) => setForm((value) => ({ ...value, cooldown_seconds: Number(e.target.value) }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            主动换号阈值（%）
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={form.quota_switch_threshold_percent}
+              onChange={(e) => setForm((value) => ({ ...value, quota_switch_threshold_percent: Number(e.target.value) }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            新会话路由顺序
+            <select
+              value={form.routing_policy}
+              onChange={(e) => setForm((value) => ({
+                ...value,
+                routing_policy: e.target.value as CodexPoolSettings['routing_policy'],
+              }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            >
+              <option value="api_first">API 优先，OAuth 回退</option>
+              <option value="native_first">OAuth 优先，API 回退</option>
+            </select>
+          </label>
+          <p className="text-[10px] leading-relaxed text-gray-500">
+            设置与账号列表一起安全持久化，保存后立即生效；服务器配置路径仍由部署环境管理。
+          </p>
+          {error && <div className="text-xs text-red-400">{error}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-700">
+          <button onClick={onClose} className="px-3 py-1.5 text-xs rounded bg-gray-700 text-gray-300 hover:bg-gray-600">取消</button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !Number.isFinite(form.cooldown_seconds) || !Number.isFinite(form.quota_switch_threshold_percent)}
+            className="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {saving ? '保存中…' : '保存并生效'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type PoolTab = 'claude' | 'codex';
 
 export function PoolDrawer() {
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [codexEnabled, setCodexEnabled] = useState(false);
   const [apiAccountsAvailable, setApiAccountsAvailable] = useState(false);
-  const [apiAccountHints, setApiAccountHints] = useState<Record<string, string>>({});
+  const [apiAccountCatalog, setApiAccountCatalog] = useState<Record<string, CloudRouterAccount>>({});
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<PoolTab>('claude');
 
@@ -1378,10 +1602,10 @@ export function PoolDrawer() {
   const loadApiAccountCatalog = useCallback(async () => {
     try {
       const accounts = await api.getCloudRouterAccounts();
-      setApiAccountHints(Object.fromEntries(
+      setApiAccountCatalog(Object.fromEntries(
         accounts
-          .filter((account) => Boolean(account.id && account.key_hint))
-          .map((account) => [account.id, account.key_hint]),
+          .filter((account) => Boolean(account.id))
+          .map((account) => [account.id, account]),
       ));
       setApiAccountsAvailable(true);
     } catch {
@@ -1465,6 +1689,7 @@ export function PoolDrawer() {
   const [showCodexAdd, setShowCodexAdd] = useState(false);
   const [showApiAdd, setShowApiAdd] = useState(false);
   const [showCcSettings, setShowCcSettings] = useState(false);
+  const [showCodexSettings, setShowCodexSettings] = useState(false);
   const [apiDeleting, setApiDeleting] = useState<Record<string, boolean>>({});
 
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
@@ -1635,13 +1860,13 @@ export function PoolDrawer() {
       return;
     }
     const prompt = cleanupPending
-      ? `继续清理 API 账号“${displayName}”？\n\n`
-        + '账号已经同时从 Claude 与 Codex 新任务中停用。继续操作会永久删除 API Key 和账号配置，无法恢复；'
-        + 'Claude projects 与 Codex sessions 会保留。活跃任务不会被强制终止，若仍在使用该账号，本次会继续保留“待清理”状态供稍后重试。'
+      ? `重试清理 API 账号“${displayName}”？\n\n`
+        + '账号已经同时从 Claude 与 Codex 新任务中停用。重试成功后会永久删除 API Key 和账号配置，无法恢复；'
+        + 'Claude projects 与 Codex sessions 会保留。活跃任务不会被强制终止，若阻塞仍未解除，账号会继续显示“删除受阻”。'
       : `删除 API 账号“${displayName}”？\n\n`
         + '此操作会同时从 Claude 与 Codex 账号视图停用该账号，并永久删除 API Key 和账号配置，无法恢复。\n\n'
         + 'Claude projects 与 Codex sessions 会保留，供已有任务上下文迁移；活跃任务不会被强制终止。'
-        + '若账号正忙，本次会进入“待清理”状态，任务结束后可点击“继续清理”。';
+        + '账号会先立即停用；若删除受阻，请解除界面显示的具体原因后点击“重试清理”。';
     if (!window.confirm(prompt)) return;
 
     setApiDeleting((current) => ({ ...current, [accountId]: true }));
@@ -1649,7 +1874,7 @@ export function PoolDrawer() {
       const result = await api.deleteCloudRouterAccount(accountId);
       await refreshBothPools();
       if (result.cleanup_pending) {
-        window.alert('账号已安全停用，但仍在使用中；已保留为“待清理”，请在活跃任务结束后点击“继续清理”。');
+        window.alert('账号已停用，但删除仍受阻。请解除界面显示的具体原因后点击“重试清理”。');
       }
     } catch (e) {
       // Retirement is staged before the backend checks every runtime fence.
@@ -1657,9 +1882,15 @@ export function PoolDrawer() {
       // immediately visible from whichever tab initiated the request.
       await refreshBothPools();
       if (isApiRequestError(e) && e.status === 409) {
+        const diagnostics = apiCleanupConflictDiagnostics(e);
+        const summary = apiCleanupSummary(diagnostics?.cleanup_code);
+        const backendDetail = diagnostics?.cleanup_reason?.trim();
         window.alert(
-          `账号已安全停用，但暂时无法完成清理：${e.message}\n\n`
-          + '活跃任务不会被强制终止；账号已保留为“待清理”，请在任务结束后点击“继续清理”。',
+          `账号已停用，但删除受阻：${summary}`
+          + (backendDetail && backendDetail !== summary ? `\n后端详情：${backendDetail}` : '')
+          + '\n\n'
+          + '活跃任务不会被强制终止。请解除该阻塞原因后点击“重试清理”；'
+          + 'Claude projects 与 Codex sessions 会保留。',
         );
       } else {
         window.alert(e instanceof Error ? e.message : 'API 账号删除失败');
@@ -1717,6 +1948,15 @@ export function PoolDrawer() {
                     onClick={() => setShowCcSettings(true)}
                     className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
                     title="CC Settings 模板"
+                  >
+                    <Settings size={14} />
+                  </button>
+                )}
+                {codexEnabled && tab === 'codex' && codexStatus?.settings && (
+                  <button
+                    onClick={() => setShowCodexSettings(true)}
+                    className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
+                    title="Codex 号池设置"
                   >
                     <Settings size={14} />
                   </button>
@@ -1794,6 +2034,13 @@ export function PoolDrawer() {
                 />
               )}
               {showCcSettings && <CcSettingsModal onClose={() => setShowCcSettings(false)} />}
+              {showCodexSettings && codexStatus?.settings && (
+                <CodexPoolSettingsModal
+                  initial={codexStatus.settings}
+                  onClose={() => setShowCodexSettings(false)}
+                  onSaved={() => loadCodexUsage(false)}
+                />
+              )}
 
               {!hasActivePool && (
                 <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-gray-400">
@@ -1813,7 +2060,7 @@ export function PoolDrawer() {
                       account={a}
                       preferred={claudeStatus?.preferred ?? null}
                       lastSelected={claudeStatus?.last_selected ?? null}
-                      apiKeyHint={a.api_account_id ? apiAccountHints[a.api_account_id] : undefined}
+                      apiAccount={a.api_account_id ? apiAccountCatalog[a.api_account_id] : undefined}
                       onClearCooldown={handleClaudeClearCooldown}
                       onSetPreferred={handleClaudeSetPreferred}
                       onRelogin={handleClaudeRelogin}
@@ -1829,7 +2076,10 @@ export function PoolDrawer() {
                             void handleApiDelete(
                               a.api_account_id,
                               a.display_name || a.api_account_id || '未命名 API 账号',
-                              a.cleanup_pending === true,
+                              isApiCleanupPending(
+                                a,
+                                a.api_account_id ? apiAccountCatalog[a.api_account_id] : undefined,
+                              ),
                             );
                           }
                         : async () => {
@@ -1850,13 +2100,18 @@ export function PoolDrawer() {
                 <>
                   {codexError && <div className="text-xs text-red-400">{codexError}</div>}
                   {codexLoading && !codexStatus && <div className="text-xs text-gray-500">加载中…</div>}
+                  {codexStatus?.settings && !codexStatus.settings.enabled && (
+                    <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-300">
+                      Codex 账号路由已暂停；新的 Codex 回合会被明确拒绝，且不会回落到默认账号。
+                    </div>
+                  )}
                   {codexStatus?.accounts.map((a) => (
                     <CodexAccountCard
                       key={`${a.id}:${a.codex_home}`}
                       account={a}
                       preferred={codexStatus.preferred ?? null}
                       lastSelected={codexStatus.last_selected ?? null}
-                      apiKeyHint={a.api_account_id ? apiAccountHints[a.api_account_id] : undefined}
+                      apiAccount={a.api_account_id ? apiAccountCatalog[a.api_account_id] : undefined}
                       onClearCooldown={handleCodexClearCooldown}
                       onSetPreferred={handleCodexSetPreferred}
                       onRelogin={handleCodexRelogin}
@@ -1866,7 +2121,10 @@ export function PoolDrawer() {
                             void handleApiDelete(
                               a.api_account_id,
                               a.display_name || a.api_account_id || '未命名 API 账号',
-                              a.cleanup_pending === true,
+                              isApiCleanupPending(
+                                a,
+                                a.api_account_id ? apiAccountCatalog[a.api_account_id] : undefined,
+                              ),
                             );
                           }
                         : async () => {

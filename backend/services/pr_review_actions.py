@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -15,7 +16,12 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
     PRMonitorRun,
     PRReview,
+    pr_monitor_run_has_terminal_intent,
 )
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
+
+
+PREffectAuthorizer = Callable[[AsyncSession, MonitoredRepo], Awaitable[None]]
 
 
 class FindingActionConflict(RuntimeError):
@@ -70,7 +76,9 @@ async def is_current_review_snapshot(
         monitor_run = await db.get(PRMonitorRun, review.monitor_run_id)
         if monitor_run is not None:
             return (
-                monitor_run.current_review_id == review.id
+                not pr_monitor_run_has_terminal_intent(monitor_run)
+                and monitor_run.completed_at is None
+                and monitor_run.current_review_id == review.id
                 and monitor_run.current_head_sha == review.head_sha
             )
     newer = (
@@ -119,6 +127,7 @@ async def create_immediate_finding_action(
     idempotency_key: str,
     actor_user_id: int | None,
     human_advice: str | None = None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Persist an ignore/advice decision without mutating the Panel gate."""
 
@@ -150,6 +159,8 @@ async def create_immediate_finding_action(
     # SQLITE_BUSY_SNAPSHOT and gives every backend the same ordering boundary.
     await db.rollback()
     repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        await effect_authorizer(db, repo)
     review = (
         await db.execute(
             select(PRReview)
@@ -171,6 +182,14 @@ async def create_immediate_finding_action(
     ).scalar_one_or_none()
     if finding is None or review is None or not repo.enabled:
         raise FindingActionConflict("Finding is no longer available")
+    # The API performs an optimistic ownership check before remote/auth work,
+    # but Delivery adoption can win while this request waits for the shared
+    # repository writer fence.  Recheck under that fence so an opaque webhook
+    # Review cannot acquire a legacy effect after it becomes Delivery-owned.
+    if await legacy_pr_effect_is_forbidden(db, review=review):
+        raise FindingActionConflict(
+            "Delivery-owned PR findings cannot use legacy finding actions"
+        )
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"

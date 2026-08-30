@@ -37,5 +37,13 @@ class ProjectTodo(Base):
     # constraint — SQLite doesn't enforce FKs here; see database.py). Enables a
     # future "task completed → mark todo done" sync by looking up created_task_id.
     created_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Canonical Todo -> Auto Task admission intent.  The Todo is the stable
+    # idempotency identity; this hash lets a client recover the already-created
+    # Task after a committed response is lost without accepting a changed
+    # request under the same Todo.
+    task_request_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)

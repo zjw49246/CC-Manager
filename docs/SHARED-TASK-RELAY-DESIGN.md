@@ -1,5 +1,7 @@
 # Shared Task Relay 设计方案
 
+> **历史设计，当前已禁用。** 跨 CCM 的 `share_token` HTTP 路由与 `/ws/shared` 不再挂载，本文仅保留早期协议背景；现行 Share 是同一 CCM 内基于真实用户身份的 Team Project/Task ACL，不得按本文重新启用匿名远端执行。
+
 ## 概述
 
 共享 task 建立类似 Worker/Manager 的实时中继关系：

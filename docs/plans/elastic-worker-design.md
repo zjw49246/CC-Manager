@@ -54,51 +54,36 @@
 Manager 和 Worker 各自有独立的 CCM 数据库，task ID 各自自增。
 当 Worker 销毁、数据迁移回 Manager 时，ID 会冲突。
 
-### 2.2 方案：Manager 统一分配 ID
+### 2.2 方案：Manager mirror + Worker 本地高区
 
-Manager 是 task ID 的唯一来源。所有 task（无论本机还是 Worker）的 ID 都由 Manager 的序列生成。
+Manager 是用户 Task 及跨节点 mirror ID 的唯一来源，使用低区
+`1..999999999`。Manager 转发到 Worker 时保留这个 ID。Worker 上后来新增了
+Browser Harness child 等必须就地持久化的派生 Task，它们只使用独立高区
+`1000000000..2147483646`。两区间永不重叠，解决“Worker 先生成 N+1 child，
+Manager 后生成 N+1 Task”的跨库冲突。
 
 **流程：**
-1. 用户在 Manager 创建 task → Manager DB 分配 ID（如 42）
-2. 如果 task 在 Worker 执行 → Manager 调 Worker API 创建 task 时**指定 ID = 42**
-3. Worker 上该 task 的 ID 也是 42
-4. 日志、session、所有引用都用同一个 ID
-5. Worker 销毁迁移时，ID 天然一致，不会冲突
+1. 用户在 Manager 创建 task → Manager DB 分配低区 ID（如 42）
+2. 如果 task 在 Worker 执行 → Manager 调 Worker API 创建 task 时指定 ID = 42
+3. Worker 上该 mirror 的 ID 也是 42，日志、session 和所有引用保持同一身份
+4. Worker 需本地创建 Browser child 时，从 `task_id_allocators` 单例行事务分配高区 ID
+5. Worker 销毁迁移时，Manager mirror ID 天然一致，高区 child 按 Harness 清理协议收口
 
-**CCM 代码改动 — Task 创建 API 支持指定 ID：**
+### 2.3 节点身份与升级门禁
 
-```python
-# backend/api/tasks.py
-
-class TaskCreate(BaseModel):
-    # 新增可选字段
-    id: int | None = None  # 不指定 → 自增；指定 → 使用该 ID
-    ...
-
-@router.post("/api/tasks")
-async def create_task(body: TaskCreate, db: AsyncSession = Depends(get_db)):
-    task = Task(**body.model_dump(exclude_unset=True))
-    if body.id is not None:
-        task.id = body.id  # 使用 Manager 指定的 ID
-    db.add(task)
-    await db.commit()
-    ...
-```
-
-**本机 task：** 不指定 ID，正常自增。
-**Worker task：** Manager 先在本地创建 task 拿到 ID，然后用这个 ID 在 Worker 上创建。
-
-### 2.3 防止 ID 冲突
-
-Worker CCM 可能也有自己本地直接创建的 task（理论上不应该有，但防御性设计）。
-Worker 的 auto-increment 起始值设为很大的数（如 100000），避免和 Manager 分配的 ID 碰撞：
-
-```python
-# Worker .env 或 bootstrap 时配置
-TASK_ID_OFFSET=100000  # Worker 本地自增从 100001 开始
-```
-
-或更简单：Worker 上只允许通过 Manager 指定 ID 创建 task，禁止自增。
+- `CCM_NODE_ROLE=manager|worker`；Manager 默认 `manager`，Worker bootstrap 强制写 `worker`。
+- 迁移完成后、API/Dispatcher/relay 启动前，数据库在 allocator 单例行持久绑定
+  role；已绑定数据库不允许原地换角色。
+- Manager 自动 ID 继续由原生 sequence/AUTO_INCREMENT/ROWID 分配，但必须低于边界且
+  Manager 拒绝任何 explicit ID。Worker 只接受低区 explicit mirror，本地 Task 统一经
+  PostgreSQL/MySQL/SQLite 共用的原子 `UPDATE` allocator 取号。
+- 旧 Worker 低区行必须都能用 worker-managed metadata 证明为 Manager mirror；
+  旧 `.env` 缺 role、出现本地低区 Task 或预留高区已有行时直接拒绝启动，
+  由管理员补配置或重建 Worker，不做静默重编号。
+- Manager 在转发/迁移前读 Worker `/api/system/config`，精确校验 protocol=1、
+  role=worker 和 boundary=1000000000；混版本在任何远端写入前 fail closed。
+- 公开 Task API 不能指定 ID；内部 schema 也会以 `0 < id < 1000000000` 拒绝高区
+  mirror。不再依赖 PostgreSQL `setval` 或各方言对 explicit primary key 的不同自增行为。
 
 ---
 

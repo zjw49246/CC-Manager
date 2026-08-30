@@ -21,6 +21,7 @@ function task(id: number, title: string): Task {
     mode: 'single',
     merge_status: 'none',
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 3,
     provider: 'claude',
     starred: false,

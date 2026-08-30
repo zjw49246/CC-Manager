@@ -4,12 +4,13 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.services import task_sharing, feishu_notify
+from backend.services.project_share_admission import ProjectShareAdmissionError
 from backend.models.feishu_binding import FeishuUserBinding
-from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,10 @@ async def share_project(project_id: int, req: ShareRequest, db: AsyncSession = D
     targets = [t.model_dump() for t in req.targets]
     try:
         created = await task_sharing.share_project(db, project_id, targets)
+    except ProjectShareAdmissionError as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     return {"shares": created}
 
 

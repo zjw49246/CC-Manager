@@ -262,6 +262,97 @@ class TestStreamParserSystemEvents:
 # ========== InstanceManager._consume_output tests ==========
 
 
+def test_parse_codex_background_lifecycle_event():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "background.lifecycle",
+        "state": "running",
+        "reason": "waiting_for_descendants",
+        "active_count": 2,
+        "active_thread_ids": ["child-a", "child-b"],
+        "started_at": "2026-08-13T12:00:00",
+        "last_activity_at": "2026-08-13T12:01:00",
+    }))
+
+    assert event is not None
+    assert event["event_type"] == "background_lifecycle"
+    assert event["background_state"] == "running"
+    assert event["background_reason"] == "waiting_for_descendants"
+    assert event["background_active_count"] == 2
+    assert event["background_active_thread_ids"] == ["child-a", "child-b"]
+    assert event["background_started_at"] == "2026-08-13T12:00:00"
+    assert event["background_last_activity_at"] == "2026-08-13T12:01:00"
+
+
+def test_parse_codex_native_sub_agent_lifecycle_event():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "native.subagent.lifecycle",
+        "lifecycle_event": "spawn",
+        "provider": "codex",
+        "native_agent_id": "thread-child",
+        "root_thread_id": "thread-root",
+        "parent_native_agent_id": "thread-root",
+        "description": "inspect the scheduler",
+        "agent_path": "/root/scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "status": "running",
+        "summary": None,
+        "sequence": 1,
+    }))
+
+    assert event is not None
+    assert event["event_type"] == "subagent_spawn"
+    assert event["role"] == "system"
+    assert event["content"] is None
+    assert event["subagent"] == {
+        "tool_use_id": "codex:thread-child",
+        "native_agent_id": "thread-child",
+        "provider": "codex",
+        "kind": "native-agent",
+        "status": "running",
+        "sequence": 1,
+        "root_thread_id": "thread-root",
+        "parent_native_agent_id": "thread-root",
+        "description": "inspect the scheduler",
+        "agent_path": "/root/scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"provider": "claude"},
+        {"native_agent_id": ""},
+        {"native_agent_id": " child "},
+        {"sequence": 0},
+        {"sequence": True},
+        {"lifecycle_event": "done", "status": "running"},
+        {"lifecycle_event": "spawn", "status": "failed"},
+        {"description": "x" * 501},
+    ],
+)
+def test_parse_codex_native_sub_agent_lifecycle_rejects_malformed(override):
+    im = InstanceManager(MagicMock(), MagicMock())
+    payload = {
+        "type": "native.subagent.lifecycle",
+        "lifecycle_event": "spawn",
+        "provider": "codex",
+        "native_agent_id": "thread-child",
+        "description": "child",
+        "status": "running",
+        "sequence": 1,
+    }
+    payload.update(override)
+
+    assert im._parse_codex_line(json.dumps(payload)) is None
+
+
 def _make_mock_process_with_output(lines: list[str], exit_code: int = 0):
     """Create a mock process that yields NDJSON lines from stdout."""
     proc = MagicMock()
@@ -403,6 +494,49 @@ async def test_consume_output_broadcasts_to_both_channels(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_consume_output_marks_legacy_tool_markup_as_inert_text(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="test")
+        task = Task(title="t", description="d")
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id, task_id = inst.id, task.id
+
+    leaked_text = (
+        'card\n<invoke name="Bash">\n'
+        '<parameter name="command">pwd</parameter>\n</invoke>'
+    )
+    mock_proc = _make_mock_process_with_output([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": leaked_text}],
+                "stop_reason": "end_turn",
+            },
+        }) + "\n",
+    ])
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    im = InstanceManager(db_factory, broadcaster)
+
+    await im._consume_output(inst_id, task_id, mock_proc)
+
+    task_messages = [
+        call.args[1]
+        for call in broadcaster.broadcast.call_args_list
+        if call.args[0] == f"task:{task_id}"
+        and call.args[1].get("event_type") == "message"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0]["content"] == leaked_text
+    assert task_messages[0]["protocol_anomaly"] == "legacy_tool_markup"
+    assert task_messages[0]["tool_name"] is None
+
+
+@pytest.mark.asyncio
 async def test_consume_output_continues_after_parse_error(db_factory):
     """_consume_output should skip bad lines and continue processing."""
     async with db_factory() as db:
@@ -531,6 +665,7 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     """Chat history should filter out system_event with content=task_progress."""
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "claude",
     })
     task_id = create_resp.json()["id"]
 
@@ -542,8 +677,11 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
         ))
         db.add(LogEntry(
             instance_id=1, task_id=task_id,
-            task_retry_count=7, event_type="message", role="assistant",
+            task_retry_count=7, task_turn_generation=11,
+            native_turn_id="native-turn-11",
+            event_type="message", role="assistant",
             content="Hello", is_error=False,
+            raw_json='{"turn_id":"legacy-turn"}',
         ))
         await db.commit()
 
@@ -552,6 +690,141 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     assert len(msgs) == 1
     assert msgs[0]["content"] == "Hello"
     assert msgs[0]["task_retry_count"] == 7
+    assert msgs[0]["task_turn_generation"] == 11
+    assert msgs[0]["native_turn_id"] == "native-turn-11"
+    assert msgs[0]["turn_id"] == "native-turn-11"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_marks_legacy_tool_markup_anomaly(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "claude",
+    })
+    task_id = create_resp.json()["id"]
+    leaked_text = (
+        '<invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke>'
+    )
+
+    async with session_factory() as db:
+        db.add_all([
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=leaked_text,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content="A normal reply",
+            ),
+        ])
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert resp.status_code == 200
+    messages = resp.json()
+    assert messages[0]["content"] == leaked_text
+    assert messages[0]["protocol_anomaly"] == "legacy_tool_markup"
+    assert messages[1]["protocol_anomaly"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_history_ignores_codex_xml_example(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "codex",
+    })
+    task_id = create_resp.json()["id"]
+    xml_example = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    async with session_factory() as db:
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=xml_example,
+            )
+        )
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert resp.status_code == 200
+    assert resp.json()[0]["protocol_anomaly"] is None
+
+
+@pytest.mark.asyncio
+async def test_shared_history_marks_legacy_tool_markup_anomaly(
+    session_factory,
+):
+    from backend.api.shared_access import shared_history
+    from backend.models.task_share import TaskShare
+
+    leaked_text = (
+        '<function_calls><invoke name="Read">'
+        '<parameter name="file_path">/tmp/a</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="T",
+            description="d",
+            target_repo="/tmp",
+            provider="claude",
+        )
+        db.add(task)
+        await db.flush()
+        task_id = task.id
+        db.add(
+            TaskShare(
+                task_id=task_id,
+                shared_to_open_id="protocol-anomaly-recipient",
+                shared_to_name="Remote Reader",
+                shared_to_ccm_url="https://receiver.test",
+                share_token="protocol-anomaly-share-token",
+                status="active",
+            )
+        )
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=leaked_text,
+            )
+        )
+        await db.commit()
+
+    async with session_factory() as db:
+        messages = await shared_history(
+            task_id,
+            token="protocol-anomaly-share-token",
+            limit=0,
+            before_id=0,
+            compact=True,
+            db=db,
+        )
+    assert messages[0]["protocol_anomaly"] == "legacy_tool_markup"
 
 
 @pytest.mark.asyncio
@@ -912,6 +1185,81 @@ async def test_chat_history_correct_role_assignment(client, session_factory):
     assert msgs[3]["role"] == "system"  # fallback for system_init with no role
 
 
+def test_client_message_id_is_strict_and_handoff_neutral():
+    from backend.api.chat import (
+        ChatMessage,
+        FrontendReviewGoalMessage,
+        _worker_turn_handoff_request_identity,
+    )
+
+    client_message_id = "123e4567-e89b-12d3-a456-426614174000"
+    baseline = ChatMessage(message="same message")
+    correlated = ChatMessage(
+        message="same message",
+        client_message_id=client_message_id,
+    )
+
+    assert correlated.client_message_id == client_message_id
+    assert correlated.model_dump(mode="json") == baseline.model_dump(mode="json")
+    assert _worker_turn_handoff_request_identity(
+        correlated,
+        ("codex", "gpt-5.6-sol", "default"),
+    ) == _worker_turn_handoff_request_identity(
+        baseline,
+        ("codex", "gpt-5.6-sol", "default"),
+    )
+    goal = FrontendReviewGoalMessage(
+        message="review",
+        client_message_id=client_message_id,
+    )
+    assert goal.client_message_id == client_message_id
+    assert "client_message_id" not in goal.model_dump(mode="json")
+
+    for invalid in (
+        "123e4567-e89b-12d3-a456-42661417400",
+        "123e4567-e89b-12d3-a456-4266141740000",
+        "123E4567-E89B-12D3-A456-426614174000",
+        "123e4567e89b12d3a456426614174000",
+    ):
+        with pytest.raises(ValueError):
+            ChatMessage(message="invalid", client_message_id=invalid)
+        with pytest.raises(ValueError):
+            FrontendReviewGoalMessage(
+                message="invalid",
+                client_message_id=invalid,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ("chat", "frontend-review-goal"),
+)
+@pytest.mark.parametrize(
+    "invalid_client_message_id",
+    (
+        "123e4567-e89b-12d3-a456-42661417400",
+        "123e4567-e89b-12d3-a456-4266141740000",
+        "123E4567-E89B-12D3-A456-426614174000",
+        "123e4567e89b12d3a456426614174000",
+    ),
+)
+async def test_chat_endpoints_reject_invalid_client_message_id(
+    client,
+    endpoint,
+    invalid_client_message_id,
+):
+    response = await client.post(
+        f"/api/tasks/999999/{endpoint}",
+        json={
+            "message": "invalid correlation id",
+            "client_message_id": invalid_client_message_id,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_chat_send_stores_user_message(client, session_factory):
     """Sending a chat message should store user_message in DB."""
@@ -986,7 +1334,13 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
 
     with patch("backend.main.instance_manager", mock_im), \
          patch("backend.main.broadcaster", mock_broadcaster):
-        await client.post(f"/api/tasks/{task_id}/chat", json={"message": "hello"})
+        await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={
+                "message": "hello",
+                "client_message_id": "11111111-2222-4333-8444-555555555555",
+            },
+        )
 
     # Check broadcast was called with user_message on task channel
     broadcast_calls = mock_broadcaster.broadcast.call_args_list
@@ -1001,6 +1355,10 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
     assert isinstance(event["id"], int)
     assert event["id"] > 0
     assert event["timestamp"].endswith("Z")
+    assert (
+        event["client_message_id"]
+        == "11111111-2222-4333-8444-555555555555"
+    )
 
     async with session_factory() as db:
         stored = (
@@ -1012,6 +1370,9 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
             )
         ).scalar_one()
     assert event["id"] == stored.id
+    assert json.loads(stored.raw_json)["client_message_id"] == (
+        "11111111-2222-4333-8444-555555555555"
+    )
 
     history_response = await client.get(
         f"/api/tasks/{task_id}/chat/history?compact=true&limit=200"
@@ -1024,6 +1385,7 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
     )
     assert history_row["id"] == stored.id
     assert history_row["timestamp"] == event["timestamp"]
+    assert history_row["client_message_id"] == event["client_message_id"]
 
 
 @pytest.mark.asyncio

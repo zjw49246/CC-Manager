@@ -4,13 +4,28 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from backend.config import settings
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.instance import Instance
+from backend.models.plan import Plan
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentRuntimeReceipt,
+    PlanAgentStep,
+)
+from backend.models.project import Project
 from backend.models.task import Task
 from backend.schemas.plan import PlanModelRoute, PlanPipelineConfig
-from backend.services.codex_app_server import CodexTurnProcess
+from backend.services.codex_app_server import (
+    CodexRequiredMcpPreTurnError,
+    CodexTurnProcess,
+)
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
     PLANNER_SCHEMA_V2,
@@ -21,16 +36,99 @@ from backend.services.plan_agent_runner import (
     PlanAgentRunner,
     PlanAgentTimeout,
     PlanRouteUnavailable,
+    _CLAUDE_STREAM_READER_LIMIT_BYTES,
     _StructuredJsonWhitespaceGuard,
     _build_command,
     _extract_provider_content,
     _plan_request_with_attachments,
+    _repository_instruction_manifest,
     _validate_structured,
     _validate_structured_v2,
     _versioned_planner_prompt,
     _versioned_reference_files,
     _versioned_reviewer_prompt,
 )
+from backend.services.plan_runtime_receipt import prepare_runtime_attempt
+from backend.services.task_queue import TaskQueue
+from backend.services.task_runtime_secrets import (
+    create_private_runtime_temp_dir,
+)
+
+
+TASK_INCARNATION = "b" * 32
+
+
+def _plan_runtime_tmp(owner_id: int, *, attempt: int = 1):
+    return create_private_runtime_temp_dir(
+        runtime_namespace="plan-run",
+        owner_id=owner_id,
+        generation_components={
+            "step": owner_id,
+            "run_generation": 1,
+            "attempt": attempt,
+        },
+    )
+
+
+async def _seed_first_class_provider_boundary(
+    db_factory,
+    *,
+    target_status: str = "pending",
+    with_project: bool = False,
+):
+    async with db_factory() as db:
+        project_id = None
+        if with_project:
+            project = Project(name="provider-boundary-project", status="ready")
+            db.add(project)
+            await db.flush()
+            project_id = project.id
+        instance = Instance(name="provider-boundary-instance", status="running")
+        db.add(instance)
+        await db.flush()
+        target = Task(
+            title="provider boundary target",
+            status=target_status,
+            provider="codex",
+            incarnation_id="7" * 32,
+            project_id=project_id,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="provider boundary Plan",
+            initial_request="admit exactly once",
+            target_task_id=target.id,
+            project_id=project_id,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        ids = (target.id, plan.id, run.id, step.id, instance.id)
+    receipt = await prepare_runtime_attempt(db_factory, ids[3])
+    return (*ids, receipt)
 
 
 def test_claude_plan_command_is_read_only():
@@ -39,13 +137,89 @@ def test_claude_plan_command_is_read_only():
         model="claude-opus-4-6",
         effort="high",
         schema=PLANNER_SCHEMA,
+        isolation_settings_path="/private/runtime/plan-security.json",
     )
 
     assert command[0] == settings.claude_binary
-    assert command[command.index("--permission-mode") + 1] == "plan"
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in command
+    assert command[command.index("--permission-mode") + 1] == "default"
     assert "--no-session-persistence" in command
     assert "--safe-mode" in command
-    assert command[command.index("--tools") + 1] == "Read,Grep,Glob"
+    assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--allowedTools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--settings") + 1] == (
+        "/private/runtime/plan-security.json"
+    )
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert "Bash" in command[command.index("--disallowed-tools") + 1]
+    assert "--dangerously-skip-permissions" not in command
+
+
+def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
+    from backend.services.plan_agent_runner import (
+        _versioned_planner_prompt,
+        _versioned_reviewer_prompt,
+    )
+
+    common = {
+        "original_request": "Add a status endpoint.",
+        "run_type": "initial",
+        "planning_request": "Add a status endpoint.",
+        "reference_files": "",
+        "target_context": "",
+        "interaction_history": "",
+        "repository_context": '{"changed_since_run_start": false}',
+    }
+    planner = _versioned_planner_prompt(
+        **common,
+        base_plan=None,
+        current_candidate=None,
+        base_review_context="(none)",
+        reviewer_feedback=None,
+    )
+    reviewer = _versioned_reviewer_prompt(
+        **common,
+        base_plan=None,
+        base_review_context="(none)",
+        previous_reviewer_feedback=None,
+        plan_content="Inspect the existing route conventions.",
+    )
+
+    assert "header must be at most 20 characters" in planner
+    assert "not user decisions" in planner
+    assert "header must be at most 20 characters" in reviewer
+    assert "not be converted into a user question" in reviewer
+    assert "instruction_manifest" in planner
+    assert "manifested symlink" in reviewer
+    assert "shortest sufficient" in planner
+    assert "byte identity of unrelated" in reviewer
+
+
+def test_repository_instruction_manifest_records_agents_symlink(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("rules", encoding="utf-8")
+    (tmp_path / "AGENTS.md").symlink_to("CLAUDE.md")
+
+    assert _repository_instruction_manifest(str(tmp_path)) == {
+        "AGENTS.md": {"kind": "symlink", "target": "CLAUDE.md"},
+        "CLAUDE.md": {"kind": "file"},
+    }
+
+
+def test_claude_plan_host_unrestricted_command_keeps_read_only_tools():
+    command = _build_command(
+        provider="claude",
+        model="claude-opus-4-6",
+        effort="high",
+        schema=PLANNER_SCHEMA,
+        isolation_settings_path=None,
+    )
+
+    assert "--settings" not in command
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert command[command.index("--permission-mode") + 1] == "default"
+    assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--allowedTools") + 1] == "Glob,Grep,Read"
     assert "Bash" in command[command.index("--disallowed-tools") + 1]
     assert "--dangerously-skip-permissions" not in command
 
@@ -58,6 +232,26 @@ def test_structured_output_parsers_accept_native_provider_envelopes():
     claude_content = _extract_provider_content("claude", claude_raw)
     assert _validate_structured("planner", claude_content) == {
         "plan": "Do the work safely"
+    }
+
+    claude_stream_raw = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": "Read"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "structured_output": {"plan": "Use the streamed result"},
+        }),
+    ])
+    claude_stream_content = _extract_provider_content(
+        "claude", claude_stream_raw
+    )
+    assert _validate_structured("planner", claude_stream_content) == {
+        "plan": "Use the streamed result"
     }
 
     codex_raw = "\n".join([
@@ -367,6 +561,734 @@ async def test_pipeline_rejects_unknown_planner_provider(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_first_class_plan_target_project_drift_fails_provider_gate(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        project = Project(name="provider-gate-project", status="ready")
+        instance = Instance(
+            name="provider-gate-instance",
+            status="running",
+        )
+        db.add_all([project, instance])
+        await db.flush()
+        target = Task(
+            title="provider gate target",
+            status="pending",
+            project_id=project.id,
+            provider="codex",
+            incarnation_id="9" * 32,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="corrupt target Project",
+            initial_request="must fail closed",
+            target_task_id=target.id,
+            project_id=None,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        step_id = step.id
+
+    receipt = await prepare_runtime_attempt(db_factory, step_id)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    with pytest.raises(
+        PlanAgentError,
+        match="target Task changed Project",
+    ):
+        await runner._prepare_provider_effect_boundary(
+            task_id=-run_id,
+            provider="codex",
+            cwd=str(tmp_path),
+            admitted_home="/private/codex-home",
+            runtime_receipt=receipt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_projectless_plan_target_passes_provider_gate(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        instance = Instance(name="projectless-provider-gate", status="running")
+        db.add(instance)
+        await db.flush()
+        target = Task(
+            title="projectless target",
+            status="pending",
+            project_id=None,
+            provider="codex",
+            incarnation_id="8" * 32,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="projectless Plan",
+            initial_request="admit without a Project",
+            target_task_id=target.id,
+            project_id=None,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        step_id = step.id
+
+    receipt = await prepare_runtime_attempt(db_factory, step_id)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    boundary = await runner._prepare_provider_effect_boundary(
+        task_id=-run_id,
+        provider="codex",
+        cwd=str(tmp_path),
+        admitted_home="/private/codex-home",
+        runtime_receipt=receipt,
+    )
+
+    assert "/private/codex-home" in boundary[0]
+    boundary[-1].cleanup()
+
+
+@pytest.mark.asyncio
+async def test_first_class_provider_gate_locks_target_before_plan_graph(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    (
+        _target_id,
+        _plan_id,
+        run_id,
+        _step_id,
+        _instance_id,
+        receipt,
+    ) = await _seed_first_class_provider_boundary(
+        db_factory,
+        with_project=True,
+    )
+    updates: list[str] = []
+    locked_gets: list[str] = []
+    original_execute = AsyncSession.execute
+    original_get = AsyncSession.get
+
+    async def traced_execute(self, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and table is not None:
+            updates.append(table.name)
+        return await original_execute(self, statement, *args, **kwargs)
+
+    async def traced_get(self, entity, ident, *args, **kwargs):
+        if kwargs.get("with_for_update") is True:
+            locked_gets.append(entity.__tablename__)
+        return await original_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", traced_execute)
+    monkeypatch.setattr(AsyncSession, "get", traced_get)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    boundary = await runner._prepare_provider_effect_boundary(
+        task_id=-run_id,
+        provider="codex",
+        cwd=str(tmp_path),
+        admitted_home="/private/codex-home",
+        runtime_receipt=receipt,
+    )
+
+    assert updates[:3] == ["projects", "tasks", "plan_agent_runs"]
+    assert locked_gets[:5] == [
+        "plan_agent_runs",
+        "plans",
+        "plan_agent_steps",
+        "plan_agent_runtime_receipts",
+        "instances",
+    ]
+    boundary[-1].cleanup()
+
+
+@pytest.mark.asyncio
+async def test_first_class_provider_gate_fails_closed_on_target_probe_drift(
+    db_factory,
+    tmp_path,
+):
+    (
+        target_id,
+        _plan_id,
+        run_id,
+        _step_id,
+        _instance_id,
+        receipt,
+    ) = await _seed_first_class_provider_boundary(db_factory)
+    opens = 0
+
+    @asynccontextmanager
+    async def drift_factory():
+        nonlocal opens
+        opens += 1
+        if opens == 2:
+            async with db_factory() as writer:
+                await writer.execute(
+                    update(Task)
+                    .where(Task.id == target_id)
+                    .values(worker_id=4815)
+                )
+                await writer.commit()
+        async with db_factory() as db:
+            yield db
+
+    runner = PlanAgentRunner(
+        db_factory=drift_factory,
+        instance_manager=MagicMock(),
+    )
+
+    with pytest.raises(PlanAgentError, match="target Task changed"):
+        await runner._prepare_provider_effect_boundary(
+            task_id=-run_id,
+            provider="codex",
+            cwd=str(tmp_path),
+            admitted_home="/private/codex-home",
+            runtime_receipt=receipt,
+        )
+
+    async with db_factory() as db:
+        current_receipt = await db.get(PlanAgentRuntimeReceipt, receipt.id)
+        assert current_receipt is not None
+        assert current_receipt.status == "admitting"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_wal_provider_admission_serializes_terminal_task_delete(
+    tmp_path,
+):
+    from backend.database import Base
+
+    task_fenced = asyncio.Event()
+    release_admission = asyncio.Event()
+    delete_task_update_attempted = asyncio.Event()
+
+    class HeldAdmissionSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            table = getattr(statement, "table", None)
+            if (
+                getattr(statement, "is_update", False)
+                and getattr(table, "name", None) == Task.__tablename__
+                and not task_fenced.is_set()
+            ):
+                result = await super().execute(statement, *args, **kwargs)
+                task_fenced.set()
+                await release_admission.wait()
+                return result
+            return await super().execute(statement, *args, **kwargs)
+
+    class ObservedDeleteSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            table = getattr(statement, "table", None)
+            if (
+                getattr(statement, "is_update", False)
+                and getattr(table, "name", None) == Task.__tablename__
+                and not delete_task_update_attempted.is_set()
+            ):
+                delete_task_update_attempted.set()
+            return await super().execute(statement, *args, **kwargs)
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'plan-provider-delete-wal.db'}",
+        connect_args={"timeout": 2},
+    )
+    admission = None
+    deleting = None
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        admission_factory = async_sessionmaker(
+            engine,
+            class_=HeldAdmissionSession,
+            expire_on_commit=False,
+        )
+        delete_factory = async_sessionmaker(
+            engine,
+            class_=ObservedDeleteSession,
+            expire_on_commit=False,
+        )
+        (
+            target_id,
+            plan_id,
+            run_id,
+            _step_id,
+            _instance_id,
+            receipt,
+        ) = await _seed_first_class_provider_boundary(
+            factory,
+            target_status="completed",
+        )
+        runner = PlanAgentRunner(
+            db_factory=admission_factory,
+            instance_manager=MagicMock(),
+        )
+        admission = asyncio.create_task(
+            runner._prepare_provider_effect_boundary(
+                task_id=-run_id,
+                provider="codex",
+                cwd=str(tmp_path),
+                admitted_home="/private/codex-home",
+                runtime_receipt=receipt,
+            )
+        )
+        await asyncio.wait_for(task_fenced.wait(), timeout=1)
+
+        async def delete_target() -> bool:
+            async with delete_factory() as db:
+                return await TaskQueue(db).delete(target_id)
+
+        deleting = asyncio.create_task(delete_target())
+        await asyncio.wait_for(delete_task_update_attempted.wait(), timeout=1)
+        release_admission.set()
+        boundary, deleted = await asyncio.wait_for(
+            asyncio.gather(admission, deleting),
+            timeout=3,
+        )
+
+        assert deleted is False
+        boundary[-1].cleanup()
+        async with factory() as db:
+            target = await db.get(Task, target_id)
+            plan = await db.get(Plan, plan_id)
+            run = await db.get(PlanAgentRun, run_id)
+            current_receipt = await db.get(PlanAgentRuntimeReceipt, receipt.id)
+            assert target is not None and target.incarnation_id == "7" * 32
+            assert plan is not None and plan.active_run_id == run_id
+            assert run is not None and run.generation == receipt.run_generation
+            assert current_receipt is not None
+            assert current_receipt.runtime_token == receipt.runtime_token
+            assert current_receipt.status == "admitting"
+    finally:
+        release_admission.set()
+        for operation in (admission, deleting):
+            if operation is not None and not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("app_server_enabled", "admitted_home", "message"),
+    [
+        (False, "/private/codex-home", "transport is disabled"),
+        (True, None, "explicit CODEX_HOME"),
+    ],
+)
+async def test_codex_plan_preflight_failure_cleans_private_tmpdir(
+    db_factory,
+    monkeypatch,
+    app_server_enabled,
+    admitted_home,
+    message,
+):
+    runtime_temp_dir = _plan_runtime_tmp(706)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield admitted_home, None
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        app_server_enabled,
+    )
+
+    with pytest.raises(PlanRouteUnavailable, match=message):
+        await runner._run_process_attempt(
+            task_id=706,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="medium",
+            cwd="/tmp",
+            prompt="must not run",
+            schema=PLANNER_SCHEMA,
+            timeout=2,
+            home=admitted_home,
+            step_id=706,
+            step_type="planner",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_provider", "primary_provider", "fallback_provider"),
+    [
+        ("claude", "codex", "claude"),
+        ("codex", "claude", "codex"),
+    ],
+)
+async def test_stage_skips_unconfigured_provider_and_uses_same_provider_fallback(
+    db_factory,
+    monkeypatch,
+    configured_provider,
+    primary_provider,
+    fallback_provider,
+):
+    monkeypatch.setattr(settings, "provider_options", configured_provider)
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": primary_provider,
+                "model": (
+                    "gpt-5.6-sol"
+                    if primary_provider == "codex"
+                    else "claude-sonnet-5"
+                ),
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": fallback_provider,
+                "model": (
+                    "gpt-5.6-terra"
+                    if fallback_provider == "codex"
+                    else "claude-sonnet-5"
+                ),
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    task = Task(
+        id=707 if configured_provider == "claude" else 708,
+        title=f"{configured_provider}-only review",
+        description="review without the other provider",
+        mode="plan",
+    )
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    run_id = await runner._create_run(task=task, pipeline=pipeline)
+    runner._run_process = AsyncMock(return_value=(
+        {"action": "approve", "feedback": ""},
+        '{"action":"approve","feedback":""}',
+    ))
+
+    result, _raw, route, route_slot, account_id = await runner._run_stage(
+        run_id=run_id,
+        task_id=task.id,
+        step_type="reviewer",
+        round_number=1,
+        routes=pipeline.reviewer,
+        cwd="/tmp",
+        prompt="review",
+        schema=REVIEWER_SCHEMA_V2,
+        timeout=30,
+    )
+
+    assert result == {"action": "approve", "feedback": ""}
+    assert route.provider == configured_provider
+    assert route_slot == "fallback"
+    assert account_id == "__default__"
+    runner._run_process.assert_awaited_once()
+    assert runner._run_process.await_args.kwargs["provider"] == configured_provider
+    async with db_factory() as db:
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep)
+                    .where(PlanAgentStep.run_id == run_id)
+                    .order_by(PlanAgentStep.id)
+                )
+            ).scalars()
+        )
+    assert [step.route_slot for step in steps] == ["primary", "fallback"]
+    assert [step.status for step in steps] == ["failed", "completed"]
+    assert "not configured" in steps[0].error
+
+
+@pytest.mark.asyncio
+async def test_codex_pre_turn_startup_failure_is_route_unavailable(
+    db_factory,
+    monkeypatch,
+):
+    runtime_temp_dir = _plan_runtime_tmp(709)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield "/private/codex-home", None
+
+    async def fail_before_turn(**kwargs):
+        kwargs["runtime_temp_dir"].cleanup_if_unbound()
+        raise CodexRequiredMcpPreTurnError(
+            "Codex app-server could not start required task context: "
+            "[Errno 2] No such file or directory: 'codex'"
+        )
+
+    runner._runtime_admission = runtime_admission
+    runner._run_codex_turn = AsyncMock(side_effect=fail_before_turn)
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="pre-turn route is unavailable",
+    ):
+        await runner._run_process_attempt(
+            task_id=709,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home="/private/codex-home",
+            step_id=709,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_claude_missing_binary_before_spawn_is_route_unavailable(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    runtime_temp_dir = _plan_runtime_tmp(710)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield None, None
+
+    async def missing_binary(*_args, **kwargs):
+        assert kwargs["limit"] == _CLAUDE_STREAM_READER_LIMIT_BYTES
+        raise FileNotFoundError("No such file or directory: 'claude'")
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "generate_claude_read_only_isolation_settings",
+        lambda *_args, **_kwargs: tmp_path / "plan-security.json",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner._settle_spawn",
+        missing_binary,
+    )
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="became unavailable before process admission",
+    ):
+        await runner._run_process_attempt(
+            task_id=710,
+            provider="claude",
+            model="claude-sonnet-5",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home=None,
+            step_id=710,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_claude_plan_projects_api_account_auth_into_process(
+    db_factory,
+    monkeypatch,
+):
+    runtime_temp_dir = _plan_runtime_tmp(712)
+    instance_manager = MagicMock()
+    cloudrouter_store = MagicMock()
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=instance_manager,
+        cloudrouter_store=cloudrouter_store,
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield "/private/claude-api-home", True
+
+    captured_env = None
+
+    async def missing_binary(*_command, **kwargs):
+        nonlocal captured_env
+        captured_env = kwargs["env"]
+        raise FileNotFoundError("No such file or directory: 'claude'")
+
+    def inject_auth(environment, store, config_dir):
+        assert store is cloudrouter_store
+        assert config_dir == "/private/claude-api-home"
+        environment["ANTHROPIC_API_KEY"] = "projected-secret"
+        environment["ANTHROPIC_BASE_URL"] = "https://api.example.invalid"
+        return True
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        "backend.services.claude_auth_projection."
+        "inject_cloudrouter_claude_direct_auth",
+        inject_auth,
+    )
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner._settle_spawn",
+        missing_binary,
+    )
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="became unavailable before process admission",
+    ):
+        await runner._run_process_attempt(
+            task_id=712,
+            provider="claude",
+            model="claude-sonnet-5",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home="/private/claude-api-home",
+            step_id=712,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert captured_env is not None
+    assert captured_env["CLAUDE_CONFIG_DIR"] == "/private/claude-api-home"
+    assert captured_env["ANTHROPIC_API_KEY"] == "projected-secret"
+    assert captured_env["ANTHROPIC_BASE_URL"] == "https://api.example.invalid"
+    assert captured_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
 async def test_cancelled_pipeline_marks_active_step_cancelled(db_factory):
     pipeline = PlanPipelineConfig.model_validate({
         "version": 1,
@@ -494,6 +1416,7 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
         prompt="plan safely",
         schema=PLANNER_SCHEMA,
         timeout=10,
+        runtime_temp_dir=_plan_runtime_tmp(7),
     )
 
     assert returncode == 0
@@ -511,8 +1434,56 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
     assert kwargs["disable_project_config"] is True
     assert kwargs["disable_user_mcp"] is True
     assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["task_ssh_disable_network"] is True
+    assert kwargs["task_git_read_paths"] == ()
+    assert kwargs["task_git_boundary_fingerprint"] == ()
+    assert kwargs["task_private_tmpdir"].cleaned is True
     assert kwargs["output_schema"] == PLANNER_SCHEMA
     assert kwargs["resume_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_plan_cleans_private_tmpdir_when_thread_admission_fails(
+    db_factory,
+):
+    captured_tmpdir = None
+
+    async def fail_start(**kwargs):
+        nonlocal captured_tmpdir
+        captured_tmpdir = kwargs["task_private_tmpdir"]
+        raise RuntimeError("thread admission failed")
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(side_effect=fail_start)
+
+    class Manager:
+        @asynccontextmanager
+        async def codex_home_app_server_guard(self, home):
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=Manager(),
+    )
+
+    with pytest.raises(RuntimeError, match="thread admission failed"):
+        await runner._run_codex_turn(
+            task_id=704,
+            home="/canonical/default-codex-home",
+            model="gpt-5.6-sol",
+            effort="medium",
+            cwd="/tmp",
+            prompt="must not run",
+            schema=PLANNER_SCHEMA,
+            timeout=2,
+            runtime_temp_dir=_plan_runtime_tmp(704),
+        )
+
+    assert captured_tmpdir is not None
+    assert captured_tmpdir.cleaned is True
 
 
 def test_structured_json_whitespace_guard_ignores_string_content_and_escapes():
@@ -580,7 +1551,7 @@ async def test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned(
         ),
     ):
         await runner._run_codex_turn(
-            task_id=-703,
+            task_id=703,
             home="/canonical/default-codex-home",
             model="gpt-5.6-sol",
             effort="medium",
@@ -589,6 +1560,7 @@ async def test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned(
             schema=PLANNER_SCHEMA_V2,
             timeout=2,
             json_whitespace_limit=16,
+            runtime_temp_dir=_plan_runtime_tmp(703),
         )
 
     assert interrupted.is_set()
@@ -656,7 +1628,7 @@ async def test_codex_reviewer_delta_stall_is_persisted_and_cleaned(
         ),
     ):
         await runner._run_codex_turn(
-            task_id=-701,
+            task_id=701,
             home="/canonical/default-codex-home",
             model="gpt-5.6-sol",
             effort="xhigh",
@@ -666,6 +1638,7 @@ async def test_codex_reviewer_delta_stall_is_persisted_and_cleaned(
             timeout=2,
             step_id=step_id,
             delta_idle_timeout=0.05,
+            runtime_temp_dir=_plan_runtime_tmp(701),
         )
 
     registry.delete_thread.assert_awaited_once_with(
@@ -721,7 +1694,7 @@ async def test_codex_delta_idle_watchdog_allows_long_initial_reasoning(
         instance_manager=Manager(),
     )
     stdout, _stderr, returncode = await runner._run_codex_turn(
-        task_id=-702,
+        task_id=702,
         home="/canonical/default-codex-home",
         model="gpt-5.6-sol",
         effort="xhigh",
@@ -730,6 +1703,7 @@ async def test_codex_delta_idle_watchdog_allows_long_initial_reasoning(
         schema=REVIEWER_SCHEMA_V2,
         timeout=2,
         delta_idle_timeout=0.05,
+        runtime_temp_dir=_plan_runtime_tmp(702),
     )
     await completion
 

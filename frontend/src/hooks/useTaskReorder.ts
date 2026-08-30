@@ -79,6 +79,8 @@ interface ReorderApi {
   overIndex: number | null;
   /** 整行可拖（侧边栏用）：targetProps + handleProps 合并。 */
   itemProps: (t: Task, idx: number) => Record<string, unknown>;
+  /** 仅作为 HTML5 拖放目标，不允许该行自身发起桌面或移动端拖拽。 */
+  dropTargetProps: (t: Task, idx: number) => Record<string, unknown>;
   /** 拖放目标 + 移动端长按（行容器用）。 */
   targetProps: (t: Task, idx: number) => Record<string, unknown>;
   /** 桌面拖拽手柄（行内有大段可选中文字时，整行 draggable 会被
@@ -214,7 +216,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     onDragEnd: () => endDrag(false),
   }), [endDrag]);
 
-  const targetProps = useCallback((t: Task, idx: number) => ({
+  const dropTargetProps = useCallback((_t: Task, idx: number) => ({
     'data-reorder-idx': idx,
     onDragOver: (e: React.DragEvent) => {
       if (dragRef.current == null) return;
@@ -227,6 +229,10 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
       overRef.current = insertionSlot(e.currentTarget, idx, e.clientY);
       endDrag(true);
     },
+  }), [endDrag]);
+
+  const targetProps = useCallback((t: Task, idx: number) => ({
+    ...dropTargetProps(t, idx),
     // 移动端长按激活
     onTouchStart: () => {
       longPress.current = setTimeout(() => {
@@ -247,7 +253,7 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     onTouchEnd: () => {
       if (longPress.current) { clearTimeout(longPress.current); longPress.current = null; }
     },
-  }), [endDrag]);
+  }), [dropTargetProps]);
 
   const pointerHandleProps = useCallback((t: Task, idx: number) => ({
     onPointerDown: (e: React.PointerEvent) => {
@@ -287,5 +293,14 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
     ...handleProps(t),
   }), [targetProps, handleProps]);
 
-  return { draggingId, overIndex, itemProps, targetProps, handleProps, pointerHandleProps, ghost };
+  return {
+    draggingId,
+    overIndex,
+    itemProps,
+    dropTargetProps,
+    targetProps,
+    handleProps,
+    pointerHandleProps,
+    ghost,
+  };
 }

@@ -22,8 +22,11 @@ export function VersionedPlanPanel({ onVisibilityChange, onNavigateTask }: Props
   const refresh = useCallback(async () => {
     try {
       const rows = (await api.listPlans()).filter((plan) => (
-        plan.display_state === 'awaiting_review'
-        || (plan.display_state === 'approved' && plan.target_task_id == null)
+        !plan.read_only
+        && (
+          plan.display_state === 'awaiting_review'
+          || (plan.display_state === 'approved' && plan.target_task_id == null)
+        )
       ));
       setPlans(rows);
       setError(null);

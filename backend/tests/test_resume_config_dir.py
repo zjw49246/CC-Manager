@@ -632,6 +632,51 @@ class TestResolveResumeConfigDirCodex:
         assert task.metadata_["codex_account_id"] == "codex-1"
 
     @pytest.mark.asyncio
+    async def test_cold_fresh_route_refreshes_rollouts_before_selecting(
+        self, tmp_path,
+    ):
+        task = MagicMock(id=42, metadata_={})
+        disp = self._dispatcher(tmp_path, task)
+        terminal_path = _codex_rollout(
+            tmp_path / "codex-1",
+            "terminal",
+            json.dumps({
+                "timestamp": "2026-08-18T19:40:04.821Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "error": {
+                        "message": "try again at Aug 20th, 2026 7:15 AM",
+                        "codex_error_info": "usage_limit_exceeded",
+                    },
+                },
+            }) + "\n",
+        )
+        assert terminal_path.exists()
+        _codex_rollout(
+            tmp_path / "codex-2",
+            "healthy",
+            json.dumps({
+                "timestamp": "2026-08-18T19:41:00Z",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {"used_percent": 10},
+                    },
+                },
+            }) + "\n",
+        )
+
+        result = await disp._resolve_codex_home(
+            None,
+            task_id=42,
+            model="gpt-5.6-sol",
+        )
+
+        assert result == str((tmp_path / "codex-2").resolve())
+        assert task.metadata_["codex_account_id"] == "codex-2"
+
+    @pytest.mark.asyncio
     async def test_fresh_task_skips_a_runtime_blocked_account(self, tmp_path):
         task = MagicMock(id=42, metadata_={})
         disp = self._dispatcher(tmp_path, task)
@@ -985,6 +1030,7 @@ class TestResolveResumeConfigDirCodex:
             shared_from_id=None,
             status="completed",
             retry_count=0,
+            turn_generation=0,
             instance_id=None,
             started_at=None,
             completed_at=None,
@@ -1031,6 +1077,7 @@ class TestResolveResumeConfigDirCodex:
             shared_from_id=None,
             status="completed",
             retry_count=0,
+            turn_generation=0,
             instance_id=None,
             started_at=None,
             completed_at=None,

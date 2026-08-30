@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.config import settings
+from backend.services.cancellation import await_task_completion
 from backend.services.process_safety import require_safe_process_group_id
 
 logger = logging.getLogger(__name__)
@@ -623,13 +624,7 @@ class ContainerManager:
                 stderr=asyncio.subprocess.STDOUT,
             )
         )
-        while not spawn.done():
-            try:
-                await asyncio.shield(spawn)
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-            except BaseException:
-                break
+        cancellation = await await_task_completion(spawn)
         try:
             proc = spawn.result()
         except BaseException:
@@ -639,27 +634,20 @@ class ContainerManager:
 
         communication = asyncio.create_task(proc.communicate())
         timed_out = False
-        while not communication.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                timed_out = True
-                break
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(communication),
-                    timeout=remaining,
-                )
-            except asyncio.CancelledError as exc:
-                # A docker exec preflight owns the container lease while it
-                # runs. Delay cancellation until it exits naturally (or the
-                # original timeout kills the client), so normal cancellation
-                # cannot release the Manager-side launch gate prematurely.
-                cancellation = cancellation or exc
-            except asyncio.TimeoutError:
-                timed_out = True
-                break
-            except BaseException:
-                break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            timed_out = True
+        elif not communication.done():
+            # Create this deadline waiter once. Recreating wait_for(shield())
+            # inside a cancelled AnyIO scope immediately re-cancels every new
+            # wrapper and can busy-spin without allowing communicate() to run.
+            deadline_wait = asyncio.create_task(
+                asyncio.wait({communication}, timeout=remaining)
+            )
+            wait_cancellation = await await_task_completion(deadline_wait)
+            cancellation = cancellation or wait_cancellation
+            done, _pending = deadline_wait.result()
+            timed_out = not done
 
         if timed_out and proc.returncode is None:
             try:
@@ -667,13 +655,8 @@ class ContainerManager:
             except ProcessLookupError:
                 pass
 
-        while not communication.done():
-            try:
-                await asyncio.shield(communication)
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-            except BaseException:
-                break
+        settle_cancellation = await await_task_completion(communication)
+        cancellation = cancellation or settle_cancellation
 
         try:
             out, _ = communication.result()
@@ -934,15 +917,7 @@ class ContainerManager:
         spawn = asyncio.create_task(
             asyncio.create_subprocess_exec(*docker_cmd, **spawn_kwargs)
         )
-        cancellation: asyncio.CancelledError | None = None
-        first_wait = True
-        while first_wait or not spawn.done():
-            first_wait = False
-            try:
-                await asyncio.shield(spawn)
-            except asyncio.CancelledError as exc:
-                if cancellation is None:
-                    cancellation = exc
+        cancellation = await await_task_completion(spawn)
 
         process = spawn.result()
         self.register_exec(process, spec)
@@ -950,15 +925,8 @@ class ContainerManager:
             cleanup = asyncio.create_task(
                 self._cleanup_cancelled_exec_spawn(process, spec)
             )
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException:
-                    if cleanup.done():
-                        break
-                    raise
+            later_cancellation = await await_task_completion(cleanup)
+            cancellation = cancellation or later_cancellation
             # On failure keep the exact record in ``_execs`` as fail-closed
             # evidence.  The cleanup exception is logged, but cancellation
             # remains the public outcome expected by the caller.
@@ -1319,18 +1287,24 @@ class ContainerManager:
 
 
 async def is_shared_project(project_id: int | None, db_factory) -> bool:
-    """Check if a project has been shared to any user."""
+    """Check legacy cross-CCM Project sharing behind its writer fence.
+
+    TeamProjectShare is an in-process ACL and deliberately does not select the
+    legacy container/shadow trust boundary.
+    """
     if not project_id:
         return False
-    from sqlalchemy import select
-    from backend.models.team_share import TeamProjectShare
+    from backend.services.project_share_admission import (
+        lock_project_share_authority,
+        project_has_active_share,
+    )
+
     async with db_factory() as db:
-        result = await db.execute(
-            select(TeamProjectShare.id).where(
-                TeamProjectShare.project_id == project_id
-            ).limit(1)
-        )
-        return result.scalar_one_or_none() is not None
+        # The lock pairs with the 0 -> >0 share transition fence. If sharing
+        # won first, launch observes the committed grant; if launch already
+        # published its reservation, the share path returns 409 instead.
+        await lock_project_share_authority(db, project_id)
+        return await project_has_active_share(db, project_id)
 
 
 async def build_sandbox_image():

@@ -445,6 +445,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
+    { name = "anyio" },
     { name = "auto-backup" },
     { name = "bcrypt" },
     { name = "boto3" },
@@ -485,6 +486,7 @@ requires-dist = [
     { name = "aiomysql", marker = "extra == 'mysql'", specifier = ">=0.2.0" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "alembic", specifier = ">=1.13.0" },
+    { name = "anyio", specifier = ">=4.12.0" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29.0" },
     { name = "auto-backup", git = "https://github.com/zjw49246/auto-backup" },
     { name = "bcrypt", specifier = ">=5.0.0" },
@@ -517,7 +519,7 @@ dev = [
 [[package]]
 name = "claude-pty"
 version = "0.1.0"
-source = { git = "https://github.com/zjw49246/Claude-Code-PTY#d6ff732d633b8b7bdb3ada717ffd1cbc9e701163" }
+source = { git = "https://github.com/zjw49246/Claude-Code-PTY#473f3fbc65d79910385dbd3ec4b29639b38001fe" }
 
 [[package]]
 name = "click"

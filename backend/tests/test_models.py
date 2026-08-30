@@ -19,6 +19,9 @@ async def test_task_defaults(db_session):
     assert task.retry_count == 0
     assert task.max_retries == 2
     assert task.mode == "auto"
+    assert task.turn_generation == 0
+    assert task.turn_source_log_id is None
+    assert task.capability_policy is None
     assert task.merge_status == "pending"
     assert task.project_id is None
     assert task.target_repo is not None  # defaults to ""
@@ -108,6 +111,120 @@ async def test_log_entry_defaults(db_session):
     assert entry.tool_input is None
     assert entry.tool_output is None
     assert entry.task_id is None
+    assert entry.task_turn_generation is None
+    assert entry.native_turn_id is None
+    assert entry.turn_scope is None
+    assert entry.actual_transport is None
+
+
+@pytest.mark.asyncio
+async def test_task_and_log_exact_turn_identity_round_trip(db_session):
+    from backend.models.log_entry import LogEntry
+
+    generation = 2**40 + 7
+    task = Task(
+        title="exact turn",
+        description="d",
+        turn_generation=generation,
+        capability_policy={
+            "version": 1,
+            "max_invocations": 2,
+            "capabilities": {"plan": 1, "code_review": 1},
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+    entry = LogEntry(
+        task_id=task.id,
+        event_type="result",
+        task_turn_generation=generation,
+        native_turn_id="turn_native_123",
+        turn_scope="foreground",
+    )
+    db_session.add(entry)
+    await db_session.flush()
+    task.turn_source_log_id = entry.id
+    await db_session.commit()
+    await db_session.refresh(task)
+    await db_session.refresh(entry)
+
+    assert task.turn_generation == generation
+    assert task.turn_source_log_id == entry.id
+    assert task.capability_policy == {
+        "version": 1,
+        "max_invocations": 2,
+        "capabilities": {"plan": 1, "code_review": 1},
+    }
+    assert entry.task_turn_generation == generation
+    assert entry.native_turn_id == "turn_native_123"
+    assert entry.turn_scope == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_log_entry_rejects_unknown_turn_scope(db_session):
+    from sqlalchemy.exc import IntegrityError
+
+    from backend.models.log_entry import LogEntry
+
+    db_session.add(
+        LogEntry(
+            event_type="result",
+            turn_scope="background",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_log_entry_actual_transport_is_source_only_and_enumerated(db_session):
+    from sqlalchemy.exc import IntegrityError
+
+    from backend.models.log_entry import LogEntry
+
+    db_session.add(
+        LogEntry(
+            event_type="turn_source",
+            turn_scope="source",
+            actual_transport="codex_app_server",
+        )
+    )
+    await db_session.commit()
+
+    db_session.add(
+        LogEntry(
+            event_type="result",
+            turn_scope="foreground",
+            actual_transport="claude_exec",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+    # SQL CHECK constraints accept UNKNOWN, so the constraint must explicitly
+    # reject a NULL scope instead of relying on ``turn_scope = 'source'``.
+    db_session.add(
+        LogEntry(
+            event_type="turn_source",
+            turn_scope=None,
+            actual_transport="codex_exec",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+    db_session.add(
+        LogEntry(
+            event_type="turn_source",
+            turn_scope="source",
+            actual_transport="codex",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,19 @@
 import re
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import settings
+from backend.pr_review_evidence import PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER
 
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+
+
+def _validate_branch_name(value: str) -> str:
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError("default_branch must be one non-empty line")
+    return value
 
 
 class RequiredCheckPolicy(BaseModel):
@@ -31,6 +39,33 @@ class RequiredCheckPolicy(BaseModel):
         return value
 
 
+def required_checks_support_direct_auto_merge(value: object) -> bool:
+    """Return whether configured CI policies retain an App identity.
+
+    Empty policies remain valid for repositories that do not ask PR Monitor
+    to gate on configured CI.  When policies are present, direct ref updates
+    can only prove branch-protection coverage for app-bound check runs.
+    """
+
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if isinstance(item, RequiredCheckPolicy):
+            if item.kind != "check_run":
+                return False
+            continue
+        if not isinstance(item, dict):
+            return False
+        if item.get("kind") != "check_run":
+            return False
+        if not all(
+            isinstance(item.get(field), str) and bool(item[field].strip())
+            for field in ("name", "app_slug")
+        ):
+            return False
+    return True
+
+
 class MonitoredRepoCreate(BaseModel):
     repo_full_name: str
     project_id: int | None = None
@@ -47,7 +82,7 @@ class MonitoredRepoCreate(BaseModel):
     auto_repair: bool = False
     max_repair_attempts: int = Field(default=3, ge=1, le=20)
     merge_queue_mode: str = "manual"
-    default_branch: str = "main"
+    default_branch: str = Field(default="main", min_length=1, max_length=100)
     allowed_authors: list[str] = []
 
     @field_validator("repo_full_name")
@@ -69,9 +104,16 @@ class MonitoredRepoCreate(BaseModel):
     @field_validator("merge_queue_mode")
     @classmethod
     def validate_merge_queue_mode(cls, v: str) -> str:
-        if v not in {"manual", "shadow", "auto"}:
-            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+        if v != "manual":
+            raise ValueError(
+                "Merge Queue is retired; merge_queue_mode must be manual"
+            )
         return v
+
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, value: str) -> str:
+        return _validate_branch_name(value)
 
 
 class MonitoredRepoUpdate(BaseModel):
@@ -86,7 +128,11 @@ class MonitoredRepoUpdate(BaseModel):
     auto_repair: bool | None = None
     max_repair_attempts: int | None = Field(default=None, ge=1, le=20)
     merge_queue_mode: str | None = None
-    default_branch: str | None = None
+    default_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
     allowed_authors: list[str] | None = None
     enabled: bool | None = None
 
@@ -120,9 +166,19 @@ class MonitoredRepoUpdate(BaseModel):
     @field_validator("merge_queue_mode")
     @classmethod
     def validate_merge_queue_mode(cls, v: str | None) -> str | None:
+        # Keep accepting historical values at the request parsing boundary so
+        # an active Delivery Run can return its durable 409 policy-freeze
+        # response before the retired setting is rejected by the route.
         if v is not None and v not in {"manual", "shadow", "auto"}:
-            raise ValueError("merge_queue_mode must be manual, shadow, or auto")
+            raise ValueError(
+                "merge_queue_mode must be manual, shadow, or auto"
+            )
         return v
+
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, value: str | None) -> str | None:
+        return _validate_branch_name(value) if value is not None else None
 
 
 class MonitoredRepoResponse(BaseModel):
@@ -173,8 +229,14 @@ class MonitoredRepoResponse(BaseModel):
         return v
 
 
-class MonitoredRepoDetailResponse(MonitoredRepoResponse):
-    """Full detail response — shows unmasked webhook_secret."""
+class MonitoredRepoSecretResponse(MonitoredRepoResponse):
+    """One-time create/rotation response containing the new raw secret.
+
+    Ordinary list, detail, update, and toggle responses always use
+    :class:`MonitoredRepoResponse`, whose validator exposes only a short hint.
+    Keeping the reveal as a distinct response type makes accidental reuse on a
+    read endpoint visible during review.
+    """
 
     # NOTE: must reuse the parent's validator method name ("mask_secret") so it
     # actually overrides it in Pydantic v2; a differently-named validator would
@@ -187,9 +249,12 @@ class MonitoredRepoDetailResponse(MonitoredRepoResponse):
 
 class PRReviewResponse(BaseModel):
     id: int
+    attempt: int = 1
+    rerun_of_review_id: int | None = None
     monitor_run_id: int | None = None
     repo_id: int
     pr_number: int
+    base_ref: str | None = None
     base_sha: str | None
     head_sha: str | None
     delivery_id: str | None
@@ -197,9 +262,78 @@ class PRReviewResponse(BaseModel):
     pr_author: str
     pr_url: str
     task_id: int | None
+    display_task_id: int | None = None
+    # ``task_id`` is retained for old clients.  Panel reviews have one Task
+    # per role, so new clients must use this complete, deterministic list
+    # instead of treating the legacy first Task as the whole review.
+    task_ids: list[int] = Field(default_factory=list)
     status: str
+    code_verdict: Literal["pass", "changes_required"] | None = None
     review_summary: str | None
+    display_status: str | None = None
+    display_summary: str | None = None
+    outcome_kind: Literal[
+        "in_progress",
+        "review_result",
+        "infrastructure_error",
+        "lifecycle",
+    ] = "in_progress"
+    aggregate_verdict: Literal["pass", "changes_required"] | None = None
+    verdict_state: Literal["pending", "complete", "unavailable"] = "pending"
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ] = "not_started"
+    lifecycle_state: Literal[
+        "unknown",
+        "reviewing",
+        "superseding",
+        "superseded",
+        "cancelled",
+        "merged",
+        "closed",
+        "failed",
+    ] = "reviewing"
+    failure_stage: Literal[
+        "reviewer",
+        "ci",
+        "github_identity",
+        "publication",
+        "merge",
+        "recovery",
+        "lifecycle",
+    ] | None = None
+    publication_error: str | None = None
+    error_category: Literal["unsupported_input_size"] | None = None
+    error_measured: int | None = Field(
+        default=None,
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_unit: Literal["characters", "UTF-8 bytes"] | None = None
+    published_actor: str | None = None
+    published_at: datetime | None = None
+    github_review_id: int | None = None
+    github_review_url: str | None = None
+    github_state: str | None = None
+    # CCM always emits informational, exact-head GitHub Reviews.  A passing
+    # code verdict must never be presented as a GitHub APPROVE mutation.
+    github_event: Literal["COMMENT"] | None = None
+    can_rerun: bool = False
+    reviewer_count: int = 0
+    reviewer_status_counts: dict[str, int] = Field(default_factory=dict)
+    reviewer_verdict_counts: dict[str, int] = Field(default_factory=dict)
     action_taken: str | None
+    merge_method: str | None = None
     ci_status: str | None = None
     ci_summary: str | None = None
     ci_details: dict | None = None
@@ -340,6 +474,15 @@ class PRReviewerRunResponse(BaseModel):
     effort: str | None
     status: str
     verdict: str | None
+    # A bounded, human-readable role summary.  The strict machine payload in
+    # ``PRReviewerRun.result_json`` is intentionally never part of the API.
+    result_body: str | None = None
+    outcome_kind: Literal[
+        "in_progress",
+        "review_result",
+        "infrastructure_error",
+        "lifecycle",
+    ] = "in_progress"
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None
@@ -351,6 +494,116 @@ class PRReviewerRunResponse(BaseModel):
 class PRReviewDetailResponse(PRReviewResponse):
     reviewer_runs: list[PRReviewerRunResponse] = Field(default_factory=list)
     is_current_snapshot: bool = False
+
+
+class PRReviewRerunRequest(BaseModel):
+    expected_head_sha: str = Field(pattern=r"[0-9a-fA-F]{40}")
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+    @field_validator("expected_head_sha")
+    @classmethod
+    def normalize_expected_head_sha(cls, value: str) -> str:
+        return value.lower()
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_rerun_idempotency_key(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9._:-]+", value) is None:
+            raise ValueError("idempotency_key contains unsafe characters")
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class PRReviewRerunResponse(BaseModel):
+    """Narrow receipt for a newly admitted exact-head review attempt.
+
+    The ordinary Tasks result surface may invoke this mutation, so the
+    response must not reuse ``PRReviewResponse`` and accidentally disclose
+    internal Reviewer Task identities or execution metadata.
+    """
+
+    id: int
+    attempt: int = Field(ge=1)
+    rerun_of_review_id: int
+    monitor_run_id: int
+    status: str
+    head_sha: str = Field(pattern=r"[0-9a-f]{40}")
+
+
+class PRResultFeedItem(BaseModel):
+    # Stable across pagination and suitable for React/Map identity. Historical
+    # Single reviews created before PRMonitorRun attachment use ``review:<id>``.
+    result_key: str = Field(pattern=r"^(run|review):[1-9][0-9]*$")
+    run_id: int | None
+    display_task_id: int | None = None
+    repo_id: int
+    repo_full_name: str
+    pr_number: int
+    pr_title: str
+    pr_url: str
+    review_id: int
+    base_ref: str | None
+    base_sha: str | None
+    head_sha: str | None
+    verdict_state: Literal["pending", "complete", "unavailable"]
+    aggregate_verdict: Literal["pass", "changes_required"] | None
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ]
+    lifecycle_state: Literal[
+        "unknown",
+        "reviewing",
+        "superseding",
+        "superseded",
+        "cancelled",
+        "merged",
+        "closed",
+        "failed",
+    ]
+    failure_stage: Literal[
+        "reviewer",
+        "ci",
+        "github_identity",
+        "publication",
+        "merge",
+        "recovery",
+        "lifecycle",
+    ] | None
+    error_category: Literal["unsupported_input_size"] | None
+    error_measured: int | None = Field(
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_limit: int | None = Field(
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_unit: Literal["characters", "UTF-8 bytes"] | None
+    display_status: str
+    display_summary: str | None
+    published_actor: str | None
+    published_at: datetime | None
+    github_review_id: int | None
+    github_review_url: str | None
+    github_state: str | None
+    github_event: Literal["COMMENT"] | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    can_rerun: bool
+
+
+class GitHubPublisherIdentityResponse(BaseModel):
+    available: bool
+    actor: str | None
+    error: str | None
+    checked_at: datetime
 
 
 class PRMonitorBindRequest(BaseModel):
@@ -374,23 +627,62 @@ class PRRepairWakeResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class PRMergeQueueActionResponse(BaseModel):
+class PRMergeActionResponse(BaseModel):
+    """Generic merge outbox projection.
+
+    The database table keeps its historical Queue name so old effects can be
+    reconciled safely, while new human-triggered actions use ``effect_kind``
+    ``direct`` and never enter GitHub Merge Queue.
+    """
+
     id: int
     review_id: int
     trigger_base_sha: str
     trigger_head_sha: str
     status: str
-    github_queue_entry_id: str | None
-    merge_group_sha: str | None
-    merge_group_ref: str | None
-    ci_status: str | None
-    ci_details: dict | None
-    attempt_count: int
-    last_error: str | None
+    effect_kind: Literal["queue", "direct"] = "queue"
+    publishing_actor: str | None = None
+    publishing_started_at: datetime | None = None
+    merge_method: str | None = None
+    wait_for_ci: bool = False
+    required_checks: list[RequiredCheckPolicy] = Field(default_factory=list)
+    github_queue_entry_id: str | None = None
+    merge_group_sha: str | None = None
+    merge_group_ref: str | None = None
+    ci_status: str | None = None
+    ci_details: dict | None = None
+    attempt_count: int = 0
+    last_error: str | None = None
     created_at: datetime
     completed_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+# Compatibility import for callers that still use the old class name.
+PRMergeQueueActionResponse = PRMergeActionResponse
+
+
+class PRMonitorReviewAttemptResponse(BaseModel):
+    """Safe history row for one immutable head reviewed by a Monitor Run."""
+
+    id: int
+    attempt: int = 1
+    head_sha: str | None
+    status: str
+    aggregate_verdict: Literal["pass", "changes_required"] | None = None
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ] = "not_started"
+    github_review_id: int | None = None
+    github_review_url: str | None = None
+    created_at: datetime
+    completed_at: datetime | None
 
 
 class PRMonitorRunResponse(BaseModel):
@@ -401,6 +693,7 @@ class PRMonitorRunResponse(BaseModel):
     current_base_sha: str
     current_head_sha: str
     current_review_id: int | None
+    display_task_id: int | None = None
     developer_task_id: int | None
     repair_attempts: int
     max_repair_attempts: int
@@ -412,6 +705,7 @@ class PRMonitorRunResponse(BaseModel):
     updated_at: datetime
     completed_at: datetime | None
     wakes: list[PRRepairWakeResponse] = Field(default_factory=list)
-    merge_actions: list[PRMergeQueueActionResponse] = Field(default_factory=list)
+    merge_actions: list[PRMergeActionResponse] = Field(default_factory=list)
+    review_history: list[PRMonitorReviewAttemptResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}

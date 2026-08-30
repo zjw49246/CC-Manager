@@ -1,4 +1,4 @@
-"""Loopback Responses API proxy that proves Codex's actual service tier.
+"""Loopback Responses API proxy that fences Codex service-tier requests.
 
 Codex 0.144.6 accepts a service tier through app-server, but its app-server
 protocol does not expose the upstream ``response.service_tier`` field.  This
@@ -7,8 +7,9 @@ proxy is therefore deliberately placed on the HTTP Responses path:
 * the request body must carry the tier expected for its native thread;
 * a child thread inherits the expectation through
   ``x-codex-parent-thread-id``;
-* Fast releases no successful SSE bytes until ``response.created`` reports
-  the exact actual tier ``priority``;
+* Fast verifies that the exact native turn sends ``service_tier=priority``;
+* a successful ``response.created`` accepts the request even when its
+  informational ``service_tier`` reports ``auto``/``default`` or is absent;
 * Standard proves that the outgoing request did not ask for priority, then
   transparently streams the upstream response without depending on optional
   response-tier metadata or a particular SSE prelude.
@@ -30,7 +31,7 @@ import stat
 import time
 import tomllib
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 CODEX_TIER_DEFAULT = "default"
 CODEX_TIER_PRIORITY = "priority"
 _CODEX_TIERS = frozenset({CODEX_TIER_DEFAULT, CODEX_TIER_PRIORITY})
+_CODEX_REPORTED_TIERS = frozenset({"auto", "default", "flex", "priority"})
 
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_HEADER_LINE_BYTES = 16 * 1024
@@ -76,11 +78,11 @@ _ALLOWED_MODEL_PATHS = frozenset({"/responses"})
 
 
 class CodexTierProxyError(RuntimeError):
-    """The actual-tier proxy could not safely serve a Codex app-server."""
+    """The tier request proxy could not safely serve a Codex app-server."""
 
 
 class CodexTierProofError(CodexTierProxyError):
-    """A request or upstream response did not prove the expected tier."""
+    """A request or upstream response could not prove safe tier admission."""
 
 
 class _CodexTierRequestMismatch(CodexTierProofError):
@@ -120,14 +122,14 @@ class CodexTierProxyRoute:
 
 
 @dataclass(frozen=True, slots=True)
-class CodexActualTierProof:
-    """Auditable proof extracted from one upstream ``response.created``."""
+class CodexTierRequestProof:
+    """Auditable priority request accepted by one upstream response."""
 
     thread_id: str
     turn_id: str
     parent_thread_id: str | None
     requested_tier: str
-    actual_tier: str | None
+    upstream_reported_tier: str | None
     response_id: str
     observed_at: float
 
@@ -135,7 +137,7 @@ class CodexActualTierProof:
 @dataclass(slots=True)
 class _ProofWaiter:
     expected_tier: str
-    future: asyncio.Future[CodexActualTierProof]
+    future: asyncio.Future[CodexTierRequestProof]
     users: int = 0
 
 
@@ -181,7 +183,7 @@ def _validate_upstream_base_url(value: str) -> str:
         or parsed.fragment
     ):
         raise CodexTierProxyError(
-            "Codex actual-tier upstream must be an HTTPS base URL "
+            "Codex tier-proxy upstream must be an HTTPS base URL "
             "without credentials, query, or fragment"
         )
     return str(value).rstrip("/")
@@ -402,7 +404,11 @@ def _connection_tokens(headers: dict[str, str]) -> set[str]:
     }
 
 
-def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
+def _filter_request_headers(
+    headers: dict[str, str],
+    *,
+    expect_sse: bool = False,
+) -> dict[str, str]:
     blocked = _HOP_BY_HOP | _connection_tokens(headers) | {
         "host",
         "content-length",
@@ -419,6 +425,8 @@ def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
     # response is still required, but this prevents normal upstreams from
     # selecting one.
     filtered["accept-encoding"] = "identity"
+    if expect_sse:
+        filtered["accept"] = "text/event-stream"
     return filtered
 
 
@@ -434,6 +442,26 @@ def _filter_response_headers(headers: httpx.Headers) -> list[tuple[str, str]]:
         if name.lower() not in blocked
         and name.lower() not in _SENSITIVE_HEADERS
     ]
+
+
+def _verified_sse_response_headers(
+    headers: httpx.Headers,
+) -> list[tuple[str, str]]:
+    """Normalize a byte-verified Responses stream for the Codex client.
+
+    The ChatGPT Codex backend can omit the SSE MIME header even though the
+    response body is a valid Responses event stream.  The proxy proves the
+    framing and service tier from the buffered body before calling this
+    helper, so the downstream header can safely be canonicalized here.
+    """
+
+    filtered = [
+        (name, value)
+        for name, value in _filter_response_headers(headers)
+        if name.lower() != "content-type"
+    ]
+    filtered.append(("Content-Type", "text/event-stream"))
+    return filtered
 
 
 def _split_sse_events(buffer: bytearray) -> tuple[list[bytes], bytearray]:
@@ -487,7 +515,7 @@ def _extract_request_identity(
     headers: dict[str, str],
     body: bytes,
     expected_lineage: Callable[[str, str | None], tuple[str, str]],
-) -> _RequestIdentity:
+) -> tuple[_RequestIdentity, bytes]:
     if headers.get("content-encoding", "identity").lower() not in {
         "",
         "identity",
@@ -600,13 +628,34 @@ def _extract_request_identity(
             f"Unsupported request service_tier {requested_raw!r}",
             identity,
         )
-    if requested != expected:
+    if requested != expected and not (
+        expected == CODEX_TIER_PRIORITY
+        and requested == CODEX_TIER_DEFAULT
+    ):
         raise _CodexTierRequestMismatch(
             f"Codex request tier mismatch for thread {thread_id}: "
             f"expected {expected}, got {requested}",
             identity,
         )
-    return identity
+    if expected == CODEX_TIER_PRIORITY and requested == CODEX_TIER_DEFAULT:
+        # Codex 0.147's app-server accepts serviceTier on thread/start but its
+        # custom-provider Responses transport can omit (or reset) the matching
+        # HTTP field.  The exact CCM lineage mapping is authoritative for
+        # request construction. ``fast`` is the Codex UI/config spelling;
+        # Responses API requests use the canonical ``priority`` wire value.
+        payload["service_tier"] = CODEX_TIER_PRIORITY
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(body) > _MAX_REQUEST_BYTES:
+            raise CodexTierProofError("Codex request body is too large")
+        identity = replace(
+            identity,
+            requested_tier=CODEX_TIER_PRIORITY,
+        )
+    return identity, body
 
 
 async def _iter_response_raw(
@@ -623,7 +672,7 @@ async def _iter_response_raw(
 
 
 class CodexActualTierProxy:
-    """One loopback actual-tier proof transport for one app-server."""
+    """One loopback service-tier request fence for one app-server."""
 
     def __init__(
         self,
@@ -646,7 +695,7 @@ class CodexActualTierProxy:
         self._parents: dict[str, str] = {}
         self._active_requests_by_root: dict[str, int] = {}
         self._waiters: dict[tuple[str, str], _ProofWaiter] = {}
-        self._proofs: dict[tuple[str, str], CodexActualTierProof] = {}
+        self._proofs: dict[tuple[str, str], CodexTierRequestProof] = {}
         self._failures: dict[tuple[str, str], CodexTierProofError] = {}
         self._proof_order: deque[tuple[str, str]] = deque()
         self._max_proofs = 1024
@@ -658,7 +707,7 @@ class CodexActualTierProxy:
     @property
     def local_base_url(self) -> str:
         if not self.is_alive or not self._port:
-            raise CodexTierProxyError("Codex actual-tier proxy is not running")
+            raise CodexTierProxyError("Codex tier request proxy is not running")
         return f"http://127.0.0.1:{self._port}/{self._secret}"
 
     def codex_override_args(self) -> tuple[str, ...]:
@@ -701,7 +750,7 @@ class CodexActualTierProxy:
         if self.is_alive:
             return
         if self._closing:
-            raise CodexTierProxyError("Codex actual-tier proxy is closing")
+            raise CodexTierProxyError("Codex tier request proxy is closing")
         self._client = httpx.AsyncClient(
             follow_redirects=False,
             timeout=httpx.Timeout(
@@ -728,14 +777,14 @@ class CodexActualTierProxy:
         if len(sockets) != 1:
             await self.close()
             raise CodexTierProxyError(
-                "Codex actual-tier proxy did not bind one loopback socket"
+                "Codex tier request proxy did not bind one loopback socket"
             )
         address = sockets[0].getsockname()
         host = ipaddress.ip_address(address[0])
         if not host.is_loopback:
             await self.close()
             raise CodexTierProxyError(
-                "Codex actual-tier proxy did not bind loopback"
+                "Codex tier request proxy did not bind loopback"
             )
         self._port = int(address[1])
 
@@ -880,14 +929,14 @@ class CodexActualTierProxy:
         else:
             self._active_requests_by_root[root] = active - 1
 
-    async def wait_for_actual_tier(
+    async def wait_for_request_acceptance(
         self,
         thread_id: str,
         turn_id: str,
         expected_tier: str,
         *,
         timeout: float,
-    ) -> CodexActualTierProof:
+    ) -> CodexTierRequestProof:
         key = (
             _validate_identifier(thread_id, field="thread id"),
             _validate_identifier(turn_id, field="turn id"),
@@ -900,13 +949,6 @@ class CodexActualTierProxy:
             raise failure
         existing = self._proofs.get(key)
         if existing is not None:
-            if (
-                expected == CODEX_TIER_PRIORITY
-                and existing.actual_tier != expected
-            ):
-                raise CodexTierProofError(
-                    "Stored actual service-tier proof does not match expectation"
-                )
             return existing
         waiter = self._waiters.get(key)
         if waiter is None:
@@ -917,7 +959,7 @@ class CodexActualTierProxy:
             self._waiters[key] = waiter
         elif waiter.expected_tier != expected:
             raise CodexTierProofError(
-                "Conflicting actual service-tier proof expectations"
+                "Conflicting service-tier request expectations"
             )
         waiter.users += 1
         try:
@@ -927,7 +969,7 @@ class CodexActualTierProxy:
             )
         except asyncio.TimeoutError as exc:
             raise CodexTierProofError(
-                f"Timed out waiting for actual {expected} service-tier proof"
+                f"Timed out waiting for {expected} request acceptance"
             ) from exc
         finally:
             waiter.users = max(0, waiter.users - 1)
@@ -939,22 +981,14 @@ class CodexActualTierProxy:
                 if not waiter.future.done():
                     waiter.future.cancel()
 
-    def _publish_proof(self, proof: CodexActualTierProof) -> None:
+    def _publish_proof(self, proof: CodexTierRequestProof) -> None:
         key = (proof.thread_id, proof.turn_id)
         self._proofs[key] = proof
         self._failures.pop(key, None)
         self._remember_proof_key(key)
         waiter = self._waiters.pop(key, None)
         if waiter is not None and not waiter.future.done():
-            if (
-                waiter.expected_tier == CODEX_TIER_PRIORITY
-                and waiter.expected_tier != proof.actual_tier
-            ):
-                waiter.future.set_exception(CodexTierProofError(
-                    "Actual service-tier proof does not match waiter",
-                ))
-            else:
-                waiter.future.set_result(proof)
+            waiter.future.set_result(proof)
 
     def _publish_failure(
         self,
@@ -1019,13 +1053,13 @@ class CodexActualTierProxy:
                 )
             except asyncio.TimeoutError:
                 logger.error(
-                    "Timed out closing Codex actual-tier proxy handlers"
+                    "Timed out closing Codex tier request proxy handlers"
                 )
         client = self._client
         self._client = None
         if client is not None:
             await client.aclose()
-        error = CodexTierProofError("Codex actual-tier proxy closed")
+        error = CodexTierProofError("Codex tier request proxy closed")
         for waiter in self._waiters.values():
             if not waiter.future.done():
                 waiter.future.set_exception(error)
@@ -1052,7 +1086,7 @@ class CodexActualTierProxy:
         except Exception as exc:
             # Do not include headers/body in logs: they may contain auth.
             logger.warning(
-                "Codex actual-tier proxy request failed: %s",
+                "Codex tier request proxy failed: %s",
                 type(exc).__name__,
             )
             if (
@@ -1213,7 +1247,7 @@ class CodexActualTierProxy:
         ):
             body = await self._read_body(reader, headers)
             try:
-                identity = _extract_request_identity(
+                identity, body = _extract_request_identity(
                     headers,
                     body,
                     self._resolve_lineage,
@@ -1258,7 +1292,10 @@ class CodexActualTierProxy:
             request = client.build_request(
                 method,
                 upstream_url,
-                headers=_filter_request_headers(headers),
+                headers=_filter_request_headers(
+                    headers,
+                    expect_sse=identity is not None,
+                ),
                 content=body,
             )
             upstream = await client.send(request, stream=True)
@@ -1416,17 +1453,12 @@ class CodexActualTierProxy:
             raise CodexTierProofError(
                 "Compressed Responses stream cannot be audited"
             )
-        content_type = upstream.headers.get("content-type", "").lower()
-        if "text/event-stream" not in content_type:
-            raise CodexTierProofError(
-                "Upstream did not return a Responses SSE stream"
-            )
 
         iterator = _iter_response_raw(upstream)
         untouched = bytearray()
         parse_buffer = bytearray()
         deadline = asyncio.get_running_loop().time() + self.first_event_timeout
-        proof: CodexActualTierProof | None = None
+        proof: CodexTierRequestProof | None = None
         while proof is None:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -1462,32 +1494,28 @@ class CodexActualTierProxy:
                 if not isinstance(response, dict):
                     raise CodexTierProofError(
                         "response.created omitted response"
-                    )
+                )
                 reported_tier = response.get("service_tier")
-                if (
-                    identity.expected_tier == CODEX_TIER_PRIORITY
-                    and reported_tier != CODEX_TIER_PRIORITY
-                ):
-                    raise CodexTierProofError(
-                        "Upstream actual service tier mismatch: "
-                        "expected priority, "
-                        f"got {reported_tier!r}"
-                    )
-                actual = (
-                    reported_tier
-                    if reported_tier in _CODEX_TIERS
+                normalised_reported_tier = (
+                    reported_tier.strip().lower()
+                    if isinstance(reported_tier, str)
+                    else None
+                )
+                reported = (
+                    normalised_reported_tier
+                    if normalised_reported_tier in _CODEX_REPORTED_TIERS
                     else None
                 )
                 response_id = _validate_identifier(
                     response.get("id"),
                     field="response id",
                 )
-                proof = CodexActualTierProof(
+                proof = CodexTierRequestProof(
                     thread_id=identity.thread_id,
                     turn_id=identity.turn_id,
                     parent_thread_id=identity.parent_thread_id,
                     requested_tier=identity.requested_tier,
-                    actual_tier=actual,
+                    upstream_reported_tier=reported,
                     response_id=response_id,
                     observed_at=time.time(),
                 )
@@ -1496,11 +1524,12 @@ class CodexActualTierProxy:
         self._publish_proof(proof)
         if proof.requested_tier == CODEX_TIER_PRIORITY:
             logger.info(
-                "Codex actual service tier verified "
-                "thread=%s turn=%s requested=priority actual=priority "
+                "Codex Fast priority request accepted "
+                "thread=%s turn=%s requested=priority upstream_reported=%s "
                 "response=%s parent=%s",
                 proof.thread_id,
                 proof.turn_id,
+                proof.upstream_reported_tier or "unreported",
                 proof.response_id,
                 proof.parent_thread_id or "-",
             )
@@ -1510,14 +1539,14 @@ class CodexActualTierProxy:
                 "thread=%s turn=%s upstream_reported=%s response=%s parent=%s",
                 proof.thread_id,
                 proof.turn_id,
-                proof.actual_tier or "unreported",
+                proof.upstream_reported_tier or "unreported",
                 proof.response_id,
                 proof.parent_thread_id or "-",
             )
         await self._send_stream_headers(
             writer,
             upstream.status_code,
-            list(_filter_response_headers(upstream.headers)),
+            _verified_sse_response_headers(upstream.headers),
         )
         writer.write(untouched)
         await writer.drain()
