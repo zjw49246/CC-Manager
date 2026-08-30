@@ -463,6 +463,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     setChatTaskWrapped(t);
     if (t.has_unread) {
       api.markTaskRead(t.id).catch(() => {});
+      const clearUnread = (list: Task[]) => list.map((item) => item.id === t.id ? { ...item, has_unread: false } : item);
+      setTasks(clearUnread);
+      setAllTasks(clearUnread);
+      setSearchResults((prev) => prev ? clearUnread(prev) : prev);
     }
   }, [setChatTaskWrapped]);
 

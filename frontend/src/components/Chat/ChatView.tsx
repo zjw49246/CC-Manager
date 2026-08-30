@@ -2857,10 +2857,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         container.scrollTop = container.scrollHeight;
       }
     }
-    const container = messagesContainerRef.current;
-    if (container && container.scrollHeight - container.scrollTop - container.clientHeight < 80) {
-      api.markTaskRead(task.id).catch(() => {});
-    }
+    const frame = requestAnimationFrame(() => {
+      const container = messagesContainerRef.current;
+      if (container && container.scrollHeight - container.scrollTop - container.clientHeight < 80) {
+        api.markTaskRead(task.id).catch(() => {});
+      }
+    });
+    return () => cancelAnimationFrame(frame);
   }, [messages, task.id]);
 
   useEffect(() => {
