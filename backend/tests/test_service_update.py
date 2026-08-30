@@ -134,6 +134,39 @@ def test_stable_tag_fetch_error_keeps_non_collision_context():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (
+            "! [rejected] v1.0.0 -> v1.0.0 (would clobber existing tag)",
+            "本地存在与远端同名但指向不同提交的版本标签",
+        ),
+        ("fatal: could not resolve host", "拉取 Stable 版本信息失败"),
+    ],
+)
+async def test_stable_check_returns_formatted_tag_fetch_error(
+    tmp_path, stderr, expected
+):
+    service = _make_service(tmp_path)
+    current = "a" * 40
+
+    async def run_cmd(args, **_kwargs):
+        if tuple(args) == ("git", "fetch", "--tags"):
+            return {"returncode": 1, "stdout": "", "stderr": stderr}
+        if tuple(args) == ("git", "rev-parse", "HEAD"):
+            return {"returncode": 0, "stdout": current, "stderr": ""}
+        raise AssertionError(args)
+
+    service._run_cmd = AsyncMock(side_effect=run_cmd)
+
+    result = await service._check_stable_updates()
+
+    assert result["channel"] == "stable"
+    assert result["has_updates"] is False
+    assert result["error"] and expected in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_stable_check_treats_main_ahead_as_explicit_channel_switch(
     tmp_path,
 ):
