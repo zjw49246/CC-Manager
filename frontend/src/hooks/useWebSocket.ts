@@ -47,7 +47,9 @@ export function useWebSocket(
     client.onMessage((msg) => {
       const parsed = msg as unknown as Record<string, unknown>;
       callbackRef.current?.(parsed);
-      setLastMessage(parsed);
+      // Callback subscribers process messages directly. Updating the legacy
+      // state for every event rerenders their entire component tree.
+      if (!callbackRef.current) setLastMessage(parsed);
     });
 
     const removeConnectionHandler = client.onConnectionChange(setIsConnected);
