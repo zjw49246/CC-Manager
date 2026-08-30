@@ -2857,7 +2857,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         container.scrollTop = container.scrollHeight;
       }
     }
-  }, [messages]);
+    const container = messagesContainerRef.current;
+    if (container && container.scrollHeight - container.scrollTop - container.clientHeight < 80) {
+      api.markTaskRead(task.id).catch(() => {});
+    }
+  }, [messages, task.id]);
 
   useEffect(() => {
     const el = textareaRef.current;
