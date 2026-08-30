@@ -2271,7 +2271,7 @@ async def start_frontend_review_goal(
         display_content = body.message
         sender_display_name = await _sender_display_name(request, db)
         if sender_display_name:
-            display_content = f"[{sender_display_name}] {body.message}"
+            display_content = body.message
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         attachments = [{
             "url": f"/api/uploads/{os.path.basename(path)}",
