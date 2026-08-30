@@ -17465,6 +17465,18 @@ class InstanceManager:
                 "autonomous": True,
             }
 
+        # PTY resume/recovery can replay JSONL records from the replaced
+        # generation. They are useful for diagnostics, but must never become
+        # new chat history rows or broadcasts; doing so duplicates completed
+        # assistant messages with a fresh database id.
+        if event.get("orphan") and not event.get("autonomous"):
+            logger.debug(
+                "Dropping orphan replay event for instance %s task %s",
+                instance_id,
+                task_id,
+            )
+            return
+
         # App-server deltas are intentionally live-only: persisting every token
         # would recreate the raw-json/DB amplification that this path is meant
         # to avoid.  The final item/completed event is still stored normally.

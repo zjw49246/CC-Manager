@@ -21931,6 +21931,12 @@ async def test_process_event_orphan_overload_does_not_set_transient_flag(db_fact
     })
     assert im.transient_error_seen(inst_id) is False
 
+    async with db_factory() as db:
+        rows = (await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task_id)
+        )).scalars().all()
+    assert rows == []
+
     # A background sub-agent turn's error is likewise not this turn's signal.
     await im._process_event(inst_id, task_id, {
         "event_type": "result",
