@@ -781,20 +781,10 @@ async def _browser_page(
                 proxy_url=proxy.url if proxy is not None else None,
             )
             if options.browser_channel != "chrome":
-                # Playwright's headless-shell package does not ship its own
-                # setuid sandbox. On Linux hosts where unprivileged user
-                # namespaces are disabled, point Chromium at the matching
-                # Playwright sandbox helper instead of weakening the browser
-                # with --no-sandbox.
-                sandbox = Path(playwright.chromium.executable_path).with_name(
-                    "chrome_sandbox"
+                _configure_bundled_chromium_sandbox(
+                    launch_options,
+                    playwright.chromium.executable_path,
                 )
-                try:
-                    sandbox_stat = sandbox.stat()
-                except OSError:
-                    sandbox_stat = None
-                if sandbox_stat is not None and sandbox_stat.st_mode & 0o4000:
-                    launch_options["env"]["CHROME_DEVEL_SANDBOX"] = str(sandbox)
             browser = await playwright.chromium.launch(**launch_options)
             context = await browser.new_context(
                 viewport={
@@ -899,6 +889,25 @@ def _browser_launch_options(
     if options.browser_channel == "chrome":
         launch_options["channel"] = "chrome"
     return launch_options
+
+
+def _configure_bundled_chromium_sandbox(
+    launch_options: dict[str, Any],
+    executable_path: str,
+) -> None:
+    """Configure Playwright's setuid sandbox helper when the host needs it."""
+
+    # Playwright's headless-shell package does not ship its own setuid
+    # sandbox. On Linux hosts where unprivileged user namespaces are disabled,
+    # point Chromium at the matching Playwright sandbox helper instead of
+    # weakening the browser with --no-sandbox.
+    sandbox = Path(executable_path).with_name("chrome_sandbox")
+    try:
+        sandbox_stat = sandbox.stat()
+    except OSError:
+        return
+    if sandbox_stat.st_mode & 0o4000:
+        launch_options["env"]["CHROME_DEVEL_SANDBOX"] = str(sandbox)
 
 
 def _request_policy_violation(

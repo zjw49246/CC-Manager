@@ -354,6 +354,34 @@ def test_bundled_chromium_is_not_treated_as_a_playwright_channel():
     assert system["channel"] == "chrome"
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_sandbox"),
+    [(0o4755, True), (0o0755, False), (None, False)],
+)
+def test_bundled_chromium_sandbox_configuration(mode, expected_sandbox, tmp_path):
+    executable = tmp_path / "chrome-headless-shell"
+    sandbox = tmp_path / "chrome_sandbox"
+    executable.touch()
+    launch = browser_review._browser_launch_options(
+        BrowserReviewOptions(url="https://example.com", browser_channel="chromium"),
+        proxy_url=None,
+    )
+
+    if mode is None:
+        sandbox.unlink(missing_ok=True)
+    else:
+        sandbox.touch()
+        sandbox.chmod(mode)
+
+    browser_review._configure_bundled_chromium_sandbox(launch, str(executable))
+
+    if expected_sandbox:
+        assert launch["env"] == {"CHROME_DEVEL_SANDBOX": str(sandbox)}
+    else:
+        assert launch["env"] == {}
+    assert not any(arg == "--no-sandbox" for arg in launch["args"])
+
+
 def test_managed_preview_blocks_every_cross_origin_subresource():
     options = BrowserReviewOptions(
         url="http://127.0.0.1:5173",
