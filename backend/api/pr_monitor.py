@@ -5554,6 +5554,48 @@ async def merge_monitor_run(
     return await get_monitor_run(run_id, request, db)
 
 
+_LEGACY_BASE_UPDATE_ERROR = "GitHub PR base ancestry is unsafe for direct auto-merge"
+
+
+def _branch_update_pause_is_admissible(
+    run: PRMonitorRun,
+    review: PRReview,
+    merge_action: PRMergeQueueAction | None,
+    *,
+    expected_head_sha: str,
+) -> bool:
+    """Recognize current and exact pre-fix base-update pause evidence."""
+
+    if (
+        run.status != "paused"
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != expected_head_sha
+        or review.head_sha != expected_head_sha
+        or run.completed_at is not None
+        or pr_monitor_run_has_terminal_intent(run)
+    ):
+        return False
+    if run.pause_reason == "direct_merge_base_update_required":
+        return True
+    error = merge_action.last_error if merge_action is not None else None
+    return bool(
+        run.pause_reason == "direct_merge_subject_changed"
+        and merge_action is not None
+        and merge_action.monitor_run_id == run.id
+        and merge_action.review_id == review.id
+        and merge_action.effect_kind == "direct"
+        and merge_action.status == "failed"
+        and merge_action.trigger_base_sha == review.base_sha
+        and merge_action.trigger_head_sha == review.head_sha
+        and merge_action.lease_token is None
+        and merge_action.completed_at is not None
+        and isinstance(error, str)
+        and error.startswith("direct_merge_remote_absence_proven:")
+        and _LEGACY_BASE_UPDATE_ERROR in error
+    )
+
+
 @router.post(
     "/runs/{run_id}/update-branch",
     response_model=PRMonitorBranchUpdateResponse,
@@ -5582,26 +5624,51 @@ async def update_monitor_pr_branch(
         raise HTTPException(409, "Enable the PR monitor before updating the PR branch")
 
     expected_head_sha = body.expected_head_sha.lower()
-    if (
-        run.status != "paused"
-        or run.pause_reason != "direct_merge_base_update_required"
-        or run.current_head_sha != expected_head_sha
-        or run.current_review_id is None
-    ):
+    if run.current_review_id is None:
         raise HTTPException(
             409,
             "The PR branch update is no longer valid for this exact reviewed head",
         )
 
     review = await db.get(PRReview, run.current_review_id)
+    merge_action = (
+        await db.execute(
+            select(PRMergeQueueAction).where(
+                PRMergeQueueAction.monitor_run_id == run.id,
+                PRMergeQueueAction.review_id == run.current_review_id,
+            )
+        )
+    ).scalar_one_or_none()
+    reviewer_runs = list(
+        (
+            await db.scalars(
+                select(PRReviewerRun).where(
+                    PRReviewerRun.pr_review_id == run.current_review_id
+                )
+            )
+        ).all()
+    )
     if (
         review is None
         or review.monitor_run_id != run.id
         or review.repo_id != repo.id
         or review.pr_number != run.pr_number
+        or review.base_sha != run.current_base_sha
         or review.head_sha != expected_head_sha
-        or review.status not in {"approved", "commented"}
-        or review.code_verdict != "pass"
+        or not _branch_update_pause_is_admissible(
+            run,
+            review,
+            merge_action,
+            expected_head_sha=expected_head_sha,
+        )
+    ):
+        raise HTTPException(
+            409,
+            "The PR branch update is no longer valid for this exact reviewed head",
+        )
+    if (
+        review.status not in {"approved", "commented"}
+        or _aggregate_review_verdict(review, reviewer_runs) != "pass"
         or review.action_taken != "lgtm_comment"
         or review.publication_state != "published"
     ):
@@ -5643,16 +5710,56 @@ async def update_monitor_pr_branch(
             if locked_run is not None and locked_run.current_review_id is not None
             else None
         )
+        locked_merge_action = (
+            (
+                await db.execute(
+                    select(PRMergeQueueAction)
+                    .where(
+                        PRMergeQueueAction.monitor_run_id == run_id,
+                        PRMergeQueueAction.review_id == review_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked_run is not None and locked_review is not None
+            else None
+        )
+        locked_reviewer_runs = (
+            list(
+                (
+                    await db.scalars(
+                        select(PRReviewerRun)
+                        .where(PRReviewerRun.pr_review_id == review_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            if locked_run is not None and locked_review is not None
+            else []
+        )
         if (
             locked_run is None
             or locked_review is None
-            or locked_run.status != "paused"
-            or locked_run.pause_reason != "direct_merge_base_update_required"
-            or locked_run.current_head_sha != expected_head_sha
             or locked_review.id != review_id
-            or locked_review.head_sha != expected_head_sha
+            or locked_review.monitor_run_id != locked_run.id
+            or locked_review.repo_id != locked_repo.id
+            or locked_review.pr_number != locked_run.pr_number
+            or locked_review.base_sha != expected_base_sha
             or locked_review.base_ref != base_ref
             or locked_run.current_base_sha != expected_base_sha
+            or not _branch_update_pause_is_admissible(
+                locked_run,
+                locked_review,
+                locked_merge_action,
+                expected_head_sha=expected_head_sha,
+            )
+            or locked_review.status not in {"approved", "commented"}
+            or _aggregate_review_verdict(
+                locked_review,
+                locked_reviewer_runs,
+            ) != "pass"
+            or locked_review.action_taken != "lgtm_comment"
+            or locked_review.publication_state != "published"
         ):
             await db.rollback()
             raise HTTPException(

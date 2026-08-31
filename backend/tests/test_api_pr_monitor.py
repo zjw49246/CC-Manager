@@ -5665,6 +5665,92 @@ async def test_paused_base_update_calls_github_update_branch(client, session_fac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_head_sha", "expected_status"),
+    (
+        pytest.param(HEAD_SHA_1, 200, id="exact-legacy-evidence"),
+        pytest.param(HEAD_SHA_2, 409, id="different-action-head"),
+    ),
+)
+async def test_paused_base_update_recognizes_only_exact_legacy_evidence(
+    client,
+    session_factory,
+    action_head_sha,
+    expected_status,
+):
+    repo = await _create_repo(
+        client,
+        f"owner/legacy-branch-update-{expected_status}",
+    )
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=142,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict=None,
+        publication_state="published",
+        reviewers=(
+            ("passed", "pass", None),
+            ("passed", "pass", None),
+            ("passed", "pass", None),
+        ),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        run = await db.get(PRMonitorRun, run_id)
+        assert review is not None and run is not None
+        review.action_taken = "lgtm_comment"
+        run.pause_reason = "direct_merge_subject_changed"
+        db.add(
+            PRMergeQueueAction(
+                monitor_run_id=run_id,
+                review_id=review_id,
+                trigger_base_sha=BASE_SHA_1,
+                trigger_head_sha=action_head_sha,
+                status="failed",
+                effect_kind="direct",
+                trigger_kind="manual",
+                action_nonce="a" * 48,
+                attempt_count=1,
+                last_error=(
+                    "direct_merge_remote_absence_proven:GhError:"
+                    "GitHub PR base ancestry is unsafe for direct auto-merge"
+                ),
+                completed_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+
+    with patch.object(
+        pr_review_service,
+        "update_pr_branch",
+        new=AsyncMock(
+            return_value={"message": "ok", "sha": HEAD_SHA_2, "ref": None}
+        ),
+    ) as update, patch.object(
+        pr_review_service,
+        "_freeze_safe_merge_method",
+        new=AsyncMock(return_value="fast-forward"),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/update-branch",
+            json={"expected_head_sha": HEAD_SHA_1},
+        )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 200:
+        update.assert_awaited_once()
+        async with session_factory() as db:
+            stored_run = await db.get(PRMonitorRun, run_id)
+            assert stored_run is not None
+            assert stored_run.pause_reason == "direct_merge_base_update_requested"
+    else:
+        update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_paused_base_update_rejects_stale_head(client, session_factory):
     repo = await _create_repo(client, "owner/branch-update-stale")
     _review_id, run_id = await _seed_public_pr_result(
