@@ -9,6 +9,7 @@ vi.mock('../../api/client', () => ({
     getReviewDetail: vi.fn(),
     getPRMonitorRun: vi.fn(),
     mergePRMonitorRun: vi.fn(),
+    updatePRMonitorBranch: vi.fn(),
     enqueuePRMonitorMerge: vi.fn(),
   },
 }));
@@ -227,7 +228,7 @@ describe('PRMonitorTaskDetail', () => {
   });
 
   it('explains when the base branch must be updated before a fresh review', async () => {
-    vi.mocked(api.getPRMonitorRun).mockResolvedValue({
+    const pausedRun = {
       id: 14,
       repo_id: 3,
       pr_number: 133,
@@ -253,6 +254,17 @@ describe('PRMonitorTaskDetail', () => {
         last_error: 'direct_merge_remote_absence_proven:GhError:GitHub PR base ancestry is unsafe for direct auto-merge',
       }],
       review_history: [],
+    };
+    vi.mocked(api.getPRMonitorRun)
+      .mockResolvedValueOnce(pausedRun)
+      .mockResolvedValueOnce({
+        ...pausedRun,
+        pause_reason: 'direct_merge_base_update_requested',
+      });
+    vi.mocked(api.updatePRMonitorBranch).mockResolvedValue({
+      status: 'accepted',
+      expected_head_sha: 'a'.repeat(40),
+      message: 'GitHub accepted the branch update',
     });
 
     render(
@@ -267,7 +279,7 @@ describe('PRMonitorTaskDetail', () => {
       />,
     );
 
-    expect(await screen.findByText('Branch update required')).toBeInTheDocument();
+    const updateButton = await screen.findByRole('button', { name: 'Update branch & re-review' });
     expect(screen.getByText(/The base branch advanced after this review/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Open PR on GitHub' })).toHaveAttribute(
       'href',
@@ -275,5 +287,8 @@ describe('PRMonitorTaskDetail', () => {
     );
     expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
     expect(screen.queryByText(/direct_merge_remote_absence_proven/)).not.toBeInTheDocument();
+    fireEvent.click(updateButton);
+    await waitFor(() => expect(api.updatePRMonitorBranch).toHaveBeenCalledWith(14, 'a'.repeat(40)));
+    await waitFor(() => expect(api.getPRMonitorRun).toHaveBeenCalledTimes(2));
   });
 });

@@ -161,6 +161,7 @@ const ACTIVE_PUBLICATION_STATUSES = new Set(['publishing', 'superseding']);
 const STARTED_REPAIR_STATUSES = new Set(['delivering', 'accepted', 'awaiting_push', 'running']);
 const STARTED_MERGE_STATUSES = new Set(['pending', 'enqueuing', 'queued', 'checking']);
 const ACTIVE_ADJUDICATION_STATUSES = new Set(['pending', 'adjudicating', 'accepted']);
+const BASE_ANCESTRY_ERROR = 'GitHub PR base ancestry is unsafe';
 
 const REVIEW_STATUS_LABELS: Record<string, string> = {
   pending: 'Queued',
@@ -975,6 +976,12 @@ function RepoDetail({
   const terminalRun = monitorRun ? TERMINAL_RUN_STATUSES.has(monitorRun.status) : false;
   const readyRun = monitorRun ? READY_RUN_STATUSES.has(monitorRun.status) : false;
   const busyRun = monitorRun ? BUSY_RUN_STATUSES.has(monitorRun.status) : false;
+  const baseUpdateRequired = Boolean(
+    monitorRun?.pause_reason === 'direct_merge_base_update_required'
+    || monitorRun?.pause_reason === 'direct_merge_base_update_requested'
+    || monitorRun?.merge_actions?.some((action) => action.last_error?.includes(BASE_ANCESTRY_ERROR)),
+  );
+  const branchUpdateRequested = monitorRun?.pause_reason === 'direct_merge_base_update_requested';
   const activeReview = Boolean(
     (selectedReview && ACTIVE_REVIEW_STATUSES.has(selectedReview.status))
     || (monitorRun && ACTIVE_REVIEW_STATUSES.has(monitorRun.status)),
@@ -1000,6 +1007,7 @@ function RepoDetail({
   const canResume = Boolean(
     monitorRun
     && monitorRun.status === 'paused'
+    && !baseUpdateRequired
     && detail.enabled
     && !protectedRun
     && !activeReview
@@ -1504,6 +1512,19 @@ function RepoDetail({
                           disabled={runActionPending !== null}
                           onClick={() => performRunAction('merge', () => api.mergePRMonitorRun(monitorRun.id))}>
                           {runActionPending === 'merge' ? 'Merging…' : 'Merge PR'}
+                        </button>
+                      )}
+                      {baseUpdateRequired && monitorRun.current_head_sha && (
+                        <button className="inline-flex items-center gap-1 bg-amber-700 text-white rounded px-2 py-1 disabled:opacity-50"
+                          disabled={runActionPending !== null || branchUpdateRequested}
+                          onClick={() => performRunAction('update-branch', async () => {
+                            await api.updatePRMonitorBranch(monitorRun.id, monitorRun.current_head_sha);
+                            return api.getPRMonitorRun(monitorRun.id);
+                          })}>
+                          <RefreshCw size={13} className={runActionPending === 'update-branch' ? 'animate-spin' : ''} />
+                          {runActionPending === 'update-branch' || branchUpdateRequested
+                            ? 'Waiting for branch update…'
+                            : 'Update branch & re-review'}
                         </button>
                       )}
                     </div>
