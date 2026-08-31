@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -87,6 +89,7 @@ from backend.services.test_harness_children import (
     TestHarnessChildService as HarnessChildService,
 )
 from backend.services.test_harness import TestHarnessService
+from backend.services.ssh_executor import openssh_public_key_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -5062,15 +5065,24 @@ def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
     managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     managed_root.chmod(0o700)
     key_path = managed_root / f"{name}.pem"
-    key_path.write_text("test-only-private-key", encoding="utf-8")
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    key_path.write_bytes(private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
     key_path.chmod(0o600)
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode("ascii")
     return SSHProfile(
         name=name,
         host="ssh.launch.internal",
         port=22,
         username="deploy",
         key_path=str(key_path),
-        public_key_fingerprint="SHA256:client",
+        public_key_fingerprint=openssh_public_key_fingerprint(public_key),
         host_key_type="ssh-ed25519",
         host_key_value="ssh-ed25519 AAAAhost",
         host_key_fingerprint="SHA256:host",
