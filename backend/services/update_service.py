@@ -926,6 +926,18 @@ class UpdateService:
         state = self._current.to_dict() if self._current else {"status": "idle"}
         return {**state, **environment}
 
+    async def get_blockers(self) -> dict[str, Any]:
+        """Return the live runtime generations that a stop would interrupt.
+
+        The service-entrypoint shutdown guard uses this small, side-effect-free
+        endpoint before forwarding an external SIGTERM. Keep it separate from
+        ``get_status`` so the guard does not trigger Git/Alembic inspection or
+        cache an activity result while task admission is changing.
+        """
+
+        blockers = await self._get_blocking_tasks()
+        return self._blocker_payload(blockers)
+
     def _reconcile_external_terminal_status(self) -> None:
         """Consume only a result carrying the exact current lease token."""
         if not self._current or self._current.status != "restarting":
