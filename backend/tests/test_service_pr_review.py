@@ -1140,6 +1140,48 @@ async def test_fetch_patch_uses_immutable_captured_sha_endpoint():
 
 
 @pytest.mark.asyncio
+async def test_fetch_patch_accepts_update_branch_merge_head_omitted_from_mbox():
+    previous_head = "8" * 40
+    identity = _compare_identity(
+        total_commits=2,
+        commits=[
+            {"sha": previous_head},
+            {
+                "sha": PR_DATA["head_sha"],
+                "parents": [
+                    {"sha": previous_head},
+                    {"sha": PR_DATA["base_sha"]},
+                ],
+            },
+        ],
+    )
+    patch_bytes = (
+        f"From {previous_head} Mon Sep 17 00:00:00 2001\n"
+        "Subject: [PATCH] branch changes\n\n"
+        "diff --git a/app.py b/app.py\n"
+    ).encode()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            AsyncMock(return_value=identity),
+        ),
+        patch.object(
+            pr_review_service,
+            "_run_gh",
+            AsyncMock(return_value=(0, patch_bytes, b"")),
+        ),
+    ):
+        result = await pr_review_service._fetch_immutable_compare_patch(
+            repo_name="owner/repo",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+        )
+
+    assert result == patch_bytes.decode()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("identity", "error"),
     [
@@ -1705,10 +1747,8 @@ async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint():
         "mergeCommit": None,
     }
     api = AsyncMock(return_value={
-        "number": 7,
-        "state": "open",
-        "base": {"ref": "main", "sha": "b" * 40},
-        "head": {"sha": "c" * 40},
+        "message": "Updating pull request branch.",
+        "url": "https://github.com/owner/repo/pull/7",
     })
     with (
         patch.object(pr_review_service, "_gh_pr_view", AsyncMock(return_value=snapshot)),
@@ -1721,7 +1761,11 @@ async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint():
             expected_base_sha="1" * 40,
             expected_head_sha="a" * 40,
         )
-    assert result["sha"] == "c" * 40
+    assert result == {
+        "message": "Updating pull request branch.",
+        "sha": None,
+        "ref": "main",
+    }
     api.assert_awaited_once_with(
         "repos/owner/repo/pulls/7/update-branch",
         method="PUT",

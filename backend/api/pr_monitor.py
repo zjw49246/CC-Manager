@@ -7,8 +7,10 @@ import re
 import secrets
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from urllib.parse import quote
 from weakref import WeakKeyDictionary
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import (
@@ -6688,6 +6690,218 @@ async def reconcile_remote_pr_lifecycles(db_factory, *, limit: int = 10) -> int:
             else:
                 if result.get("status") == "accepted":
                     reconciled += 1
+    return reconciled
+
+
+def _branch_update_synchronize_payload(
+    repo_name: str,
+    pr_number: int,
+    remote: object,
+) -> tuple[dict, str] | None:
+    """Project one fresh REST PR response into a bounded webhook payload."""
+
+    if not isinstance(remote, dict):
+        return None
+    base = remote.get("base")
+    head = remote.get("head")
+    user = remote.get("user")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    base_ref = base.get("ref") if isinstance(base, dict) else None
+    head_ref = head.get("ref") if isinstance(head, dict) else None
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    author = user.get("login") if isinstance(user, dict) else None
+    head_repo_name = (
+        head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    )
+    title = remote.get("title")
+    html_url = remote.get("html_url")
+    if (
+        remote.get("number") != pr_number
+        or remote.get("state") != "open"
+        or remote.get("draft") is not False
+        or not isinstance(base_ref, str)
+        or not base_ref
+        or len(base_ref) > 200
+        or "\x00" in base_ref
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or len(head_ref) > 200
+        or "\x00" in head_ref
+        or not isinstance(base_sha, str)
+        or _GIT_COMMIT_SHA_RE.fullmatch(base_sha) is None
+        or not isinstance(head_sha, str)
+        or _GIT_COMMIT_SHA_RE.fullmatch(head_sha) is None
+        or not isinstance(author, str)
+        or not author
+        or len(author) > 200
+        or not isinstance(title, str)
+        or not isinstance(html_url, str)
+        or html_url.rstrip("/")
+        != f"https://github.com/{repo_name}/pull/{pr_number}"
+        or (
+            head_repo_name is not None
+            and (
+                not isinstance(head_repo_name, str)
+                or re.fullmatch(
+                    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+                    head_repo_name,
+                )
+                is None
+            )
+        )
+    ):
+        return None
+    return ({
+        "action": "synchronize",
+        "repository": {"full_name": repo_name},
+        "pull_request": {
+            "number": pr_number,
+            "title": title,
+            "html_url": html_url,
+            "draft": False,
+            "user": {"login": author},
+            "base": {"ref": base_ref, "sha": base_sha},
+            "head": {
+                "ref": head_ref,
+                "sha": head_sha,
+                "repo": (
+                    {"full_name": head_repo_name}
+                    if head_repo_name is not None
+                    else None
+                ),
+            },
+        },
+    }, head_sha)
+
+
+async def reconcile_requested_branch_updates(
+    db_factory,
+    *,
+    limit: int = 5,
+    http_client: httpx.AsyncClient | None = None,
+) -> int:
+    """Recover accepted branch updates whose synchronize webhook was lost."""
+
+    if limit <= 0:
+        return 0
+    async with db_factory() as db:
+        from backend.services.pr_review_service import _database_now
+
+        cutoff = await _database_now(db) - timedelta(seconds=15)
+        candidates = list((await db.execute(
+            select(
+                PRMonitorRun.id,
+                PRMonitorRun.pr_number,
+                PRMonitorRun.current_head_sha,
+                MonitoredRepo.repo_full_name,
+                MonitoredRepo.webhook_secret,
+            )
+            .join(MonitoredRepo, MonitoredRepo.id == PRMonitorRun.repo_id)
+            .join(
+                PRReview,
+                and_(
+                    PRReview.id == PRMonitorRun.current_review_id,
+                    PRReview.monitor_run_id == PRMonitorRun.id,
+                    PRReview.repo_id == PRMonitorRun.repo_id,
+                    PRReview.pr_number == PRMonitorRun.pr_number,
+                    PRReview.base_sha == PRMonitorRun.current_base_sha,
+                    PRReview.head_sha == PRMonitorRun.current_head_sha,
+                ),
+            )
+            .where(
+                MonitoredRepo.enabled.is_(True),
+                PRMonitorRun.status == "paused",
+                PRMonitorRun.pause_reason == "direct_merge_base_update_requested",
+                PRMonitorRun.completed_at.is_(None),
+                PRMonitorRun.updated_at <= cutoff,
+                ~select(DeliveryRun.id).where(
+                    DeliveryRun.pr_monitor_run_id == PRMonitorRun.id,
+                ).exists(),
+            )
+            .order_by(PRMonitorRun.updated_at.asc(), PRMonitorRun.id.asc())
+            .limit(limit)
+        )).all())
+        await db.rollback()
+    if not candidates:
+        return 0
+
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
+    from backend.services.pr_review_service import (
+        _MAX_GH_PR_VIEW_RESPONSE_BYTES,
+        _gh_api_json,
+    )
+
+    owned_client = None
+    if http_client is None:
+        owned_client = httpx.AsyncClient(timeout=180, trust_env=False)
+        http_client = owned_client
+    reconciled = 0
+    try:
+        for candidate in candidates:
+            try:
+                remote = await _gh_api_json(
+                    (
+                        f"repos/{quote(candidate.repo_full_name, safe='/')}"
+                        f"/pulls/{candidate.pr_number}"
+                    ),
+                    max_output_bytes=_MAX_GH_PR_VIEW_RESPONSE_BYTES,
+                )
+                projected = _branch_update_synchronize_payload(
+                    candidate.repo_full_name,
+                    candidate.pr_number,
+                    remote,
+                )
+                if projected is None:
+                    continue
+                payload, remote_head_sha = projected
+                if remote_head_sha == candidate.current_head_sha:
+                    continue
+                body = json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+                delivery_hash = hashlib.sha256(
+                    (
+                        f"{candidate.id}:{candidate.current_head_sha}:"
+                        f"{remote_head_sha}"
+                    ).encode()
+                ).hexdigest()
+                signature = hmac.new(
+                    candidate.webhook_secret.encode(),
+                    body,
+                    hashlib.sha256,
+                ).hexdigest()
+                response = await http_client.post(
+                    f"{resolve_internal_api_base()}/api/github/webhook",
+                    content=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-GitHub-Event": "pull_request",
+                        "X-GitHub-Delivery": (
+                            f"ccm-branch-update-{delivery_hash[:40]}"
+                        ),
+                        "X-Hub-Signature-256": f"sha256={signature}",
+                    },
+                )
+                if response.status_code == 200:
+                    reconciled += 1
+                else:
+                    logger.warning(
+                        "Requested PR branch update recovery returned %s for run %s",
+                        response.status_code,
+                        candidate.id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Requested PR branch update recovery failed for run %s",
+                    candidate.id,
+                )
+    finally:
+        if owned_client is not None:
+            await owned_client.aclose()
     return reconciled
 
 

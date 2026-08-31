@@ -983,10 +983,30 @@ async def _fetch_immutable_compare_patch(
     if "\x00" in diff_text:
         raise GhError("GitHub PR patch contains a NUL byte")
     patch_commit_shas = _PATCH_COMMIT_HEADER_RE.findall(diff_text)
-    if (
-        not patch_commit_shas
-        or patch_commit_shas[-1].lower() != head_sha
-    ):
+    patch_head_sha = (
+        patch_commit_shas[-1].lower() if patch_commit_shas else None
+    )
+    # GitHub's compare JSON includes the merge commit created by
+    # update-branch, while its mbox patch omits that commit because the commit
+    # contributes no additional file diff. Accept only the exact two-parent
+    # shape joining the patch's last commit to the captured base.
+    head_commit = commits[-1]
+    head_parents = head_commit.get("parents")
+    merge_head_omitted = bool(
+        patch_head_sha is not None
+        and patch_head_sha != head_sha
+        and isinstance(head_parents, list)
+        and len(head_parents) == 2
+        and all(
+            isinstance(parent, dict)
+            and isinstance(parent.get("sha"), str)
+            and _GITHUB_SHA_RE.fullmatch(parent["sha"].lower()) is not None
+            for parent in head_parents
+        )
+        and {parent["sha"].lower() for parent in head_parents}
+        == {patch_head_sha, base_sha}
+    )
+    if patch_head_sha != head_sha and not merge_head_omitted:
         raise GhError(
             "immutable GitHub patch identity does not match captured head"
         )
@@ -1467,29 +1487,23 @@ async def update_pr_branch(
                 "PR changed while updating its branch; refresh the Monitor"
             ) from exc
         raise
-    response_number = response.get("number")
-    response_state = response.get("state")
-    response_base = response.get("base")
-    response_head = response.get("head")
-    response_base_ref = response_base.get("ref") if isinstance(response_base, dict) else None
-    response_base_sha = response_base.get("sha") if isinstance(response_base, dict) else None
-    response_head_sha = response_head.get("sha") if isinstance(response_head, dict) else None
+    response_message = response.get("message")
+    response_url = response.get("url")
+    expected_urls = {
+        f"https://github.com/{repo_name}/pull/{pr_number}",
+        f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}",
+    }
     if (
-        type(response_number) is not int
-        or response_number != pr_number
-        or response_state != "open"
-        or response_base_ref != base_ref
-        or not isinstance(response_base_sha, str)
-        or _GITHUB_SHA_RE.fullmatch(response_base_sha.lower()) is None
-        or not isinstance(response_head_sha, str)
-        or _GITHUB_SHA_RE.fullmatch(response_head_sha.lower()) is None
-        or response_head_sha.lower() == expected_head_sha
+        not isinstance(response_message, str)
+        or not response_message.strip()
+        or not isinstance(response_url, str)
+        or response_url.rstrip("/") not in expected_urls
     ):
-        raise GhError("GitHub update-branch response is malformed or unchanged")
+        raise GhError("GitHub update-branch acknowledgement is malformed")
     return {
-        "message": "GitHub accepted the PR branch update",
-        "sha": response_head_sha.lower(),
-        "ref": response_base_ref,
+        "message": response_message.strip(),
+        "sha": None,
+        "ref": base_ref,
     }
 
 
@@ -7751,9 +7765,15 @@ async def recover_incomplete_pr_reviews(
     )
 
     terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
-    from backend.api.pr_monitor import reconcile_remote_pr_lifecycles
+    from backend.api.pr_monitor import (
+        reconcile_remote_pr_lifecycles,
+        reconcile_requested_branch_updates,
+    )
 
     remote_lifecycles_reconciled = await reconcile_remote_pr_lifecycles(
+        db_factory
+    )
+    branch_updates_reconciled = await reconcile_requested_branch_updates(
         db_factory
     )
     repair_queued = await reconcile_repair_wakes(db_factory, dispatcher)
@@ -7796,7 +7816,8 @@ async def recover_incomplete_pr_reviews(
     return (
         recovered + action_recovered + panel_recovered
         + cancelled_reviewers_reconciled + ci_started
-        + terminal_runs_reconciled + remote_lifecycles_reconciled + repair_queued
+        + terminal_runs_reconciled + remote_lifecycles_reconciled
+        + branch_updates_reconciled + repair_queued
         + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
         + finding_actions_recovered

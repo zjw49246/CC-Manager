@@ -5778,6 +5778,97 @@ async def test_paused_base_update_rejects_stale_head(client, session_factory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_head_sha", "expected_reconciled"),
+    (
+        pytest.param(HEAD_SHA_2, 1, id="remote-head-advanced"),
+        pytest.param(HEAD_SHA_1, 0, id="remote-head-unchanged"),
+    ),
+)
+async def test_requested_branch_update_recovery_delivers_exact_synchronize(
+    client,
+    session_factory,
+    remote_head_sha,
+    expected_reconciled,
+):
+    from backend.api import pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        f"owner/branch-update-recovery-{expected_reconciled}",
+    )
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=145,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict="pass",
+        publication_state="published",
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run is not None
+        run.pause_reason = "direct_merge_base_update_requested"
+        run.updated_at = datetime.utcnow() - timedelta(minutes=1)
+        await db.commit()
+
+    remote = {
+        "number": 145,
+        "state": "open",
+        "draft": False,
+        "title": "Updated branch",
+        "html_url": (
+            f"https://github.com/{repo['repo_full_name']}/pull/145"
+        ),
+        "user": {"login": "alice"},
+        "base": {"ref": "main", "sha": BASE_SHA_2},
+        "head": {
+            "ref": "feature/update",
+            "sha": remote_head_sha,
+            "repo": {"full_name": "fork-owner/result"},
+        },
+    }
+    post = AsyncMock(return_value=SimpleNamespace(status_code=200))
+    fake_http_client = SimpleNamespace(post=post)
+    with patch.object(
+        pr_review_service,
+        "_gh_api_json",
+        new=AsyncMock(return_value=remote),
+    ), patch(
+        "backend.services.internal_api_endpoint.resolve_internal_api_base",
+        return_value="http://manager.test:8123",
+    ):
+        reconciled = await pr_monitor_api.reconcile_requested_branch_updates(
+            session_factory,
+            http_client=fake_http_client,
+        )
+
+    assert reconciled == expected_reconciled
+    if expected_reconciled == 0:
+        post.assert_not_awaited()
+        return
+    post.assert_awaited_once()
+    call_kwargs = post.await_args.kwargs
+    assert post.await_args.args == (
+        "http://manager.test:8123/api/github/webhook",
+    )
+    body = call_kwargs["content"]
+    payload = json.loads(body)
+    assert payload["action"] == "synchronize"
+    assert payload["pull_request"]["head"]["sha"] == HEAD_SHA_2
+    assert payload["pull_request"]["base"]["sha"] == BASE_SHA_2
+    assert call_kwargs["headers"]["X-Hub-Signature-256"] == _sign(
+        repo["webhook_secret"],
+        body,
+    )
+    assert call_kwargs["headers"]["X-GitHub-Delivery"].startswith(
+        "ccm-branch-update-"
+    )
+
+
+@pytest.mark.asyncio
 async def test_webhook_synchronize_persists_recovery_intent_before_cleanup(
     client,
     session_factory,
