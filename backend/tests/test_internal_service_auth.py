@@ -111,6 +111,11 @@ def test_skills_credential_cannot_use_the_general_task_update_route():
 
     auth.authenticate_internal_service_token(
         token,
+        method="GET",
+        path="/api/tasks/42/sub-agents/sessions",
+    )
+    auth.authenticate_internal_service_token(
+        token,
         method="PUT",
         path="/api/tasks/42/internal/enabled-skills",
     )

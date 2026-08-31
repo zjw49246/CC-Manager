@@ -503,6 +503,8 @@ def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> boo
             f"{task_path}/sub-agent-sessions",
         } and method in {"GET", "POST"}:
             return True
+        if path == f"{task_path}/sub-agents/sessions" and method == "GET":
+            return True
         return method == "DELETE" and _fullmatch(
             rf"{re.escape(task_path)}/(monitor-sessions|sub-agent-sessions)/[1-9][0-9]*",
             path,

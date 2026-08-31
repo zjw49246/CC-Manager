@@ -603,16 +603,16 @@ async def create_sub_agent(
 
 @mcp.tool()
 async def check_sub_agents() -> str:
-    """查看当前所有 Sub-Agent 的状态、进度和结果。
+    """查看当前 Task 下所有 Sub-Agent 的状态、进度和结果。
 
-    返回每个 Sub-Agent 的: id, 名称, 状态, 最新进度, 最终结果。
+    结果同时包含 CCM Sub-Agent 和模型原生 Agent/Monitor，并标明
+    ``agent_type``、``source`` 和 ``provider``。
     """
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                _api_url("/sub-agent-sessions"),
+                _api_url("/sub-agents/sessions"),
                 headers=_headers(),
-                params={"agent_type": "sub_agent"},
             )
             resp.raise_for_status()
             sessions = resp.json()
@@ -623,6 +623,9 @@ async def check_sub_agents() -> str:
                 summary.append({
                     "sub_agent_id": s["id"],
                     "name": s["description"],
+                    "agent_type": s.get("agent_type", "unknown"),
+                    "source": s.get("source", "unknown"),
+                    "provider": s.get("provider"),
                     "status": s["status"],
                     "progress_count": s["checks_done"],
                     "last_progress": s.get("last_summary"),
