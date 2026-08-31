@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client';
 import type { PRMonitorReviewAttempt, PRMonitorRun, PRReview, PRReviewResult, Task } from '../../api/client';
-import { ArrowLeft, GitBranch, GitPullRequest } from '../icons';
+import { ArrowLeft, GitBranch, GitPullRequest, RefreshCw } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
-import { canonicalGitHubReviewUrl } from '../PRReview/githubUrls';
+import { canonicalGitHubPRUrl, canonicalGitHubReviewUrl } from '../PRReview/githubUrls';
 import { PRReviewResultCard } from '../PRReview/PRReviewResultCard';
+
+const BASE_ANCESTRY_ERROR = 'GitHub PR base ancestry is unsafe';
 
 interface PRMonitorTaskDetailProps {
   task: Pick<Task, 'title' | 'description' | 'metadata_'>;
@@ -33,6 +35,8 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
   } | null>(null);
   const [mergePending, setMergePending] = useState(false);
   const [mergeError, setMergeError] = useState<string | null>(null);
+  const [branchUpdatePending, setBranchUpdatePending] = useState(false);
+  const [branchUpdateError, setBranchUpdateError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -78,10 +82,20 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
     && result.review_id === currentReviewId
     && result.head_sha === monitorRun?.current_head_sha,
   );
+  const baseUpdateRequired = Boolean(
+    monitorRun?.pause_reason === 'direct_merge_base_update_required'
+    || monitorRun?.pause_reason === 'direct_merge_base_update_requested'
+    || monitorRun?.merge_actions?.some((action) => action.last_error?.includes(BASE_ANCESTRY_ERROR)),
+  );
+  const branchUpdateRequested = monitorRun?.pause_reason === 'direct_merge_base_update_requested';
+  const prUrl = result
+    ? canonicalGitHubPRUrl(result.pr_url, result.repo_full_name, result.pr_number)
+    : null;
   const canMerge = Boolean(
     result?.aggregate_verdict === 'pass'
     && resultMatchesCurrentHead
     && monitorRun?.status === 'ready_to_merge'
+    && !baseUpdateRequired
     && !mergePending,
   );
 
@@ -100,6 +114,32 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
       setMergeError(String(error));
     } finally {
       setMergePending(false);
+    }
+  };
+
+  const updateBranch = async () => {
+    if (
+      runId == null
+      || !baseUpdateRequired
+      || !monitorRun
+      || !monitorRun.current_head_sha
+      || branchUpdatePending
+      || branchUpdateRequested
+    ) return;
+    setBranchUpdatePending(true);
+    setBranchUpdateError(null);
+    try {
+      await api.updatePRMonitorBranch(runId, monitorRun.current_head_sha);
+      const updatedRun = await api.getPRMonitorRun(runId);
+      setHistoryState({
+        loadKey: historyLoadKey ?? `${runId}:${refreshKey}`,
+        value: updatedRun,
+        error: false,
+      });
+    } catch (error: unknown) {
+      setBranchUpdateError(String(error));
+    } finally {
+      setBranchUpdatePending(false);
     }
   };
 
@@ -141,7 +181,17 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
             <section aria-label="Merge controls" className="border-y border-gray-800 py-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h3 className="text-sm font-medium text-gray-200">Merge exact reviewed head</h3>
-                {monitorRun.status === 'ready_to_merge' ? (
+                {baseUpdateRequired ? (
+                  <button
+                    type="button"
+                    onClick={() => void updateBranch()}
+                    disabled={branchUpdatePending || branchUpdateRequested}
+                    className="inline-flex items-center gap-1.5 rounded border border-amber-500/50 px-3 py-1.5 text-xs text-amber-200 hover:bg-amber-500/10 disabled:opacity-50"
+                  >
+                    <RefreshCw size={14} className={branchUpdatePending ? 'animate-spin' : ''} aria-hidden="true" />
+                    {branchUpdatePending || branchUpdateRequested ? 'Waiting for branch update…' : 'Update branch & re-review'}
+                  </button>
+                ) : monitorRun.status === 'ready_to_merge' ? (
                   <button
                     type="button"
                     onClick={() => void mergePR()}
@@ -157,8 +207,27 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
                   </span>
                 )}
               </div>
+              {baseUpdateRequired && (
+                <p role="alert" className="mt-2 text-xs text-amber-300">
+                  The base branch advanced after this review. CCM can merge the latest base into the PR branch, then review the new head before merging.
+                  {prUrl && (
+                    <>
+                      {' '}
+                      <a
+                        href={prUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-indigo-300 hover:text-indigo-200"
+                      >
+                        Open PR on GitHub
+                      </a>
+                    </>
+                  )}
+                </p>
+              )}
+              {branchUpdateError && <p role="alert" className="mt-2 text-xs text-amber-300">Branch update failed: {branchUpdateError}</p>}
               {mergeError && <p role="alert" className="mt-2 text-xs text-amber-300">Merge failed: {mergeError}</p>}
-              {monitorRun.merge_actions?.map((action) => action.last_error && (
+              {monitorRun.merge_actions?.map((action) => action.last_error && !action.last_error.includes(BASE_ANCESTRY_ERROR) && (
                 <p key={`merge-error-${action.id}`} role="alert" className="mt-2 text-xs text-amber-300">
                   Merge action #{action.id}: {action.last_error}
                 </p>

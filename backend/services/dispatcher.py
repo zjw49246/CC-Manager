@@ -1454,7 +1454,10 @@ class GlobalDispatcher:
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        if not self._running:
+            return False
+        dispatch_task = getattr(self, "_dispatch_task", None)
+        return dispatch_task is None or not dispatch_task.done()
 
     @property
     def max_concurrent_instances(self) -> int:
@@ -1806,7 +1809,19 @@ class GlobalDispatcher:
         if self._shutting_down:
             raise RuntimeError("GlobalDispatcher is shutting down")
         if self._running:
-            return
+            # ``_running`` is the admission flag, but it must not hide a
+            # producer that already exited. A cancelled/failed dispatch task
+            # otherwise strands pending work and makes the /start control path
+            # a no-op forever.
+            dispatch_task = self._dispatch_task
+            if dispatch_task is None or not dispatch_task.done():
+                return
+            logger.warning(
+                "GlobalDispatcher producer ended while marked running; "
+                "restarting dispatch runtime"
+            )
+            self._running = False
+            self._dispatch_task = None
         self._running = True
         try:
             # Initialize pool if enabled
@@ -1874,6 +1889,7 @@ class GlobalDispatcher:
             await self._recover_worker_turn_handoff_outbox()
 
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+            self._dispatch_task.add_done_callback(self._dispatch_task_done)
             self._curator_task = asyncio.create_task(self._curator_loop())
         except BaseException:
             # start() is retryable.  In particular, a transient DB failure in
@@ -2763,6 +2779,42 @@ class GlobalDispatcher:
     def wake(self) -> None:
         """Wake the task dispatcher after a pending task is committed."""
         self._dispatch_wakeup.set()
+
+    def _dispatch_task_done(self, finished: asyncio.Task) -> None:
+        """Close admission when the producer exits outside normal stop().
+
+        ``stop()`` clears ``_running`` before cancelling the producer, so its
+        expected completion is ignored here. Any other exit must make the
+        public state fail closed; otherwise pending Tasks remain queued while
+        ``start()`` incorrectly treats the dead producer as healthy.
+        """
+
+        if finished is not getattr(self, "_dispatch_task", None):
+            return
+        if finished.cancelled():
+            failure = None
+        else:
+            try:
+                failure = finished.exception()
+            except asyncio.CancelledError:
+                failure = None
+        if self._running and not self._shutting_down:
+            self._running = False
+            if failure is not None:
+                logger.error(
+                    "Dispatch loop exited unexpectedly; Dispatcher admission "
+                    "has been closed",
+                    exc_info=(
+                        type(failure),
+                        failure,
+                        failure.__traceback__,
+                    ),
+                )
+            else:
+                logger.error(
+                    "Dispatch loop exited unexpectedly; Dispatcher admission "
+                    "has been closed"
+                )
 
     async def _reserve_idle_instance(
         self,
@@ -4894,7 +4946,7 @@ class GlobalDispatcher:
 
     def status(self) -> dict:
         return {
-            "running": self._running,
+            "running": self.is_running,
             "paused": self._dispatch_paused,
             "active_tasks": {
                 iid: not t.done() for iid, t in self._running_tasks.items()

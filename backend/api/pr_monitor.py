@@ -88,6 +88,8 @@ from backend.schemas.pr_monitor import (
     PRFindingRebuttalCreate,
     PRFindingRebuttalResponse,
     PRMonitorBindRequest,
+    PRMonitorBranchUpdateRequest,
+    PRMonitorBranchUpdateResponse,
     PRMonitorRunResponse,
     PRMonitorReviewAttemptResponse,
     PRRepairWakeResponse,
@@ -4890,6 +4892,14 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
         raise HTTPException(409, "Enable the PR monitor before resuming a Run")
     if run.status != "paused":
         raise HTTPException(409, "Only a paused PR Monitor Run can be resumed")
+    if run.pause_reason in {
+        "direct_merge_base_update_required",
+        "direct_merge_base_update_requested",
+    }:
+        raise HTTPException(
+            409,
+            "Update the PR branch and wait for CCM to review the new head",
+        )
     review = (
         await db.get(PRReview, run.current_review_id)
         if run.current_review_id is not None
@@ -5542,6 +5552,298 @@ async def merge_monitor_run(
         # create an untracked second GitHub effect.
         logger.exception("Immediate direct PR merge reconciliation failed")
     return await get_monitor_run(run_id, request, db)
+
+
+_LEGACY_BASE_UPDATE_ERROR = "GitHub PR base ancestry is unsafe for direct auto-merge"
+
+
+def _branch_update_pause_is_admissible(
+    run: PRMonitorRun,
+    review: PRReview,
+    merge_action: PRMergeQueueAction | None,
+    *,
+    expected_head_sha: str,
+) -> bool:
+    """Recognize current and exact pre-fix base-update pause evidence."""
+
+    if (
+        run.status != "paused"
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != expected_head_sha
+        or review.head_sha != expected_head_sha
+        or run.completed_at is not None
+        or pr_monitor_run_has_terminal_intent(run)
+    ):
+        return False
+    if run.pause_reason == "direct_merge_base_update_required":
+        return True
+    error = merge_action.last_error if merge_action is not None else None
+    return bool(
+        run.pause_reason == "direct_merge_subject_changed"
+        and merge_action is not None
+        and merge_action.monitor_run_id == run.id
+        and merge_action.review_id == review.id
+        and merge_action.effect_kind == "direct"
+        and merge_action.status == "failed"
+        and merge_action.trigger_base_sha == review.base_sha
+        and merge_action.trigger_head_sha == review.head_sha
+        and merge_action.lease_token is None
+        and merge_action.completed_at is not None
+        and isinstance(error, str)
+        and error.startswith("direct_merge_remote_absence_proven:")
+        and _LEGACY_BASE_UPDATE_ERROR in error
+    )
+
+
+@router.post(
+    "/runs/{run_id}/update-branch",
+    response_model=PRMonitorBranchUpdateResponse,
+)
+async def update_monitor_pr_branch(
+    run_id: int,
+    body: PRMonitorBranchUpdateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Merge the current base branch into a paused PR through GitHub's API."""
+
+    run = await db.get(PRMonitorRun, run_id)
+    if run is None:
+        raise HTTPException(404, "PR Monitor Run not found")
+    repo = await db.get(MonitoredRepo, run.repo_id)
+    if repo is None:
+        raise HTTPException(404, "Repository not found")
+    await _require_pr_monitor_access(request, db, repo)
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action="update the PR branch",
+        monitor_run=run,
+    )
+    if not repo.enabled:
+        raise HTTPException(409, "Enable the PR monitor before updating the PR branch")
+
+    expected_head_sha = body.expected_head_sha.lower()
+    if run.current_review_id is None:
+        raise HTTPException(
+            409,
+            "The PR branch update is no longer valid for this exact reviewed head",
+        )
+
+    review = await db.get(PRReview, run.current_review_id)
+    merge_action = (
+        await db.execute(
+            select(PRMergeQueueAction).where(
+                PRMergeQueueAction.monitor_run_id == run.id,
+                PRMergeQueueAction.review_id == run.current_review_id,
+            )
+        )
+    ).scalar_one_or_none()
+    reviewer_runs = list(
+        (
+            await db.scalars(
+                select(PRReviewerRun).where(
+                    PRReviewerRun.pr_review_id == run.current_review_id
+                )
+            )
+        ).all()
+    )
+    if (
+        review is None
+        or review.monitor_run_id != run.id
+        or review.repo_id != repo.id
+        or review.pr_number != run.pr_number
+        or review.base_sha != run.current_base_sha
+        or review.head_sha != expected_head_sha
+        or not _branch_update_pause_is_admissible(
+            run,
+            review,
+            merge_action,
+            expected_head_sha=expected_head_sha,
+        )
+    ):
+        raise HTTPException(
+            409,
+            "The PR branch update is no longer valid for this exact reviewed head",
+        )
+    if (
+        review.status not in {"approved", "commented"}
+        or _aggregate_review_verdict(review, reviewer_runs) != "pass"
+        or review.action_taken != "lgtm_comment"
+        or review.publication_state != "published"
+    ):
+        raise HTTPException(
+            409,
+            "The PR branch update requires a published passing review",
+        )
+
+    repo_id = repo.id
+    repo_name = repo.repo_full_name
+    pr_number = run.pr_number
+    base_ref = review.base_ref
+    expected_base_sha = run.current_base_sha
+    review_id = review.id
+
+    # Mark the operation before remote I/O so a crash after GitHub accepts the
+    # request remains visible and cannot be mistaken for an untouched pause.
+    # Do not re-admit a requested marker: an unknown outcome must wait for the
+    # synchronize webhook or explicit reconciliation.
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        await _reauthorize_pr_effect(request, db, locked_repo)
+        if not locked_repo.enabled or locked_repo.repo_full_name != repo_name:
+            raise HTTPException(409, "PR Monitor repository policy changed; retry")
+        locked_run = (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(
+                    PRMonitorRun.id == run_id,
+                    PRMonitorRun.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        locked_review = (
+            await db.get(PRReview, locked_run.current_review_id)
+            if locked_run is not None and locked_run.current_review_id is not None
+            else None
+        )
+        locked_merge_action = (
+            (
+                await db.execute(
+                    select(PRMergeQueueAction)
+                    .where(
+                        PRMergeQueueAction.monitor_run_id == run_id,
+                        PRMergeQueueAction.review_id == review_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked_run is not None and locked_review is not None
+            else None
+        )
+        locked_reviewer_runs = (
+            list(
+                (
+                    await db.scalars(
+                        select(PRReviewerRun)
+                        .where(PRReviewerRun.pr_review_id == review_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            if locked_run is not None and locked_review is not None
+            else []
+        )
+        if (
+            locked_run is None
+            or locked_review is None
+            or locked_review.id != review_id
+            or locked_review.monitor_run_id != locked_run.id
+            or locked_review.repo_id != locked_repo.id
+            or locked_review.pr_number != locked_run.pr_number
+            or locked_review.base_sha != expected_base_sha
+            or locked_review.base_ref != base_ref
+            or locked_run.current_base_sha != expected_base_sha
+            or not _branch_update_pause_is_admissible(
+                locked_run,
+                locked_review,
+                locked_merge_action,
+                expected_head_sha=expected_head_sha,
+            )
+            or locked_review.status not in {"approved", "commented"}
+            or _aggregate_review_verdict(
+                locked_review,
+                locked_reviewer_runs,
+            ) != "pass"
+            or locked_review.action_taken != "lgtm_comment"
+            or locked_review.publication_state != "published"
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "The PR branch update is no longer valid for this exact reviewed head",
+            )
+        await _require_legacy_pr_effect_allowed(
+            db,
+            action="update the PR branch",
+            monitor_run=locked_run,
+            review=locked_review,
+        )
+        locked_run.pause_reason = "direct_merge_base_update_requested"
+        locked_run.state_version += 1
+        await db.commit()
+
+    from backend.services.pr_review_service import (
+        GhError,
+        GhRepositoryCapabilityError,
+        PRBranchUpdateConflict,
+        _freeze_safe_merge_method,
+        update_pr_branch,
+    )
+
+    try:
+        await _freeze_safe_merge_method(repo_name)
+    except GhRepositoryCapabilityError as exc:
+        async with _pr_repo_write_lock(repo_id):
+            locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+            await _reauthorize_pr_effect(request, db, locked_repo)
+            locked_run = await db.get(PRMonitorRun, run_id, populate_existing=True)
+            if (
+                locked_run is not None
+                and locked_run.status == "paused"
+                and locked_run.current_head_sha == expected_head_sha
+                and locked_run.pause_reason == "direct_merge_base_update_requested"
+            ):
+                locked_run.pause_reason = "direct_merge_base_update_required"
+                locked_run.state_version += 1
+                await db.commit()
+            else:
+                await db.rollback()
+        raise HTTPException(409, f"GitHub cannot update this PR branch: {exc}") from exc
+    except GhError as exc:
+        raise HTTPException(503, "GitHub branch update capability could not be verified; retry shortly") from exc
+
+    try:
+        await update_pr_branch(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            base_ref=base_ref,
+            expected_base_sha=expected_base_sha,
+            expected_head_sha=expected_head_sha,
+        )
+    except PRBranchUpdateConflict as exc:
+        logger.info("PR branch update became stale for run %s: %s", run_id, exc)
+        async with _pr_repo_write_lock(repo_id):
+            locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+            await _reauthorize_pr_effect(request, db, locked_repo)
+            locked_run = await db.get(PRMonitorRun, run_id, populate_existing=True)
+            if (
+                locked_run is not None
+                and locked_run.status == "paused"
+                and locked_run.current_head_sha == expected_head_sha
+                and locked_run.pause_reason == "direct_merge_base_update_requested"
+            ):
+                locked_run.pause_reason = "direct_merge_base_update_required"
+                locked_run.state_version += 1
+                await db.commit()
+            else:
+                await db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    except GhError as exc:
+        logger.warning("GitHub PR branch update failed for run %s: %s", run_id, exc)
+        raise HTTPException(
+            503,
+            "GitHub branch update outcome is uncertain; wait for the synchronize webhook before retrying",
+        ) from exc
+
+    return PRMonitorBranchUpdateResponse(
+        status="accepted",
+        expected_head_sha=expected_head_sha,
+        message="GitHub accepted the branch update; CCM will review the new head after synchronize",
+    )
 
 
 # --- Webhook endpoint ---

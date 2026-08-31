@@ -398,6 +398,14 @@ async def update_status():
     return await svc.get_status()
 
 
+@router.get("/update/blockers", dependencies=[Depends(require_admin)])
+async def update_blockers():
+    """Return live Task/process blockers without running update inspection."""
+
+    svc = _get_update_service()
+    return await svc.get_blockers()
+
+
 @router.post("/update/reconcile", dependencies=[Depends(require_admin)])
 async def reconcile_update_blockers():
     result = await _get_update_service().reconcile_blockers()

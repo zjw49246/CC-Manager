@@ -537,6 +537,59 @@ async def test_no_progress_pty_interrupt_fails_and_clears_native_session(
 
 
 @pytest.mark.asyncio
+async def test_pty_provider_error_overrides_clean_exit_code(
+    db_factory,
+):
+    """A PTY timeout must fail the Task even when Claude exits with code 0."""
+
+    scope = await _terminal_scope(
+        db_factory,
+        transport="claude_pty",
+        reason="provider timeout",
+        generation=8,
+        pid=81_108,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    process = _process(pid=scope.pid, returncode=0)
+    manager.processes[scope.instance_id] = process
+    record = manager._track_output_consumer(
+        scope.instance_id,
+        process,
+        asyncio.current_task(),
+        chat_initiated=True,
+        provider="claude",
+        task_id=scope.task_id,
+        task_retry_count=scope.retry_count,
+        task_turn_generation=scope.generation,
+        instance_started_at=scope.started_at,
+    )
+    object.__setattr__(
+        record,
+        "fatal_provider_error",
+        "Response timed out after 900.0s",
+    )
+
+    status = await manager.finalize_pty_chat_generation(
+        scope.instance_id,
+        scope.task_id,
+        0,
+        record,
+    )
+
+    assert status == "failed"
+    async with db_factory() as db:
+        task = await db.get(Task, scope.task_id)
+        instance = await db.get(Instance, scope.instance_id)
+        assert task.status == "failed"
+        assert task.error_message == "Response timed out after 900.0s"
+        assert task.completed_at is not None
+        assert task.session_id is None
+        assert instance.status == "error"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_resumed_generation_settles_then_requests_next_capability(
     db_factory,
     monkeypatch,

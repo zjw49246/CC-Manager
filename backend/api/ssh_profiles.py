@@ -40,6 +40,7 @@ from backend.services.ssh_key_store import (
 )
 from backend.services.ssh_profiles import (
     CONNECTION_IDENTITY_FIELDS,
+    profile_key_is_usable,
     test_profile,
     update_profile_revision_cas,
     validated_profile_material,
@@ -142,6 +143,7 @@ async def list_ssh_profiles(
             profile
             for profile in profiles
             if store.is_task_managed_path(profile.key_path)
+            and profile_key_is_usable(profile)
         ]
     return profiles
 

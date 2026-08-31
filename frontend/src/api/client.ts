@@ -1724,6 +1724,12 @@ export interface PRMonitorRun {
   review_history?: PRMonitorReviewAttempt[];
 }
 
+export interface PRMonitorBranchUpdateResponse {
+  status: 'accepted';
+  expected_head_sha: string;
+  message: string;
+}
+
 export interface PRMonitorReviewAttempt {
   id: number;
   attempt: number;
@@ -3363,6 +3369,11 @@ export const api = {
     request<PRFindingRebuttal>(`/api/pr-monitor/findings/${findingId}/rebut`, { method: 'POST', body: JSON.stringify({ evidence }) }),
   mergePRMonitorRun: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/merge`, { method: 'POST' }),
+  updatePRMonitorBranch: (runId: number, expectedHeadSha: string) =>
+    request<PRMonitorBranchUpdateResponse>(`/api/pr-monitor/runs/${runId}/update-branch`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_head_sha: expectedHeadSha }),
+    }),
   /** @deprecated compatibility alias; backend performs direct merge. */
   enqueuePRMonitorMerge: (runId: number) =>
     request<PRMonitorRun>(`/api/pr-monitor/runs/${runId}/enqueue-merge`, { method: 'POST' }),

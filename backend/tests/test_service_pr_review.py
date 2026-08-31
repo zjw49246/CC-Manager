@@ -1693,6 +1693,74 @@ async def test_gh_api_json_sends_dynamic_body_only_over_stdin():
 
 
 @pytest.mark.asyncio
+async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint():
+    snapshot = {
+        "state": "OPEN",
+        "isDraft": False,
+        "baseRefName": "main",
+        "baseRefOid": "b" * 40,
+        "headRefOid": "a" * 40,
+        "mergedAt": None,
+        "mergedBy": None,
+        "mergeCommit": None,
+    }
+    api = AsyncMock(return_value={
+        "number": 7,
+        "state": "open",
+        "base": {"ref": "main", "sha": "b" * 40},
+        "head": {"sha": "c" * 40},
+    })
+    with (
+        patch.object(pr_review_service, "_gh_pr_view", AsyncMock(return_value=snapshot)),
+        patch.object(pr_review_service, "_gh_api_json", api),
+    ):
+        result = await pr_review_service.update_pr_branch(
+            repo_name="owner/repo",
+            pr_number=7,
+            base_ref="main",
+            expected_base_sha="1" * 40,
+            expected_head_sha="a" * 40,
+        )
+    assert result["sha"] == "c" * 40
+    api.assert_awaited_once_with(
+        "repos/owner/repo/pulls/7/update-branch",
+        method="PUT",
+        payload={"expected_head_sha": "a" * 40, "update_method": "merge"},
+        max_output_bytes=pr_review_service._MAX_GH_PR_VIEW_RESPONSE_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_pr_branch_rejects_stale_expected_head_before_write():
+    from backend.services.pr_review_service import PRBranchUpdateConflict
+
+    snapshot = {
+        "state": "OPEN",
+        "isDraft": False,
+        "baseRefName": "main",
+        "baseRefOid": "b" * 40,
+        "headRefOid": "d" * 40,
+        "mergedAt": None,
+        "mergedBy": None,
+        "mergeCommit": None,
+    }
+    api = AsyncMock()
+    with (
+        patch.object(pr_review_service, "_gh_pr_view", AsyncMock(return_value=snapshot)),
+        patch.object(pr_review_service, "_gh_api_json", api),
+    ):
+        with pytest.raises(PRBranchUpdateConflict, match="head changed"):
+            await pr_review_service.update_pr_branch(
+                repo_name="owner/repo",
+                pr_number=7,
+                base_ref="main",
+                expected_base_sha="1" * 40,
+                expected_head_sha="a" * 40,
+            )
+    api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stdout", "stderr", "returncode", "match"),
     [

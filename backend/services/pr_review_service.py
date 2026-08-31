@@ -298,6 +298,10 @@ class GhRepositoryCapabilityError(GhError):
     """A deterministic repository policy/schema rejection, not transport."""
 
 
+class PRBranchUpdateConflict(GhError):
+    """GitHub cannot update the exact PR head selected by the operator."""
+
+
 def _direct_ref_capability_error(detail: str) -> GhRepositoryCapabilityError:
     return GhRepositoryCapabilityError(
         f"GitHub repository direct-ref capability is unsafe: {detail}"
@@ -1392,6 +1396,101 @@ async def _gh_pr_view(pr_number: int, repo_full_name: str) -> dict:
         return json.loads(stdout.decode())
     except Exception as e:
         raise GhError(f"invalid gh output: {e}") from e
+
+
+async def update_pr_branch(
+    *,
+    repo_name: str,
+    pr_number: int,
+    base_ref: str,
+    expected_base_sha: str,
+    expected_head_sha: str,
+) -> dict[str, str | None]:
+    """Ask GitHub to merge the current base into one exact PR head.
+
+    The REST ``update-branch`` mutation is deliberately guarded by a fresh
+    PR snapshot.  This prevents a stale UI click from updating a newer head,
+    and keeps the operation independent of each repository's GitHub UI
+    preference for suggesting branch updates.
+    """
+
+    if (
+        not _GITHUB_REPO_RE.fullmatch(repo_name)
+        or type(pr_number) is not int
+        or pr_number <= 0
+        or not _valid_base_ref(base_ref)
+        or not isinstance(expected_base_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(expected_base_sha.lower()) is None
+        or not isinstance(expected_head_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(expected_head_sha.lower()) is None
+    ):
+        raise ValueError("invalid PR branch update identifiers")
+    expected_base_sha = expected_base_sha.lower()
+    expected_head_sha = expected_head_sha.lower()
+    snapshot = _validated_pr_snapshot(await _gh_pr_view(pr_number, repo_name))
+    if snapshot["state"] != "OPEN" or snapshot["is_draft"]:
+        raise PRBranchUpdateConflict("PR is no longer open")
+    if snapshot["base_ref"] != base_ref:
+        raise PRBranchUpdateConflict("PR base branch changed")
+    if snapshot["head_sha"] != expected_head_sha:
+        raise PRBranchUpdateConflict(
+            "PR head changed; refresh the Monitor before updating its branch"
+        )
+    if snapshot["base_sha"] == expected_base_sha:
+        raise PRBranchUpdateConflict("PR base branch has not advanced")
+
+    encoded_repo = quote(repo_name, safe="/")
+    try:
+        response = await _gh_api_json(
+            f"repos/{encoded_repo}/pulls/{pr_number}/update-branch",
+            method="PUT",
+            payload={
+                "expected_head_sha": expected_head_sha,
+                "update_method": "merge",
+            },
+            max_output_bytes=_MAX_GH_PR_VIEW_RESPONSE_BYTES,
+        )
+    except GhError as exc:
+        # A concurrent synchronize can win between the snapshot and PUT. A
+        # second read turns that race into a deterministic conflict while
+        # preserving unknown transport failures as retryable errors.
+        try:
+            current = _validated_pr_snapshot(await _gh_pr_view(pr_number, repo_name))
+        except Exception:
+            raise exc
+        if (
+            current["state"] != "OPEN"
+            or current["base_ref"] != base_ref
+            or current["head_sha"] != expected_head_sha
+        ):
+            raise PRBranchUpdateConflict(
+                "PR changed while updating its branch; refresh the Monitor"
+            ) from exc
+        raise
+    response_number = response.get("number")
+    response_state = response.get("state")
+    response_base = response.get("base")
+    response_head = response.get("head")
+    response_base_ref = response_base.get("ref") if isinstance(response_base, dict) else None
+    response_base_sha = response_base.get("sha") if isinstance(response_base, dict) else None
+    response_head_sha = response_head.get("sha") if isinstance(response_head, dict) else None
+    if (
+        type(response_number) is not int
+        or response_number != pr_number
+        or response_state != "open"
+        or response_base_ref != base_ref
+        or not isinstance(response_base_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(response_base_sha.lower()) is None
+        or not isinstance(response_head_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(response_head_sha.lower()) is None
+        or response_head_sha.lower() == expected_head_sha
+    ):
+        raise GhError("GitHub update-branch response is malformed or unchanged")
+    return {
+        "message": "GitHub accepted the PR branch update",
+        "sha": response_head_sha.lower(),
+        "ref": response_base_ref,
+    }
 
 
 def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:

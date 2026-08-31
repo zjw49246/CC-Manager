@@ -90,7 +90,23 @@ interface ActivePtyFollowup {
   httpSettled: boolean;
 }
 
-type InjectOutcome = 'injected' | 'rejected' | 'uncertain';
+type InjectOutcome = 'injected' | 'rejected' | 'uncertain' | 'no_active_turn';
+
+/**
+ * A stale Task projection can still advertise an executing turn after the
+ * provider process has already handed its turn back.  The inject endpoint
+ * deliberately rejects that race with a specific 409.  This is safe to
+ * downgrade to an ordinary queued message; all other 409s must remain
+ * rejected because they may represent an authority/routing or delivery
+ * race.
+ */
+function isNoActiveTurnInjectionError(error: unknown): boolean {
+  if (!isApiRequestError(error) || error.status !== 409) return false;
+  const detail = typeof error.detail === 'string'
+    ? error.detail
+    : error.message;
+  return /没有正在运行的 turn|no active provider turn to inject/i.test(detail);
+}
 
 const WORKSPACE_REVIEW_START_TOOLS = new Set([
   'ccm_workspace_review.test_current_changes',
@@ -394,7 +410,19 @@ type MessageGroup =
 function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
   const systemDedup = new Set(['system_init', 'system_event']);
   const result: ChatMessage[] = [];
+  let lastUserTurnAssistant = new Set<string>();
   for (const msg of messages) {
+    if (msg.role === 'user' && msg.event_type === 'user_message') {
+      lastUserTurnAssistant = new Set();
+    }
+    if (
+      msg.role === 'assistant'
+      && (msg.event_type === 'message' || msg.event_type === 'result')
+      && msg.content
+      && lastUserTurnAssistant.has(msg.content.replace(/\s+/g, ' ').trim())
+    ) {
+      continue;
+    }
     if (systemDedup.has(msg.event_type)) {
       const prev = result[result.length - 1];
       if (
@@ -404,6 +432,9 @@ function deduplicateSystemEvents(messages: ChatMessage[]): ChatMessage[] {
       ) {
         continue; // skip duplicate
       }
+    }
+    if (msg.role === 'assistant' && (msg.event_type === 'message' || msg.event_type === 'result') && msg.content) {
+      lastUserTurnAssistant.add(msg.content.replace(/\s+/g, ' ').trim());
     }
     result.push(msg);
   }
@@ -850,7 +881,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const detail = reason instanceof Error ? reason.message : String(reason);
       setError(outcome === 'uncertain'
         ? `注入结果不确定，消息和附件已保留且不会自动重试；请先查看聊天记录或运行日志，再决定是否手动重试：${detail}`
-        : `未收到注入成功确认，消息和附件已保留：${detail}`
+        : outcome === 'no_active_turn'
+          ? `当前 turn 已结束，消息和附件已保留，可转入普通队列：${detail}`
+          : `未收到注入成功确认，消息和附件已保留：${detail}`
       );
       onTaskUpdated?.();
       refreshHistoryRef.current();
@@ -924,6 +957,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
       return 'injected';
     } catch (e) {
+      if (isNoActiveTurnInjectionError(e)) {
+        return reportUnconfirmed('no_active_turn', e);
+      }
       const explicitRejection = isApiRequestError(e) && e.status < 500;
       return reportUnconfirmed(
         transportAttempted && !explicitRejection ? 'uncertain' : 'rejected',
@@ -2842,7 +2878,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         container.scrollTop = container.scrollHeight;
       }
     }
-  }, [messages]);
+    const frame = requestAnimationFrame(() => {
+      const container = messagesContainerRef.current;
+      if (container && container.scrollHeight - container.scrollTop - container.clientHeight < 80) {
+        api.markTaskRead(task.id).catch(() => {});
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages, task.id]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -3040,12 +3083,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           suppressedAt: Date.now(),
         });
       }
-      await handleInject(
+      const outcome = await handleInject(
         text,
         uploadedResultsForTurn,
         false,
         task.provider === 'claude' && backgroundOnly,
       );
+      if (outcome === 'no_active_turn') {
+        // The Task row may lag behind the provider turn boundary.  Keep the
+        // exact input (including Plan metadata and uploads) for a normal next
+        // turn instead of asking the user to retype it or replaying the
+        // injection request.  Closing inject mode also makes the next action
+        // unambiguously use the ordinary chat route.
+        addToQueue(
+          text,
+          uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
+          planIdsForTurn.length > 0 ? [...planIdsForTurn] : undefined,
+          planVersionIdsForTurn.length > 0 ? [...planVersionIdsForTurn] : undefined,
+        );
+        setInput('');
+        fileUpload.clear();
+        consumeForkSeedUploads();
+        setInjectMode(false);
+        setError('当前 turn 已结束，消息和附件已转入普通队列，将在下一次普通 turn 发送。');
+      }
       return;
     }
 

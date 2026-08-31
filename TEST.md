@@ -1316,6 +1316,17 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
+## 主会话、PR 合并与运维围栏回归
+
+| 测试文件 | 测试用例 | 验证内容 |
+|----------|----------|----------|
+| `frontend/src/components/Chat/ChatView.test.tsx` | `moves a stale Claude PTY injection into the ordinary queue when the turn has ended` | 主回复结束边界的 409 只把原消息、附件和 Plan 转入普通队列，不重放注入、不丢输入 |
+| `backend/tests/test_instance_manager_capability_terminal.py` | `test_pty_provider_error_overrides_clean_exit_code` | PTY 已记录 fatal provider error 时，即使进程 exit code 为 0 也必须按失败收口 |
+| `backend/tests/test_pr_direct_merge.py` | `test_direct_merge_base_advance_is_not_subject_change` / `test_direct_merge_diverged_base_requests_branch_update` | base 前进不冒充 subject 漂移；无法 fast-forward 时持久化明确的 branch-update pause reason |
+| `frontend/src/components/Tasks/PRMonitorTaskDetail.test.tsx` | `explains when the base branch must be updated before a fresh review` | 隐藏原始 merge error 和无效按钮，展示 GitHub 更新分支入口 |
+| `backend/tests/test_api_ssh_profiles.py` / `test_api_task_ssh.py` | unusable managed key cases | 托管私钥缺失、类型错误或指纹失配后不再可授权，已有 grant 与执行入口统一 fail closed |
+| `backend/tests/test_guarded_service_entrypoint.py` | active / idle / controlled handoff cases | 活动或不可验证工作拒绝普通 SIGTERM；空闲服务和受控部署 handoff 才转发到真实服务进程组 |
+
 ## Delivery Loop V1
 
 ```bash

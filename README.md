@@ -38,7 +38,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **多轮对话** — 任务完成后可通过 Chat 界面继续追问，自动 `--resume` 同一 session
 - **Session 关注标签** — 每个 Task 可维护一个自定义短标签，在任务列表和 Chat 顶栏醒目展示并随时编辑，便于记录“何时再看/下一步做什么”；该字段与系统内部 `tags` 独立，复制、Fork 和 Worker 迁移时会保留
 - **Task 产物下载** — Claude/Codex 会把明确交付给用户的文件保存到当前 Project 的 `.claude-manager/artifacts/task-<id>/`，聊天中的显式产物链接可直接下载；普通源码和文档引用不会误显示为下载文件
-- **SSH 工作台与 Task 授权** — Files 页面可管理固定主机指纹的 SSH Profile、浏览/下载远程文件；新建、legacy 迁移与密钥轮换只接受上传到 CCM 托管目录，升级前的外部路径 Profile 仅可保持 Files-only。管理员可在新建 Task 或 Chat 中按 `exec/read/write` 最小权限授权，Claude/Codex 通过 task-scoped `ccm_ssh` MCP 使用，私钥始终留在 Manager。使用和安全边界见 [SSH access](docs/ssh-access.md)
+- **SSH 工作台与 Task 授权** — Files 页面可管理固定主机指纹的 SSH Profile、浏览/下载远程文件；新建、legacy 迁移与密钥轮换只接受上传到 CCM 托管目录，升级前的外部路径 Profile 仅可保持 Files-only。管理员可在新建 Task 或 Chat 中按 `exec/read/write` 最小权限授权，Claude/Codex 通过 task-scoped `ccm_ssh` MCP 使用，私钥始终留在 Manager。托管私钥被删除、替换或权限/指纹失配后，对应 Profile 会立即退出 Task 可授权列表，已有 grant 也会 fail closed，不影响普通 Admin 对话。使用和安全边界见 [SSH access](docs/ssh-access.md)
 - **数学公式渲染** — 聊天和 Discussion 中的 Markdown 支持 KaTeX；兼容 Codex 常用的 `\\(...\\)` / 整段 `\\[...\\]` 以及 `$$...$$`，单美元符号内容按普通文本显示，链接、HTML、代码和货币内容保持不变
 - **交互式提问（ask_user）** — 模型调用内置 `AskUserQuestion` 时，聊天里弹出可选卡片（单选/多选/自定义文本），用户选完即把答案喂回模型继续。超时默认 1800s，支持跨页面全局通知（右下角弹窗 + 未读标记），可用 `ASK_USER_ENABLED=false` 关闭
 - **权限透传（PTY 模式）** — CC 请求工具权限时聊天里出现卡片（工具名/描述/输入预览），点允许/拒绝实时回包；120s 超时默认拒绝
@@ -54,14 +54,15 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **瞬时 429/过载自动重试** — 基础设施侧的临时限流/过载（非账号额度用尽），指数退避+jitter 用同一账号自动 `--resume` 重试，最多 5 次；检测按 provider 分流（Claude / Codex 各自的 CLI 错误文案）
 - **`/tmp` 空间保护** — 服务启动时及后台每 3 小时检查容量和 inode；任一达到 80% 时，清理全部超过 6 小时的 CCM 白名单临时产物
 - **进程超时保护** — 单任务最长执行时间可配置，超时后自动 kill
+- **后台工作不阻塞主会话** — Claude PTY 主回复结束后，即使测试或子任务仍在后台收口，也可立即发送下一轮普通消息；若前端恰好撞上 turn 结束边界，原消息、附件和 Plan 会转入普通队列，不会丢失或重复注入
 
 ### 分布式
 - **分布式 Worker** — 将任务分发到远程 EC2 实例执行，突破单机并发瓶颈。Phase 1（创建/部署/管理）+ Phase 2（任务转发+事件中继）+ Phase 3（任务实时迁移）全部可用。详见 [Worker 部署指南](docs/worker-deployment-guide.md)
-- **安全的一键更新重启** — 后台定时检查并弹窗提醒；更新时暂停领取新工作，运行中 task、无 Task 的手动实例或待续跑消息未清零则拒绝重启；支持识别手动拉取但尚未加载的代码，再完成依赖、迁移、前端构建和智能重启
+- **安全的一键更新重启** — 后台定时检查并弹窗提醒；更新时暂停领取新工作，运行中 task、无 Task 的手动实例或待续跑消息未清零则拒绝重启；支持识别手动拉取但尚未加载的代码，再完成依赖、迁移、前端构建和智能重启。systemd 部署可使用 guarded entrypoint，让普通外部 SIGTERM 也必须先通过实时 blocker 检查
 
 ### 项目与协作
 - **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目。后台 clone 不会因等待凭据输入而挂起，认证失败给出明确提示；clone 失败的项目会拒绝新建任务（422），已排队任务保持等待并在 Re-clone 成功后自动开始
-- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；内部 Reviewer/Fix/Rebuttal Task 始终隐藏，Tasks 页面改为展示一张按 `PRMonitorRun` 聚合的只读结果卡，可直接看到代码 verdict、GitHub 发布状态、PR 生命周期和后端发布身份，并进入完整 Review History。每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
+- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；内部 Reviewer/Fix/Rebuttal Task 始终隐藏，Tasks 页面改为展示一张按 `PRMonitorRun` 聚合的只读结果卡，可直接看到代码 verdict、GitHub 发布状态、PR 生命周期和后端发布身份，并进入完整 Review History。通过结果可直接合并 exact reviewed head；若 base 分支在审查后已前进且无法安全 fast-forward，页面会要求先在 GitHub 更新 PR 分支并等待新 head 重审，不会把它误报为 PR subject 已变化或重复暴露无效 Merge。每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址
 - **主题切换** — v2 主题系统：现代深色（默认，Multica 风格）/ 现代浅色（tonal zinc 灰调分层）/ 飞书（官方色板 + 真实 App 截图取色实证：白底为主 + 经典飞书蓝 #3370FF + N 系中性色 + 低边框风，与浅色主题以「白 vs 灰」区分，飞书客户端式窄图标 rail + IconPark 双色图标集）/ 苹果（apple-design skill 驱动：iOS systemGray 中性色 + apple.com CTA 蓝 #0071E3 + 系统字体优先 + 毛玻璃顶栏 + 按压反馈 + macOS Settings 式侧栏与 Ionicons 图标集，尊重 reduced-motion/transparency），v1 的经典深色、海蓝、森林、莓红完整保留为 Legacy 组，偏好持久化
@@ -437,6 +438,8 @@ curl -X POST http://localhost:8000/api/system/restart \
 一键更新和自动修复仅支持文件型 SQLite，因为 CCM 必须能在停服后制作并验证快照，才能承诺自动回滚。PostgreSQL/MySQL 等外部数据库仍可在版本完全一致时使用「重启」，但更新和修复必须由管理员先完成数据库备份，再按数据库自己的迁移/恢复流程部署。迁移失败通常来自数据库 schema 漂移、迁移脚本本身报错、数据库文件被其他进程占用、权限/磁盘空间问题或新服务未在健康检查期限内启动；页面和 deployment status 会保留失败步骤与日志，不应通过反复点击更新绕过。
 
 为避免中断任务，更新开始前会关闭统一的任务启动门禁：普通 Dispatcher、Worker 转发、聊天/Monitor 续跑、RalphLoop 和手动 Instance 运行都不能越过维护窗口。`in_progress/executing` task、无 Task 关联但仍为 `running` 的 prompt-only 实例，或已经进入队列、尚未启动的续跑消息都会阻止停服；stop-session 清空消息时会在同一门禁内同步移除已经失效的队列 blocker，避免之后出现幽灵阻塞。若更新期间收到新的续跑消息，本次重启会取消并恢复调度，消息不会因进程重启而从内存队列丢失。更新与回滚请求还共用同一个操作准入锁：一次只能放行一个操作，回滚使用的 commit 和备份会在锁内固定，不能被并发更新替换。所有更新、迁移、手动拉取后的快速重启和回滚都在同一门禁内完成最后一次 blocker 查询，并在查询成功后不再经过异步等待，直接提交停服操作。任务完成后点击「重新检查」即可继续。手动 `git pull` 后触发更新时，系统会以服务实际加载的旧 commit 为基线补齐部署步骤，而不是只做一次盲目重启。
+
+生产 systemd unit 可将 `scripts/guarded_service_entrypoint.py` 设为主进程包装器，并同时配置 `KillMode=mixed` 与 `SendSIGKILL=no`。包装器收到普通 SIGTERM 时会调用只读的 `/api/system/update/blockers`：只有确认本机没有活动工作才转发信号；一键更新已写入受控 deployment handoff lease 时则直接放行。认证、探测或 lease 校验不确定时一律拒绝转发。`SendSIGKILL=no` 不能省略，否则 systemd 在停止超时后仍会强杀被保护的子进程。
 
 如果任务列表里已经找不到任务、更新弹窗却仍显示运行阻断项，可点击「重新核对运行状态」。系统会暂停新领取并由 Dispatcher 对照内存中的真实 lifecycle/process 与数据库 Task↔Instance 所有权：明确死亡且关系一致的残留会安全收敛；多 owner、关系不一致或 PID 仍可能存活时不会猜测重放，而会终止损坏状态或继续保留阻断证据。正在准备 launch 的任务、当前进程拥有的任务、Monitor/子 Agent 不会被误清；远端共享任务镜像不参与本机 stale recovery。
 
