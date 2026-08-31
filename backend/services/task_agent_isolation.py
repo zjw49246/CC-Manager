@@ -109,6 +109,23 @@ CLAUDE_UNRESTRICTED_PERMISSION_TOOLS = (
     "Write",
 )
 
+# Native Claude delegation and team-management tools must stay unavailable
+# while the CCM Sub-Agent skill is active. Keep legacy ``Task`` alongside the
+# current task/team tool names because Claude versions expose both shapes.
+CLAUDE_NATIVE_SUB_AGENT_TOOLS = (
+    "Agent",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TeamCreate",
+    "TeamDelete",
+    "SendMessage",
+)
+
 CLAUDE_DELIVERY_BUILTIN_TOOLS = (
     "Bash",
     "Edit",

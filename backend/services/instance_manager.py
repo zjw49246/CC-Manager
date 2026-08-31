@@ -6057,6 +6057,7 @@ class InstanceManager:
                             or browser_review_task
                             or delivery_task
                             or codex_task_isolation_required
+                            or codex_sub_agent_mcp_required
                         ),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
@@ -12765,14 +12766,17 @@ class InstanceManager:
                 discover_skills,
                 get_skill_disallowed_tools,
             )
+            from backend.services.task_agent_isolation import (
+                CLAUDE_NATIVE_SUB_AGENT_TOOLS,
+            )
             skills = discover_skills(project_dir=cwd)
             disallowed = []
             if not enable_workflows:
                 disallowed.append("Workflow")
             disallowed.extend(get_skill_disallowed_tools(skills, enabled_skills))
-            # Sub-Agent skill: force-disable native Agent/Task tools
+            # Sub-Agent skill: force-disable every native delegation surface.
             if enabled_skills and enabled_skills.get("sub-agent"):
-                disallowed.extend(["Agent", "Task"])
+                disallowed.extend(CLAUDE_NATIVE_SUB_AGENT_TOOLS)
             if disallowed:
                 cmd.extend(["--disallowedTools", ",".join(sorted(set(disallowed)))])
             if mcp_config_path and Path(mcp_config_path).exists():

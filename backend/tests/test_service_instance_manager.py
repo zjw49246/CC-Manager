@@ -60,6 +60,7 @@ from backend.services.mcp_config import (
 )
 from backend.services.task_agent_isolation import (
     CLAUDE_SUBPROCESS_ENV_SCRUB,
+    CLAUDE_NATIVE_SUB_AGENT_TOOLS,
     CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
     CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
     TaskAgentIsolationError,
@@ -11300,6 +11301,10 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
 
     exec_mock.assert_not_awaited()
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
+    assert (
+        im._launch_codex_app_server.await_args.kwargs["disable_autonomous_features"]
+        is True
+    )
     if main_mcp_enabled:
         assert "ccm_command_help" in specs[0].enabled_tools
         assert "create_sub_agent" in specs[0].enabled_tools
@@ -19869,6 +19874,22 @@ def test_build_command_claude_enable_workflows_default():
     assert "--disallowedTools" in cmd
     idx = cmd.index("--disallowedTools")
     assert cmd[idx + 1] == "Workflow"
+
+
+def test_build_command_claude_sub_agent_disables_native_delegation_tools():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="claude",
+        prompt="delegate through CCM",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        enabled_skills={"sub-agent": True},
+        claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+    )
+
+    disallowed = set(cmd[cmd.index("--disallowedTools") + 1].split(","))
+    assert set(CLAUDE_NATIVE_SUB_AGENT_TOOLS) <= disallowed
 
 
 def test_build_command_claude_enable_workflows_true():
