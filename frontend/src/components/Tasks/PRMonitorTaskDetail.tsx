@@ -3,8 +3,10 @@ import { api } from '../../api/client';
 import type { PRMonitorReviewAttempt, PRMonitorRun, PRReview, PRReviewResult, Task } from '../../api/client';
 import { ArrowLeft, GitBranch, GitPullRequest } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
-import { canonicalGitHubReviewUrl } from '../PRReview/githubUrls';
+import { canonicalGitHubPRUrl, canonicalGitHubReviewUrl } from '../PRReview/githubUrls';
 import { PRReviewResultCard } from '../PRReview/PRReviewResultCard';
+
+const BASE_ANCESTRY_ERROR = 'GitHub PR base ancestry is unsafe';
 
 interface PRMonitorTaskDetailProps {
   task: Pick<Task, 'title' | 'description' | 'metadata_'>;
@@ -78,10 +80,18 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
     && result.review_id === currentReviewId
     && result.head_sha === monitorRun?.current_head_sha,
   );
+  const baseUpdateRequired = Boolean(
+    monitorRun?.pause_reason === 'direct_merge_base_update_required'
+    || monitorRun?.merge_actions?.some((action) => action.last_error?.includes(BASE_ANCESTRY_ERROR)),
+  );
+  const prUrl = result
+    ? canonicalGitHubPRUrl(result.pr_url, result.repo_full_name, result.pr_number)
+    : null;
   const canMerge = Boolean(
     result?.aggregate_verdict === 'pass'
     && resultMatchesCurrentHead
     && monitorRun?.status === 'ready_to_merge'
+    && !baseUpdateRequired
     && !mergePending,
   );
 
@@ -141,7 +151,9 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
             <section aria-label="Merge controls" className="border-y border-gray-800 py-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h3 className="text-sm font-medium text-gray-200">Merge exact reviewed head</h3>
-                {monitorRun.status === 'ready_to_merge' ? (
+                {baseUpdateRequired ? (
+                  <span className="text-xs font-medium text-amber-300">Branch update required</span>
+                ) : monitorRun.status === 'ready_to_merge' ? (
                   <button
                     type="button"
                     onClick={() => void mergePR()}
@@ -157,8 +169,26 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
                   </span>
                 )}
               </div>
+              {baseUpdateRequired && (
+                <p role="alert" className="mt-2 text-xs text-amber-300">
+                  The base branch advanced after this review. Update the PR branch and wait for CCM to review the new head before merging.
+                  {prUrl && (
+                    <>
+                      {' '}
+                      <a
+                        href={prUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-indigo-300 hover:text-indigo-200"
+                      >
+                        Open PR on GitHub
+                      </a>
+                    </>
+                  )}
+                </p>
+              )}
               {mergeError && <p role="alert" className="mt-2 text-xs text-amber-300">Merge failed: {mergeError}</p>}
-              {monitorRun.merge_actions?.map((action) => action.last_error && (
+              {monitorRun.merge_actions?.map((action) => action.last_error && !action.last_error.includes(BASE_ANCESTRY_ERROR) && (
                 <p key={`merge-error-${action.id}`} role="alert" className="mt-2 text-xs text-amber-300">
                   Merge action #{action.id}: {action.last_error}
                 </p>

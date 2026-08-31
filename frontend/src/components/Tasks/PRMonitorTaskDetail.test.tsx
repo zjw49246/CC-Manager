@@ -225,4 +225,55 @@ describe('PRMonitorTaskDetail', () => {
     await waitFor(() => expect(api.getPRMonitorRun).toHaveBeenCalledWith(14));
     expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
   });
+
+  it('explains when the base branch must be updated before a fresh review', async () => {
+    vi.mocked(api.getPRMonitorRun).mockResolvedValue({
+      id: 14,
+      repo_id: 3,
+      pr_number: 133,
+      status: 'paused',
+      current_head_sha: 'a'.repeat(40),
+      current_review_id: 113,
+      display_task_id: 42,
+      developer_task_id: null,
+      repair_attempts: 0,
+      max_repair_attempts: 3,
+      pause_reason: 'direct_merge_subject_changed',
+      wakes: [],
+      merge_actions: [{
+        id: 31,
+        review_id: 113,
+        trigger_head_sha: 'a'.repeat(40),
+        status: 'failed',
+        effect_kind: 'direct',
+        github_queue_entry_id: null,
+        merge_group_sha: null,
+        ci_status: null,
+        attempt_count: 1,
+        last_error: 'direct_merge_remote_absence_proven:GhError:GitHub PR base ancestry is unsafe for direct auto-merge',
+      }],
+      review_history: [],
+    });
+
+    render(
+      <PRMonitorTaskDetail
+        task={{
+          title: 'PR Review: acme/widget#133',
+          description: null,
+          metadata_: { pr_monitor_display: true, pr_monitor_run_id: 14, pr_monitor_review_id: 113 },
+        }}
+        result={{ ...resultFixture(), aggregate_verdict: 'pass' }}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Branch update required')).toBeInTheDocument();
+    expect(screen.getByText(/The base branch advanced after this review/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open PR on GitHub' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/widget/pull/133',
+    );
+    expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/direct_merge_remote_absence_proven/)).not.toBeInTheDocument();
+  });
 });
