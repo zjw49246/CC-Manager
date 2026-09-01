@@ -287,7 +287,7 @@ export function SubAgentsBadge({ task }: { task: Task }) {
     <div className="relative" data-subagents-dropdown>
       <button
         onClick={toggle}
-        className={`text-xs bg-teal-600/30 text-teal-300 px-1.5 rounded cursor-pointer hover:bg-teal-600/40 flex items-center gap-0.5${task.active_sub_agents > 0 ? ' animate-pulse' : ''}`}
+        className="text-xs bg-teal-600/30 text-teal-300 px-1.5 rounded cursor-pointer hover:bg-teal-600/40 flex items-center gap-0.5"
         title="Sub-agents"
       >
         <Users size={12} />

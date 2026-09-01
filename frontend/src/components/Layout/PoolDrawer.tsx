@@ -1173,6 +1173,18 @@ function AddAccountModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
   const [status, setStatus] = useState<string | null>(null);
   const [detail, setDetail] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const aliveRef = useRef(true);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    // React StrictMode replays effects in development; each setup must make
+    // the modal live again after the probe cleanup.
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1181,16 +1193,21 @@ function AddAccountModal({ onClose, onAdded }: { onClose: () => void; onAdded: (
     setDetail(null);
     try {
       await api.poolAddAccount({ email: email.trim(), token: token.trim(), login_method: loginMethod || undefined });
+      if (!aliveRef.current) return;
       setStatus('running');
       const poll = async () => {
+        if (!aliveRef.current) return;
         const s = await api.poolAddStatus(email.trim());
-        if (s.status === 'running') { setTimeout(poll, 5000); return; }
+        if (!aliveRef.current) return;
+        if (s.status === 'running') { pollTimerRef.current = setTimeout(poll, 5000); return; }
         setStatus(s.status);
+        setSubmitting(false);
         if (s.status === 'failed') setDetail(s.detail?.slice(-500) || '登录失败');
         if (s.status === 'success') { onAdded(); onClose(); }
       };
-      setTimeout(poll, 5000);
+      pollTimerRef.current = setTimeout(poll, 5000);
     } catch (e) {
+      if (!aliveRef.current) return;
       setStatus('failed');
       setDetail(e instanceof Error ? e.message : '请求失败');
       setSubmitting(false);
@@ -1685,6 +1702,8 @@ export function PoolDrawer() {
   }, [loadClaudeUsage]);
 
   const [relogin, setRelogin] = useState<Record<string, { status: string; message?: string }>>({});
+  const claudeReloginAlive = useRef(true);
+  const claudeReloginTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const [showAdd, setShowAdd] = useState(false);
   const [showCodexAdd, setShowCodexAdd] = useState(false);
   const [showApiAdd, setShowApiAdd] = useState(false);
@@ -1692,26 +1711,47 @@ export function PoolDrawer() {
   const [showCodexSettings, setShowCodexSettings] = useState(false);
   const [apiDeleting, setApiDeleting] = useState<Record<string, boolean>>({});
 
+  useEffect(() => {
+    claudeReloginAlive.current = true;
+    const timers = claudeReloginTimers.current;
+    return () => {
+      claudeReloginAlive.current = false;
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
     setRelogin((m) => ({ ...m, [accountId]: { status: 'running' } }));
     try {
       const res = await api.poolRelogin(accountId);
+      if (!claudeReloginAlive.current) return;
       if (res.status === 'success') {
         setRelogin((m) => ({ ...m, [accountId]: { status: 'success' } }));
         await loadClaudeUsage();
         return;
       }
+      const schedulePoll = (delay: number) => {
+        const previous = claudeReloginTimers.current.get(accountId);
+        if (previous) clearTimeout(previous);
+        const timer = setTimeout(poll, delay);
+        claudeReloginTimers.current.set(accountId, timer);
+      };
       const poll = async () => {
+        if (!claudeReloginAlive.current) return;
         const s = await api.poolReloginStatus(accountId);
-        if (s.status === 'running') { setTimeout(poll, 5000); return; }
+        if (!claudeReloginAlive.current) return;
+        if (s.status === 'running') { schedulePoll(5000); return; }
+        claudeReloginTimers.current.delete(accountId);
         setRelogin((m) => ({ ...m, [accountId]: {
           status: s.status,
           message: s.status === 'failed' ? `登录失败：${(s.detail || '').slice(-300)}` : undefined,
         } }));
         if (s.status === 'success') await loadClaudeUsage();
       };
-      setTimeout(poll, 5000);
+      schedulePoll(5000);
     } catch (e) {
+      if (!claudeReloginAlive.current) return;
       setRelogin((m) => ({ ...m, [accountId]: {
         status: 'failed',
         message: e instanceof Error ? e.message : '重新登录失败',
@@ -1748,6 +1788,7 @@ export function PoolDrawer() {
     setCodexRelogin((m) => ({ ...m, [accountId]: { status: 'running' } }));
     try {
       const started = await api.codexPoolRelogin(accountId);
+      if (!codexReloginAlive.current) return;
       setCodexRelogin((m) => ({ ...m, [accountId]: {
         status: started.status,
         attempt_id: started.attempt_id,
@@ -1787,6 +1828,7 @@ export function PoolDrawer() {
       };
       schedulePoll(1000);
     } catch (e) {
+      if (!codexReloginAlive.current) return;
       setCodexRelogin((m) => ({ ...m, [accountId]: {
         status: 'failed',
         detail: e instanceof Error ? e.message : '重新登录失败',

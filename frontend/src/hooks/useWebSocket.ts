@@ -2,6 +2,94 @@ import { useEffect, useRef, useState } from 'react';
 import { WsClient } from '../api/ws';
 import { getWsUrl } from '../config/server';
 
+type Subscriber = {
+  channels: Set<string>;
+  onMessage?: (msg: Record<string, unknown>) => void;
+  onReconnect?: () => void;
+  onSubscribed?: (channels: string[]) => void;
+  onConnectionChange: (connected: boolean) => void;
+};
+
+class SharedWsConnection {
+  readonly client: WsClient;
+  private subscribers = new Set<Subscriber>();
+  private acceptedChannels = new Set<string>();
+  private currentChannels = new Set<string>();
+  private removeHandlers: Array<() => void> = [];
+
+  constructor(url: string) {
+    this.client = new WsClient(url);
+    this.removeHandlers.push(
+      this.client.onMessage((message) => {
+        const channel = message.channel;
+        if (typeof channel !== 'string') return;
+        for (const subscriber of this.subscribers) {
+          if (subscriber.channels.has(channel)) subscriber.onMessage?.(message as unknown as Record<string, unknown>);
+        }
+      }),
+      this.client.onReconnect(() => {
+        this.acceptedChannels.clear();
+        for (const subscriber of this.subscribers) subscriber.onReconnect?.();
+      }),
+      this.client.onConnectionChange((connected) => {
+        if (!connected) this.acceptedChannels.clear();
+        for (const subscriber of this.subscribers) subscriber.onConnectionChange(connected);
+      }),
+      this.client.onSubscribed((channels) => {
+        for (const channel of channels) this.acceptedChannels.add(channel);
+        for (const subscriber of this.subscribers) {
+          const accepted = channels.filter((channel) => subscriber.channels.has(channel));
+          subscriber.onSubscribed?.(accepted);
+        }
+      }),
+    );
+    this.client.connect();
+  }
+
+  add(subscriber: Subscriber) {
+    this.subscribers.add(subscriber);
+    subscriber.onConnectionChange(this.client.isConnected());
+    const added = [...subscriber.channels].filter((channel) => !this.currentChannels.has(channel));
+    for (const channel of subscriber.channels) this.currentChannels.add(channel);
+    if (added.length > 0) this.client.subscribe(added);
+    const accepted = [...subscriber.channels].filter((channel) => this.acceptedChannels.has(channel));
+    if (accepted.length > 0) subscriber.onSubscribed?.(accepted);
+  }
+
+  remove(subscriber: Subscriber): boolean {
+    this.subscribers.delete(subscriber);
+    if (this.subscribers.size === 0) {
+      this.dispose();
+      return true;
+    }
+    const aggregate = new Set<string>();
+    for (const current of this.subscribers) {
+      for (const channel of current.channels) aggregate.add(channel);
+    }
+    if (aggregate.size === this.currentChannels.size && [...aggregate].every((channel) => this.currentChannels.has(channel))) return false;
+    this.currentChannels = aggregate;
+    this.acceptedChannels.clear();
+    this.client.unsubscribe();
+    this.client.subscribe([...aggregate]);
+    return false;
+  }
+
+  dispose() {
+    for (const remove of this.removeHandlers) remove();
+    this.removeHandlers = [];
+    this.subscribers.clear();
+    this.client.close();
+  }
+}
+
+const sharedConnections = new Map<string, SharedWsConnection>();
+
+function connectionKey(wsUrl: string): string {
+  let token = '';
+  try { token = localStorage.getItem('cc_token') || ''; } catch { /* storage may be unavailable */ }
+  return `${wsUrl}\n${token}`;
+}
+
 /**
  * useWebSocket hook with callback support.
  *
@@ -20,11 +108,9 @@ export function useWebSocket(
   onReconnect?: () => void,
   onSubscribed?: (channels: string[]) => void,
 ) {
-  const clientRef = useRef<WsClient | null>(null);
   const callbackRef = useRef(onMessage);
   const reconnectRef = useRef(onReconnect);
   const subscribedRef = useRef(onSubscribed);
-  const [lastMessage, setLastMessage] = useState<Record<string, unknown> | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
   // Keep callback refs in sync without reconnecting the socket whenever a
@@ -41,36 +127,27 @@ export function useWebSocket(
   useEffect(() => {
     const wsUrl = getWsUrl();
     if (!wsUrl) return;
-    const client = new WsClient(wsUrl);
-    clientRef.current = client;
-
-    client.onMessage((msg) => {
-      const parsed = msg as unknown as Record<string, unknown>;
-      callbackRef.current?.(parsed);
-      // Callback subscribers process messages directly. Updating the legacy
-      // state for every event rerenders their entire component tree.
-      if (!callbackRef.current) setLastMessage(parsed);
-    });
-
-    const removeConnectionHandler = client.onConnectionChange(setIsConnected);
-    const removeReconnectHandler = client.onReconnect(() => {
-      reconnectRef.current?.();
-    });
-
-    const removeSubscriptionHandler = client.onSubscribed((subscribedChannels) => {
-      subscribedRef.current?.(subscribedChannels);
-    });
-
-    client.connect();
-    client.subscribe(channelsKey.split(','));
+    const key = connectionKey(wsUrl);
+    let shared = sharedConnections.get(key);
+    if (!shared) {
+      shared = new SharedWsConnection(wsUrl);
+      sharedConnections.set(key, shared);
+    }
+    const subscriber: Subscriber = {
+      channels: new Set(channelsKey ? channelsKey.split(',') : []),
+      onMessage: (message) => callbackRef.current?.(message),
+      onReconnect: () => reconnectRef.current?.(),
+      onSubscribed: (accepted) => subscribedRef.current?.(accepted),
+      onConnectionChange: setIsConnected,
+    };
+    shared.add(subscriber);
 
     return () => {
-      removeConnectionHandler();
-      removeReconnectHandler();
-      removeSubscriptionHandler();
-      client.close();
+      if (shared?.remove(subscriber) && sharedConnections.get(key) === shared) {
+        sharedConnections.delete(key);
+      }
     };
   }, [channelsKey]);
 
-  return { lastMessage, isConnected };
+  return { isConnected };
 }

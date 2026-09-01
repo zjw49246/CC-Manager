@@ -6,8 +6,17 @@ vi.mock('../api/client', () => ({
   api: { getAskUserPendingAll: vi.fn() },
 }));
 
+let onSubscribed: ((channels: string[]) => void) | undefined;
 vi.mock('../hooks/useWebSocket', () => ({
-  useWebSocket: vi.fn(() => ({ lastMessage: null, isConnected: true })),
+  useWebSocket: vi.fn((
+    _channels: string[],
+    _onMessage?: (message: Record<string, unknown>) => void,
+    _onReconnect?: () => void,
+    subscribed?: (channels: string[]) => void,
+  ) => {
+    onSubscribed = subscribed;
+    return { isConnected: true };
+  }),
 }));
 
 import { api } from '../api/client';
@@ -15,6 +24,7 @@ import { api } from '../api/client';
 describe('AskUserNotifications member fallback', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    onSubscribed = undefined;
     vi.mocked(api.getAskUserPendingAll).mockResolvedValue({ pending: [] });
   });
 
@@ -39,5 +49,18 @@ describe('AskUserNotifications member fallback', () => {
 
     expect(screen.getByText('Task #42 needs your input')).toBeInTheDocument();
     expect(screen.getByText('Choose a deployment target')).toBeInTheDocument();
+  });
+
+  it('uses a 30 second fallback after the tasks channel is authorized', async () => {
+    render(<AskUserNotifications />);
+    await act(async () => { await Promise.resolve(); });
+    expect(api.getAskUserPendingAll).toHaveBeenCalledTimes(1);
+
+    act(() => onSubscribed?.(['tasks']));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(api.getAskUserPendingAll).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(25_000); });
+    expect(api.getAskUserPendingAll).toHaveBeenCalledTimes(2);
   });
 });

@@ -21,6 +21,7 @@ import type {
 } from '../../api/client';
 import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw, Pin } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
@@ -995,27 +996,62 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   };
 
-  // Persist the draft as the user types; cleared when input empties (e.g. send)
+  // Persist the draft after a short idle window so every keystroke does not
+  // synchronously write localStorage (which can block the main thread).
+  const draftValueRef = useRef(input);
+  const draftIdentityRef = useRef({ draftKey, legacyDraftKey, hasControlAccess });
   useEffect(() => {
-    try {
-      if (input) localStorage.setItem(draftKey, input);
-      else localStorage.removeItem(draftKey);
-      if (hasControlAccess) localStorage.removeItem(legacyDraftKey);
-    } catch { /* storage may be unavailable */ }
+    draftValueRef.current = input;
+    draftIdentityRef.current = { draftKey, legacyDraftKey, hasControlAccess };
   }, [draftKey, hasControlAccess, input, legacyDraftKey]);
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        if (input) localStorage.setItem(draftKey, input);
+        else localStorage.removeItem(draftKey);
+        if (hasControlAccess) localStorage.removeItem(legacyDraftKey);
+      } catch { /* storage may be unavailable */ }
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [draftKey, hasControlAccess, input, legacyDraftKey]);
+  useEffect(() => () => {
     try {
-      if (fileUpload.uploadedResults.length > 0) {
-        localStorage.setItem(
-          draftUploadsKey,
-          JSON.stringify(fileUpload.uploadedResults),
-        );
-      } else {
-        localStorage.removeItem(draftUploadsKey);
-      }
-      if (hasControlAccess) localStorage.removeItem(legacyDraftUploadsKey);
+      const { draftKey: key, legacyDraftKey: legacyKey, hasControlAccess: controlAccess } = draftIdentityRef.current;
+      if (draftValueRef.current) localStorage.setItem(key, draftValueRef.current);
+      else localStorage.removeItem(key);
+      if (controlAccess) localStorage.removeItem(legacyKey);
     } catch { /* storage may be unavailable */ }
+  }, []);
+  const draftUploadsRef = useRef(fileUpload.uploadedResults);
+  const draftUploadsIdentityRef = useRef({ draftUploadsKey, legacyDraftUploadsKey, hasControlAccess });
+  useEffect(() => {
+    draftUploadsRef.current = fileUpload.uploadedResults;
+    draftUploadsIdentityRef.current = { draftUploadsKey, legacyDraftUploadsKey, hasControlAccess };
   }, [draftUploadsKey, fileUpload.uploadedResults, hasControlAccess, legacyDraftUploadsKey]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        if (fileUpload.uploadedResults.length > 0) {
+          localStorage.setItem(draftUploadsKey, JSON.stringify(fileUpload.uploadedResults));
+        } else {
+          localStorage.removeItem(draftUploadsKey);
+        }
+        if (hasControlAccess) localStorage.removeItem(legacyDraftUploadsKey);
+      } catch { /* storage may be unavailable */ }
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [draftUploadsKey, fileUpload.uploadedResults, hasControlAccess, legacyDraftUploadsKey]);
+  useEffect(() => () => {
+    try {
+      const { draftUploadsKey: key, legacyDraftUploadsKey: legacyKey, hasControlAccess: controlAccess } = draftUploadsIdentityRef.current;
+      if (draftUploadsRef.current.length > 0) {
+        localStorage.setItem(key, JSON.stringify(draftUploadsRef.current));
+      } else {
+        localStorage.removeItem(key);
+      }
+      if (controlAccess) localStorage.removeItem(legacyKey);
+    } catch { /* storage may be unavailable */ }
+  }, []);
   useEffect(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
@@ -1197,11 +1233,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     } catch { /* modal exposes actionable errors; passive polling is best-effort */ }
   }, [hasControlAccess, hasTaskSession, task.id, task.shared_from_id]);
 
-  useEffect(() => {
-    void refreshVersionedPlans();
-    const timer = window.setInterval(() => void refreshVersionedPlans(), 5000);
-    return () => window.clearInterval(timer);
-  }, [refreshVersionedPlans]);
+  useVisibilityAwareInterval(() => refreshVersionedPlans(), 5000, hasControlAccess && hasTaskSession && task.shared_from_id == null);
 
   const togglePlanVersionAttachment = useCallback((versionId: number) => {
     setSelectedPlanVersionIds((current) => current.includes(versionId)
@@ -1295,14 +1327,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     suppressesCurrentLifecycle ? null : rawBackgroundLifecycle
   );
   const [, refreshBackgroundAge] = useState(0);
-  useEffect(() => {
-    if (!backgroundLifecycle) return;
-    const timer = window.setInterval(
-      () => refreshBackgroundAge((generation) => generation + 1),
-      60_000,
-    );
-    return () => window.clearInterval(timer);
-  }, [backgroundLifecycle]);
+  useVisibilityAwareInterval(
+    () => refreshBackgroundAge((generation) => generation + 1),
+    60_000,
+    Boolean(backgroundLifecycle),
+    false,
+  );
   const workspaceReviewCanBeConfigured = (
     workspaceReviewCapability?.available === true
     || workspaceReviewCapability?.suggested_config != null
@@ -3608,7 +3638,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 </>
               )}
               {backgroundActive && (
-                <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap">
                   后台运行中
                 </span>
               )}

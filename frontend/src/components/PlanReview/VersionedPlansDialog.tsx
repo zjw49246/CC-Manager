@@ -7,6 +7,7 @@ import { ChevronLeft, ChevronRight, ListTodo, Loader2, Paperclip, X } from '../i
 import { PlanDetail } from './PlanDetail';
 import { planDisplayStateLabel } from './planResourceStatus';
 import { usePlanEvents } from './usePlanEvents';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 
 type Filter = 'all' | 'input' | 'review' | 'running' | 'approved';
 interface Props { open: boolean; taskId: number; refreshGeneration?: number; selectedVersionIds: number[]; onToggleVersion: (versionId: number) => void; onAttachVersion: (versionId: number) => void; onPlansChange: (plans: PlanResource[]) => void; onClose: () => void; }
@@ -58,7 +59,7 @@ export function VersionedPlansDialog({ open, taskId, refreshGeneration = 0, sele
     finally { if (requestId === refreshRequest.current) setLoading(false); }
   }, [onPlansChange, taskId]);
 
-  useEffect(() => { if (!open) return; void refresh(true); const timer = window.setInterval(() => void refresh(), 15000); return () => window.clearInterval(timer); }, [open, refresh]);
+  useVisibilityAwareInterval(() => refresh(), 15000, open);
   useEffect(() => { if (open && refreshGeneration > 0) void refresh(); }, [open, refresh, refreshGeneration]);
   usePlanEvents(plans, refresh);
   const selected = plans.find((plan) => plan.id === selectedId) || null;

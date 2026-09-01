@@ -6,6 +6,7 @@ import { PlanCreateForm } from '../components/PlanReview/PlanCreateForm';
 import { PlanDetail } from '../components/PlanReview/PlanDetail';
 import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPanel';
 import { usePlanEvents } from '../components/PlanReview/usePlanEvents';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
 import { ProjectSelect } from '../components/ProjectSelect';
 import { Archive, ChevronLeft, ChevronRight, Search, X } from '../components/icons';
@@ -125,11 +126,8 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
     }
   }, [baseQuery, page, query, selectedPlanId]);
 
-  useEffect(() => {
-    void refresh(true);
-    const timer = window.setInterval(() => void refresh(), 15000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+  useEffect(() => { void refresh(true); }, [refresh]);
+  useVisibilityAwareInterval(() => refresh(), 15000, true, false);
   useEffect(() => setPage(1), [query]);
   usePlanEvents(selectedPlan && !plans.some((plan) => plan.id === selectedPlan.id) ? [...plans, selectedPlan] : plans, refresh);
 

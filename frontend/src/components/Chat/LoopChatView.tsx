@@ -414,7 +414,7 @@ function IterationPanel({ iteration, messages, meta, isActive, defaultOpen, task
             )
           )}
           {isActive && (
-            <div className="text-xs text-gray-500 px-4 animate-pulse">Claude is working...</div>
+            <div className="text-xs text-gray-500 px-4">Claude is working...</div>
           )}
           <div ref={bottomRef} />
         </div>

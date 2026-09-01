@@ -12,7 +12,7 @@ interface SubAgentIndicatorProps {
 
 /** ChatView 头部的子 agent 小人：常驻显示；点开按类型汇总
  *（和任务卡上的 SubAgentsBadge 一致），没有子 agent 显示 "No sub-agents"。 */
-export function SubAgentIndicator({ taskId, count, active, onNavigate }: SubAgentIndicatorProps) {
+export function SubAgentIndicator({ taskId, count, onNavigate }: SubAgentIndicatorProps) {
   const [expanded, setExpanded] = useState(false);
   const [summary, setSummary] = useState<SubAgentSummary | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -35,7 +35,7 @@ export function SubAgentIndicator({ taskId, count, active, onNavigate }: SubAgen
     <div className="relative inline-block" ref={ref}>
       <button
         onClick={() => setExpanded(!expanded)}
-        className={`text-xs bg-teal-600/30 text-teal-300 px-1.5 rounded cursor-pointer hover:bg-teal-600/40 flex items-center gap-0.5${active ? ' animate-pulse' : ''}`}
+        className="text-xs bg-teal-600/30 text-teal-300 px-1.5 rounded cursor-pointer hover:bg-teal-600/40 flex items-center gap-0.5"
       >
         <Users size={12} />
         {count}

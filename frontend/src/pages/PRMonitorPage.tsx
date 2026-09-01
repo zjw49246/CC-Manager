@@ -6,6 +6,7 @@ import { FindingActions } from '../components/PRReview/FindingActions';
 import { MarkdownContent } from '../components/MarkdownContent';
 import { useDialogA11y } from '../hooks/useDialogA11y';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import {
   canonicalGitHubFindingCommentUrl,
   canonicalGitHubPRUrl,
@@ -803,21 +804,16 @@ function RepoDetail({
     void refreshSelectedReview();
   }, [loadReviews, refreshSelectedReview]);
 
-  useWebSocket(
+  const shouldPollReviews = reviews.some(isActiveReview)
+    || Boolean(selectedReview && isActiveReview(selectedReview))
+    || Boolean(monitorRun?.merge_actions?.some((action) => STARTED_MERGE_STATUSES.has(action.status)));
+  const prMonitorWs = useWebSocket(
     ['pr-monitor'],
     refreshReviewData,
     refreshReviewData,
     refreshReviewData,
   );
-
-  const shouldPollReviews = reviews.some(isActiveReview)
-    || Boolean(selectedReview && isActiveReview(selectedReview))
-    || Boolean(monitorRun?.merge_actions?.some((action) => STARTED_MERGE_STATUSES.has(action.status)));
-  useEffect(() => {
-    if (!shouldPollReviews) return;
-    const timer = window.setInterval(refreshReviewData, 5000);
-    return () => window.clearInterval(timer);
-  }, [refreshReviewData, shouldPollReviews]);
+  useVisibilityAwareInterval(refreshReviewData, prMonitorWs?.isConnected ? 30000 : 5000, shouldPollReviews, false);
 
   const latestReviewIdByPr = useMemo(() => {
     const latest = new Map<number, number>();

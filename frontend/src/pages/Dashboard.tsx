@@ -1,8 +1,10 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { api } from '../api/client';
 import type { Instance } from '../api/client';
 import { InstanceGrid } from '../components/Instances/InstanceGrid';
 import { InstanceLog } from '../components/Instances/InstanceLog';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 export function Dashboard() {
   const [instances, setInstances] = useState<Instance[]>([]);
@@ -21,11 +23,8 @@ export function Dashboard() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, 5000);
-    return () => clearInterval(interval);
-  }, [refresh]);
+  const { isConnected } = useWebSocket(['tasks', 'system'], refresh);
+  useVisibilityAwareInterval(refresh, isConnected ? 30000 : 5000);
 
   return (
     <div className="space-y-6">

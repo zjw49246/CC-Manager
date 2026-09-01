@@ -12,6 +12,7 @@ import {
   type UploadResult,
 } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import { AlertCircle, Archive, ArchiveRestore, Check, ChevronLeft, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
 import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
@@ -227,13 +228,12 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     await Promise.all([onRefresh(), load()]);
   }, [load, onRefresh]);
 
-  useEffect(() => {
-    if (!activeRun) return;
-    const timer = window.setInterval(() => {
-      void refreshDetail().catch(() => undefined);
-    }, 2_000);
-    return () => window.clearInterval(timer);
-  }, [activeRun, refreshDetail]);
+  useVisibilityAwareInterval(
+    () => refreshDetail().catch(() => undefined),
+    2_000,
+    Boolean(activeRun),
+    false,
+  );
 
   const mutate = async (
     label: string,
