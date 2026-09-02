@@ -1216,6 +1216,86 @@ async def test_restart_only_pty_refresh_failure_keeps_service_running(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_same_commit_update_restarts_when_pty_revision_changed(tmp_path):
+    (tmp_path / "scripts").mkdir(parents=True)
+    pty_script = tmp_path / "scripts" / "refresh_pty.sh"
+    pty_script.write_text("#!/bin/sh\necho CCM_PTY_REFRESH_CHANGED=1\n")
+    pty_script.chmod(0o700)
+    commit = "a" * 40
+    svc = _make_service(tmp_path, running_commit=commit)
+    state = _make_state()
+    state.old_commit = commit
+    state.new_commit = ""
+    svc._disk_commit = AsyncMock(return_value=commit)
+    svc._deployment_base_commit = AsyncMock(return_value=commit)
+    svc._fetch_and_validate_target_protocol = AsyncMock(
+        return_value=(True, "", commit)
+    )
+    svc._resolve_remote = AsyncMock(return_value="origin")
+    svc._database_revision_status = AsyncMock(
+        return_value={"database_up_to_date": True, "database_revision_error": ""}
+    )
+    svc._run_cmd = AsyncMock(
+        side_effect=lambda command, **_: {
+            "returncode": 0,
+            "stdout": "main\n" if command == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+            else f"{commit}\n" if command == ["git", "rev-parse", "HEAD"]
+            else "" if command[:3] == ["git", "merge", "--ff-only"]
+            else "CCM_PTY_REFRESH_CHANGED=1\n" if command[:2] == ["bash", str(pty_script)]
+            else "",
+            "stderr": "",
+        }
+    )
+    svc._fast_restart_path = AsyncMock(return_value=True)
+
+    with patch("backend.services.update_service.asyncio.sleep", new=AsyncMock()):
+        await svc._pipeline_inner(state, skip_frontend_build=False, force=False)
+
+    assert state.steps[4].status == "completed"
+    svc._fast_restart_path.assert_awaited_once_with(state)
+
+
+@pytest.mark.asyncio
+async def test_same_commit_update_keeps_completed_pty_check_without_restart(tmp_path):
+    (tmp_path / "scripts").mkdir(parents=True)
+    pty_script = tmp_path / "scripts" / "refresh_pty.sh"
+    pty_script.write_text("#!/bin/sh\necho CCM_PTY_REFRESH_CHANGED=0\n")
+    pty_script.chmod(0o700)
+    commit = "a" * 40
+    svc = _make_service(tmp_path, running_commit=commit)
+    state = _make_state()
+    state.old_commit = commit
+    state.new_commit = ""
+    svc._disk_commit = AsyncMock(return_value=commit)
+    svc._deployment_base_commit = AsyncMock(return_value=commit)
+    svc._fetch_and_validate_target_protocol = AsyncMock(
+        return_value=(True, "", commit)
+    )
+    svc._resolve_remote = AsyncMock(return_value="origin")
+    svc._database_revision_status = AsyncMock(
+        return_value={"database_up_to_date": True, "database_revision_error": ""}
+    )
+    svc._run_cmd = AsyncMock(
+        side_effect=lambda command, **_: {
+            "returncode": 0,
+            "stdout": "main\n" if command == ["git", "rev-parse", "--abbrev-ref", "HEAD"]
+            else f"{commit}\n" if command == ["git", "rev-parse", "HEAD"]
+            else "CCM_PTY_REFRESH_CHANGED=0\n" if command[:2] == ["bash", str(pty_script)]
+            else "" if command[:3] == ["git", "merge", "--ff-only"]
+            else "",
+            "stderr": "",
+        }
+    )
+    svc._fast_restart_path = AsyncMock()
+
+    await svc._pipeline_inner(state, skip_frontend_build=False, force=False)
+
+    assert state.status == "completed"
+    assert state.steps[4].status == "completed"
+    svc._fast_restart_path.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rollback_rechecks_queued_resume_after_warning(
     tmp_path, db_factory,
 ):

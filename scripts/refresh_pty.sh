@@ -22,6 +22,7 @@ PTY_URL=$(grep -E '"claude-pty @ git\+' pyproject.toml | grep -oE 'git\+https://
 # editable 安装：代码就是本地 PTY 仓库，无需刷新
 if ! "$PY" -c "import claude_pty, sys; sys.exit(0 if 'site-packages' in claude_pty.__file__ else 1)" 2>/dev/null; then
     echo "claude-pty 是 editable/本地安装（$("$PY" -c 'import claude_pty; print(claude_pty.__file__)' 2>/dev/null || echo 未安装)），跳过刷新"
+    echo "CCM_PTY_REFRESH_CHANGED=0"
     exit 0
 fi
 
@@ -36,10 +37,15 @@ EOF
 )
 
 latest=$(git ls-remote "$PTY_URL" refs/heads/main | cut -f1)
-[ -n "$latest" ] || { echo "无法获取 PTY 远端 main HEAD（网络/权限？），跳过"; exit 0; }
+[ -n "$latest" ] || {
+    echo "无法获取 PTY 远端 main HEAD（网络/权限？），跳过"
+    echo "CCM_PTY_REFRESH_CHANGED=0"
+    exit 0
+}
 
 if [ "$installed" = "$latest" ]; then
     echo "claude-pty 已是最新（${latest:0:12}）"
+    echo "CCM_PTY_REFRESH_CHANGED=0"
     exit 0
 fi
 
@@ -47,3 +53,4 @@ echo "claude-pty: ${installed:0:12} -> ${latest:0:12}，重新安装…"
 "$UV" pip install --python "$PY" --force-reinstall --no-deps "claude-pty @ git+${PTY_URL}@${latest}"
 echo "完成。验证："
 "$PY" -c "import claude_pty; print(' import OK:', claude_pty.__file__)"
+echo "CCM_PTY_REFRESH_CHANGED=1"

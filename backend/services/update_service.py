@@ -2724,13 +2724,56 @@ class UpdateService:
                     state, skip_frontend_build=skip_frontend_build
                 )
                 return
+            # The CCM commit can be unchanged while the independently pinned
+            # claude-pty git dependency has advanced.  Do not short-circuit
+            # this Update request before checking that dependency; a normal
+            # pre-start hook is skipped during controlled handoff, so without
+            # this check the new PTY code would remain unloaded indefinitely.
+            pty_changed = False
+            pty_step = state.steps[4]
+            pty_script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+            if pty_script.exists():
+                await self._start_step(pty_step)
+                result = await self._run_cmd(
+                    ["bash", str(pty_script)], timeout=120, step=pty_step
+                )
+                if result["returncode"] != 0:
+                    await self._fail_step(
+                        pty_step,
+                        state,
+                        f"refresh_pty.sh 失败: {result['stderr']}",
+                    )
+                    return
+                await self._complete_step(pty_step)
+                pty_changed = "CCM_PTY_REFRESH_CHANGED=1" in result["stdout"]
+            else:
+                pty_step.status = "skipped"
+                pty_step.message = "脚本不存在"
+                await self._broadcast_step(pty_step)
+            if pty_changed:
+                # There is no schema/code migration to perform in this path;
+                # mark the non-applicable stages explicitly and reuse the
+                # normal fenced restart handoff to load the new PTY module.
+                for index, step in enumerate(state.steps[1:], start=1):
+                    if index in {4, 9}:
+                        continue
+                    step.status = "skipped"
+                    step.message = "仅更新 PTY 依赖"
+                    await self._broadcast_step(step)
+                await self._fast_restart_path(state)
+                return
             step.message = (
                 "代码已是最新，服务可通过独立重启按钮重新加载"
             )
             await self._complete_step(step)
             state.status = "completed"
             state.completed_at = datetime.now(timezone.utc).isoformat()
-            for s in state.steps[1:]:
+            for index, s in enumerate(state.steps[1:], start=1):
+                # Keep the PTY check's completed/skipped result visible in the
+                # deployment history instead of overwriting it as a generic
+                # no-op step.
+                if index == 4:
+                    continue
                 s.status = "skipped"
             await self._broadcast(
                 "update_complete",
