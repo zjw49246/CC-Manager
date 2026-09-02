@@ -43,6 +43,16 @@ CLAUDE_TASK_BUILTIN_TOOLS = (
     "Write",
 )
 
+# Claude's native Plan Mode ends in an interactive ``ExitPlanMode`` approval
+# dialog. CCM Tasks are controlled through the web API and have their own
+# durable Plan workflow, so an unattended/background PTY turn cannot answer
+# that terminal-only dialog. Keep both transition tools unavailable for every
+# ordinary CCM Task instead of letting the Session wait forever off-screen.
+CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS = (
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
 # An unrestricted administrator turn historically used Claude's complete
 # built-in inventory.  It still needs an explicit permission allowlist because
 # subprocess environment scrubbing can make an interactive PTY report effective

@@ -1064,6 +1064,8 @@ class _PtyBackgroundState:
     outcome: str | None = None
     accepting_events: bool = True
     watchdog_stopping: bool = False
+    idle_reap_hold: object | None = None
+    idle_reap_hold_session: Any = None
 
 
 @dataclass(frozen=True)
@@ -8789,6 +8791,9 @@ class InstanceManager:
                     from backend.services.skill_context import (
                         wrap_skill_context,
                     )
+                    from backend.services.task_agent_isolation import (
+                        CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS,
+                    )
 
                     wrapped_prompt = wrap_skill_context(prompt, skill_context)
                     if on_launch_admitted is not None:
@@ -8814,6 +8819,9 @@ class InstanceManager:
                         enable_workflows=enable_workflows,
                         enabled_skills=enabled_skills,
                         mcp_config_path=mcp_config_path,
+                        disallowed_tools=list(
+                            CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS
+                        ),
                     )
                 finally:
                     if original_build_config is None:
@@ -9802,6 +9810,7 @@ class InstanceManager:
         state.outcome = None
         state.accepting_events = True
         state.done.clear()
+        self._ensure_pty_background_idle_reap_hold(state)
         watcher = state.watcher
         if (
             watcher is None
@@ -10015,7 +10024,10 @@ class InstanceManager:
                 raise RuntimeError(
                     "PTY background generation turn identity changed"
                 )
-            current.session = session
+            if current.session is not session:
+                self._release_pty_background_idle_reap_hold(current)
+                current.session = session
+            self._ensure_pty_background_idle_reap_hold(current)
             current.last_event_monotonic = time.monotonic()
             return current
         if current is not None:
@@ -10033,10 +10045,55 @@ class InstanceManager:
             last_event_monotonic=now,
         )
         self._pty_background_states[key] = state
+        self._ensure_pty_background_idle_reap_hold(state)
         state.watcher = asyncio.create_task(
             self._watch_pty_background_generation(state)
         )
         return state
+
+    @staticmethod
+    def _release_pty_background_idle_reap_hold(
+        state: _PtyBackgroundState,
+    ) -> None:
+        token = state.idle_reap_hold
+        session = state.idle_reap_hold_session
+        state.idle_reap_hold = None
+        state.idle_reap_hold_session = None
+        release = getattr(session, "release_idle_reap_hold", None)
+        if token is not None and callable(release):
+            try:
+                release(token)
+            except Exception:
+                logger.exception(
+                    "Could not release PTY idle-reap hold for task %s session %s",
+                    state.task_id,
+                    state.session_id,
+                )
+
+    def _ensure_pty_background_idle_reap_hold(
+        self,
+        state: _PtyBackgroundState,
+    ) -> None:
+        session = state.session
+        if (
+            state.idle_reap_hold is not None
+            and state.idle_reap_hold_session is session
+            and bool(getattr(session, "idle_reap_protected", True))
+        ):
+            return
+        self._release_pty_background_idle_reap_hold(state)
+        acquire = getattr(session, "acquire_idle_reap_hold", None)
+        if not callable(acquire):
+            return
+        try:
+            state.idle_reap_hold = acquire()
+            state.idle_reap_hold_session = session
+        except Exception:
+            logger.exception(
+                "Could not retain PTY Session from idle reaping for task %s session %s",
+                state.task_id,
+                state.session_id,
+            )
 
     def _discard_pty_background_state(
         self,
@@ -10047,6 +10104,7 @@ class InstanceManager:
         if state is None or state.generation != generation:
             return
         self._pty_background_states.pop(key, None)
+        self._release_pty_background_idle_reap_hold(state)
         state.accepting_events = False
         state.done.set()
         # A chat post-exit proof is the event-consumer identity for this
@@ -10135,14 +10193,16 @@ class InstanceManager:
         session_id: str,
         task_id: int,
     ) -> bool:
-        """Stop one Session object without ever addressing a reusable key."""
+        """Stop one exact Session object without addressing a reusable key.
+
+        FullMirror keeps the old adapter entry until its background wait is
+        released. The durable Instance slot may already belong to another
+        provider/Task by then, so presence in the adapter dictionary is not
+        live ownership. Stopping this captured object is safe: no lookup by
+        reusable instance key occurs and an ABA replacement remains untouched.
+        """
 
         if getattr(session, "session_id", None) != session_id:
-            return False
-        attached = getattr(self._pty_backend, "_sessions", {})
-        if isinstance(attached, dict) and any(
-            candidate is session for candidate in attached.values()
-        ):
             return False
 
         try:
@@ -12770,7 +12830,15 @@ class InstanceManager:
                 CLAUDE_NATIVE_SUB_AGENT_TOOLS,
             )
             skills = discover_skills(project_dir=cwd)
-            disallowed = []
+            from backend.services.task_agent_isolation import (
+                CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS,
+            )
+
+            disallowed = (
+                list(CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS)
+                if task_id is not None
+                else []
+            )
             if not enable_workflows:
                 disallowed.append("Workflow")
             disallowed.extend(get_skill_disallowed_tools(skills, enabled_skills))

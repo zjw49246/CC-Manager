@@ -4642,6 +4642,106 @@ class TestFullMirrorBackend:
             task_id, session.session_id
         )
 
+    async def test_detached_stop_reaps_stale_adapter_attachment_after_slot_reuse(
+        self,
+        db_factory,
+    ):
+        """A stale adapter index is not ownership of the captured Session."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        generation = "reused-slot-background-generation"
+        completed_at = datetime.utcnow()
+
+        class Session:
+            session_id = "reused-slot-background-session"
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.stop_calls = 0
+                self._holds = set()
+
+            @property
+            def idle_reap_protected(self):
+                return bool(self._holds)
+
+            def acquire_idle_reap_hold(self):
+                token = object()
+                self._holds.add(token)
+                return token
+
+            def release_idle_reap_hold(self, token):
+                self._holds.discard(token)
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+
+        session = Session()
+        backend._sessions[instance_id] = session
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.retry_count = 14
+            task.instance_id = instance_id
+            task.started_at = None
+            task.completed_at = completed_at
+            task.session_id = session.session_id
+            task.pty_background_generation = generation
+            replacement = Task(
+                title="replacement",
+                description="new provider owner",
+                status="executing",
+                instance_id=instance_id,
+            )
+            db.add(replacement)
+            await db.flush()
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.current_task_id = replacement.id
+            await db.commit()
+            replacement_id = replacement.id
+
+        state = im.register_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=14,
+            task_turn_generation=0,
+        )
+        watcher = state.watcher
+        assert session.idle_reap_protected is True
+
+        assert await im.stop_detached_pty_background_generation(
+            task_id,
+            session.session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=14,
+            expected_turn_generation=0,
+            expected_instance_id=instance_id,
+            expected_started_at=None,
+            expected_completed_at=completed_at,
+        )
+
+        assert session.stop_calls == 1
+        assert session.is_alive is False
+        assert session.idle_reap_protected is False
+        # The exact object was stopped directly; no reusable instance key was
+        # popped, so a concurrent replacement mapping could not be touched.
+        assert backend._sessions[instance_id] is session
+        if watcher is not None:
+            await asyncio.gather(watcher, return_exceptions=True)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.pty_background_generation is None
+            assert inst.current_task_id == replacement_id
+
     async def test_dead_detached_session_after_cas_loss_stays_frozen_for_cleanup(
         self, db_factory
     ):

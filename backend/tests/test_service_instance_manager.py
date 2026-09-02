@@ -19899,6 +19899,27 @@ def test_build_command_claude_enable_workflows_true():
     assert "--disallowedTools" not in cmd
 
 
+def test_build_command_claude_task_disables_interactive_plan_mode():
+    """Managed Tasks cannot enter Claude's terminal-only Plan approval UI."""
+
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="claude",
+        prompt="inspect",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        enable_workflows=True,
+        task_id=91,
+    )
+
+    idx = cmd.index("--disallowedTools")
+    assert set(cmd[idx + 1].split(",")) == {
+        "EnterPlanMode",
+        "ExitPlanMode",
+    }
+
+
 def test_build_command_claude_enable_workflows_false():
     """_build_command with enable_workflows=False includes --disallowedTools Workflow."""
     im = InstanceManager(MagicMock(), MagicMock())
@@ -20280,6 +20301,10 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["prompt"] == "do it"
     assert calls["model"] is None  # "default" normalized away
     assert calls["cwd"] == "/w"
+    assert calls["disallowed_tools"] == [
+        "EnterPlanMode",
+        "ExitPlanMode",
+    ]
 
 
 @pytest.mark.asyncio
