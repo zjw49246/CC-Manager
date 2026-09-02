@@ -82,10 +82,31 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
     && result.review_id === currentReviewId
     && result.head_sha === monitorRun?.current_head_sha,
   );
+  // Merge actions are an append-only outbox.  A previous reviewed head may
+  // have failed the direct merge ancestry check even after a later head was
+  // reviewed successfully.  Never let that historical failure block the
+  // current review projection.
+  const currentMergeActions = monitorRun?.merge_actions?.filter((action) => (
+    action.review_id === currentReviewId
+    && action.trigger_head_sha === monitorRun.current_head_sha
+  )) ?? [];
+  // The review projection may learn about a manual GitHub merge before the
+  // monitor-run lifecycle row is reconciled.  Treat either source as terminal
+  // so stale merge/base-update controls cannot be shown for an already closed
+  // PR (the card itself already displays this lifecycle state).
+  const terminalRun = Boolean(
+    monitorRun?.status === 'merged'
+    || monitorRun?.status === 'closed'
+    || result?.lifecycle_state === 'merged'
+    || result?.lifecycle_state === 'closed',
+  );
   const baseUpdateRequired = Boolean(
-    monitorRun?.pause_reason === 'direct_merge_base_update_required'
-    || monitorRun?.pause_reason === 'direct_merge_base_update_requested'
-    || monitorRun?.merge_actions?.some((action) => action.last_error?.includes(BASE_ANCESTRY_ERROR)),
+    !terminalRun
+    && (
+      monitorRun?.pause_reason === 'direct_merge_base_update_required'
+      || monitorRun?.pause_reason === 'direct_merge_base_update_requested'
+      || currentMergeActions.some((action) => action.last_error?.includes(BASE_ANCESTRY_ERROR))
+    ),
   );
   const branchUpdateRequested = monitorRun?.pause_reason === 'direct_merge_base_update_requested';
   const prUrl = result
@@ -177,7 +198,7 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
               error={historyError}
             />
           )}
-          {monitorRun && result?.aggregate_verdict === 'pass' && resultMatchesCurrentHead && (
+          {monitorRun && !terminalRun && result?.aggregate_verdict === 'pass' && resultMatchesCurrentHead && (
             <section aria-label="Merge controls" className="border-y border-gray-800 py-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h3 className="text-sm font-medium text-gray-200">Merge exact reviewed head</h3>
@@ -227,7 +248,7 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
               )}
               {branchUpdateError && <p role="alert" className="mt-2 text-xs text-amber-300">Branch update failed: {branchUpdateError}</p>}
               {mergeError && <p role="alert" className="mt-2 text-xs text-amber-300">Merge failed: {mergeError}</p>}
-              {monitorRun.merge_actions?.map((action) => action.last_error && !action.last_error.includes(BASE_ANCESTRY_ERROR) && (
+              {currentMergeActions.map((action) => action.last_error && !action.last_error.includes(BASE_ANCESTRY_ERROR) && (
                 <p key={`merge-error-${action.id}`} role="alert" className="mt-2 text-xs text-amber-300">
                   Merge action #{action.id}: {action.last_error}
                 </p>

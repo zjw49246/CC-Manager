@@ -1170,6 +1170,52 @@ async def test_manual_pull_fast_restart_branch_uses_final_gate(
 
 
 @pytest.mark.asyncio
+async def test_restart_only_refreshes_claude_pty_before_shutdown(tmp_path):
+    (tmp_path / "scripts").mkdir(parents=True)
+    pty_script = tmp_path / "scripts" / "refresh_pty.sh"
+    pty_script.write_text("#!/bin/sh\nexit 0\n")
+    pty_script.chmod(0o700)
+    svc = _make_service(tmp_path)
+    state = _make_state()
+    state.operation = "restart"
+    svc._run_cmd = AsyncMock(return_value={"returncode": 0, "stdout": "", "stderr": ""})
+    svc._commit_shutdown_if_idle = AsyncMock(return_value=[])
+
+    with patch("backend.services.update_service.asyncio.sleep", new=AsyncMock()):
+        result = await svc._fast_restart_path(state)
+
+    assert result is True
+    assert state.steps[4].status == "completed"
+    svc._run_cmd.assert_awaited_once_with(
+        ["bash", str(pty_script)], timeout=120, step=state.steps[4]
+    )
+    svc._commit_shutdown_if_idle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_only_pty_refresh_failure_keeps_service_running(tmp_path):
+    (tmp_path / "scripts").mkdir(parents=True)
+    pty_script = tmp_path / "scripts" / "refresh_pty.sh"
+    pty_script.write_text("#!/bin/sh\nexit 1\n")
+    pty_script.chmod(0o700)
+    svc = _make_service(tmp_path)
+    state = _make_state()
+    state.operation = "restart"
+    svc._run_cmd = AsyncMock(
+        return_value={"returncode": 1, "stdout": "", "stderr": "network down"}
+    )
+    svc._commit_shutdown_if_idle = AsyncMock(return_value=[])
+    svc._write_status_file = MagicMock()
+
+    result = await svc._fast_restart_path(state)
+
+    assert result is False
+    assert state.status == "failed"
+    assert "refresh_pty.sh 失败" in state.error
+    svc._commit_shutdown_if_idle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_rollback_rechecks_queued_resume_after_warning(
     tmp_path, db_factory,
 ):

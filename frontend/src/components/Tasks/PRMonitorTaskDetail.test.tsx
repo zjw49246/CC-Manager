@@ -291,4 +291,97 @@ describe('PRMonitorTaskDetail', () => {
     await waitFor(() => expect(api.updatePRMonitorBranch).toHaveBeenCalledWith(14, 'a'.repeat(40)));
     await waitFor(() => expect(api.getPRMonitorRun).toHaveBeenCalledTimes(2));
   });
+
+  it('ignores a failed merge action from an older reviewed head', async () => {
+    vi.mocked(api.getPRMonitorRun).mockResolvedValue({
+      id: 14,
+      repo_id: 3,
+      pr_number: 133,
+      status: 'ready_to_merge',
+      current_head_sha: 'a'.repeat(40),
+      current_review_id: 113,
+      display_task_id: 42,
+      developer_task_id: null,
+      repair_attempts: 0,
+      max_repair_attempts: 3,
+      pause_reason: null,
+      wakes: [],
+      merge_actions: [{
+        id: 30,
+        review_id: 112,
+        trigger_head_sha: 'c'.repeat(40),
+        status: 'failed',
+        effect_kind: 'direct',
+        github_queue_entry_id: null,
+        merge_group_sha: null,
+        ci_status: null,
+        attempt_count: 1,
+        last_error: 'direct_merge_remote_absence_proven:GhError:GitHub PR base ancestry is unsafe for direct auto-merge',
+      }],
+      review_history: [],
+    });
+
+    render(
+      <PRMonitorTaskDetail
+        task={{
+          title: 'PR Review: acme/widget#133',
+          description: null,
+          metadata_: { pr_monitor_display: true, pr_monitor_run_id: 14, pr_monitor_review_id: 113 },
+        }}
+        result={{ ...resultFixture(), aggregate_verdict: 'pass' }}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByRole('button', { name: 'Merge PR' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Update branch & re-review' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/The base branch advanced after this review/)).not.toBeInTheDocument();
+  });
+
+  it('hides stale merge controls after the PR was merged externally', async () => {
+    vi.mocked(api.getPRMonitorRun).mockResolvedValue({
+      id: 14,
+      repo_id: 3,
+      pr_number: 133,
+      status: 'paused',
+      current_head_sha: 'a'.repeat(40),
+      current_review_id: 113,
+      display_task_id: 42,
+      developer_task_id: null,
+      repair_attempts: 0,
+      max_repair_attempts: 3,
+      pause_reason: null,
+      wakes: [],
+      merge_actions: [{
+        id: 30,
+        review_id: 112,
+        trigger_head_sha: 'c'.repeat(40),
+        status: 'failed',
+        effect_kind: 'direct',
+        github_queue_entry_id: null,
+        merge_group_sha: null,
+        ci_status: null,
+        attempt_count: 1,
+        last_error: 'direct_merge_remote_absence_proven:GhError:GitHub PR base ancestry is unsafe for direct auto-merge',
+      }],
+      review_history: [],
+    });
+
+    render(
+      <PRMonitorTaskDetail
+        task={{
+          title: 'PR Review: acme/widget#133',
+          description: null,
+          metadata_: { pr_monitor_display: true, pr_monitor_run_id: 14, pr_monitor_review_id: 113 },
+        }}
+        result={{ ...resultFixture(), aggregate_verdict: 'pass', lifecycle_state: 'merged' }}
+        onBack={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(api.getPRMonitorRun).toHaveBeenCalledWith(14));
+    expect(screen.queryByRole('region', { name: 'Merge controls' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/The base branch advanced after this review/)).not.toBeInTheDocument();
+  });
 });

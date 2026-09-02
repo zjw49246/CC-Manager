@@ -2227,7 +2227,11 @@ class UpdateService:
                     started_at=datetime.now(timezone.utc).isoformat(),
                     steps=[StepInfo(name=name) for name in STEP_NAMES],
                 )
-                for step in state.steps[:-1]:
+                for index, step in enumerate(state.steps[:-1]):
+                    # Keep refresh_pty pending so the restart-only path can
+                    # refresh the independently pinned git dependency.
+                    if index == 4:
+                        continue
                     step.status = "skipped"
                     step.message = "仅重启服务"
                 self._current = state
@@ -3359,7 +3363,36 @@ class UpdateService:
         *,
         restart_failure_policy: str = "rollback",
     ) -> bool:
-        """No migration: skip steps 8-9, do nohup restart for step 10."""
+        """Refresh restart-only dependencies, then do the no-migration restart.
+
+        ``claude-pty`` is a git dependency whose installed revision can move
+        independently of the CCM checkout.  Update pipelines already run
+        ``refresh_pty.sh`` before reaching this method, but restart-only
+        requests used to skip it entirely.  Keep the refresh inside the
+        deployment lease and before the shutdown handoff so a failed refresh
+        leaves the running service untouched.
+        """
+        if state.operation == "restart" and state.steps[4].status == "pending":
+            pty_step = state.steps[4]
+            await self._start_step(pty_step)
+            pty_script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+            if pty_script.exists():
+                result = await self._run_cmd(
+                    ["bash", str(pty_script)], timeout=120, step=pty_step
+                )
+                if result["returncode"] != 0:
+                    await self._fail_step(
+                        pty_step,
+                        state,
+                        f"refresh_pty.sh 失败，已取消重启: {result['stderr']}",
+                    )
+                    return False
+                await self._complete_step(pty_step)
+            else:
+                pty_step.status = "skipped"
+                pty_step.message = "脚本不存在"
+                await self._broadcast_step(pty_step)
+
         state.steps[7].status = "skipped"
         state.steps[7].message = "无新迁移"
         state.steps[8].status = "skipped"
