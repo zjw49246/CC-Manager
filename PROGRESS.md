@@ -4,6 +4,12 @@
 
 ## 已完成功能
 
+### 2026-09-02：修复 Claude 隐式异步原生子 Agent 提前完成
+
+- [x] PTY 结构化读取 `toolUseResult.isAsync/status=async_launched/agentId`；即使 Agent 输入未声明 `run_in_background`，启动回执也保持 `running`，直到匹配的 `<task-notification>` 才完成并保留 transcript summary/report。
+- [x] CCM 增加真实 JSONL→DB 全链路回归，验证 active 子 Agent 计数、running/completed report 与最终 summary；相关测试 `111 passed`，开发服务使用 PTY `4d7c819`。
+- [x] CCM 实现提交：`723401a8`；PTY 上游实现与文档提交：`2d6e5b1`、`4d7c819`。
+
 ### 2026-08-18：一键更新 SQLite 快照提速
 
 - [x] 权威 Alembic revision 已是最新时不再生成数据库回滚快照；有待迁移项时只预留路径，由停服后的外部 worker 生成一次权威快照，取消会被立即覆盖的在线全量备份。
