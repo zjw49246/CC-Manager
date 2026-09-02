@@ -1252,6 +1252,7 @@ async def test_same_commit_update_restarts_when_pty_revision_changed(tmp_path):
         await svc._pipeline_inner(state, skip_frontend_build=False, force=False)
 
     assert state.steps[4].status == "completed"
+    assert state.deployment_incomplete is True
     svc._fast_restart_path.assert_awaited_once_with(state)
 
 

@@ -2751,6 +2751,13 @@ class UpdateService:
                 pty_step.message = "脚本不存在"
                 await self._broadcast_step(pty_step)
             if pty_changed:
+                # The new package is now on disk but the running process still
+                # has the previous module loaded until a restart succeeds. Keep
+                # this deployment fenced as incomplete if shutdown admission
+                # is blocked or the handoff fails, so a later no-op Update
+                # cannot incorrectly declare the stale process healthy.
+                state.deployment_incomplete = True
+                self._update_deployment_lease(deployment_incomplete=True)
                 # There is no schema/code migration to perform in this path;
                 # mark the non-applicable stages explicitly and reuse the
                 # normal fenced restart handoff to load the new PTY module.
@@ -3688,10 +3695,14 @@ class UpdateService:
         state.status = "failed"
         state.error = message
         state.deployment_incomplete = bool(
-            state.new_commit
-            and state.old_commit
-            and state.new_commit != state.old_commit
-        ) or state.operation == "repair"
+            state.deployment_incomplete
+            or (
+                state.new_commit
+                and state.old_commit
+                and state.new_commit != state.old_commit
+            )
+            or state.operation == "repair"
+        )
         state.completed_at = datetime.now(timezone.utc).isoformat()
         self._write_status_file(
             "failed",
