@@ -312,6 +312,7 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 | `test_native_agent_record` | native-agent 记录 + meta JSON（tool_use_id） |
 | `test_legacy_aliases_still_work` | MonitorSession/MonitorCheck 别名 + monitor_session_id synonym 兼容 |
 | `test_spawn_progress_done_lifecycle` | spawn→progress→done 生命周期 + 去重 + sub_agent_* 广播 |
+| `test_implicitly_async_claude_agent_keeps_reports_until_notification` | Claude 隐式 async Agent 的启动回执保持 running，transcript 形成 report，匹配 notification 才带 summary 完成 |
 | `test_progress_for_unknown_agent_is_noop` | 未注册 tool_use_id 的 progress 为 no-op |
 | `test_missing_tool_use_id_ignored` | 无 tool_use_id 不入库 |
 | `test_summary_groups_by_agent_type` | /sub-agents/summary 按 agent_type 分组，running/completed 恒存在 |
