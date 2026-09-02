@@ -6775,6 +6775,50 @@ def _branch_update_synchronize_payload(
     }, head_sha)
 
 
+async def _post_internal_synchronize(
+    http_client,
+    *,
+    payload: dict,
+    candidate_id: int,
+    previous_head_sha: str,
+    remote_head_sha: str,
+    webhook_secret: str,
+    delivery_prefix: str,
+) -> bool:
+    """Deliver one verified remote head change through the normal webhook path."""
+
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
+
+    body = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    delivery_hash = hashlib.sha256(
+        f"{candidate_id}:{previous_head_sha}:{remote_head_sha}".encode()
+    ).hexdigest()
+    signature = hmac.new(webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+    response = await http_client.post(
+        f"{resolve_internal_api_base()}/api/github/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": f"{delivery_prefix}-{delivery_hash[:40]}",
+            "X-Hub-Signature-256": f"sha256={signature}",
+        },
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "Internal PR synchronize recovery returned %s for run %s",
+            response.status_code,
+            candidate_id,
+        )
+        return False
+    return True
+
+
 async def reconcile_requested_branch_updates(
     db_factory,
     *,
@@ -6826,7 +6870,6 @@ async def reconcile_requested_branch_updates(
     if not candidates:
         return 0
 
-    from backend.services.internal_api_endpoint import resolve_internal_api_base
     from backend.services.pr_review_service import (
         _MAX_GH_PR_VIEW_RESPONSE_BYTES,
         _gh_api_json,
@@ -6857,46 +6900,135 @@ async def reconcile_requested_branch_updates(
                 payload, remote_head_sha = projected
                 if remote_head_sha == candidate.current_head_sha:
                     continue
-                body = json.dumps(
-                    payload,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode()
-                delivery_hash = hashlib.sha256(
-                    (
-                        f"{candidate.id}:{candidate.current_head_sha}:"
-                        f"{remote_head_sha}"
-                    ).encode()
-                ).hexdigest()
-                signature = hmac.new(
-                    candidate.webhook_secret.encode(),
-                    body,
-                    hashlib.sha256,
-                ).hexdigest()
-                response = await http_client.post(
-                    f"{resolve_internal_api_base()}/api/github/webhook",
-                    content=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-GitHub-Event": "pull_request",
-                        "X-GitHub-Delivery": (
-                            f"ccm-branch-update-{delivery_hash[:40]}"
-                        ),
-                        "X-Hub-Signature-256": f"sha256={signature}",
-                    },
-                )
-                if response.status_code == 200:
+                if await _post_internal_synchronize(
+                    http_client,
+                    payload=payload,
+                    candidate_id=candidate.id,
+                    previous_head_sha=candidate.current_head_sha,
+                    remote_head_sha=remote_head_sha,
+                    webhook_secret=candidate.webhook_secret,
+                    delivery_prefix="ccm-branch-update",
+                ):
                     reconciled += 1
-                else:
-                    logger.warning(
-                        "Requested PR branch update recovery returned %s for run %s",
-                        response.status_code,
-                        candidate.id,
-                    )
             except Exception:
                 logger.exception(
                     "Requested PR branch update recovery failed for run %s",
+                    candidate.id,
+                )
+    finally:
+        if owned_client is not None:
+            await owned_client.aclose()
+    return reconciled
+
+
+async def reconcile_missed_pr_synchronizes(
+    db_factory,
+    *,
+    limit: int = 5,
+    http_client: httpx.AsyncClient | None = None,
+) -> int:
+    """Recover PR head changes when GitHub's synchronize delivery was lost.
+
+    The scan is deliberately bounded and excludes terminal/Delivery-owned
+    lifecycles. Any resulting mutation is sent through ``github_webhook`` so
+    the existing exact-generation cleanup and idempotency fences remain the
+    single source of truth.
+    """
+
+    if limit <= 0:
+        return 0
+    async with db_factory() as db:
+        from backend.services.pr_review_service import _database_now
+
+        cutoff = await _database_now(db) - timedelta(seconds=15)
+        candidates = list((await db.execute(
+            select(
+                PRMonitorRun.id,
+                PRMonitorRun.pr_number,
+                PRMonitorRun.current_head_sha,
+                MonitoredRepo.repo_full_name,
+                MonitoredRepo.webhook_secret,
+            )
+            .join(MonitoredRepo, MonitoredRepo.id == PRMonitorRun.repo_id)
+            .join(
+                PRReview,
+                and_(
+                    PRReview.id == PRMonitorRun.current_review_id,
+                    PRReview.monitor_run_id == PRMonitorRun.id,
+                    PRReview.repo_id == PRMonitorRun.repo_id,
+                    PRReview.pr_number == PRMonitorRun.pr_number,
+                    PRReview.base_sha == PRMonitorRun.current_base_sha,
+                    PRReview.head_sha == PRMonitorRun.current_head_sha,
+                ),
+            )
+            .where(
+                MonitoredRepo.enabled.is_(True),
+                PRMonitorRun.status.not_in(("merged", "closed")),
+                PRMonitorRun.completed_at.is_(None),
+                PRMonitorRun.terminal_intent_status.is_(None),
+                PRMonitorRun.terminal_intent_base_ref.is_(None),
+                PRMonitorRun.terminal_intent_head_sha.is_(None),
+                PRMonitorRun.terminal_intent_delivery_id.is_(None),
+                PRMonitorRun.terminal_intent_observed_at.is_(None),
+                PRMonitorRun.updated_at <= cutoff,
+                or_(
+                    PRMonitorRun.pause_reason.is_(None),
+                    PRMonitorRun.pause_reason != "direct_merge_base_update_requested",
+                ),
+                ~select(DeliveryRun.id).where(
+                    DeliveryRun.pr_monitor_run_id == PRMonitorRun.id,
+                ).exists(),
+            )
+            .order_by(PRMonitorRun.updated_at.asc(), PRMonitorRun.id.asc())
+            .limit(limit)
+        )).all())
+        await db.rollback()
+    if not candidates:
+        return 0
+
+    from backend.services.pr_review_service import (
+        _MAX_GH_PR_VIEW_RESPONSE_BYTES,
+        _gh_api_json,
+    )
+
+    owned_client = None
+    if http_client is None:
+        owned_client = httpx.AsyncClient(timeout=180, trust_env=False)
+        http_client = owned_client
+    reconciled = 0
+    try:
+        for candidate in candidates:
+            try:
+                remote = await _gh_api_json(
+                    (
+                        f"repos/{quote(candidate.repo_full_name, safe='/')}"
+                        f"/pulls/{candidate.pr_number}"
+                    ),
+                    max_output_bytes=_MAX_GH_PR_VIEW_RESPONSE_BYTES,
+                )
+                projected = _branch_update_synchronize_payload(
+                    candidate.repo_full_name,
+                    candidate.pr_number,
+                    remote,
+                )
+                if projected is None:
+                    continue
+                payload, remote_head_sha = projected
+                if remote_head_sha == candidate.current_head_sha:
+                    continue
+                if await _post_internal_synchronize(
+                    http_client,
+                    payload=payload,
+                    candidate_id=candidate.id,
+                    previous_head_sha=candidate.current_head_sha,
+                    remote_head_sha=remote_head_sha,
+                    webhook_secret=candidate.webhook_secret,
+                    delivery_prefix="ccm-synchronize-recovery",
+                ):
+                    reconciled += 1
+            except Exception:
+                logger.exception(
+                    "Missed PR synchronize recovery failed for run %s",
                     candidate.id,
                 )
     finally:

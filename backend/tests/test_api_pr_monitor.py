@@ -5869,6 +5869,84 @@ async def test_requested_branch_update_recovery_delivers_exact_synchronize(
 
 
 @pytest.mark.asyncio
+async def test_missed_synchronize_recovery_reviews_new_head_after_comments(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A lost synchronize delivery must not leave a commented head stuck."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/missed-synchronize")
+    old_review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=146,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run is not None
+        run.updated_at = datetime.utcnow() - timedelta(minutes=1)
+        await db.commit()
+
+    remote = {
+        "number": 146,
+        "state": "open",
+        "draft": False,
+        "title": "Fix after review comments",
+        "html_url": f"https://github.com/{repo['repo_full_name']}/pull/146",
+        "user": {"login": "alice"},
+        "base": {"ref": "main", "sha": BASE_SHA_1},
+        "head": {
+            "ref": "feature/result-146",
+            "sha": HEAD_SHA_2,
+            "repo": {"full_name": repo["repo_full_name"]},
+        },
+    }
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_api_json",
+        AsyncMock(return_value=remote),
+    )
+    monkeypatch.setattr(
+        "backend.services.internal_api_endpoint.resolve_internal_api_base",
+        lambda: "http://test",
+    )
+
+    reconciled = await pr_monitor_api.reconcile_missed_pr_synchronizes(
+        session_factory,
+        http_client=client,
+    )
+
+    assert reconciled == 1
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        reviews = list((await db.execute(
+            select(PRReview).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 146,
+            ).order_by(PRReview.id)
+        )).scalars())
+        run = await db.get(PRMonitorRun, run_id)
+        assert old_review is not None and run is not None
+        # The old comment remains an immutable historical result; the Run now
+        # points at a fresh review for the newly pushed head.
+        assert old_review.status == "commented"
+        assert len(reviews) == 2
+        assert reviews[-1].head_sha == HEAD_SHA_2
+        assert reviews[-1].status == "reviewing"
+        assert run.current_review_id == reviews[-1].id
+        assert run.current_head_sha == HEAD_SHA_2
+
+
+@pytest.mark.asyncio
 async def test_webhook_synchronize_persists_recovery_intent_before_cleanup(
     client,
     session_factory,

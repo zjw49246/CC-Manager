@@ -7766,10 +7766,14 @@ async def recover_incomplete_pr_reviews(
 
     terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
     from backend.api.pr_monitor import (
+        reconcile_missed_pr_synchronizes,
         reconcile_remote_pr_lifecycles,
         reconcile_requested_branch_updates,
     )
 
+    missed_synchronizes_reconciled = await reconcile_missed_pr_synchronizes(
+        db_factory
+    )
     remote_lifecycles_reconciled = await reconcile_remote_pr_lifecycles(
         db_factory
     )
@@ -7816,7 +7820,8 @@ async def recover_incomplete_pr_reviews(
     return (
         recovered + action_recovered + panel_recovered
         + cancelled_reviewers_reconciled + ci_started
-        + terminal_runs_reconciled + remote_lifecycles_reconciled
+        + terminal_runs_reconciled + missed_synchronizes_reconciled
+        + remote_lifecycles_reconciled
         + branch_updates_reconciled + repair_queued
         + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
