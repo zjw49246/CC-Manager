@@ -1749,11 +1749,42 @@ class UpdateService:
             version_result = await self._cached_version_check(target_branch, force=force)
         version_result.setdefault("channel", selected_channel)
         environment = await self._inspect_environment()
+        pty_status = await self._check_pty_update()
         active_tasks = await self._get_blocking_tasks()
         return {
             **version_result,
             **environment,
+            # A PTY git dependency is independent from the CCM checkout SHA;
+            # surface it as an update so the Update button does not incorrectly
+            # reduce this case to a restart/"already current" no-op.
+            "has_updates": bool(
+                version_result.get("has_updates")
+                or pty_status.get("pty_update_available")
+            ),
+            **pty_status,
             **self._blocker_payload(active_tasks),
+        }
+
+    async def _check_pty_update(self) -> dict[str, Any]:
+        """Report whether the independently pinned claude-pty has advanced."""
+        script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+        if not script.exists():
+            return {"pty_update_available": False}
+        result = await self._run_cmd(
+            ["bash", str(script), "--check"], timeout=30
+        )
+        if result["returncode"] != 0:
+            # A failed remote probe must not make the Update button claim that
+            # an update exists; the actual update path will report a precise
+            # error if it cannot refresh the dependency.
+            return {
+                "pty_update_available": False,
+                "pty_update_error": result["stderr"] or "无法检查 PTY 依赖",
+            }
+        return {
+            "pty_update_available": (
+                "CCM_PTY_REFRESH_CHANGED=1" in result["stdout"]
+            )
         }
 
     async def _configured_update_channel(self) -> str:

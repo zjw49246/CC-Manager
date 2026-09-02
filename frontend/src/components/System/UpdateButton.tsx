@@ -47,6 +47,8 @@ interface DeploymentCheck {
   migration_count?: number;
   has_frontend_changes?: boolean;
   has_package_changes?: boolean;
+  pty_update_available?: boolean;
+  pty_update_error?: string;
   active_task_count?: number;
   active_tasks?: ActiveTaskSummary[];
   update_blocked?: boolean;
@@ -874,7 +876,9 @@ export function UpdateButton() {
                         <p>
                           {dryRunResult.is_stable_downgrade
                             ? <>将从测试版切换回正式版 <span className="text-indigo-400 font-medium">{dryRunResult.latest_version || 'Stable'}</span></>
-                            : <>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</>}
+                            : dryRunResult.pty_update_available && !dryRunResult.commits_behind
+                              ? <>发现新的 <span className="text-indigo-400 font-medium">PTY 依赖</span></>
+                              : <>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</>}
                         </p>
                         <p className="text-xs text-gray-500">{dryRunResult.current_commit} → {dryRunResult.latest_commit}</p>
                         {dryRunResult.remote && (
@@ -905,6 +909,9 @@ export function UpdateButton() {
                         )}
                         {dryRunResult.has_package_changes && (
                           <span className="px-2 py-0.5 rounded bg-purple-900/50 text-purple-300">依赖变更</span>
+                        )}
+                        {dryRunResult.pty_update_available && (
+                          <span className="px-2 py-0.5 rounded bg-amber-900/50 text-amber-300">PTY 依赖更新</span>
                         )}
                       </div>
 

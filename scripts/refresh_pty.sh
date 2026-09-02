@@ -13,6 +13,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+CHECK_ONLY=0
+if [ "${1:-}" = "--check" ]; then
+    CHECK_ONLY=1
+fi
+
 PY=.venv/bin/python3
 UV="${UV:-$HOME/.local/bin/uv}"
 # 必须锚定 claude-pty 那一行——pyproject 里还有其他 git 依赖（如 auto-backup）
@@ -46,6 +51,12 @@ latest=$(git ls-remote "$PTY_URL" refs/heads/main | cut -f1)
 if [ "$installed" = "$latest" ]; then
     echo "claude-pty 已是最新（${latest:0:12}）"
     echo "CCM_PTY_REFRESH_CHANGED=0"
+    exit 0
+fi
+
+if [ "$CHECK_ONLY" = "1" ]; then
+    echo "claude-pty 可更新（${installed:0:12} -> ${latest:0:12}）"
+    echo "CCM_PTY_REFRESH_CHANGED=1"
     exit 0
 fi
 
