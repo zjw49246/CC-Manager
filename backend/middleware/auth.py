@@ -596,6 +596,15 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
                         == claims.task_turn_generation,
                         Task.status == claims.task_status,
                     ))
+                elif claims.owner_kind == "task-session":
+                    # Long-lived PTY children bind to the durable Task
+                    # incarnation, but must stop authorizing callbacks once
+                    # that Task is terminal. This keeps one hot session safe
+                    # across turns without allowing a stale child to act
+                    # after completion/cancellation.
+                    task_identity_predicates.append(
+                        Task.status.in_(["in_progress", "executing"])
+                    )
                 async with async_session() as db:
                     bound_task = await db.scalar(
                         select(Task.id)

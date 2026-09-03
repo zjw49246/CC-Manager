@@ -85,13 +85,21 @@ async def ask_user_wait(body: AskUserWaitRequest, request: Request):
 
         claimed_task_id = internal_task_id(claims)
         claimed_incarnation = getattr(claims, "task_incarnation_id", None)
+        claimed_owner_kind = getattr(claims, "owner_kind", None)
         claimed_retry = getattr(claims, "task_retry_count", None)
         claimed_turn = getattr(claims, "task_turn_generation", None)
         claimed_status = getattr(claims, "task_status", None)
-        if (
-            claimed_task_id is None
-            or not claimed_incarnation
-            or claimed_retry is None
+        if claimed_task_id is None or not claimed_incarnation:
+            raise HTTPException(403, "Internal hook Task generation is invalid")
+        persistent_session = claimed_owner_kind == "task-session"
+        if persistent_session:
+            if any(
+                value is not None
+                for value in (claimed_retry, claimed_turn, claimed_status)
+            ):
+                raise HTTPException(403, "Internal hook Task session binding is invalid")
+        elif (
+            claimed_retry is None
             or claimed_turn is None
             or claimed_status not in {"in_progress", "executing"}
         ):
@@ -99,10 +107,13 @@ async def ask_user_wait(body: AskUserWaitRequest, request: Request):
         task_predicates.extend((
             Task.id == claimed_task_id,
             Task.incarnation_id == claimed_incarnation,
-            Task.retry_count == claimed_retry,
-            Task.turn_generation == claimed_turn,
-            Task.status == claimed_status,
         ))
+        if not persistent_session:
+            task_predicates.extend((
+                Task.retry_count == claimed_retry,
+                Task.turn_generation == claimed_turn,
+                Task.status == claimed_status,
+            ))
 
     # Bind the session to the exact active Task generation carried by a scoped
     # hook. Deployment-token compatibility still resolves the newest active

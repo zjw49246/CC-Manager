@@ -867,6 +867,93 @@ async def test_internal_ask_user_wait_rejects_member_jwt(secured_client):
 
 
 @pytest.mark.asyncio
+async def test_persistent_ask_user_token_uses_current_task_generation(
+    secured_client,
+):
+    from backend.services import internal_service_auth
+    from backend.services.ask_user import ask_user_registry
+
+    client, session_factory = secured_client
+    incarnation = "f" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="persistent ask-user hook",
+            description="d",
+            session_id="persistent-ask-session",
+            incarnation_id=incarnation,
+            retry_count=2,
+            turn_generation=9,
+            status="executing",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    token = internal_service_auth.issue_internal_service_token(
+        audience="ccm_ask_user",
+        task_id=task_id,
+        task_incarnation_id=incarnation,
+        owner_kind="task-session",
+        owner_id=task_id,
+    )
+    waiting = asyncio.create_task(client.post(
+        "/api/ask-user/wait",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "session_id": "persistent-ask-session",
+            "questions": [{"header": "Choice", "question": "Proceed?"}],
+        },
+    ))
+    pending = None
+    try:
+        for _ in range(100):
+            candidates = ask_user_registry.list_all()
+            pending = next(
+                (item for item in candidates if item.task_id == task_id),
+                None,
+            )
+            if pending is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert pending is not None
+        assert pending.task_retry_count == 2
+        assert pending.task_turn_generation == 9
+        assert pending.task_status == "executing"
+        assert ask_user_registry.resolve(
+            pending.request_id,
+            [{"labels": ["Yes"]}],
+        )
+        response = await waiting
+    finally:
+        if pending is not None:
+            ask_user_registry.discard(pending.request_id)
+        if not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+    assert response.status_code == 200
+    assert response.json()["answered"] is True
+
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id, Task.incarnation_id == incarnation)
+            .values(status="completed")
+        )
+        await db.commit()
+    stale = await client.post(
+        "/api/ask-user/wait",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "session_id": "persistent-ask-session",
+            "questions": [{"header": "Choice", "question": "Again?"}],
+        },
+    )
+    assert stale.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_ask_user_pending_submit_follow_task_acl_and_validate_answers(
     secured_client,
 ):

@@ -735,6 +735,24 @@ def test_claude_hot_runtime_fingerprint_covers_ssh_socket_inode(tmp_path):
     assert first != second
 
 
+def test_claude_hot_runtime_fingerprint_is_stable_for_persistent_credentials(
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"permissions":{"allow":[]}}')
+    first = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "task-incarnation-token"},
+    )
+    second = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "task-incarnation-token"},
+    )
+    assert first == second
+
+
 def test_ssh_agent_snapshot_rejects_non_socket_and_detects_replacement(
     tmp_path,
     monkeypatch,
@@ -7626,6 +7644,63 @@ async def test_claude_pty_large_prompt_receives_task_ssh_guard_env_and_policy(
     )
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_claude_pty_task_uses_persistent_runtime_credentials(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    async with db_factory() as db:
+        inst = Instance(name="claude-pty-persistent-credentials")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Claude PTY persistent credentials",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_321)
+
+    with (
+        patch(
+            "backend.services.mcp_config.generate_mcp_config",
+            return_value=tmp_path / "mcp.json",
+        ) as generate_mcp,
+        patch(
+            "backend.services.internal_service_auth.issue_internal_service_token",
+            return_value="persistent-ask-token",
+        ) as issue_token,
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="continue",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+        )
+
+    assert generate_mcp.call_args.kwargs["persistent_session"] is True
+    ask_kwargs = issue_token.call_args.kwargs
+    assert ask_kwargs["audience"] == "ccm_ask_user"
+    assert ask_kwargs["owner_kind"] == "task-session"
+    assert ask_kwargs["task_incarnation_id"]
+    assert ask_kwargs["task_retry_count"] is None
+    assert ask_kwargs["task_turn_generation"] is None
+    assert ask_kwargs["task_status"] is None
+    assert manager._launch_pty.call_args.kwargs["git_env"][
+        "CCM_ASK_USER_TOKEN"
+    ] == "persistent-ask-token"
 
 
 @pytest.mark.asyncio
@@ -21522,6 +21597,86 @@ async def test_launch_pty_runtime_fingerprint_change_fails_when_hot_session_surv
             claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
             claude_unrestricted_allowed_rules=("Read",),
         )
+
+
+@pytest.mark.asyncio
+async def test_launch_pty_reuses_matching_hot_session_without_release(tmp_path):
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"permissions":{"allow":[]}}')
+
+    class Session:
+        session_id = "sid-hot"
+        is_alive = True
+        config = types.SimpleNamespace()
+
+    session = Session()
+    fingerprint = im._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "stable-token"},
+    )
+    session.config._ccm_task_isolation_fingerprint = fingerprint
+    process = types.SimpleNamespace(
+        pid=54001,
+        returncode=None,
+        session=session,
+    )
+
+    class FakePool:
+        _sessions = {"sid-hot": session}
+
+        async def get(self, _sid):
+            return session
+
+    class FakeBackend:
+        _pool = FakePool()
+        _sessions = {1: session}
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            assert kwargs["resume_session_id"] == "sid-hot"
+            # A real CCMBackend binds the existing Session to a new proxy and
+            # starts a fresh output consumer for the next prompt. The native
+            # Session/PID itself must remain unchanged.
+            im.processes[kwargs["instance_id"]] = process
+            return "sid-hot"
+
+    im._pty_backend = FakeBackend()
+    im.processes[1] = process
+    with patch.object(im, "release_pty_session", new=AsyncMock()) as release:
+        result = await im._launch_pty(
+            instance_id=1,
+            prompt="continue",
+            task_id=None,
+            cwd=str(tmp_path),
+            model=None,
+            resume_session_id="sid-hot",
+            loop_iteration=None,
+            git_env={"CCM_ASK_USER_TOKEN": "stable-token"},
+            thinking_budget=None,
+            effort_level=None,
+            chat_initiated=False,
+            config_dir=None,
+            enable_workflows=False,
+            enabled_skills=None,
+            mcp_config_path=None,
+            claude_unrestricted_settings_path=settings_path,
+            claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+            claude_unrestricted_allowed_rules=("Read",),
+        )
+
+    assert result == 54001
+    release.assert_not_awaited()
+    assert im.processes[1] is process
+    assert FakeBackend._pool._sessions["sid-hot"] is session
 
 
 def test_task_runtime_scope_retained_by_live_pty_and_removed_after_dead_eviction(

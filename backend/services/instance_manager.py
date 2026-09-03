@@ -5484,6 +5484,14 @@ class InstanceManager:
         ):
             from backend.services.mcp_config import generate_mcp_config
 
+            # A normal isolated Claude PTY is a durable Task session. Its
+            # trusted MCP/AskUser children stay alive across visible turns;
+            # every callback still revalidates the current Task incarnation,
+            # grants, and status at the Manager boundary. Per-turn and
+            # privileged/review sessions retain exact generation credentials.
+            persistent_pty_task = bool(
+                self.pty_mode_enabled and not unrestricted_admin_turn
+            )
             mcp_config_path = generate_mcp_config(
                 task_id,
                 enabled_skills or {},
@@ -5492,6 +5500,7 @@ class InstanceManager:
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
+                persistent_session=persistent_pty_task,
             )
         if (
             provider == "claude"
@@ -5661,15 +5670,27 @@ class InstanceManager:
                 issue_internal_service_token,
             )
 
+            persistent_pty_task = bool(
+                self.pty_mode_enabled and not unrestricted_admin_turn
+            )
+            ask_user_token_kwargs = {
+                "audience": "ccm_ask_user",
+                "task_id": task_id,
+                "task_incarnation_id": task_incarnation_id,
+                "task_retry_count": (
+                    None if persistent_pty_task else task_retry_count
+                ),
+                "task_turn_generation": (
+                    None if persistent_pty_task else task_turn_generation
+                ),
+                "task_status": None if persistent_pty_task else task_status,
+                "owner_kind": (
+                    "task-session" if persistent_pty_task else "task-turn"
+                ),
+                "owner_id": task_id,
+            }
             ask_user_token = issue_internal_service_token(
-                audience="ccm_ask_user",
-                task_id=task_id,
-                task_incarnation_id=task_incarnation_id,
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-                task_status=task_status,
-                owner_kind="task-turn",
-                owner_id=task_id,
+                **ask_user_token_kwargs
             )
             if ask_user_token:
                 git_env = dict(git_env or {})
@@ -8508,20 +8529,19 @@ class InstanceManager:
                 "agent-unrestricted-v1",
                 tuple(claude_unrestricted_tools),
             )
-        if isolation_fingerprint is not None and resume_session_id:
-            existing_session = (
-                self._pty_backend._pool._sessions.get(
-                    resume_session_id
-                )
+        existing_session = None
+        if resume_session_id:
+            existing_session = self._pty_backend._pool._sessions.get(
+                resume_session_id
             )
+        if isolation_fingerprint is not None and existing_session is not None:
             existing_fingerprint = getattr(
                 getattr(existing_session, "config", None),
                 "_ccm_task_isolation_fingerprint",
                 None,
             )
             if (
-                existing_session is not None
-                and existing_fingerprint != isolation_fingerprint
+                existing_fingerprint != isolation_fingerprint
             ):
                 # A hot process cannot absorb changed CLI settings. Stop
                 # it while idle and cold-resume the same native session.
@@ -8531,6 +8551,24 @@ class InstanceManager:
                         "Changed Claude Task runtime could not stop its exact "
                         "hot PTY Session"
                     )
+                existing_session = None
+
+        if existing_session is not None:
+            logger.info(
+                "Claude PTY reuse hit task_id=%s instance_id=%s "
+                "session_id=%s",
+                task_id,
+                instance_id,
+                resume_session_id,
+            )
+        elif resume_session_id:
+            logger.info(
+                "Claude PTY reuse miss task_id=%s instance_id=%s "
+                "session_id=%s reason=session-not-resident",
+                task_id,
+                instance_id,
+                resume_session_id,
+            )
 
         is_cold_start = (
             resume_session_id

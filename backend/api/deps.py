@@ -291,6 +291,10 @@ async def require_internal_task_incarnation(
             Task.turn_generation == turn_generation,
             Task.status == task_status,
         ))
+    elif getattr(claims, "owner_kind", None) == "task-session":
+        identity_predicates.append(
+            Task.status.in_(["in_progress", "executing"])
+        )
     stale_detail = (
         "Internal service SSH Task generation is stale"
         if getattr(claims, "audience", None) == "ccm_ssh"

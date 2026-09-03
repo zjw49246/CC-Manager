@@ -1,9 +1,12 @@
-"""Short-lived, route-scoped credentials for CCM child processes.
+"""Route-scoped credentials for CCM child processes.
 
 The deployment ``AUTH_TOKEN`` is an administrator credential and must never be
 handed to a Task-launched MCP process.  This module derives signed bearer
 tokens whose audience and identifiers are checked against every HTTP request.
-The raw deployment secret never leaves the Manager process.
+The raw deployment secret never leaves the Manager process. Ordinary per-turn
+credentials carry an exact retry/turn/status generation; resident Claude PTY
+children may instead carry a Task-incarnation credential whose routes still
+revalidate the current active Task on every request.
 """
 
 from __future__ import annotations
@@ -36,6 +39,44 @@ _GENERATION_BOUND_TASK_AUDIENCES = frozenset({
     "ccm_workspace_review",
     "ccm_browser_review",
 })
+# A Claude PTY keeps its MCP children alive across visible turns.  These
+# credentials remain bound to one durable Task incarnation and each endpoint
+# re-reads the current Task state before applying an effect.
+_LONG_LIVED_TASK_OWNER_KIND = "task-session"
+_LONG_LIVED_TASK_AUDIENCES = frozenset({
+    "ccm_skills",
+    "ccm_ssh",
+    "ccm_ask_user",
+    "ccm_frontend_review",
+    "ccm_workspace_review",
+})
+
+
+def _valid_long_lived_task_binding(
+    *,
+    audience: str,
+    task_id: int | None,
+    task_incarnation_id: str | None,
+    task_retry_count: int | None,
+    task_turn_generation: int | None,
+    task_status: str | None,
+    monitor_session_id: int | None,
+    sub_agent_session_id: int | None,
+    owner_id: str | None,
+) -> bool:
+    """Validate the one credential shape allowed to outlive a Task turn."""
+
+    return bool(
+        audience in _LONG_LIVED_TASK_AUDIENCES
+        and task_id is not None
+        and task_incarnation_id is not None
+        and owner_id == str(task_id)
+        and task_retry_count is None
+        and task_turn_generation is None
+        and task_status is None
+        and monitor_session_id is None
+        and sub_agent_session_id is None
+    )
 
 
 class InternalServiceTokenError(ValueError):
@@ -205,15 +246,6 @@ def issue_internal_service_token(
             "Task generation credential requires task id, retry count, "
             "turn generation, and status"
         )
-    if audience in _GENERATION_BOUND_TASK_AUDIENCES:
-        if any(value is None for value in task_generation_claims):
-            raise ValueError(
-                f"{audience} credential requires an exact active generation"
-            )
-        if task_status not in _ACTIVE_TASK_STATUSES:
-            raise ValueError(
-                f"{audience} credential requires an active Task status"
-            )
     monitor_session_id = _positive_int(
         monitor_session_id,
         "monitor session id",
@@ -222,6 +254,28 @@ def issue_internal_service_token(
         sub_agent_session_id,
         "sub-agent session id",
     )
+    long_lived_task_session = owner_kind == _LONG_LIVED_TASK_OWNER_KIND
+    if long_lived_task_session and not _valid_long_lived_task_binding(
+        audience=audience,
+        task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+        monitor_session_id=monitor_session_id,
+        sub_agent_session_id=sub_agent_session_id,
+        owner_id=owner_id_value,
+    ):
+        raise ValueError("Task session credential has an invalid binding")
+    if audience in _GENERATION_BOUND_TASK_AUDIENCES and not long_lived_task_session:
+        if any(value is None for value in task_generation_claims):
+            raise ValueError(
+                f"{audience} credential requires an exact active generation"
+            )
+        if task_status not in _ACTIVE_TASK_STATUSES:
+            raise ValueError(
+                f"{audience} credential requires an active Task status"
+            )
     if (
         isinstance(ttl_seconds, bool)
         or not isinstance(ttl_seconds, int)
@@ -419,9 +473,31 @@ def _decode_claims(token: str) -> InternalServiceClaims:
             401,
             "Invalid internal Task generation binding",
         )
-    if claims.audience in _GENERATION_BOUND_TASK_AUDIENCES and (
-        any(value is None for value in task_generation_claims)
-        or claims.task_status not in _ACTIVE_TASK_STATUSES
+    long_lived_task_session = (
+        claims.owner_kind == _LONG_LIVED_TASK_OWNER_KIND
+    )
+    if long_lived_task_session and not _valid_long_lived_task_binding(
+        audience=claims.audience,
+        task_id=claims.task_id,
+        task_incarnation_id=claims.task_incarnation_id,
+        task_retry_count=claims.task_retry_count,
+        task_turn_generation=claims.task_turn_generation,
+        task_status=claims.task_status,
+        monitor_session_id=claims.monitor_session_id,
+        sub_agent_session_id=claims.sub_agent_session_id,
+        owner_id=claims.owner_id,
+    ):
+        raise InternalServiceTokenError(
+            401,
+            "Invalid internal Task session binding",
+        )
+    if (
+        claims.audience in _GENERATION_BOUND_TASK_AUDIENCES
+        and not long_lived_task_session
+        and (
+            any(value is None for value in task_generation_claims)
+            or claims.task_status not in _ACTIVE_TASK_STATUSES
+        )
     ):
         raise InternalServiceTokenError(
             401,

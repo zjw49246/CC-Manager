@@ -1,5 +1,9 @@
 """Security tests for Task-scoped CCM child-process credentials."""
 
+import hashlib
+import hmac
+import json
+
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 import pytest
@@ -346,6 +350,92 @@ def test_task_scoped_credential_requires_exact_incarnation():
             task_id=42,
             owner_kind="task-turn",
             owner_id=42,
+        )
+
+
+def test_long_lived_task_session_credential_accepts_identity_only():
+    token = auth.issue_internal_service_token(
+        audience="ccm_ask_user",
+        task_id=42,
+        task_incarnation_id=TASK_INCARNATION,
+        owner_kind="task-session",
+        owner_id=42,
+    )
+    claims = auth.authenticate_internal_service_token(
+        token,
+        method="POST",
+        path="/api/ask-user/wait",
+    )
+    assert claims.owner_kind == "task-session"
+    assert claims.task_incarnation_id == TASK_INCARNATION
+    assert claims.task_retry_count is None
+    assert claims.task_turn_generation is None
+    assert claims.task_status is None
+
+
+def test_long_lived_task_session_does_not_bypass_browser_child_generation():
+    with pytest.raises(ValueError, match="invalid binding"):
+        auth.issue_internal_service_token(
+            audience="ccm_browser_review",
+            task_id=42,
+            task_incarnation_id=TASK_INCARNATION,
+            owner_kind="task-session",
+            owner_id=42,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"owner_id": 43},
+        {"task_retry_count": 0, "task_turn_generation": 1, "task_status": "executing"},
+        {"monitor_session_id": 7},
+    ),
+)
+def test_long_lived_task_session_rejects_non_session_bindings(overrides):
+    claims = {
+        "audience": "ccm_ask_user",
+        "task_id": 42,
+        "task_incarnation_id": TASK_INCARNATION,
+        "owner_kind": "task-session",
+        "owner_id": 42,
+    }
+    claims.update(overrides)
+    with pytest.raises(ValueError, match="invalid binding"):
+        auth.issue_internal_service_token(**claims)
+
+
+def test_decode_rejects_signed_task_session_with_mismatched_owner():
+    token = auth.issue_internal_service_token(
+        audience="ccm_ask_user",
+        task_id=42,
+        task_incarnation_id=TASK_INCARNATION,
+        owner_kind="task-session",
+        owner_id=42,
+    )
+    prefix, encoded, _signature = token.split(".")
+    payload = json.loads(auth._b64decode(encoded))
+    payload["owner_id"] = "43"
+    encoded = auth._b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    )
+    signed = f"{prefix}.{encoded}"
+    signature = auth._b64encode(
+        hmac.new(
+            auth._deployment_secret(),
+            signed.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    )
+
+    with pytest.raises(
+        auth.InternalServiceTokenError,
+        match="Task session binding",
+    ):
+        auth.authenticate_internal_service_token(
+            f"{signed}.{signature}",
+            method="POST",
+            path="/api/ask-user/wait",
         )
 
 
