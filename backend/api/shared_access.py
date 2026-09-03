@@ -16,6 +16,7 @@ from backend.database import get_db
 from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.log_entry import LogEntry
+from backend.services.chat_event_identity import persisted_chat_event
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ async def shared_chat(
     # Sender identity is display metadata only.  Keep it in the persisted/UI
     # copy, while the model receives the caller's original message verbatim.
     sender = body.sender_name or share.shared_to_name or "Anonymous"
-    prefixed = body.message
+    prefixed = f"[{sender}] {body.message}"
 
     # Store user message
     user_log = LogEntry(
@@ -178,13 +179,20 @@ async def shared_chat(
 
     # Broadcast
     from backend.main import broadcaster
-    await broadcaster.broadcast(f"task:{task_id}", {
-        "event_type": "user_message",
-        "role": "user",
-        "content": prefixed,
-        "sender_name": sender,
-        "raw_content": body.message,
-    })
+    await broadcaster.broadcast(
+        f"task:{task_id}",
+        persisted_chat_event(
+            user_log,
+            {
+                "event_type": "user_message",
+                "role": "user",
+                "content": prefixed,
+                "sender_name": sender,
+                "raw_content": body.message,
+            },
+            provider=task.provider,
+        ),
+    )
 
     # Enqueue
     from backend.main import dispatcher
@@ -196,6 +204,10 @@ async def shared_chat(
             priority=PRIORITY_USER,
             source="shared",
             source_log_id=user_log.id,
+            initiating_user_id=None,
+            initiating_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
         )
     except TaskStartPausedError as exc:
         raise HTTPException(

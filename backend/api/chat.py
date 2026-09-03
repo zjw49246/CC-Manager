@@ -1421,8 +1421,8 @@ async def send_chat_message(
     model_message = body.message
     display_content = model_message
     sender_display_name = await _sender_display_name(request, db)
-    # Keep sender identity in metadata, not in the visible chat content.
-    display_content = model_message
+    if sender_display_name:
+        display_content = f"[{sender_display_name}] {model_message}"
 
     # Explicit commands append their invocation instructions. Permanently
     # enabled skills are advertised by the launch-time skill directory; merely
@@ -2271,7 +2271,7 @@ async def start_frontend_review_goal(
         display_content = body.message
         sender_display_name = await _sender_display_name(request, db)
         if sender_display_name:
-            display_content = body.message
+            display_content = f"[{sender_display_name}] {body.message}"
         image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         attachments = [{
             "url": f"/api/uploads/{os.path.basename(path)}",
@@ -3168,7 +3168,8 @@ async def _send_worker_chat(
         sender_display_name = None
         if request:
             sender_display_name = await _sender_display_name(request, db)
-            display_content = model_message
+            if sender_display_name:
+                display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
         # Older Workers may silently ignore the delegated principal fields and
@@ -4544,7 +4545,8 @@ async def _inject_display_content(
 ) -> tuple[str, str | None]:
     display_content = raw_content
     sender_display_name = await _sender_display_name(request, db)
-    display_content = raw_content
+    if sender_display_name:
+        display_content = f"[{sender_display_name}] {raw_content}"
     return display_content, sender_display_name
 
 
