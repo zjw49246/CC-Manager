@@ -467,6 +467,9 @@ async def test_config_default_model_options_include_1m_variants(client):
     options = resp.json()["model_options"]
     assert "claude-opus-4-6[1m]" in options
     assert "claude-sonnet-4-6[1m]" in options
+    assert "claude-fable-5-1" in options
+    assert "claude-fable-5-1[1m]" in options
+    assert "claude-fable-5.1" not in options
 
 
 @pytest.mark.asyncio

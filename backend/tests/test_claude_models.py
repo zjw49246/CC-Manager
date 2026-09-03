@@ -16,6 +16,11 @@ def test_existing_1m_suffix_remains_supported():
     assert claude_context_window("claude-opus-4-8[1m]") == 1_000_000
 
 
+def test_fable51_uses_canonical_hyphenated_id_and_1m_alias():
+    assert claude_context_window("claude-fable-5-1") == 1_000_000
+    assert claude_context_window("claude-fable-5-1[1m]") == 1_000_000
+
+
 def test_unknown_claude_model_uses_default_context_window():
     assert (
         claude_context_window("claude-future-model")
