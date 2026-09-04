@@ -4,6 +4,13 @@
 
 ## 已完成功能
 
+### 2026-09-04：修复 queue-operation 通知遗漏导致的后台状态卡死
+
+- [x] 生产 Task 501 取证确认：3 个 native Agent 的持久行均已终态，但其中一个完成通知只存在于 Claude `queue-operation` journal，PTY tracker 未收到普通 `<task-notification>`，使 `background_active` 永久残留。
+- [x] CCM 现在按持久镜像中的精确 `tool_use_id` 调用 PTY reconciliation API；只有已证明终态的 tracker 项会被移除，仍为 `running` 的 sibling 保持 fail closed。
+- [x] watcher 即使没有 `turn_duration` 也会主动尝试持久终态 reconciliation；该完成证据在新的 autonomous turn 开始时清零，不能跨轮误用。CCM 实现提交 `bdd42f55`，PTY 实现提交 `da9de45`。
+- [x] 验证：PTY 非真实账号套件 `211 passed`；CCM PTY/native 生命周期矩阵 `689 passed`；新增场景 `4 passed`；前端 TypeScript + production build（4771 modules）通过。PTY 的 8 个真实 Claude 集成失败均为环境中既有 OAuth token revoked；CCM 整库基线的 96 个失败集中在未配置 `AUTH_TOKEN`、固定运行时配置与既有隔离基线，不涉及本次相关套件。
+
 ### 2026-09-02：修复 Claude 隐式异步原生子 Agent 提前完成
 
 - [x] PTY 结构化读取 `toolUseResult.isAsync/status=async_launched/agentId`；即使 Agent 输入未声明 `run_in_background`，启动回执也保持 `running`，直到匹配的 `<task-notification>` 才完成并保留 transcript summary/report。
