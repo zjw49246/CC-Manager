@@ -1662,14 +1662,16 @@ def generate_claude_unrestricted_task_settings(
     turn_generation: int,
     builtin_tools: Iterable[str] = CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
 ) -> Path:
-    """Write one private permission profile for an unrestricted admin turn.
+    """Write one private permission profile for an unrestricted admin Task.
 
     Claude 2.1.168 can report effective ``default`` mode when subprocess
     credential scrubbing is enabled even though the launcher requested bypass
     mode.  Exact built-in and CCM MCP allow rules prevent that compatibility
     behavior from opening an invisible interactive permission dialog.  This
     profile deliberately contains no filesystem or network sandbox; role and
-    execution-mode admission remain the launcher's responsibility.
+    execution-mode admission remain the launcher's responsibility. PTY mode
+    keeps this file stable for the Task incarnation so the native process can
+    be reused across visible turns.
     """
 
     if (

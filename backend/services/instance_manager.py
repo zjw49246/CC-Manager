@@ -5484,13 +5484,15 @@ class InstanceManager:
         ):
             from backend.services.mcp_config import generate_mcp_config
 
-            # A normal isolated Claude PTY is a durable Task session. Its
-            # trusted MCP/AskUser children stay alive across visible turns;
-            # every callback still revalidates the current Task incarnation,
-            # grants, and status at the Manager boundary. Per-turn and
-            # privileged/review sessions retain exact generation credentials.
+            # A Claude Task PTY is a durable Task session. Its trusted
+            # MCP/AskUser children stay alive across visible turns; every
+            # callback still revalidates the current Task incarnation, grants,
+            # and status at the Manager boundary. The unrestricted profile
+            # keeps its exact administrator permission boundary, while its
+            # scoped CCM credentials are still safe to retain because they
+            # are incarnation-bound and revalidated on every request.
             persistent_pty_task = bool(
-                self.pty_mode_enabled and not unrestricted_admin_turn
+                self.pty_mode_enabled
             )
             mcp_config_path = generate_mcp_config(
                 task_id,
@@ -5670,9 +5672,11 @@ class InstanceManager:
                 issue_internal_service_token,
             )
 
-            persistent_pty_task = bool(
-                self.pty_mode_enabled and not unrestricted_admin_turn
-            )
+            # Keep the AskUser credential aligned with the MCP config above.
+            # An unrestricted administrator PTY is also resident; the token is
+            # bound to the Task incarnation (not a turn), and the endpoint
+            # checks the current active Task before applying any effect.
+            persistent_pty_task = bool(self.pty_mode_enabled)
             ask_user_token_kwargs = {
                 "audience": "ccm_ask_user",
                 "task_id": task_id,

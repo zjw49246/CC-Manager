@@ -7704,6 +7704,214 @@ async def test_claude_pty_task_uses_persistent_runtime_credentials(
 
 
 @pytest.mark.asyncio
+async def test_unrestricted_claude_pty_uses_persistent_runtime_credentials(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Administrator PTYs must reuse the native process across chat turns."""
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    async with db_factory() as db:
+        inst = Instance(name="unrestricted-pty-persistent-credentials")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Unrestricted Claude PTY persistent credentials",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_322)
+
+    with (
+        patch(
+            "backend.services.mcp_config.generate_mcp_config",
+            return_value=tmp_path / "mcp.json",
+        ) as generate_mcp,
+        patch(
+            "backend.services.internal_service_auth.issue_internal_service_token",
+            return_value="persistent-admin-ask-token",
+        ) as issue_token,
+    ):
+        result = await manager.launch(
+            instance_id=instance_id,
+            prompt="continue as administrator",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+
+    assert result == 54_322
+    assert generate_mcp.call_args.kwargs["persistent_session"] is True
+    ask_kwargs = issue_token.call_args.kwargs
+    assert ask_kwargs["owner_kind"] == "task-session"
+    assert ask_kwargs["task_retry_count"] is None
+    assert ask_kwargs["task_turn_generation"] is None
+    assert ask_kwargs["task_status"] is None
+    assert manager._launch_pty.call_args.kwargs["git_env"][
+        "CCM_ASK_USER_TOKEN"
+    ] == "persistent-admin-ask-token"
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_claude_pty_reuses_resident_process_across_turns(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """A new admin chat turn must retain a matching native PTY and PID."""
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    async with db_factory() as db:
+        inst = Instance(name="unrestricted-pty-hot-reuse")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Unrestricted Claude PTY hot reuse",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    native_session_id = "84d8d832-f879-4f59-a0c6-affa0af157d4"
+
+    class NativeProcess:
+        pid = 54_323
+
+    class Session:
+        session_id = native_session_id
+        is_alive = True
+        config = None
+        _process = NativeProcess()
+
+        async def stop(self):
+            raise AssertionError("matching unrestricted PTY must stay resident")
+
+    session = Session()
+
+    class Process:
+        pid = session._process.pid
+        returncode = None
+
+        def __init__(self):
+            self.session = session
+
+    class FakePTYBackend:
+        def __init__(self):
+            self._pool = types.SimpleNamespace(_sessions={})
+            self._sessions = {}
+            self._consumers = {}
+            self._proxies = {}
+            self.launch_count = 0
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="/opt/claude-real",
+                dangerously_skip_permissions=True,
+                config_dir=None,
+                default_model=None,
+                default_effort=None,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            self.launch_count += 1
+            config = self.build_config()
+            if session.config is None:
+                session.config = config
+                self._pool._sessions[native_session_id] = session
+            process = Process()
+            manager.processes[kwargs["instance_id"]] = process
+            self._sessions[kwargs["instance_id"]] = session
+            return native_session_id
+
+    backend = FakePTYBackend()
+    manager._pty_backend = backend
+    manager._pty_enabled = True
+
+    first_pid = await manager.launch(
+        instance_id=instance_id,
+        prompt="first administrator turn",
+        task_id=task_id,
+        cwd=str(tmp_path),
+        provider="claude",
+        initiating_user_role="super_admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="deployment_token",
+    )
+    assert first_pid == session._process.pid
+
+    # Mirror FullMirror's normal terminal cleanup: the reusable Instance maps
+    # are released, while the native Session remains resident in the pool.
+    manager.processes.pop(instance_id, None)
+    backend._sessions.pop(instance_id, None)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        task.status = "executing"
+        task.turn_generation += 1
+        instance.status = "idle"
+        instance.current_task_id = None
+        instance.pid = None
+        instance.process_identity = None
+        await db.commit()
+
+    with patch.object(
+        manager,
+        "release_pty_session",
+        new=AsyncMock(),
+    ) as release:
+        second_pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="second administrator turn",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            resume_session_id=native_session_id,
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+
+    assert second_pid == first_pid
+    assert backend.launch_count == 2
+    assert backend._pool._sessions[native_session_id] is session
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
     db_factory,
     monkeypatch,
