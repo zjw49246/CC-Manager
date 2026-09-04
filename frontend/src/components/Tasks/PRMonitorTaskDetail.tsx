@@ -230,7 +230,7 @@ export function PRMonitorTaskDetail({ task, result, onBack }: PRMonitorTaskDetai
               </div>
               {baseUpdateRequired && (
                 <p role="alert" className="mt-2 text-xs text-amber-300">
-                  The base branch advanced after this review. CCM can merge the latest base into the PR branch, then review the new head before merging.
+                  The PR branch is not based on the current base branch. CCM can merge the latest base into the PR branch, then review the new head before merging.
                   {prUrl && (
                     <>
                       {' '}

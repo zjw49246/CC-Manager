@@ -1431,7 +1431,10 @@ async def update_pr_branch(
     The REST ``update-branch`` mutation is deliberately guarded by a fresh
     PR snapshot.  This prevents a stale UI click from updating a newer head,
     and keeps the operation independent of each repository's GitHub UI
-    preference for suggesting branch updates.
+    preference for suggesting branch updates.  The base SHA may be unchanged
+    from the reviewed snapshot: a PR can already be diverged from that base,
+    so ancestry still needs to be repaired even when the base branch itself
+    has not advanced.
     """
 
     if (
@@ -1445,7 +1448,8 @@ async def update_pr_branch(
         or _GITHUB_SHA_RE.fullmatch(expected_head_sha.lower()) is None
     ):
         raise ValueError("invalid PR branch update identifiers")
-    expected_base_sha = expected_base_sha.lower()
+    # The reviewed base SHA is validated as part of the request identity, but
+    # the fresh base is intentionally allowed to be equal or newer.
     expected_head_sha = expected_head_sha.lower()
     snapshot = _validated_pr_snapshot(await _gh_pr_view(pr_number, repo_name))
     if snapshot["state"] != "OPEN" or snapshot["is_draft"]:
@@ -1456,9 +1460,6 @@ async def update_pr_branch(
         raise PRBranchUpdateConflict(
             "PR head changed; refresh the Monitor before updating its branch"
         )
-    if snapshot["base_sha"] == expected_base_sha:
-        raise PRBranchUpdateConflict("PR base branch has not advanced")
-
     encoded_repo = quote(repo_name, safe="/")
     try:
         response = await _gh_api_json(

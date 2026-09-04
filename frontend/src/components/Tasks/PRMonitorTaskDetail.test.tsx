@@ -280,7 +280,7 @@ describe('PRMonitorTaskDetail', () => {
     );
 
     const updateButton = await screen.findByRole('button', { name: 'Update branch & re-review' });
-    expect(screen.getByText(/The base branch advanced after this review/)).toBeInTheDocument();
+    expect(screen.getByText(/The PR branch is not based on the current base branch/)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Open PR on GitHub' })).toHaveAttribute(
       'href',
       'https://github.com/acme/widget/pull/133',
@@ -335,7 +335,7 @@ describe('PRMonitorTaskDetail', () => {
 
     expect(await screen.findByRole('button', { name: 'Merge PR' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Update branch & re-review' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/The base branch advanced after this review/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The PR branch is not based on the current base branch/)).not.toBeInTheDocument();
   });
 
   it('hides stale merge controls after the PR was merged externally', async () => {
@@ -382,6 +382,6 @@ describe('PRMonitorTaskDetail', () => {
     await waitFor(() => expect(api.getPRMonitorRun).toHaveBeenCalledWith(14));
     expect(screen.queryByRole('region', { name: 'Merge controls' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Merge PR' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/The base branch advanced after this review/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The PR branch is not based on the current base branch/)).not.toBeInTheDocument();
   });
 });

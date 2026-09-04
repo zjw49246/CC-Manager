@@ -5661,6 +5661,7 @@ async def test_paused_base_update_calls_github_update_branch(client, session_fac
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "accepted"
     update.assert_awaited_once()
+    assert update.await_args.kwargs["expected_base_sha"] == BASE_SHA_1
     assert update.await_args.kwargs["expected_head_sha"] == HEAD_SHA_1
 
 

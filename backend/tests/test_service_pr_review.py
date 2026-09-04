@@ -1735,7 +1735,14 @@ async def test_gh_api_json_sends_dynamic_body_only_over_stdin():
 
 
 @pytest.mark.asyncio
-async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint():
+@pytest.mark.parametrize(
+    "expected_base_sha",
+    ("1" * 40, "b" * 40),
+    ids=("base-advanced", "base-unchanged"),
+)
+async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint(
+    expected_base_sha,
+):
     snapshot = {
         "state": "OPEN",
         "isDraft": False,
@@ -1758,7 +1765,7 @@ async def test_update_pr_branch_uses_expected_head_and_update_branch_endpoint():
             repo_name="owner/repo",
             pr_number=7,
             base_ref="main",
-            expected_base_sha="1" * 40,
+            expected_base_sha=expected_base_sha,
             expected_head_sha="a" * 40,
         )
     assert result == {
