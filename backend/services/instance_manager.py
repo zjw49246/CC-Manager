@@ -1059,6 +1059,12 @@ class _PtyBackgroundState:
     # follow-up has finished pumping its ordered provider events.
     pending_followups: int = 0
     terminal_seen: bool = False
+    # A native child may reach a durable terminal state while Claude only
+    # records its completion in the queue journal (without delivering the
+    # matching task-notification user event).  Keep explicit evidence that
+    # the host reconciled such a child so the epoch can complete without
+    # waiting forever for a turn_duration sentinel that will never arrive.
+    durable_native_completion_reconciled: bool = False
     watcher: asyncio.Task | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: str | None = None
@@ -9889,6 +9895,8 @@ class InstanceManager:
     ) -> bool:
         """Check live native/Bash work and its durable native-agent mirror."""
 
+        await self._reconcile_completed_pty_native_subagents(task_id, session)
+
         # A retained Session can accept one user follow-up while the original
         # root consumer waits for its native descendants.  That follow-up is
         # not represented by the autonomous tracker, but its event pump still
@@ -9933,6 +9941,92 @@ class InstanceManager:
                 .limit(1)
             )
             return result.scalar_one_or_none() is not None
+
+    async def _reconcile_completed_pty_native_subagents(
+        self,
+        task_id: int,
+        session: Any,
+    ) -> int:
+        """Reconcile terminal DB children missing a PTY notification.
+
+        The PTY tracker is intentionally fail-closed when a native Agent
+        completion notification is absent.  CCM also has a durable native
+        child mirror, however, and the exact ``tool_use_id`` in that mirror
+        lets us safely retire only tracker entries already proven terminal.
+        This closes the production case where Claude's queue journal contains
+        a completed notification but no normal ``user`` JSONL record.
+        """
+
+        tracker = getattr(session, "_tracker", None)
+        pending = getattr(tracker, "pending", None)
+        if not isinstance(pending, dict) or not pending:
+            return 0
+
+        pending_ids = {
+            tool_use_id
+            for tool_use_id in pending
+            if isinstance(tool_use_id, str) and tool_use_id
+        }
+        if not pending_ids:
+            return 0
+
+        from backend.models.sub_agent import SubAgentSession
+
+        terminal_statuses = ("completed", "failed", "cancelled")
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(SubAgentSession.meta).where(
+                    SubAgentSession.task_id == task_id,
+                    SubAgentSession.source == "native",
+                    SubAgentSession.status.in_(terminal_statuses),
+                )
+            )
+            terminal_meta = list(result.scalars())
+
+        proven_ids: set[str] = set()
+        for raw_meta in terminal_meta:
+            try:
+                meta = json.loads(raw_meta or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            tool_use_id = meta.get("tool_use_id")
+            if tool_use_id in pending_ids:
+                proven_ids.add(tool_use_id)
+        if not proven_ids:
+            return 0
+
+        reconcile = getattr(tracker, "reconcile_terminal_tool_uses", None)
+        if not callable(reconcile):
+            logger.warning(
+                "PTY tracker cannot reconcile %d terminal native child(ren) "
+                "for task %s; dependency is missing the reconciliation API",
+                len(proven_ids),
+                task_id,
+            )
+            return 0
+        reconciled = reconcile(proven_ids)
+        if not reconciled:
+            return 0
+
+        state = self._pty_background_states.get(
+            (task_id, getattr(session, "session_id", None))
+        )
+        if (
+            state is not None
+            and not getattr(tracker, "has_pending", False)
+            and not getattr(tracker, "has_pending_background_commands", False)
+        ):
+            state.durable_native_completion_reconciled = True
+
+        logger.warning(
+            "Reconciled %d terminal native PTY child(ren) for task %s "
+            "from the durable CCM mirror",
+            len(reconciled),
+            task_id,
+        )
+        return len(reconciled)
 
     async def arm_pty_background_generation(
         self,
@@ -10889,6 +10983,7 @@ class InstanceManager:
             # prior sentinel starts a new turn; never let that old sentinel
             # authorize completion of the new turn.
             state.terminal_seen = False
+            state.durable_native_completion_reconciled = False
             event_type = str(event.get("event_type") or "")
             if event_type == "tool_use":
                 state.pending_tools += 1
@@ -10956,13 +11051,16 @@ class InstanceManager:
         if (
             self._pty_background_states.get(key) is not state
             or state.pending_tools
-            or not state.terminal_seen
             or await self.pty_background_activity_pending(
                 state.task_id,
                 state.session,
             )
         ):
             return False
+        if not state.terminal_seen:
+            if not state.durable_native_completion_reconciled:
+                return False
+            state.terminal_seen = True
         # This preflight is deliberately before Harness cleanup.  On a
         # Worker, NodeControl must be the first writer and the exact Task CAS
         # keeps a drain that starts afterwards from overlooking this live
@@ -11740,12 +11838,7 @@ class InstanceManager:
                 key = (state.task_id, state.session_id)
                 if self._pty_background_states.get(key) is not state:
                     return
-                if (
-                    state.terminal_seen
-                    and await self._try_complete_pty_background_generation(
-                        state
-                    )
-                ):
+                if await self._try_complete_pty_background_generation(state):
                     return
                 now = time.monotonic()
                 if (

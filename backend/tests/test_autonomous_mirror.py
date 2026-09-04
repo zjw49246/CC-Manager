@@ -3393,6 +3393,270 @@ class TestFullMirrorBackend:
         async with db_factory() as db:
             assert (await db.get(Task, task_id)).background_active is False
 
+    async def test_terminal_native_mirror_reconciles_missing_pty_notification(
+        self, db_factory
+    ):
+        """A durable native child terminal row closes a lost PTY notice."""
+
+        from claude_pty.subagents import SubagentTracker
+
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        session_id = "reconcile-missing-notification-session"
+        tool_use_id = "toolu_missing-notification"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            db.add(
+                SubAgentSession(
+                    task_id=task_id,
+                    source="native",
+                    agent_type="native-agent",
+                    description="finished child",
+                    status="completed",
+                    completed_at=datetime.utcnow(),
+                    meta=json.dumps({"tool_use_id": tool_use_id}),
+                )
+            )
+            await db.commit()
+
+        class Session:
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+                self._tracker = SubagentTracker()
+                self._tracker.note_tool_use(
+                    {
+                        "id": tool_use_id,
+                        "name": "Agent",
+                        "input": {"description": "finished child"},
+                    }
+                )
+
+            @property
+            def has_pending_subagents(self):
+                return self._tracker.has_pending
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session_id,
+            session,
+            {"event_type": "message", "role": "assistant", "content": "done"},
+        )
+        assert generation
+        state = im._pty_background_states[(task_id, session_id)]
+        assert state.terminal_seen is False
+        assert session.has_pending_subagents is True
+
+        # No turn_duration or task-notification event is delivered.  The
+        # host-side mirror proves the exact child terminal and allows the
+        # watcher/finalizer to converge safely.
+        try:
+            assert await im._try_complete_pty_background_generation(state) is True
+            assert state.durable_native_completion_reconciled is True
+            assert session.has_pending_subagents is False
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.background_active is False
+                assert task.pty_background_generation is None
+        finally:
+            if (task_id, session_id) in im._pty_background_states:
+                im._discard_pty_background_state((task_id, session_id), generation)
+
+    async def test_running_native_mirror_does_not_reconcile_live_pty_child(
+        self, db_factory
+    ):
+        """A running durable child keeps the background marker fail-closed."""
+
+        from claude_pty.subagents import SubagentTracker
+
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        session_id = "reconcile-live-child-session"
+        tool_use_id = "toolu-live-child"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            db.add(
+                SubAgentSession(
+                    task_id=task_id,
+                    source="native",
+                    agent_type="native-agent",
+                    description="live child",
+                    status="running",
+                    meta=json.dumps({"tool_use_id": tool_use_id}),
+                )
+            )
+            await db.commit()
+
+        class Session:
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+                self._tracker = SubagentTracker()
+                self._tracker.note_tool_use(
+                    {
+                        "id": tool_use_id,
+                        "name": "Agent",
+                        "input": {"description": "live child"},
+                    }
+                )
+
+            @property
+            def has_pending_subagents(self):
+                return self._tracker.has_pending
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session_id,
+            session,
+            {"event_type": "message", "role": "assistant", "content": "working"},
+        )
+        state = im._pty_background_states[(task_id, session_id)]
+        assert generation
+        try:
+            assert await im._try_complete_pty_background_generation(state) is False
+            assert state.terminal_seen is False
+            assert state.durable_native_completion_reconciled is False
+            async with db_factory() as db:
+                assert (await db.get(Task, task_id)).background_active is True
+        finally:
+            im._discard_pty_background_state((task_id, session_id), generation)
+
+    async def test_new_autonomous_turn_clears_durable_completion_evidence(
+        self, db_factory
+    ):
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        session_id = "reconcile-new-turn-session"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        session = Session()
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session_id,
+            session,
+            {"event_type": "message", "role": "assistant", "content": "first"},
+        )
+        state = im._pty_background_states[(task_id, session_id)]
+        state.durable_native_completion_reconciled = True
+        state.terminal_seen = True
+        await im.begin_pty_autonomous_activity(
+            task_id,
+            session_id,
+            session,
+            {"event_type": "message", "role": "assistant", "content": "second"},
+        )
+        assert generation
+        assert state.terminal_seen is False
+        assert state.durable_native_completion_reconciled is False
+        state.outcome = "test-cleanup"
+        im._discard_pty_background_state((task_id, session_id), generation)
+
+    async def test_background_watcher_reconciles_without_terminal_sentinel(
+        self, db_factory, monkeypatch
+    ):
+        """The polling watcher must invoke reconciliation before a sentinel."""
+
+        from claude_pty.subagents import SubagentTracker
+
+        im, _ = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        session_id = "watcher-reconcile-session"
+        generation = "watcher-reconcile-generation"
+        tool_use_id = "toolu-watcher-reconcile"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            db.add(
+                SubAgentSession(
+                    task_id=task_id,
+                    source="native",
+                    agent_type="native-agent",
+                    description="watcher child",
+                    status="completed",
+                    completed_at=datetime.utcnow(),
+                    meta=json.dumps({"tool_use_id": tool_use_id}),
+                )
+            )
+            await db.commit()
+
+        class Session:
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+                self._tracker = SubagentTracker()
+                self._tracker.note_tool_use(
+                    {
+                        "id": tool_use_id,
+                        "name": "Agent",
+                        "input": {"description": "watcher child"},
+                    }
+                )
+
+            @property
+            def has_pending_subagents(self):
+                return self._tracker.has_pending
+
+        session = Session()
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        initial_watcher = state.watcher
+        if initial_watcher is not None:
+            initial_watcher.cancel()
+            await asyncio.gather(initial_watcher, return_exceptions=True)
+        state.watcher = None
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_POLL_SECONDS",
+            0,
+        )
+        watcher = asyncio.create_task(im._watch_pty_background_generation(state))
+        try:
+            await asyncio.wait_for(watcher, 1)
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.background_active is False
+                assert task.pty_background_generation is None
+            assert session.has_pending_subagents is False
+            assert state.durable_native_completion_reconciled is True
+        finally:
+            if not watcher.done():
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            if (task_id, session_id) in im._pty_background_states:
+                im._discard_pty_background_state((task_id, session_id), generation)
+
     async def test_autonomous_completion_preserves_marker_when_harness_cleanup_fails(
         self,
         db_factory,
