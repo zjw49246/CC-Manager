@@ -3222,7 +3222,11 @@ def test_codex_untrusted_project_helpers_quote_canonical_target(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_turn_uses_native_resume_and_turn_start():
+@pytest.mark.parametrize("model,effort", [
+    ("gpt-5.6-luna", "max"),
+    ("gpt-6-astra", "ultra"),
+])
+async def test_start_turn_uses_native_resume_and_turn_start(model, effort):
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
@@ -3240,8 +3244,8 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     process, thread_id = await server.start_turn(
         prompt="continue",
         cwd="/tmp",
-        model="gpt-5.6-luna",
-        effort="max",
+        model=model,
+        effort=effort,
         resume_session_id="thread-123",
         git_env={"GIT_AUTHOR_NAME": "CCM"},
         task_id=9,
@@ -3282,8 +3286,8 @@ async def test_start_turn_uses_native_resume_and_turn_start():
         str(Path("/tmp").resolve()): {"trust_level": "untrusted"}
     }
     assert turn_call.args[0] == "turn/start"
-    assert turn_call.args[1]["effort"] == "max"
-    assert turn_call.args[1]["model"] == "gpt-5.6-luna"
+    assert turn_call.args[1]["effort"] == effort
+    assert turn_call.args[1]["model"] == model
     assert turn_call.args[1]["serviceTier"] is None
     assert turn_call.args[1]["input"] == [{
         "type": "text",
@@ -3509,7 +3513,11 @@ async def test_resume_rejects_different_thread_id_before_terminal_recycle():
 
 
 @pytest.mark.asyncio
-async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
+@pytest.mark.parametrize("model,effort", [
+    ("gpt-5.6-sol", "high"),
+    ("gpt-6-astra", "ultra"),
+])
+async def test_fast_turn_requires_live_catalog_and_persists_admission_proof(model, effort):
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
@@ -3518,8 +3526,8 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
         if method == "model/list":
             return {
                 "data": [{
-                    "id": "gpt-5.6-sol",
-                    "model": "gpt-5.6-sol",
+                    "id": model,
+                    "model": model,
                     "isDefault": True,
                     "serviceTiers": [{"id": "priority", "name": "Fast"}],
                 }],
@@ -3561,8 +3569,8 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     process, thread_id = await server.start_turn(
         prompt="fast",
         cwd="/tmp",
-        model="gpt-5.6-sol",
-        effort="high",
+        model=model,
+        effort=effort,
         resume_session_id=None,
         git_env=None,
         task_id=91,
@@ -3579,17 +3587,20 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     assert thread_call.args[1]["serviceTier"] == "priority"
     assert turn_call.args[0] == "turn/start"
     assert turn_call.args[1]["serviceTier"] == "priority"
+    assert thread_call.args[1]["model"] == model
+    assert turn_call.args[1]["model"] == model
+    assert turn_call.args[1]["effort"] == effort
 
     started = json.loads((await process.stdout.readline()).decode())
     proof = json.loads((await process.stdout.readline()).decode())
     assert started == {"type": "thread.started", "thread_id": "thread-fast"}
     assert proof == {
         "type": "system_event",
-        "content": "Codex Fast priority 请求已发送 · 模型 gpt-5.6-sol",
+        "content": f"Codex Fast priority 请求已发送 · 模型 {model}",
         "requested_service_tier": "priority",
         "admitted_service_tier": "priority",
         "service_tier_request_verified": False,
-        "model": "gpt-5.6-sol",
+        "model": model,
         "thread_id": "thread-fast",
         "turn_id": "turn-fast",
     }

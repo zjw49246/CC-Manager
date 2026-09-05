@@ -18,16 +18,18 @@ vi.mock('../../api/client', () => ({
       default_model: 'claude-opus-4-6',
       model_options: ['claude-opus-4-6', 'claude-sonnet-4-6'],
       default_codex_model: 'gpt-5.5',
-      codex_model_options: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini'],
+      codex_model_options: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini'],
       default_effort: 'medium',
       effort_options: ['low', 'medium', 'high'],
       codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
       codex_model_efforts: {
+        'gpt-6-astra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
         'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
         'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
         'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
       },
       codex_model_service_tiers: {
+        'gpt-6-astra': ['default', 'priority'],
         'gpt-5.6-sol': ['default', 'priority'],
         'gpt-5.6-terra': ['default', 'priority'],
         'gpt-5.6-luna': ['default', 'priority'],
@@ -374,7 +376,7 @@ describe('TaskForm copy-context-from select overflow fix', () => {
   });
 });
 
-describe('Codex GPT-5.6 per-model effort options', () => {
+describe('Codex per-model effort options', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -386,20 +388,21 @@ describe('Codex GPT-5.6 per-model effort options', () => {
     await userEvent.selectOptions(cliSelect, 'codex');
   }
 
-  it('lists all three GPT-5.6 models in the model dropdown', async () => {
+  it('lists GPT-6 Astra and all three GPT-5.6 models in the model dropdown', async () => {
     await switchToCodex();
     const modelSelect = screen.getByDisplayValue('gpt-5.5 (default)');
     const values = Array.from(modelSelect.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
+    expect(values).toContain('gpt-6-astra');
     expect(values).toContain('gpt-5.6-sol');
     expect(values).toContain('gpt-5.6-terra');
     expect(values).toContain('gpt-5.6-luna');
     expect(values).not.toContain('gpt-5.6');
   });
 
-  it('shows max/ultra efforts for gpt-5.6-sol but not for gpt-5.5', async () => {
+  it.each(['gpt-6-astra', 'gpt-5.6-sol'])('shows max/ultra efforts for %s but not for gpt-5.5', async (model) => {
     await switchToCodex();
     const modelSelect = screen.getByDisplayValue('gpt-5.5 (default)');
-    await userEvent.selectOptions(modelSelect, 'gpt-5.6-sol');
+    await userEvent.selectOptions(modelSelect, model);
 
     const effortSelect = screen.getByDisplayValue('medium (default)');
     let efforts = Array.from(effortSelect.querySelectorAll('option')).map((o) => (o as HTMLOptionElement).value);
@@ -533,7 +536,7 @@ describe('Codex Fast speed configuration', () => {
       default_model: 'claude-opus-4-6',
       model_options: ['claude-opus-4-6'],
       default_codex_model: 'gpt-5.5',
-      codex_model_options: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini'],
+      codex_model_options: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini'],
       default_effort: 'medium',
       effort_options: ['low', 'medium', 'high'],
       claude_model_efforts: {},
@@ -541,6 +544,7 @@ describe('Codex Fast speed configuration', () => {
       codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
       codex_model_efforts: {},
       codex_model_service_tiers: {
+        'gpt-6-astra': ['default', 'priority'],
         'gpt-5.6-sol': ['default', 'priority'],
         'gpt-5.5': ['default', 'priority'],
         'gpt-5.4-mini': ['default'],
@@ -570,8 +574,9 @@ describe('Codex Fast speed configuration', () => {
     expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
   });
 
-  it('persists priority in the task creation payload', async () => {
+  it.each(['gpt-6-astra', 'gpt-5.6-sol'])('persists %s and priority in the task creation payload', async (model) => {
     const speedSelect = await switchToCodexFastForm();
+    await userEvent.selectOptions(screen.getByDisplayValue('gpt-5.5 (default)'), model);
     await userEvent.selectOptions(speedSelect, 'priority');
     await selectProject();
     await userEvent.type(
@@ -581,7 +586,7 @@ describe('Codex Fast speed configuration', () => {
     await userEvent.click(screen.getByRole('button', { name: /create/i }));
 
     await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
-      expect.objectContaining({ codex_service_tier: 'priority' }),
+      expect.objectContaining({ provider: 'codex', model, codex_service_tier: 'priority' }),
     ));
   });
 

@@ -4722,6 +4722,23 @@ def test_build_command_codex_default_model_not_passed():
     assert "--model" not in cmd
 
 
+@pytest.mark.parametrize("effort", ["max", "ultra"])
+@pytest.mark.parametrize("resume_session_id", [None, "thread-astra"])
+def test_build_command_codex_astra_preserves_model_and_effort(effort, resume_session_id):
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="review changes",
+        model="gpt-6-astra",
+        resume_session_id=resume_session_id,
+        effort_level=effort,
+    )
+
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert f'model_reasoning_effort="{effort}"' in cmd
+    assert 'service_tier="default"' in cmd
+
+
 def test_build_command_codex_standard_explicitly_clears_fast_mode():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(

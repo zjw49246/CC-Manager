@@ -1,5 +1,6 @@
-"""GPT-5.6 是三个模型（sol/terra/luna），不存在裸 "gpt-5.6" ID。
+"""Codex 模型目录覆盖 GPT-6 Astra 及 GPT-5.6 sol/terra/luna。
 
+GPT-6 Astra 的 low..ultra 与 priority 由 2026-09-05 model/list 确认。
 证据：Codex CLI 0.144.6 服务端模型列表（~/.codex/models_cache.json）：
 sol/terra 支持 effort low..ultra，luna 支持 low..max，gpt-5.5 及更早只到 xhigh。
 """
@@ -21,6 +22,18 @@ GPT56_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
 def _option_list() -> list[str]:
     return [m.strip() for m in settings.codex_model_options.split(",") if m.strip()]
+
+
+def test_gpt6_astra_is_selectable_with_native_fast_support():
+    assert "gpt-6-astra" in _option_list()
+    assert supported_codex_service_tiers("gpt-6-astra") == ["default", "priority"]
+    assert validate_codex_service_tier("codex", "gpt-6-astra", "priority") == "priority"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max", "ultra"])
+def test_gpt6_astra_preserves_supported_efforts(effort):
+    assert effort in supported_codex_efforts("gpt-6-astra")
+    assert clamp_codex_effort("gpt-6-astra", effort) == effort
 
 
 def test_codex_model_options_contain_all_three_gpt56_models():
@@ -85,6 +98,7 @@ def test_effort_map_keys_are_valid_model_options():
 
 def test_fast_service_tier_capabilities_match_catalog():
     for model in (
+        "gpt-6-astra",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",

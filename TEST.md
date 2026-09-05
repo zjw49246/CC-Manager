@@ -606,15 +606,18 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_existing_1m_suffix_remains_supported` / `test_unknown_claude_model_uses_default_context_window` | 兼容既有 `[1m]` 变体，未知模型安全回退 200K |
 | `test_opus5_supports_full_effort_scale` | Opus 5 支持 `low/medium/high/xhigh/max` 完整 effort 档位 |
 
-##### `test_codex_models.py` — Codex 模型目录（GPT-5.6 三模型）
+##### `test_codex_models.py` — Codex 模型目录（GPT-6 Astra / GPT-5.6 三模型）
 
 | 测试 | 验证内容 |
 |------|---------|
+| `test_gpt6_astra_*` | Astra 可选、Fast 准入，完整推理档位（含 max/ultra）不降级 |
+| `test_config_advertises_gpt6_astra_capabilities` / `test_create_fast_codex_task_persists_priority` | API 下发 Astra 模型/能力，任务创建保留模型、ultra 和 priority |
+| `test_build_command_codex_astra_preserves_model_and_effort` / `test_start_turn_uses_native_resume_and_turn_start` / `test_fast_turn_requires_live_catalog_and_persists_admission_proof` | exec 新建/续接及 app-server Standard/Fast 请求透传 Astra 模型和 effort，Fast 保留实时能力准入 |
 | `test_codex_model_options_contain_all_three_gpt56_models` | 选项含 `gpt-5.6-sol`/`-terra`/`-luna` 三个模型 |
 | `test_codex_model_options_have_no_bare_gpt56` | **关键**：裸 `gpt-5.6` 不是有效模型 ID（服务端列表实证） |
 | `test_gpt56_*_support_*` / `test_older_models_fall_back_*` | 按模型区分档位：sol/terra 到 ultra、luna 到 max、旧模型到 xhigh |
 | `test_clamp_*` | `clamp_codex_effort` 透传受支持档位 / 向下夹不支持档位 / None 与未知输入安全 |
-| `test_fast_service_tier_capabilities_match_catalog` | Fast 能力只开放给 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；mini/Spark/未知模型只有 Standard |
+| `test_fast_service_tier_capabilities_match_catalog` | Fast 能力只开放给 GPT-6 Astra、GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；mini/Spark/未知模型只有 Standard |
 | `test_validate_fast_service_tier_requires_codex_and_supported_model` | `priority` 仅允许 Codex + 支持模型，且与 model/effort 语义独立 |
 
 （前端配套：`TaskForm.test.tsx` 覆盖 Fast 选择、能力禁用、模型切换原子回落及 localStorage 默认；`TaskBadges.test.tsx` / `TaskList.test.tsx` / `ChatView.test.tsx` 覆盖下一轮配置、Fast 徽标和不支持的一次性模型禁用。）

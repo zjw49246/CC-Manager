@@ -6202,17 +6202,21 @@ async def test_create_task_defaults_to_standard_service_tier(client):
 
 
 @pytest.mark.asyncio
-async def test_create_fast_codex_task_persists_priority(client):
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra"])
+async def test_create_fast_codex_task_persists_priority(client, model):
     resp = await client.post("/api/tasks", json={
         "title": "Fast task",
         "description": "d",
         "provider": "codex",
-        "model": "gpt-5.6-sol",
+        "model": model,
+        "effort_level": "ultra",
         "codex_service_tier": "priority",
     })
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["codex_service_tier"] == "priority"
+    assert resp.json()["model"] == model
+    assert resp.json()["effort_level"] == "ultra"
 
 
 @pytest.mark.asyncio

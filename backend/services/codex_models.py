@@ -1,6 +1,8 @@
 """Codex model catalog: per-model reasoning effort support.
 
 Source of truth: Codex CLI 服务端模型列表（~/.codex/models_cache.json, 2026-07-19 实测）。
+GPT-6 Astra: gpt-6-astra，efforts low..ultra，支持 priority Fast
+（Codex app-server model/list，2026-09-05 实测；Codex 的 ultra 不同于通用 API 目录）。
 GPT-5.6 是一个家族、三个模型（无裸 "gpt-5.6" ID）：
   - gpt-5.6-sol   (GPT-5.6 Sol,   frontier)  efforts: low..max + ultra
   - gpt-5.6-terra (GPT-5.6 Terra, balanced)  efforts: low..max + ultra
@@ -29,6 +31,7 @@ CODEX_SERVICE_TIERS = (
 # request/UI safety gate for native accounts. API gateway accounts additionally
 # require their own catalog capability before CCM sends a priority request.
 CODEX_MODEL_SERVICE_TIERS: dict[str, list[str]] = {
+    "gpt-6-astra": ["default", "priority"],
     "gpt-5.6-sol": ["default", "priority"],
     "gpt-5.6-terra": ["default", "priority"],
     "gpt-5.6-luna": ["default", "priority"],
@@ -40,6 +43,7 @@ CODEX_MODEL_SERVICE_TIERS: dict[str, list[str]] = {
 
 # 基线档位：codex_effort_options（gpt-5.5 及更早的模型）
 CODEX_MODEL_EFFORTS: dict[str, list[str]] = {
+    "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
