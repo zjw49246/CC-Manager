@@ -4,6 +4,12 @@
 
 ## 已完成功能
 
+### 2026-09-05：补齐 GPT-6 Astra 模型请求配置
+
+- [x] `gpt-6-astra` 原先缺少模型目录、推理档位和 Fast 能力，导致界面不可选且 `max/ultra` 降为 `xhigh`；已按 Codex `model/list` 实测结果登记 `low..ultra` 与 `priority`，默认模型仍为 `gpt-5.6-sol`。实现提交：`b4d224fc`。
+- [x] 验证模型目录、API 下发/创建、exec 新建/续接和 app-server Standard/Fast 请求：后端专项 `52 passed`，前端 TaskForm `49 passed, 7 skipped`，TypeScript `--noEmit` 与项目构建类型检查通过；最终目录回归 `23 passed`。没有发送计费推理请求。
+- [x] 整库前后复核均在 `698 passed` 后因既有 `test_shared_pr_review_chat_waits_for_terminal_owner_state` 未抛出预期 HTTPException 停止（`--maxfail=1`），未宣称整库全绿。后续新增模型需同时维护模型选项、effort、tier 和真实请求测试；自定义 `CODEX_MODEL_OPTIONS` 的部署需同步添加 ID。
+
 ### 2026-09-04：修复 queue-operation 通知遗漏导致的后台状态卡死
 
 - [x] 生产 Task 501 取证确认：3 个 native Agent 的持久行均已终态，但其中一个完成通知只存在于 Claude `queue-operation` journal，PTY tracker 未收到普通 `<task-notification>`，使 `background_active` 永久残留。
