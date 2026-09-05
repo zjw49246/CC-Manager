@@ -4,6 +4,13 @@
 
 ## 已完成功能
 
+### 2026-09-05：修复 PTY pretrust 错库导致的新项目启动卡死（生产 Task 752）
+
+- [x] 生产取证：Task 752（默认账号 `~/.claude`、全新项目 cwd）PTY 启动后 pty-bridge channel server 15 次注入全部 Connection refused，30 秒后盲降级 stdin 粘贴，Claude 0.5 秒内 exit_code=1，dispatcher 以「provider turn failed after crossing its external-effect boundary; exact turn selected transport claude_pty」fail closed。dispatcher 侧 fail-closed 判定符合设计，不改。
+- [x] 根因在 claude-pty：`_pretrust_workdir` 对任何非空 `config_dir` 写 `<config_dir>/.claude.json`，而 `build_clean_env` 对等于默认 `~/.claude` 的 config_dir 不导出 `CLAUDE_CONFIG_DIR`，CC 实际读 `$HOME/.claude.json`——trust 条目与 pty-bridge MCP 预批准写进了 CC 不读的文件，新项目首启必弹 trust/MCP 对话框，MCP 不加载、channel server 永远起不来。
+- [x] PTY 修复（commit `a259aaf`）：`_env.claude_json_path` 与 spawn env 共用同一 CLAUDE_CONFIG_DIR 判定；drain loop 常开输出尾部缓冲并在进程死亡时记录最后屏幕内容；channel 全部拒连且屏幕仍停在启动对话框时拒绝 stdin 盲降级（pre-delivery `SessionError`，prompt 未送达可安全重试）。本仓库级联 bump uv.lock 至 `a259aaf5`。
+- [x] 验证：PTY 单元套件 225 passed；11 个真实 Claude 集成失败与未修改 main 基线完全一致（沙箱禁写 $HOME/真实登录环境所致）。CCM `test_service_instance_manager.py + test_native_sub_agents.py` 592 passed，唯一失败 `test_cloudrouter_claude_pty_projects_direct_auth_for_model_only` 在旧 pin 下同样复现，属既有基线。生产（8002/ccm-b 与 8000）需 `./scripts/refresh_pty.sh` + 重启后生效——重启时机待用户确认。
+
 ### 2026-09-05：补齐 GPT-6 Astra 模型请求配置
 
 - [x] `gpt-6-astra` 原先缺少模型目录、推理档位和 Fast 能力，导致界面不可选且 `max/ultra` 降为 `xhigh`；已按 Codex `model/list` 实测结果登记 `low..ultra` 与 `priority`，默认模型仍为 `gpt-5.6-sol`。实现提交：`b4d224fc`。
