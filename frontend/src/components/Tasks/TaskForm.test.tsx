@@ -59,7 +59,17 @@ vi.mock('../../api/client', () => ({
   },
 }));
 
-import { api } from '../../api/client';
+import { api, type Task } from '../../api/client';
+
+type TaskListFixture = Pick<Task, 'id' | 'description' | 'project_id'> & {
+  title: Task['title'] | null;
+  has_session?: boolean;
+  session_id?: string | null;
+};
+
+function mockTaskList(tasks: TaskListFixture[]) {
+  vi.mocked(api.listTasks).mockResolvedValue(tasks as unknown as Task[]);
+}
 
 async function openConfigPanel() {
   // Mode/Model/Effort/Timeout 等选择器位于 Config 下拉面板内
@@ -261,10 +271,10 @@ describe('TaskForm copy-context-from select overflow fix', () => {
 
   it('shows the copy-context-from select when project has tasks with sessions', async () => {
     const tasksWithSession = [
-      { id: 10, description: 'A'.repeat(80), session_id: 'sess-1', title: null, project_id: 1 },
-      { id: 11, description: 'Short task', session_id: 'sess-2', title: null, project_id: 1 },
+      { id: 10, description: 'A'.repeat(80), has_session: true, title: null, project_id: 1 },
+      { id: 11, description: 'Short task', has_session: true, title: null, project_id: 1 },
     ];
-    vi.mocked(api.listTasks).mockResolvedValue(tasksWithSession as any);
+    mockTaskList(tasksWithSession);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();
@@ -276,11 +286,22 @@ describe('TaskForm copy-context-from select overflow fix', () => {
     expect(select).toBeInTheDocument();
   });
 
+  it('supports legacy task responses that expose session_id', async () => {
+    mockTaskList([
+      { id: 10, description: 'Legacy task', session_id: 'sess-1', title: null, project_id: 1 },
+    ]);
+
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+
+    expect(await screen.findByText('Copy context from:')).toBeInTheDocument();
+  });
+
   it('copy-context-from select has min-w-0 to prevent overflow on mobile', async () => {
     const tasksWithSession = [
-      { id: 10, description: 'Very long task description that could overflow the container on mobile devices', session_id: 'sess-1', title: null, project_id: 1 },
+      { id: 10, description: 'Very long task description that could overflow the container on mobile devices', has_session: true, title: null, project_id: 1 },
     ];
-    vi.mocked(api.listTasks).mockResolvedValue(tasksWithSession as any);
+    mockTaskList(tasksWithSession);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();
@@ -291,9 +312,9 @@ describe('TaskForm copy-context-from select overflow fix', () => {
 
   it('copy-context-from container has min-w-0 to constrain width', async () => {
     const tasksWithSession = [
-      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
+      { id: 10, description: 'task', has_session: true, title: null, project_id: 1 },
     ];
-    vi.mocked(api.listTasks).mockResolvedValue(tasksWithSession as any);
+    mockTaskList(tasksWithSession);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();
@@ -305,9 +326,9 @@ describe('TaskForm copy-context-from select overflow fix', () => {
 
   it('copy-context-from label has shrink-0 to prevent label truncation', async () => {
     const tasksWithSession = [
-      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
+      { id: 10, description: 'task', has_session: true, title: null, project_id: 1 },
     ];
-    vi.mocked(api.listTasks).mockResolvedValue(tasksWithSession as any);
+    mockTaskList(tasksWithSession);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();
@@ -324,9 +345,9 @@ describe('TaskForm copy-context-from select overflow fix', () => {
   });
 
   it('does not show any copy-from control for Codex', async () => {
-    vi.mocked(api.listTasks).mockResolvedValue([
-      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
-    ] as any);
+    mockTaskList([
+      { id: 10, description: 'task', has_session: true, title: null, project_id: 1 },
+    ]);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();
@@ -340,9 +361,9 @@ describe('TaskForm copy-context-from select overflow fix', () => {
   });
 
   it('does not submit a previously selected Claude context for Codex', async () => {
-    vi.mocked(api.listTasks).mockResolvedValue([
-      { id: 10, description: 'task', session_id: 'sess-1', title: null, project_id: 1 },
-    ] as any);
+    mockTaskList([
+      { id: 10, description: 'task', has_session: true, title: null, project_id: 1 },
+    ]);
 
     render(<TaskForm onCreated={vi.fn()} />);
     await selectProject();

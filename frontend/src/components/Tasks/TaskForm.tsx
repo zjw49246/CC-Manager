@@ -165,7 +165,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       return;
     }
     api.listTasks(undefined, true, projectId as number, undefined, 100)
-      .then((tasks) => setContextTasks(tasks.filter((t) => t.session_id)))
+      .then((tasks) => setContextTasks(tasks.filter((t) => (
+        t.has_session ?? Boolean((t as Task & { session_id?: string | null }).session_id)
+      ))))
       .catch(() => setContextTasks([]));
   }, [projectId]);
 
