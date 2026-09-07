@@ -492,7 +492,7 @@ async def websocket_endpoint(ws: WebSocket):
                         "detail": "Channel access denied",
                         "channels": denied,
                     }))
-            elif action == "unsubscribe" and channels:
+            elif action == "unsubscribe":
                 await broadcaster.unsubscribe(ws)
                 decisions.clear()
                 subscribed_channels.clear()

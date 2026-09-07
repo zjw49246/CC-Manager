@@ -9,6 +9,15 @@ when_to_use: >
 disallowed-tools:
   - Agent
   - Task
+  - TaskCreate
+  - TaskGet
+  - TaskList
+  - TaskOutput
+  - TaskStop
+  - TaskUpdate
+  - TeamCreate
+  - TeamDelete
+  - SendMessage
 
 ccm:
   always: false

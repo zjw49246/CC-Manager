@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from backend.models.project import Project
 from backend.models.ssh_profile import SSHProfile
@@ -26,6 +28,9 @@ from backend.services.task_ssh_access import (
     valid_task_ssh_capabilities,
 )
 from backend.config import settings
+from backend.services.ssh_executor import (
+    openssh_public_key_fingerprint,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,15 +54,31 @@ async def _seed_task_profile(db_factory, *, with_grant: bool = False):
             status="pending",
             project_id=project.id,
         )
+        key_path = (
+            Path(settings.ssh_key_storage_dir) / "managed" / "profile-key"
+        )
+        public_key_fingerprint = "SHA256:client"
+        if with_grant:
+            private_key = ed25519.Ed25519PrivateKey.generate()
+            key_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            key_path.write_bytes(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.OpenSSH,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+            key_path.chmod(0o600)
+            public_key = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.OpenSSH,
+                format=serialization.PublicFormat.OpenSSH,
+            ).decode("ascii")
+            public_key_fingerprint = openssh_public_key_fingerprint(public_key)
         profile = SSHProfile(
             name="ssh-sharing-profile",
             host="example.invalid",
             port=22,
             username="deploy",
-            key_path=str(
-                Path(settings.ssh_key_storage_dir) / "managed" / "profile-key"
-            ),
-            public_key_fingerprint="SHA256:client",
+            key_path=str(key_path),
+            public_key_fingerprint=public_key_fingerprint,
             host_key_type="ssh-ed25519",
             host_key_value="ssh-ed25519 AAAA",
             host_key_fingerprint="SHA256:host",
@@ -178,7 +199,10 @@ async def test_cannot_add_ssh_grant_to_outbound_shared_scope(
 async def test_grant_admission_persists_incarnation_for_upgraded_legacy_task(
     db_factory,
 ):
-    _project_id, task_id, profile_id = await _seed_task_profile(db_factory)
+    _project_id, task_id, profile_id = await _seed_task_profile(
+        db_factory,
+        with_grant=True,
+    )
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         task.incarnation_id = None

@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -58,6 +60,7 @@ from backend.services.mcp_config import (
 )
 from backend.services.task_agent_isolation import (
     CLAUDE_SUBPROCESS_ENV_SCRUB,
+    CLAUDE_NATIVE_SUB_AGENT_TOOLS,
     CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
     CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
     TaskAgentIsolationError,
@@ -87,6 +90,7 @@ from backend.services.test_harness_children import (
     TestHarnessChildService as HarnessChildService,
 )
 from backend.services.test_harness import TestHarnessService
+from backend.services.ssh_executor import openssh_public_key_fingerprint
 
 
 @pytest.fixture(autouse=True)
@@ -729,6 +733,24 @@ def test_claude_hot_runtime_fingerprint_covers_ssh_socket_inode(tmp_path):
         ),
     )
     assert first != second
+
+
+def test_claude_hot_runtime_fingerprint_is_stable_for_persistent_credentials(
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"permissions":{"allow":[]}}')
+    first = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "task-incarnation-token"},
+    )
+    second = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "task-incarnation-token"},
+    )
+    assert first == second
 
 
 def test_ssh_agent_snapshot_rejects_non_socket_and_detects_replacement(
@@ -4700,6 +4722,23 @@ def test_build_command_codex_default_model_not_passed():
     assert "--model" not in cmd
 
 
+@pytest.mark.parametrize("effort", ["max", "ultra"])
+@pytest.mark.parametrize("resume_session_id", [None, "thread-astra"])
+def test_build_command_codex_astra_preserves_model_and_effort(effort, resume_session_id):
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="review changes",
+        model="gpt-6-astra",
+        resume_session_id=resume_session_id,
+        effort_level=effort,
+    )
+
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert f'model_reasoning_effort="{effort}"' in cmd
+    assert 'service_tier="default"' in cmd
+
+
 def test_build_command_codex_standard_explicitly_clears_fast_mode():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(
@@ -5062,15 +5101,24 @@ def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
     managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     managed_root.chmod(0o700)
     key_path = managed_root / f"{name}.pem"
-    key_path.write_text("test-only-private-key", encoding="utf-8")
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    key_path.write_bytes(private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
     key_path.chmod(0o600)
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode("ascii")
     return SSHProfile(
         name=name,
         host="ssh.launch.internal",
         port=22,
         username="deploy",
         key_path=str(key_path),
-        public_key_fingerprint="SHA256:client",
+        public_key_fingerprint=openssh_public_key_fingerprint(public_key),
         host_key_type="ssh-ed25519",
         host_key_value="ssh-ed25519 AAAAhost",
         host_key_fingerprint="SHA256:host",
@@ -7613,6 +7661,271 @@ async def test_claude_pty_large_prompt_receives_task_ssh_guard_env_and_policy(
     )
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_claude_pty_task_uses_persistent_runtime_credentials(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    async with db_factory() as db:
+        inst = Instance(name="claude-pty-persistent-credentials")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Claude PTY persistent credentials",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_321)
+
+    with (
+        patch(
+            "backend.services.mcp_config.generate_mcp_config",
+            return_value=tmp_path / "mcp.json",
+        ) as generate_mcp,
+        patch(
+            "backend.services.internal_service_auth.issue_internal_service_token",
+            return_value="persistent-ask-token",
+        ) as issue_token,
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="continue",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+        )
+
+    assert generate_mcp.call_args.kwargs["persistent_session"] is True
+    ask_kwargs = issue_token.call_args.kwargs
+    assert ask_kwargs["audience"] == "ccm_ask_user"
+    assert ask_kwargs["owner_kind"] == "task-session"
+    assert ask_kwargs["task_incarnation_id"]
+    assert ask_kwargs["task_retry_count"] is None
+    assert ask_kwargs["task_turn_generation"] is None
+    assert ask_kwargs["task_status"] is None
+    assert manager._launch_pty.call_args.kwargs["git_env"][
+        "CCM_ASK_USER_TOKEN"
+    ] == "persistent-ask-token"
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_claude_pty_uses_persistent_runtime_credentials(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Administrator PTYs must reuse the native process across chat turns."""
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    async with db_factory() as db:
+        inst = Instance(name="unrestricted-pty-persistent-credentials")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Unrestricted Claude PTY persistent credentials",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_322)
+
+    with (
+        patch(
+            "backend.services.mcp_config.generate_mcp_config",
+            return_value=tmp_path / "mcp.json",
+        ) as generate_mcp,
+        patch(
+            "backend.services.internal_service_auth.issue_internal_service_token",
+            return_value="persistent-admin-ask-token",
+        ) as issue_token,
+    ):
+        result = await manager.launch(
+            instance_id=instance_id,
+            prompt="continue as administrator",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+
+    assert result == 54_322
+    assert generate_mcp.call_args.kwargs["persistent_session"] is True
+    ask_kwargs = issue_token.call_args.kwargs
+    assert ask_kwargs["owner_kind"] == "task-session"
+    assert ask_kwargs["task_retry_count"] is None
+    assert ask_kwargs["task_turn_generation"] is None
+    assert ask_kwargs["task_status"] is None
+    assert manager._launch_pty.call_args.kwargs["git_env"][
+        "CCM_ASK_USER_TOKEN"
+    ] == "persistent-admin-ask-token"
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_claude_pty_reuses_resident_process_across_turns(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """A new admin chat turn must retain a matching native PTY and PID."""
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    async with db_factory() as db:
+        inst = Instance(name="unrestricted-pty-hot-reuse")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="Unrestricted Claude PTY hot reuse",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    native_session_id = "84d8d832-f879-4f59-a0c6-affa0af157d4"
+
+    class NativeProcess:
+        pid = 54_323
+
+    class Session:
+        session_id = native_session_id
+        is_alive = True
+        config = None
+        _process = NativeProcess()
+
+        async def stop(self):
+            raise AssertionError("matching unrestricted PTY must stay resident")
+
+    session = Session()
+
+    class Process:
+        pid = session._process.pid
+        returncode = None
+
+        def __init__(self):
+            self.session = session
+
+    class FakePTYBackend:
+        def __init__(self):
+            self._pool = types.SimpleNamespace(_sessions={})
+            self._sessions = {}
+            self._consumers = {}
+            self._proxies = {}
+            self.launch_count = 0
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="/opt/claude-real",
+                dangerously_skip_permissions=True,
+                config_dir=None,
+                default_model=None,
+                default_effort=None,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            self.launch_count += 1
+            config = self.build_config()
+            if session.config is None:
+                session.config = config
+                self._pool._sessions[native_session_id] = session
+            process = Process()
+            manager.processes[kwargs["instance_id"]] = process
+            self._sessions[kwargs["instance_id"]] = session
+            return native_session_id
+
+    backend = FakePTYBackend()
+    manager._pty_backend = backend
+    manager._pty_enabled = True
+
+    first_pid = await manager.launch(
+        instance_id=instance_id,
+        prompt="first administrator turn",
+        task_id=task_id,
+        cwd=str(tmp_path),
+        provider="claude",
+        initiating_user_role="super_admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="deployment_token",
+    )
+    assert first_pid == session._process.pid
+
+    # Mirror FullMirror's normal terminal cleanup: the reusable Instance maps
+    # are released, while the native Session remains resident in the pool.
+    manager.processes.pop(instance_id, None)
+    backend._sessions.pop(instance_id, None)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        task.status = "executing"
+        task.turn_generation += 1
+        instance.status = "idle"
+        instance.current_task_id = None
+        instance.pid = None
+        instance.process_identity = None
+        await db.commit()
+
+    with patch.object(
+        manager,
+        "release_pty_session",
+        new=AsyncMock(),
+    ) as release:
+        second_pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="second administrator turn",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            resume_session_id=native_session_id,
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+
+    assert second_pid == first_pid
+    assert backend.launch_count == 2
+    assert backend._pool._sessions[native_session_id] is session
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -11288,6 +11601,10 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
 
     exec_mock.assert_not_awaited()
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
+    assert (
+        im._launch_codex_app_server.await_args.kwargs["disable_autonomous_features"]
+        is True
+    )
     if main_mcp_enabled:
         assert "ccm_command_help" in specs[0].enabled_tools
         assert "create_sub_agent" in specs[0].enabled_tools
@@ -19859,11 +20176,48 @@ def test_build_command_claude_enable_workflows_default():
     assert cmd[idx + 1] == "Workflow"
 
 
+def test_build_command_claude_sub_agent_disables_native_delegation_tools():
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="claude",
+        prompt="delegate through CCM",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        enabled_skills={"sub-agent": True},
+        claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+    )
+
+    disallowed = set(cmd[cmd.index("--disallowedTools") + 1].split(","))
+    assert set(CLAUDE_NATIVE_SUB_AGENT_TOOLS) <= disallowed
+
+
 def test_build_command_claude_enable_workflows_true():
     """_build_command with enable_workflows=True does NOT include --disallowedTools."""
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="claude", prompt="hi", model=None, resume_session_id=None, effort_level=None, enable_workflows=True)
     assert "--disallowedTools" not in cmd
+
+
+def test_build_command_claude_task_disables_interactive_plan_mode():
+    """Managed Tasks cannot enter Claude's terminal-only Plan approval UI."""
+
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="claude",
+        prompt="inspect",
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        enable_workflows=True,
+        task_id=91,
+    )
+
+    idx = cmd.index("--disallowedTools")
+    assert set(cmd[idx + 1].split(",")) == {
+        "EnterPlanMode",
+        "ExitPlanMode",
+    }
 
 
 def test_build_command_claude_enable_workflows_false():
@@ -20247,6 +20601,10 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["prompt"] == "do it"
     assert calls["model"] is None  # "default" normalized away
     assert calls["cwd"] == "/w"
+    assert calls["disallowed_tools"] == [
+        "EnterPlanMode",
+        "ExitPlanMode",
+    ]
 
 
 @pytest.mark.asyncio
@@ -21466,6 +21824,86 @@ async def test_launch_pty_runtime_fingerprint_change_fails_when_hot_session_surv
         )
 
 
+@pytest.mark.asyncio
+async def test_launch_pty_reuses_matching_hot_session_without_release(tmp_path):
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"permissions":{"allow":[]}}')
+
+    class Session:
+        session_id = "sid-hot"
+        is_alive = True
+        config = types.SimpleNamespace()
+
+    session = Session()
+    fingerprint = im._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"CCM_ASK_USER_TOKEN": "stable-token"},
+    )
+    session.config._ccm_task_isolation_fingerprint = fingerprint
+    process = types.SimpleNamespace(
+        pid=54001,
+        returncode=None,
+        session=session,
+    )
+
+    class FakePool:
+        _sessions = {"sid-hot": session}
+
+        async def get(self, _sid):
+            return session
+
+    class FakeBackend:
+        _pool = FakePool()
+        _sessions = {1: session}
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            assert kwargs["resume_session_id"] == "sid-hot"
+            # A real CCMBackend binds the existing Session to a new proxy and
+            # starts a fresh output consumer for the next prompt. The native
+            # Session/PID itself must remain unchanged.
+            im.processes[kwargs["instance_id"]] = process
+            return "sid-hot"
+
+    im._pty_backend = FakeBackend()
+    im.processes[1] = process
+    with patch.object(im, "release_pty_session", new=AsyncMock()) as release:
+        result = await im._launch_pty(
+            instance_id=1,
+            prompt="continue",
+            task_id=None,
+            cwd=str(tmp_path),
+            model=None,
+            resume_session_id="sid-hot",
+            loop_iteration=None,
+            git_env={"CCM_ASK_USER_TOKEN": "stable-token"},
+            thinking_budget=None,
+            effort_level=None,
+            chat_initiated=False,
+            config_dir=None,
+            enable_workflows=False,
+            enabled_skills=None,
+            mcp_config_path=None,
+            claude_unrestricted_settings_path=settings_path,
+            claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+            claude_unrestricted_allowed_rules=("Read",),
+        )
+
+    assert result == 54001
+    release.assert_not_awaited()
+    assert im.processes[1] is process
+    assert FakeBackend._pool._sessions["sid-hot"] is session
+
+
 def test_task_runtime_scope_retained_by_live_pty_and_removed_after_dead_eviction(
     monkeypatch,
 ):
@@ -21930,6 +22368,12 @@ async def test_process_event_orphan_overload_does_not_set_transient_flag(db_fact
         "raw_json": "{}",
     })
     assert im.transient_error_seen(inst_id) is False
+
+    async with db_factory() as db:
+        rows = (await db.execute(
+            select(LogEntry).where(LogEntry.task_id == task_id)
+        )).scalars().all()
+    assert rows == []
 
     # A background sub-agent turn's error is likewise not this turn's signal.
     await im._process_event(inst_id, task_id, {

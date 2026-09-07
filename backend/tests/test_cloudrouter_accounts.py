@@ -766,6 +766,24 @@ async def test_claude_short_alias_matches_only_exact_dated_model(
 
 
 @pytest.mark.asyncio
+async def test_fable51_catalog_id_accepts_ccm_1m_alias_but_not_dot_alias(
+    tmp_path, monkeypatch,
+):
+    _store, account = await _add(
+        tmp_path,
+        monkeypatch,
+        models={
+            "claude": ["claude-fable-5-1"],
+            "codex": [],
+        },
+    )
+
+    assert account.supports_model("claude", "claude-fable-5-1")
+    assert account.supports_model("claude", "claude-fable-5-1[1m]")
+    assert not account.supports_model("claude", "claude-fable-5.1")
+
+
+@pytest.mark.asyncio
 async def test_account_numbers_do_not_reuse_retired_folders(tmp_path, monkeypatch):
     store, first = await _add(tmp_path, monkeypatch)
     await store.retire_account(first.id)

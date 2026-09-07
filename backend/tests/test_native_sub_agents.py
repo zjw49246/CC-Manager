@@ -199,6 +199,174 @@ async def test_spawn_progress_done_lifecycle(im, db_session):
 
 
 @pytest.mark.asyncio
+async def test_implicitly_async_claude_agent_keeps_reports_until_notification(
+    im,
+    db_session,
+    tmp_path,
+):
+    """Claude may choose async execution without a run_in_background input."""
+    from claude_pty.jsonl_reader import JsonlReader
+    from claude_pty.subagents import SubagentTracker
+
+    task = await _create_native_task(
+        db_session,
+        retry_count=3,
+        turn_generation=18,
+    )
+    generation = {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+    session_jsonl = tmp_path / "session.jsonl"
+    session_jsonl.write_text("", encoding="utf-8")
+    subagents_dir = tmp_path / "session" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-async-1.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "Explore",
+                "description": "inspect scheduler",
+                "toolUseId": "toolu_async",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracker = SubagentTracker(str(session_jsonl))
+    reader = JsonlReader(str(session_jsonl), tracker=tracker)
+    spawn_events = reader.normalize({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_async",
+                "name": "Agent",
+                "input": {
+                    "subagent_type": "Explore",
+                    "description": "inspect scheduler",
+                },
+            }],
+        },
+    })
+    launch_events = reader.normalize({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_async",
+                "content": [{
+                    "type": "text",
+                    "text": "Async agent launched successfully.",
+                }],
+            }],
+        },
+        "toolUseResult": {
+            "isAsync": True,
+            "status": "async_launched",
+            "agentId": "async-1",
+        },
+    })
+
+    lifecycle_events = [
+        event.to_dict()
+        for event in [*spawn_events, *launch_events]
+        if event.subagent
+    ]
+    assert [event["event_type"] for event in lifecycle_events] == [
+        "subagent_spawn"
+    ]
+    for event in lifecycle_events:
+        await im._upsert_native_sub_agent(
+            task.id,
+            event["event_type"],
+            event["subagent"],
+            **generation,
+        )
+
+    row = (
+        await db_session.execute(
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
+        )
+    ).scalar_one()
+    await db_session.refresh(task)
+    assert row.status == "running"
+    assert task.active_sub_agents == 1
+
+    (subagents_dir / "agent-async-1.jsonl").write_text(
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": "Located the scheduler constraint.",
+                }],
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    updates = tracker.read_transcript_updates()
+    assert updates == [{
+        "tool_use_id": "toolu_async",
+        "agent_id": "async-1",
+        "summary": "Located the scheduler constraint.",
+    }]
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_progress",
+        {
+            "tool_use_id": updates[0]["tool_use_id"],
+            "summary": updates[0]["summary"],
+        },
+        **generation,
+    )
+
+    completion_events = reader.normalize(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": (
+                    "<task-notification>\n"
+                    "<task-id>async-1</task-id>\n"
+                    "<status>completed</status>\n"
+                    "<summary>Scheduler analysis complete.</summary>\n"
+                    "</task-notification>"
+                ),
+            },
+        },
+        include_user_text=True,
+    )
+    done = next(event.to_dict() for event in completion_events if event.subagent)
+    assert done["event_type"] == "subagent_done"
+    await im._upsert_native_sub_agent(
+        task.id,
+        done["event_type"],
+        done["subagent"],
+        **generation,
+    )
+
+    await db_session.refresh(row)
+    await db_session.refresh(task)
+    assert row.status == "completed"
+    assert row.checks_done == 2
+    assert row.last_summary == "Scheduler analysis complete."
+    assert task.active_sub_agents == 0
+    reports = list((
+        await db_session.execute(
+            select(SubAgentReport)
+            .where(SubAgentReport.session_id == row.id)
+            .order_by(SubAgentReport.check_number)
+        )
+    ).scalars())
+    assert [(report.status, report.summary) for report in reports] == [
+        ("running", "Located the scheduler constraint."),
+        ("completed", "Scheduler analysis complete."),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_progress_for_unknown_agent_is_noop(im, db_session):
     task = await _create_native_task(
         db_session,

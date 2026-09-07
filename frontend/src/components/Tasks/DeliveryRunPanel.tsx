@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { api } from '../../api/client';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import type { DeliveryRun } from '../../api/client';
 import {
   GitPullRequest,
@@ -89,9 +90,8 @@ export function DeliveryRunPanel({
 
   useEffect(() => {
     void load();
-    const interval = window.setInterval(() => void load(true), 5000);
-    return () => window.clearInterval(interval);
   }, [load]);
+  useVisibilityAwareInterval(() => load(true), 5000, run != null && run.activity !== 'terminal', false);
 
   useEffect(() => {
     if (

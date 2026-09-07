@@ -155,6 +155,22 @@ describe('WsClient', () => {
 
       expect(JSON.parse(ws.sent[0]).channels).toEqual(['task:1', 'task:2']);
     });
+
+    it('clears all server subscriptions before replacing a shared aggregate', () => {
+      const client = new WsClient('ws://test');
+      client.subscribe(['tasks', 'workers']);
+      client.connect();
+      const ws = mockInstances[0];
+      ws.simulateOpen();
+
+      client.unsubscribe();
+      client.subscribe(['tasks']);
+
+      expect(ws.sent.slice(-2).map((message) => JSON.parse(message))).toEqual([
+        { action: 'unsubscribe' },
+        { action: 'subscribe', channels: ['tasks'] },
+      ]);
+    });
   });
 
   describe('message handling', () => {

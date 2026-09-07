@@ -16,6 +16,7 @@ export class WsClient {
   private destroyed = false;
   private hasConnectedOnce = false;
   private connected = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -53,15 +54,31 @@ export class WsClient {
     this.ws.onclose = () => {
       this.setConnectionState(false);
       if (this.destroyed) return;
-      setTimeout(() => this.connect(), this.retryDelay);
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, this.retryDelay);
       this.retryDelay = Math.min(this.retryDelay * 2, this.maxDelay);
     };
   }
 
   subscribe(channels: string[]) {
     this.channels = [...new Set([...this.channels, ...channels])];
+    const unique = [...new Set(channels)];
+    if (unique.length > 0 && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ action: 'subscribe', channels: unique }));
+    }
+  }
+
+  /**
+   * The server treats unsubscribe as clearing every channel on this socket.
+   * Shared consumers call this before subscribing the current aggregate.
+   */
+  unsubscribe() {
+    this.channels = [];
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ action: 'subscribe', channels }));
+      this.ws.send(JSON.stringify({ action: 'unsubscribe' }));
     }
   }
 
@@ -93,6 +110,10 @@ export class WsClient {
     };
   }
 
+  isConnected() {
+    return this.connected;
+  }
+
   private setConnectionState(connected: boolean) {
     if (this.connected === connected) return;
     this.connected = connected;
@@ -101,6 +122,10 @@ export class WsClient {
 
   close() {
     this.destroyed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.setConnectionState(false);
     this.ws?.close();
     this.ws = null;

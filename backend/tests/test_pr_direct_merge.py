@@ -10,7 +10,10 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.services.pr_review_service import GhError
-from backend.services.pr_direct_merge import reconcile_direct_merge_action
+from backend.services.pr_direct_merge import (
+    _remote_state,
+    reconcile_direct_merge_action,
+)
 
 
 BASE_SHA = "a" * 40
@@ -142,6 +145,70 @@ async def test_direct_merge_ci_failure_is_terminal_and_explains_gate(
         "direct_merge_remote_absence_proven:"
     )
     assert refreshed_run.status == "ready_to_merge"
+
+
+@pytest.mark.asyncio
+async def test_direct_merge_base_advance_is_not_subject_change():
+    with patch(
+        "backend.services.pr_review_service._gh_pr_view",
+        new=AsyncMock(return_value={
+            "state": "OPEN",
+            "isDraft": False,
+            "baseRefName": "main",
+            "baseRefOid": "c" * 40,
+            "headRefOid": HEAD_SHA,
+            "mergedAt": None,
+            "mergedBy": None,
+            "mergeCommit": None,
+        }),
+    ):
+        assert await _remote_state(
+            repo_name="owner/direct-merge",
+            pr_number=7,
+            base_ref="main",
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+            nonce="n" * 48,
+            actor="ccm-bot",
+            publishing_started_at=datetime(2026, 8, 27),
+            merge_method="fast-forward",
+        ) == "open_exact"
+
+
+@pytest.mark.asyncio
+async def test_direct_merge_diverged_base_requests_branch_update(
+    db_session, db_factory,
+):
+    _repo, run, _review, action = await _seed_direct_action(db_session)
+
+    with (
+        patch(
+            "backend.services.pr_direct_merge._remote_state",
+            new=AsyncMock(return_value="open_exact"),
+        ),
+        patch(
+            "backend.services.pr_review_service._publish_direct_merge",
+            new=AsyncMock(side_effect=GhError(
+                "GitHub PR base ancestry is unsafe for direct auto-merge"
+            )),
+        ),
+    ):
+        assert not await reconcile_direct_merge_action(db_factory, action.id)
+
+    refreshed_action = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed_action is not None
+    assert refreshed_run is not None
+    assert refreshed_action.status == "failed"
+    assert refreshed_action.last_error.startswith(
+        "direct_merge_remote_absence_proven:"
+    )
+    assert refreshed_run.status == "paused"
+    assert refreshed_run.pause_reason == "direct_merge_base_update_required"
 
 
 @pytest.mark.asyncio

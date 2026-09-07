@@ -298,6 +298,10 @@ class GhRepositoryCapabilityError(GhError):
     """A deterministic repository policy/schema rejection, not transport."""
 
 
+class PRBranchUpdateConflict(GhError):
+    """GitHub cannot update the exact PR head selected by the operator."""
+
+
 def _direct_ref_capability_error(detail: str) -> GhRepositoryCapabilityError:
     return GhRepositoryCapabilityError(
         f"GitHub repository direct-ref capability is unsafe: {detail}"
@@ -979,10 +983,30 @@ async def _fetch_immutable_compare_patch(
     if "\x00" in diff_text:
         raise GhError("GitHub PR patch contains a NUL byte")
     patch_commit_shas = _PATCH_COMMIT_HEADER_RE.findall(diff_text)
-    if (
-        not patch_commit_shas
-        or patch_commit_shas[-1].lower() != head_sha
-    ):
+    patch_head_sha = (
+        patch_commit_shas[-1].lower() if patch_commit_shas else None
+    )
+    # GitHub's compare JSON includes the merge commit created by
+    # update-branch, while its mbox patch omits that commit because the commit
+    # contributes no additional file diff. Accept only the exact two-parent
+    # shape joining the patch's last commit to the captured base.
+    head_commit = commits[-1]
+    head_parents = head_commit.get("parents")
+    merge_head_omitted = bool(
+        patch_head_sha is not None
+        and patch_head_sha != head_sha
+        and isinstance(head_parents, list)
+        and len(head_parents) == 2
+        and all(
+            isinstance(parent, dict)
+            and isinstance(parent.get("sha"), str)
+            and _GITHUB_SHA_RE.fullmatch(parent["sha"].lower()) is not None
+            for parent in head_parents
+        )
+        and {parent["sha"].lower() for parent in head_parents}
+        == {patch_head_sha, base_sha}
+    )
+    if patch_head_sha != head_sha and not merge_head_omitted:
         raise GhError(
             "immutable GitHub patch identity does not match captured head"
         )
@@ -1392,6 +1416,96 @@ async def _gh_pr_view(pr_number: int, repo_full_name: str) -> dict:
         return json.loads(stdout.decode())
     except Exception as e:
         raise GhError(f"invalid gh output: {e}") from e
+
+
+async def update_pr_branch(
+    *,
+    repo_name: str,
+    pr_number: int,
+    base_ref: str,
+    expected_base_sha: str,
+    expected_head_sha: str,
+) -> dict[str, str | None]:
+    """Ask GitHub to merge the current base into one exact PR head.
+
+    The REST ``update-branch`` mutation is deliberately guarded by a fresh
+    PR snapshot.  This prevents a stale UI click from updating a newer head,
+    and keeps the operation independent of each repository's GitHub UI
+    preference for suggesting branch updates.  The base SHA may be unchanged
+    from the reviewed snapshot: a PR can already be diverged from that base,
+    so ancestry still needs to be repaired even when the base branch itself
+    has not advanced.
+    """
+
+    if (
+        not _GITHUB_REPO_RE.fullmatch(repo_name)
+        or type(pr_number) is not int
+        or pr_number <= 0
+        or not _valid_base_ref(base_ref)
+        or not isinstance(expected_base_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(expected_base_sha.lower()) is None
+        or not isinstance(expected_head_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(expected_head_sha.lower()) is None
+    ):
+        raise ValueError("invalid PR branch update identifiers")
+    # The reviewed base SHA is validated as part of the request identity, but
+    # the fresh base is intentionally allowed to be equal or newer.
+    expected_head_sha = expected_head_sha.lower()
+    snapshot = _validated_pr_snapshot(await _gh_pr_view(pr_number, repo_name))
+    if snapshot["state"] != "OPEN" or snapshot["is_draft"]:
+        raise PRBranchUpdateConflict("PR is no longer open")
+    if snapshot["base_ref"] != base_ref:
+        raise PRBranchUpdateConflict("PR base branch changed")
+    if snapshot["head_sha"] != expected_head_sha:
+        raise PRBranchUpdateConflict(
+            "PR head changed; refresh the Monitor before updating its branch"
+        )
+    encoded_repo = quote(repo_name, safe="/")
+    try:
+        response = await _gh_api_json(
+            f"repos/{encoded_repo}/pulls/{pr_number}/update-branch",
+            method="PUT",
+            payload={
+                "expected_head_sha": expected_head_sha,
+                "update_method": "merge",
+            },
+            max_output_bytes=_MAX_GH_PR_VIEW_RESPONSE_BYTES,
+        )
+    except GhError as exc:
+        # A concurrent synchronize can win between the snapshot and PUT. A
+        # second read turns that race into a deterministic conflict while
+        # preserving unknown transport failures as retryable errors.
+        try:
+            current = _validated_pr_snapshot(await _gh_pr_view(pr_number, repo_name))
+        except Exception:
+            raise exc
+        if (
+            current["state"] != "OPEN"
+            or current["base_ref"] != base_ref
+            or current["head_sha"] != expected_head_sha
+        ):
+            raise PRBranchUpdateConflict(
+                "PR changed while updating its branch; refresh the Monitor"
+            ) from exc
+        raise
+    response_message = response.get("message")
+    response_url = response.get("url")
+    expected_urls = {
+        f"https://github.com/{repo_name}/pull/{pr_number}",
+        f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}",
+    }
+    if (
+        not isinstance(response_message, str)
+        or not response_message.strip()
+        or not isinstance(response_url, str)
+        or response_url.rstrip("/") not in expected_urls
+    ):
+        raise GhError("GitHub update-branch acknowledgement is malformed")
+    return {
+        "message": response_message.strip(),
+        "sha": None,
+        "ref": base_ref,
+    }
 
 
 def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:
@@ -7652,9 +7766,19 @@ async def recover_incomplete_pr_reviews(
     )
 
     terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
-    from backend.api.pr_monitor import reconcile_remote_pr_lifecycles
+    from backend.api.pr_monitor import (
+        reconcile_missed_pr_synchronizes,
+        reconcile_remote_pr_lifecycles,
+        reconcile_requested_branch_updates,
+    )
 
+    missed_synchronizes_reconciled = await reconcile_missed_pr_synchronizes(
+        db_factory
+    )
     remote_lifecycles_reconciled = await reconcile_remote_pr_lifecycles(
+        db_factory
+    )
+    branch_updates_reconciled = await reconcile_requested_branch_updates(
         db_factory
     )
     repair_queued = await reconcile_repair_wakes(db_factory, dispatcher)
@@ -7697,7 +7821,9 @@ async def recover_incomplete_pr_reviews(
     return (
         recovered + action_recovered + panel_recovered
         + cancelled_reviewers_reconciled + ci_started
-        + terminal_runs_reconciled + remote_lifecycles_reconciled + repair_queued
+        + terminal_runs_reconciled + missed_synchronizes_reconciled
+        + remote_lifecycles_reconciled
+        + branch_updates_reconciled + repair_queued
         + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
         + finding_actions_recovered

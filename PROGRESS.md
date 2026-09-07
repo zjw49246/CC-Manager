@@ -4,6 +4,32 @@
 
 ## 已完成功能
 
+### 2026-09-05：修复 PTY pretrust 错库导致的新项目启动卡死（生产 Task 752）
+
+- [x] 生产取证：Task 752（默认账号 `~/.claude`、全新项目 cwd）PTY 启动后 pty-bridge channel server 15 次注入全部 Connection refused，30 秒后盲降级 stdin 粘贴，Claude 0.5 秒内 exit_code=1，dispatcher 以「provider turn failed after crossing its external-effect boundary; exact turn selected transport claude_pty」fail closed。dispatcher 侧 fail-closed 判定符合设计，不改。
+- [x] 根因在 claude-pty：`_pretrust_workdir` 对任何非空 `config_dir` 写 `<config_dir>/.claude.json`，而 `build_clean_env` 对等于默认 `~/.claude` 的 config_dir 不导出 `CLAUDE_CONFIG_DIR`，CC 实际读 `$HOME/.claude.json`——trust 条目与 pty-bridge MCP 预批准写进了 CC 不读的文件，新项目首启必弹 trust/MCP 对话框，MCP 不加载、channel server 永远起不来。
+- [x] PTY 修复（commit `a259aaf`）：`_env.claude_json_path` 与 spawn env 共用同一 CLAUDE_CONFIG_DIR 判定；drain loop 常开输出尾部缓冲并在进程死亡时记录最后屏幕内容；channel 全部拒连且屏幕仍停在启动对话框时拒绝 stdin 盲降级（pre-delivery `SessionError`，prompt 未送达可安全重试）。本仓库级联 bump uv.lock 至 `a259aaf5`。
+- [x] 验证：PTY 单元套件 225 passed；11 个真实 Claude 集成失败与未修改 main 基线完全一致（沙箱禁写 $HOME/真实登录环境所致）。CCM `test_service_instance_manager.py + test_native_sub_agents.py` 592 passed，唯一失败 `test_cloudrouter_claude_pty_projects_direct_auth_for_model_only` 在旧 pin 下同样复现，属既有基线。生产（8002/ccm-b 与 8000）需 `./scripts/refresh_pty.sh` + 重启后生效——重启时机待用户确认。
+
+### 2026-09-05：补齐 GPT-6 Astra 模型请求配置
+
+- [x] `gpt-6-astra` 原先缺少模型目录、推理档位和 Fast 能力，导致界面不可选且 `max/ultra` 降为 `xhigh`；已按 Codex `model/list` 实测结果登记 `low..ultra` 与 `priority`，默认模型仍为 `gpt-5.6-sol`。实现提交：`b4d224fc`。
+- [x] 验证模型目录、API 下发/创建、exec 新建/续接和 app-server Standard/Fast 请求：后端专项 `52 passed`，前端 TaskForm `49 passed, 7 skipped`，TypeScript `--noEmit` 与项目构建类型检查通过；最终目录回归 `23 passed`。没有发送计费推理请求。
+- [x] 整库前后复核均在 `698 passed` 后因既有 `test_shared_pr_review_chat_waits_for_terminal_owner_state` 未抛出预期 HTTPException 停止（`--maxfail=1`），未宣称整库全绿。后续新增模型需同时维护模型选项、effort、tier 和真实请求测试；自定义 `CODEX_MODEL_OPTIONS` 的部署需同步添加 ID。
+
+### 2026-09-04：修复 queue-operation 通知遗漏导致的后台状态卡死
+
+- [x] 生产 Task 501 取证确认：3 个 native Agent 的持久行均已终态，但其中一个完成通知只存在于 Claude `queue-operation` journal，PTY tracker 未收到普通 `<task-notification>`，使 `background_active` 永久残留。
+- [x] CCM 现在按持久镜像中的精确 `tool_use_id` 调用 PTY reconciliation API；只有已证明终态的 tracker 项会被移除，仍为 `running` 的 sibling 保持 fail closed。
+- [x] watcher 即使没有 `turn_duration` 也会主动尝试持久终态 reconciliation；该完成证据在新的 autonomous turn 开始时清零，不能跨轮误用。CCM 实现提交 `bdd42f55`，PTY 实现提交 `da9de45`。
+- [x] 验证：PTY 非真实账号套件 `211 passed`；CCM PTY/native 生命周期矩阵 `689 passed`；新增场景 `4 passed`；前端 TypeScript + production build（4771 modules）通过。PTY 的 8 个真实 Claude 集成失败均为环境中既有 OAuth token revoked；CCM 整库基线的 96 个失败集中在未配置 `AUTH_TOKEN`、固定运行时配置与既有隔离基线，不涉及本次相关套件。
+
+### 2026-09-02：修复 Claude 隐式异步原生子 Agent 提前完成
+
+- [x] PTY 结构化读取 `toolUseResult.isAsync/status=async_launched/agentId`；即使 Agent 输入未声明 `run_in_background`，启动回执也保持 `running`，直到匹配的 `<task-notification>` 才完成并保留 transcript summary/report。
+- [x] CCM 增加真实 JSONL→DB 全链路回归，验证 active 子 Agent 计数、running/completed report 与最终 summary；相关测试 `111 passed`，开发服务使用 PTY `4d7c819`。
+- [x] CCM 实现提交：`723401a8`；PTY 上游实现与文档提交：`2d6e5b1`、`4d7c819`。
+
 ### 2026-08-18：一键更新 SQLite 快照提速
 
 - [x] 权威 Alembic revision 已是最新时不再生成数据库回滚快照；有待迁移项时只预留路径，由停服后的外部 worker 生成一次权威快照，取消会被立即覆盖的在线全量备份。
@@ -1256,3 +1282,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **评审跟进（PR #141 Reviewer Panel，同分支第二个 commit）**：① SSH clone 在无 `GIT_SSH_COMMAND` 时也强制 batch mode（SSH 会绕过 stdin 直开 /dev/tty，仅 `stdin=DEVNULL`+`GIT_TERMINAL_PROMPT=0` 挡不住交互）——无配置用默认 `ssh -o BatchMode=yes`，有配置则增补；② `ready` 提交改为 clone 的最终发布：Delivery Monitor 自动配置移到 ready 之后并隔离异常（失败只记日志，绝不翻回 error），`_wake_dispatcher` 挪到全部后置步骤之后，杜绝「任务已被领走、项目又被后置失败翻成 error」的窗口；③ PUT 只在 project 归属真正变更时做 error 项目门禁，全量表单带原 project_id 的编辑不再 422；④ Panel 的 HIGH finding（Codex reservation 早期泄漏）经代码核实不成立——`_launch_locked` 只经 `_launch_impl` 调用，reserve 后任何异常都落入其 BaseException 分支的 provider 无关 discard（instance_manager.py:3479-3486）——但按 QA 要求补了三个确定性回归测试锁死该协议（pre-spawn 窗口跳过清理 / adopt 交接 / 失败 discard）。教训：安全兜底要按「最弱前提」设计，不能假设某个环境变量一定存在；成功状态一经发布就必须不可逆，可选后置步骤的失败域要显式隔离。
 
 - **评审跟进（PR #141 Reviewer Panel 第三轮，同分支第四个 commit）**：clone 失败注记 `_sync_waiting_task_clone_notes` 的写入侧此前无条件覆盖等待任务的 `error_message`，会冲掉任务已有的独立启动/校验诊断且不可恢复——与清除侧的 prefix-only 守卫不对称。修复：写入侧补对称守卫，只对 `error_message` 为 NULL/空串或已带本 helper 前缀（`Project clone failed: `）的任务写注记；清除逻辑不变。红绿验证：`test_clone_note_annotation_preserves_foreign_error_messages`（独立错误保留 / 空任务收到注记 / 旧注记可更新 / 成功清除后独立错误仍在）在未打补丁时确实失败。教训：成对的写入/清除逻辑必须共享同一识别谓词，只给一侧加守卫等于没有守卫。
+
+## 2026-08-31 — 主会话继续、PR Merge 分支更新与运行围栏收口（commit：本提交）
+
+- **主会话边界**：Claude PTY 主回复已结束但 Task 投影仍显示 executing 时，注入 API 会返回精确的 no-active-turn 409。前端只对这一种拒绝保留原消息、附件和 Plan 并转入普通队列，同时退出注入模式；其他 409/不确定 ACK 继续 fail closed，禁止盲目重放。补充 PTY fatal provider error + clean exit 的终态回归，避免超时被误记成功。
+- **PR direct merge**：远端 base SHA 前进不再被误判为 PR subject 变化；exact head 的 captured-base ancestry 仍由 publisher 验证。若新 base 已分叉、不能 non-force fast-forward，Run 进入 `direct_merge_base_update_required`，页面显示 `Branch update required` 和 GitHub 入口，隐藏原始内部错误与无效 Merge，等待 PR 新 head 触发重审。
+- **SSH 与停服安全**：Task 可用性每次重新执行私钥普通文件/权限/格式/公钥指纹 preflight；损坏 Profile 从可授权列表移除，已有 grant 统一标记 `profile_key_unusable`，普通 Admin 主会话不受影响。新增 systemd guarded entrypoint 和轻量 blocker API，只有实时证明无活动工作或 deployment lease 证明受控 handoff 时才向真实服务进程组转发 SIGTERM。
+- **验证**：后端核心矩阵 `89 passed`；所有受新 SSH preflight 影响的 InstanceManager 精确用例 `13 passed`（其中一个 AF_UNIX 路径长度环境失败以 `TMPDIR=/tmp` 重跑通过）。前端 Chat/PR Monitor `168 passed`，ESLint 0 errors（3 个既有 Hook warnings），TypeScript + Vite production build（4770 modules）通过；`git diff --check` 通过。代码仅推送仓库，未重启或部署生产服务。

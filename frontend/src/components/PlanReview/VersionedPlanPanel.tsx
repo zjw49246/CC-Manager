@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 
 import { api, type PlanResource } from '../../api/client';
 import { useDialogA11y } from '../../hooks/useDialogA11y';
 import { ChevronRight } from '../icons';
 import { PlanDetail } from './PlanDetail';
 import { usePlanEvents } from './usePlanEvents';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 
 interface Props {
   onVisibilityChange?: (visible: boolean) => void;
@@ -38,14 +39,7 @@ export function VersionedPlanPanel({ onVisibilityChange, onNavigateTask }: Props
     }
   }, [onVisibilityChange]);
 
-  useEffect(() => {
-    const initial = window.setTimeout(() => void refresh(), 0);
-    const timer = window.setInterval(() => void refresh(), 15000);
-    return () => {
-      window.clearTimeout(initial);
-      window.clearInterval(timer);
-    };
-  }, [refresh]);
+  useVisibilityAwareInterval(() => refresh(), 15000);
   usePlanEvents(plans, refresh);
   const selected = plans.find((plan) => plan.id === selectedId) || null;
   if (plans.length === 0 && !error) return null;

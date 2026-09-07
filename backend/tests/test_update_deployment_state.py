@@ -1031,6 +1031,7 @@ async def test_external_database_can_use_same_commit_restart(tmp_path):
     assert service._current is not None
     assert service._current.old_commit == service.running_commit
     assert service._current.new_commit == service.running_commit
+    assert service._current.steps[4].status == "pending"
     create_task.assert_called_once()
     create_task.call_args.args[0].close()
 

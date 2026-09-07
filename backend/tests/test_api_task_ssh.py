@@ -489,6 +489,44 @@ async def test_task_ssh_execute_fails_closed_after_profile_revision_change(
 
 
 @pytest.mark.asyncio
+async def test_grant_snapshot_rejects_unusable_managed_key(
+    client,
+    db_session,
+    tmp_path,
+):
+    profile_id, managed_key = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Detect a removed managed key",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["exec"]}],
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    # Simulate an operator or filesystem repair replacing the key with an
+    # unsafe object after the grant was saved. ``last_test_ok`` and revision
+    # remain unchanged, but the next snapshot must match execution preflight.
+    managed_key.unlink()
+    managed_key.mkdir()
+
+    snapshot = await client.get(f"/api/tasks/{task_id}/ssh-grants")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()[0]["valid"] is False
+    assert snapshot.json()[0]["invalid_reason"] == "profile_key_unusable"
+
+    task = await db_session.get(Task, task_id)
+    policy = await task_ssh_runtime_policy(db_session, task)
+    assert policy.broker_only is True
+    assert policy.capabilities == frozenset()
+
+    denied = await client.post(
+        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+        json={"effect_id": _effect_id(88), "command": "hostname"},
+    )
+    assert denied.status_code == 409
+    assert "profile_key_unusable" in denied.text
+
+
+@pytest.mark.asyncio
 async def test_task_ssh_execute_requires_explicit_exec_capability(
     client,
     tmp_path,

@@ -140,8 +140,9 @@ def test_generate_mcp_config_empty_skills_still_includes_ccm_skills():
     path.unlink(missing_ok=True)
 
 
-def test_generate_mcp_config_skills_do_not_add_extra_servers():
+def test_generate_mcp_config_skills_do_not_add_extra_servers(monkeypatch):
     """普通 skill 不增加服务；固定的 Task 工具服务保持存在。"""
+    monkeypatch.setattr(settings, "auth_token", "test-token")
     path = generate_mcp_config(
         1,
         {"worker": True, "monitor": True},
@@ -338,6 +339,122 @@ def test_ordinary_task_adds_repeatable_frontend_review_server(monkeypatch):
         "test_git_target",
         "compare_test_runs",
     )
+
+
+def test_persistent_task_mcp_credentials_bind_only_to_incarnation(monkeypatch):
+    """Hot Claude PTY children keep one token while endpoints re-read Task state."""
+
+    monkeypatch.setattr(settings, "auth_token", "persistent-test-secret")
+    specs = build_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+        task_incarnation_id=TASK_INCARNATION,
+        persistent_session=True,
+        **TASK_ACTIVE_GENERATION,
+    )
+    for spec in specs:
+        token = dict(spec.env).get("CCM_INTERNAL_SERVICE_TOKEN")
+        assert token
+        claims = internal_service_auth.authenticate_internal_service_token(
+            token,
+            method=(
+                "POST"
+                if spec.name == "ccm_skills"
+                else "GET"
+            ),
+            path=(
+                "/api/tasks/73/internal/skill-tools"
+                if spec.name == "ccm_skills"
+                else "/api/tasks/73/test-runs/capabilities"
+            ),
+        )
+        assert claims.owner_kind == "task-session"
+        assert claims.task_incarnation_id == TASK_INCARNATION
+        assert claims.task_retry_count is None
+        assert claims.task_turn_generation is None
+        assert claims.task_status is None
+
+
+def test_persistent_task_mcp_requires_active_launch_status():
+    with pytest.raises(ValueError, match="active Task status"):
+        build_mcp_server_specs(
+            73,
+            api_base="http://127.0.0.1:8795",
+            task_incarnation_id=TASK_INCARNATION,
+            persistent_session=True,
+            task_retry_count=3,
+            task_turn_generation=8,
+            task_status="completed",
+        )
+
+
+def test_persistent_ssh_mcp_credentials_bind_only_to_incarnation(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "persistent-test-secret")
+    (spec,) = build_task_ssh_mcp_server_specs(
+        73,
+        capabilities=("exec",),
+        task_incarnation_id=TASK_INCARNATION,
+        persistent_session=True,
+        **TASK_ACTIVE_GENERATION,
+    )
+    token = dict(spec.env)["CCM_INTERNAL_SERVICE_TOKEN"]
+    claims = internal_service_auth.authenticate_internal_service_token(
+        token,
+        method="GET",
+        path="/api/tasks/73/ssh-access",
+    )
+    assert claims.owner_kind == "task-session"
+    assert claims.task_incarnation_id == TASK_INCARNATION
+    assert claims.task_retry_count is None
+    assert claims.task_turn_generation is None
+    assert claims.task_status is None
+
+
+def test_persistent_mcp_config_is_stable_across_visible_turns(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "persistent-test-secret")
+    try:
+        first = generate_mcp_config(
+            74,
+            api_base="http://127.0.0.1:8795",
+            task_incarnation_id=TASK_INCARNATION,
+            task_retry_count=2,
+            task_turn_generation=8,
+            task_status="executing",
+            persistent_session=True,
+        ).read_bytes()
+        second = generate_mcp_config(
+            74,
+            api_base="http://127.0.0.1:8795",
+            task_incarnation_id=TASK_INCARNATION,
+            task_retry_count=2,
+            task_turn_generation=9,
+            task_status="in_progress",
+            persistent_session=True,
+        ).read_bytes()
+        assert second == first
+    finally:
+        cleanup_mcp_config(74)
+
+
+def test_cleanup_revokes_persistent_task_session_credential(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "persistent-test-secret")
+    (spec,) = build_task_ssh_mcp_server_specs(
+        75,
+        task_incarnation_id=TASK_INCARNATION,
+        persistent_session=True,
+        **TASK_ACTIVE_GENERATION,
+    )
+    token = dict(spec.env)["CCM_INTERNAL_SERVICE_TOKEN"]
+    cleanup_mcp_config(75)
+    with pytest.raises(
+        internal_service_auth.InternalServiceTokenError,
+        match="revoked",
+    ):
+        internal_service_auth.authenticate_internal_service_token(
+            token,
+            method="GET",
+            path="/api/tasks/75/ssh-access",
+        )
 
 
 def test_generate_mcp_config_monitor_enabled():

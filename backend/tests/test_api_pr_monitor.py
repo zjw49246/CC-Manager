@@ -5625,6 +5625,329 @@ async def test_ready_run_manual_merge_persists_user_trigger(
 
 
 @pytest.mark.asyncio
+async def test_paused_base_update_calls_github_update_branch(client, session_factory):
+    repo = await _create_repo(client, "owner/branch-update")
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=140,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict="pass",
+        publication_state="published",
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        run = await db.get(PRMonitorRun, run_id)
+        assert review is not None and run is not None
+        review.action_taken = "lgtm_comment"
+        run.pause_reason = "direct_merge_base_update_required"
+        await db.commit()
+
+    with patch.object(
+        pr_review_service,
+        "update_pr_branch",
+        new=AsyncMock(return_value={"message": "ok", "sha": HEAD_SHA_2, "ref": None}),
+    ) as update, patch.object(
+        pr_review_service,
+        "_freeze_safe_merge_method",
+        new=AsyncMock(return_value="fast-forward"),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/update-branch",
+            json={"expected_head_sha": HEAD_SHA_1},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "accepted"
+    update.assert_awaited_once()
+    assert update.await_args.kwargs["expected_base_sha"] == BASE_SHA_1
+    assert update.await_args.kwargs["expected_head_sha"] == HEAD_SHA_1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_head_sha", "expected_status"),
+    (
+        pytest.param(HEAD_SHA_1, 200, id="exact-legacy-evidence"),
+        pytest.param(HEAD_SHA_2, 409, id="different-action-head"),
+    ),
+)
+async def test_paused_base_update_recognizes_only_exact_legacy_evidence(
+    client,
+    session_factory,
+    action_head_sha,
+    expected_status,
+):
+    repo = await _create_repo(
+        client,
+        f"owner/legacy-branch-update-{expected_status}",
+    )
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=142,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict=None,
+        publication_state="published",
+        reviewers=(
+            ("passed", "pass", None),
+            ("passed", "pass", None),
+            ("passed", "pass", None),
+        ),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        run = await db.get(PRMonitorRun, run_id)
+        assert review is not None and run is not None
+        review.action_taken = "lgtm_comment"
+        run.pause_reason = "direct_merge_subject_changed"
+        db.add(
+            PRMergeQueueAction(
+                monitor_run_id=run_id,
+                review_id=review_id,
+                trigger_base_sha=BASE_SHA_1,
+                trigger_head_sha=action_head_sha,
+                status="failed",
+                effect_kind="direct",
+                trigger_kind="manual",
+                action_nonce="a" * 48,
+                attempt_count=1,
+                last_error=(
+                    "direct_merge_remote_absence_proven:GhError:"
+                    "GitHub PR base ancestry is unsafe for direct auto-merge"
+                ),
+                completed_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+
+    with patch.object(
+        pr_review_service,
+        "update_pr_branch",
+        new=AsyncMock(
+            return_value={"message": "ok", "sha": HEAD_SHA_2, "ref": None}
+        ),
+    ) as update, patch.object(
+        pr_review_service,
+        "_freeze_safe_merge_method",
+        new=AsyncMock(return_value="fast-forward"),
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/update-branch",
+            json={"expected_head_sha": HEAD_SHA_1},
+        )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 200:
+        update.assert_awaited_once()
+        async with session_factory() as db:
+            stored_run = await db.get(PRMonitorRun, run_id)
+            assert stored_run is not None
+            assert stored_run.pause_reason == "direct_merge_base_update_requested"
+    else:
+        update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_paused_base_update_rejects_stale_head(client, session_factory):
+    repo = await _create_repo(client, "owner/branch-update-stale")
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=141,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict="pass",
+        publication_state="published",
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run is not None
+        run.pause_reason = "direct_merge_base_update_required"
+        await db.commit()
+    with patch.object(pr_review_service, "update_pr_branch", new=AsyncMock()) as update:
+        response = await client.post(
+            f"/api/pr-monitor/runs/{run_id}/update-branch",
+            json={"expected_head_sha": HEAD_SHA_2},
+        )
+    assert response.status_code == 409, response.text
+    update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_head_sha", "expected_reconciled"),
+    (
+        pytest.param(HEAD_SHA_2, 1, id="remote-head-advanced"),
+        pytest.param(HEAD_SHA_1, 0, id="remote-head-unchanged"),
+    ),
+)
+async def test_requested_branch_update_recovery_delivers_exact_synchronize(
+    client,
+    session_factory,
+    remote_head_sha,
+    expected_reconciled,
+):
+    from backend.api import pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        f"owner/branch-update-recovery-{expected_reconciled}",
+    )
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=145,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="paused",
+        code_verdict="pass",
+        publication_state="published",
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run is not None
+        run.pause_reason = "direct_merge_base_update_requested"
+        run.updated_at = datetime.utcnow() - timedelta(minutes=1)
+        await db.commit()
+
+    remote = {
+        "number": 145,
+        "state": "open",
+        "draft": False,
+        "title": "Updated branch",
+        "html_url": (
+            f"https://github.com/{repo['repo_full_name']}/pull/145"
+        ),
+        "user": {"login": "alice"},
+        "base": {"ref": "main", "sha": BASE_SHA_2},
+        "head": {
+            "ref": "feature/update",
+            "sha": remote_head_sha,
+            "repo": {"full_name": "fork-owner/result"},
+        },
+    }
+    post = AsyncMock(return_value=SimpleNamespace(status_code=200))
+    fake_http_client = SimpleNamespace(post=post)
+    with patch.object(
+        pr_review_service,
+        "_gh_api_json",
+        new=AsyncMock(return_value=remote),
+    ), patch(
+        "backend.services.internal_api_endpoint.resolve_internal_api_base",
+        return_value="http://manager.test:8123",
+    ):
+        reconciled = await pr_monitor_api.reconcile_requested_branch_updates(
+            session_factory,
+            http_client=fake_http_client,
+        )
+
+    assert reconciled == expected_reconciled
+    if expected_reconciled == 0:
+        post.assert_not_awaited()
+        return
+    post.assert_awaited_once()
+    call_kwargs = post.await_args.kwargs
+    assert post.await_args.args == (
+        "http://manager.test:8123/api/github/webhook",
+    )
+    body = call_kwargs["content"]
+    payload = json.loads(body)
+    assert payload["action"] == "synchronize"
+    assert payload["pull_request"]["head"]["sha"] == HEAD_SHA_2
+    assert payload["pull_request"]["base"]["sha"] == BASE_SHA_2
+    assert call_kwargs["headers"]["X-Hub-Signature-256"] == _sign(
+        repo["webhook_secret"],
+        body,
+    )
+    assert call_kwargs["headers"]["X-GitHub-Delivery"].startswith(
+        "ccm-branch-update-"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missed_synchronize_recovery_reviews_new_head_after_comments(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A lost synchronize delivery must not leave a commented head stuck."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/missed-synchronize")
+    old_review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=146,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run is not None
+        run.updated_at = datetime.utcnow() - timedelta(minutes=1)
+        await db.commit()
+
+    remote = {
+        "number": 146,
+        "state": "open",
+        "draft": False,
+        "title": "Fix after review comments",
+        "html_url": f"https://github.com/{repo['repo_full_name']}/pull/146",
+        "user": {"login": "alice"},
+        "base": {"ref": "main", "sha": BASE_SHA_1},
+        "head": {
+            "ref": "feature/result-146",
+            "sha": HEAD_SHA_2,
+            "repo": {"full_name": repo["repo_full_name"]},
+        },
+    }
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_api_json",
+        AsyncMock(return_value=remote),
+    )
+    monkeypatch.setattr(
+        "backend.services.internal_api_endpoint.resolve_internal_api_base",
+        lambda: "http://test",
+    )
+
+    reconciled = await pr_monitor_api.reconcile_missed_pr_synchronizes(
+        session_factory,
+        http_client=client,
+    )
+
+    assert reconciled == 1
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        reviews = list((await db.execute(
+            select(PRReview).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 146,
+            ).order_by(PRReview.id)
+        )).scalars())
+        run = await db.get(PRMonitorRun, run_id)
+        assert old_review is not None and run is not None
+        # The old comment remains an immutable historical result; the Run now
+        # points at a fresh review for the newly pushed head.
+        assert old_review.status == "commented"
+        assert len(reviews) == 2
+        assert reviews[-1].head_sha == HEAD_SHA_2
+        assert reviews[-1].status == "reviewing"
+        assert run.current_review_id == reviews[-1].id
+        assert run.current_head_sha == HEAD_SHA_2
+
+
+@pytest.mark.asyncio
 async def test_webhook_synchronize_persists_recovery_intent_before_cleanup(
     client,
     session_factory,

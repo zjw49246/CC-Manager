@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import type {
   CodexLoginStatus,
   TeamUser,
@@ -1097,16 +1098,13 @@ export default function WorkersPage() {
     }
   }, [isAdmin]);
 
-  useEffect(() => {
-    load();
-    // WebSocket is primary; this slow poll only covers disconnects or lost events.
-    const timer = setInterval(load, 30000);
-    return () => clearInterval(timer);
-  }, [load]);
-
-  useWebSocket(['workers'], (message) => {
+  const workerWs = useWebSocket(['workers'], (message) => {
     if (message.channel === 'workers') load();
   });
+  const isConnected = workerWs?.isConnected ?? false;
+  // WebSocket is primary; this slow poll only covers disconnects or lost events.
+  useEffect(() => { void load(); }, [load]);
+  useVisibilityAwareInterval(load, isConnected ? 120000 : 30000, true, false);
 
   return (
     <div className="space-y-4">

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import { api } from '../../api/client';
 import type {
   DiscussionDetail,
@@ -7,6 +7,7 @@ import type {
   DiscussionEventItem,
 } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import {
   Send,
   ArrowLeft,
@@ -71,20 +72,11 @@ function countToolCalls(events: DiscussionEventItem[]): number {
   return events.filter((e) => e.event_type === 'tool_use').length;
 }
 
-function useIdleTime(events: DiscussionEventItem[], isRunning: boolean): string | null {
-  const [, setTick] = useState(0);
-
-  useEffect(() => {
-    if (isRunning || events.length === 0) return;
-    const interval = setInterval(() => setTick((t) => t + 1), 5000);
-    return () => clearInterval(interval);
-  }, [isRunning, events.length]);
-
-  if (isRunning || events.length === 0) return null;
-  const last = events[events.length - 1];
-  let ts = last.timestamp || '';
-  if (ts && !ts.endsWith('Z') && !ts.includes('+')) ts += 'Z';
-  const lastTime = ts ? new Date(ts).getTime() : 0;
+function formatIdleTime(timestamp: string | undefined, isRunning: boolean): string | null {
+  if (isRunning || !timestamp) return null;
+  let ts = timestamp;
+  if (!ts.endsWith('Z') && !ts.includes('+')) ts += 'Z';
+  const lastTime = new Date(ts).getTime();
   if (!lastTime) return null;
   const seconds = Math.floor((Date.now() - lastTime) / 1000);
   if (seconds < 10) return null;
@@ -92,6 +84,24 @@ function useIdleTime(events: DiscussionEventItem[], isRunning: boolean): string 
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   return `${Math.floor(seconds / 3600)}h`;
 }
+
+const IdleTimeBadge = memo(function IdleTimeBadge({ timestamp, isRunning }: {
+  timestamp?: string;
+  isRunning: boolean;
+}) {
+  const [, setTick] = useState(0);
+
+  // Keep the small clock active only while this tab is visible.
+  useVisibilityAwareInterval(() => setTick((t) => t + 1), 5000, !isRunning && Boolean(timestamp), false);
+
+  const idleTime = formatIdleTime(timestamp, isRunning);
+  if (!idleTime) return null;
+  return (
+    <span className="flex items-center gap-0.5 text-gray-600" title="Time since last output">
+      <Clock size={9} />{idleTime}
+    </span>
+  );
+});
 
 function formatToolInput(input: string): string {
   try {
@@ -571,7 +581,7 @@ function AgentTab({
 }) {
   const isRunning = agent.status === 'running';
   const toolCount = useMemo(() => countToolCalls(events), [events]);
-  const idleTime = useIdleTime(events, isRunning);
+  const lastEventTimestamp = events.length > 0 ? events[events.length - 1].timestamp : undefined;
 
   return (
     <button
@@ -582,7 +592,7 @@ function AgentTab({
           : `bg-gray-800 border-transparent text-gray-400 hover:text-gray-300 hover:bg-gray-750`
       }`}
     >
-      <div className={`w-1.5 h-1.5 rounded-full ${isRunning ? 'animate-pulse ' + color.dot : agent.status === 'idle' ? color.dot : 'bg-red-500'}`} />
+      <div className={`w-1.5 h-1.5 rounded-full ${isRunning ? color.dot : agent.status === 'idle' ? color.dot : 'bg-red-500'}`} />
       <span className="font-medium">{agent.role_name}</span>
       {isRunning && <Loader2 className="animate-spin" size={10} />}
       {toolCount > 0 && (
@@ -590,11 +600,7 @@ function AgentTab({
           <Wrench size={9} />{toolCount}
         </span>
       )}
-      {idleTime && (
-        <span className="flex items-center gap-0.5 text-gray-600" title="Time since last output">
-          <Clock size={9} />{idleTime}
-        </span>
-      )}
+      <IdleTimeBadge timestamp={lastEventTimestamp} isRunning={isRunning} />
     </button>
   );
 }

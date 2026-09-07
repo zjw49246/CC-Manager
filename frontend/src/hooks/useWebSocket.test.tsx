@@ -50,6 +50,24 @@ function ConnectionProbe({
   return <div>{isConnected ? 'online' : 'offline'}</div>;
 }
 
+function MessageProbe({ channels, onMessage }: { channels: string[]; onMessage: (message: Record<string, unknown>) => void }) {
+  useWebSocket(channels, onMessage);
+  return null;
+}
+
+function SharedMessageProbes({ showTasks, tasks, workers }: {
+  showTasks: boolean;
+  tasks: (message: Record<string, unknown>) => void;
+  workers: (message: Record<string, unknown>) => void;
+}) {
+  return (
+    <>
+      {showTasks && <MessageProbe key="tasks" channels={['tasks']} onMessage={tasks} />}
+      <MessageProbe key="workers" channels={['workers']} onMessage={workers} />
+    </>
+  );
+}
+
 describe('useWebSocket connection state', () => {
   beforeEach(() => {
     sockets = [];
@@ -108,5 +126,43 @@ describe('useWebSocket connection state', () => {
     }));
     expect(screen.getByText('online')).toBeInTheDocument();
     expect(onSubscribed).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares one socket and routes channel messages to matching consumers', () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const view = render(
+      <SharedMessageProbes showTasks tasks={first} workers={second} />,
+    );
+    expect(sockets).toHaveLength(1);
+    act(() => sockets[0].simulateOpen());
+    act(() => sockets[0].simulateMessage({ action: 'subscribed', channels: ['tasks', 'workers'] }));
+    act(() => sockets[0].simulateMessage({ channel: 'tasks', data: { event: 'task' } }));
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).not.toHaveBeenCalled();
+    view.unmount();
+    expect(sockets[0].readyState).toBe(3);
+  });
+
+  it('keeps the shared socket alive when one consumer unmounts', () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const view = render(
+      <SharedMessageProbes showTasks tasks={first} workers={second} />,
+    );
+    expect(sockets).toHaveLength(1);
+    act(() => sockets[0].simulateOpen());
+
+    view.rerender(<SharedMessageProbes showTasks={false} tasks={first} workers={second} />);
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].readyState).toBe(MockWebSocket.OPEN);
+
+    act(() => sockets[0].simulateMessage({ channel: 'tasks', data: {} }));
+    act(() => sockets[0].simulateMessage({ channel: 'workers', data: {} }));
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    expect(sockets[0].readyState).toBe(3);
   });
 });

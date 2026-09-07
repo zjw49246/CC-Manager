@@ -926,6 +926,18 @@ class UpdateService:
         state = self._current.to_dict() if self._current else {"status": "idle"}
         return {**state, **environment}
 
+    async def get_blockers(self) -> dict[str, Any]:
+        """Return the live runtime generations that a stop would interrupt.
+
+        The service-entrypoint shutdown guard uses this small, side-effect-free
+        endpoint before forwarding an external SIGTERM. Keep it separate from
+        ``get_status`` so the guard does not trigger Git/Alembic inspection or
+        cache an activity result while task admission is changing.
+        """
+
+        blockers = await self._get_blocking_tasks()
+        return self._blocker_payload(blockers)
+
     def _reconcile_external_terminal_status(self) -> None:
         """Consume only a result carrying the exact current lease token."""
         if not self._current or self._current.status != "restarting":
@@ -1737,11 +1749,42 @@ class UpdateService:
             version_result = await self._cached_version_check(target_branch, force=force)
         version_result.setdefault("channel", selected_channel)
         environment = await self._inspect_environment()
+        pty_status = await self._check_pty_update()
         active_tasks = await self._get_blocking_tasks()
         return {
             **version_result,
             **environment,
+            # A PTY git dependency is independent from the CCM checkout SHA;
+            # surface it as an update so the Update button does not incorrectly
+            # reduce this case to a restart/"already current" no-op.
+            "has_updates": bool(
+                version_result.get("has_updates")
+                or pty_status.get("pty_update_available")
+            ),
+            **pty_status,
             **self._blocker_payload(active_tasks),
+        }
+
+    async def _check_pty_update(self) -> dict[str, Any]:
+        """Report whether the independently pinned claude-pty has advanced."""
+        script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+        if not script.exists():
+            return {"pty_update_available": False}
+        result = await self._run_cmd(
+            ["bash", str(script), "--check"], timeout=30
+        )
+        if result["returncode"] != 0:
+            # A failed remote probe must not make the Update button claim that
+            # an update exists; the actual update path will report a precise
+            # error if it cannot refresh the dependency.
+            return {
+                "pty_update_available": False,
+                "pty_update_error": result["stderr"] or "无法检查 PTY 依赖",
+            }
+        return {
+            "pty_update_available": (
+                "CCM_PTY_REFRESH_CHANGED=1" in result["stdout"]
+            )
         }
 
     async def _configured_update_channel(self) -> str:
@@ -2215,7 +2258,11 @@ class UpdateService:
                     started_at=datetime.now(timezone.utc).isoformat(),
                     steps=[StepInfo(name=name) for name in STEP_NAMES],
                 )
-                for step in state.steps[:-1]:
+                for index, step in enumerate(state.steps[:-1]):
+                    # Keep refresh_pty pending so the restart-only path can
+                    # refresh the independently pinned git dependency.
+                    if index == 4:
+                        continue
                     step.status = "skipped"
                     step.message = "仅重启服务"
                 self._current = state
@@ -2708,13 +2755,63 @@ class UpdateService:
                     state, skip_frontend_build=skip_frontend_build
                 )
                 return
+            # The CCM commit can be unchanged while the independently pinned
+            # claude-pty git dependency has advanced.  Do not short-circuit
+            # this Update request before checking that dependency; a normal
+            # pre-start hook is skipped during controlled handoff, so without
+            # this check the new PTY code would remain unloaded indefinitely.
+            pty_changed = False
+            pty_step = state.steps[4]
+            pty_script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+            if pty_script.exists():
+                await self._start_step(pty_step)
+                result = await self._run_cmd(
+                    ["bash", str(pty_script)], timeout=120, step=pty_step
+                )
+                if result["returncode"] != 0:
+                    await self._fail_step(
+                        pty_step,
+                        state,
+                        f"refresh_pty.sh 失败: {result['stderr']}",
+                    )
+                    return
+                await self._complete_step(pty_step)
+                pty_changed = "CCM_PTY_REFRESH_CHANGED=1" in result["stdout"]
+            else:
+                pty_step.status = "skipped"
+                pty_step.message = "脚本不存在"
+                await self._broadcast_step(pty_step)
+            if pty_changed:
+                # The new package is now on disk but the running process still
+                # has the previous module loaded until a restart succeeds. Keep
+                # this deployment fenced as incomplete if shutdown admission
+                # is blocked or the handoff fails, so a later no-op Update
+                # cannot incorrectly declare the stale process healthy.
+                state.deployment_incomplete = True
+                self._update_deployment_lease(deployment_incomplete=True)
+                # There is no schema/code migration to perform in this path;
+                # mark the non-applicable stages explicitly and reuse the
+                # normal fenced restart handoff to load the new PTY module.
+                for index, step in enumerate(state.steps[1:], start=1):
+                    if index in {4, 9}:
+                        continue
+                    step.status = "skipped"
+                    step.message = "仅更新 PTY 依赖"
+                    await self._broadcast_step(step)
+                await self._fast_restart_path(state)
+                return
             step.message = (
                 "代码已是最新，服务可通过独立重启按钮重新加载"
             )
             await self._complete_step(step)
             state.status = "completed"
             state.completed_at = datetime.now(timezone.utc).isoformat()
-            for s in state.steps[1:]:
+            for index, s in enumerate(state.steps[1:], start=1):
+                # Keep the PTY check's completed/skipped result visible in the
+                # deployment history instead of overwriting it as a generic
+                # no-op step.
+                if index == 4:
+                    continue
                 s.status = "skipped"
             await self._broadcast(
                 "update_complete",
@@ -3347,7 +3444,36 @@ class UpdateService:
         *,
         restart_failure_policy: str = "rollback",
     ) -> bool:
-        """No migration: skip steps 8-9, do nohup restart for step 10."""
+        """Refresh restart-only dependencies, then do the no-migration restart.
+
+        ``claude-pty`` is a git dependency whose installed revision can move
+        independently of the CCM checkout.  Update pipelines already run
+        ``refresh_pty.sh`` before reaching this method, but restart-only
+        requests used to skip it entirely.  Keep the refresh inside the
+        deployment lease and before the shutdown handoff so a failed refresh
+        leaves the running service untouched.
+        """
+        if state.operation == "restart" and state.steps[4].status == "pending":
+            pty_step = state.steps[4]
+            await self._start_step(pty_step)
+            pty_script = Path(self.project_dir) / "scripts" / "refresh_pty.sh"
+            if pty_script.exists():
+                result = await self._run_cmd(
+                    ["bash", str(pty_script)], timeout=120, step=pty_step
+                )
+                if result["returncode"] != 0:
+                    await self._fail_step(
+                        pty_step,
+                        state,
+                        f"refresh_pty.sh 失败，已取消重启: {result['stderr']}",
+                    )
+                    return False
+                await self._complete_step(pty_step)
+            else:
+                pty_step.status = "skipped"
+                pty_step.message = "脚本不存在"
+                await self._broadcast_step(pty_step)
+
         state.steps[7].status = "skipped"
         state.steps[7].message = "无新迁移"
         state.steps[8].status = "skipped"
@@ -3600,10 +3726,14 @@ class UpdateService:
         state.status = "failed"
         state.error = message
         state.deployment_incomplete = bool(
-            state.new_commit
-            and state.old_commit
-            and state.new_commit != state.old_commit
-        ) or state.operation == "repair"
+            state.deployment_incomplete
+            or (
+                state.new_commit
+                and state.old_commit
+                and state.new_commit != state.old_commit
+            )
+            or state.operation == "repair"
+        )
         state.completed_at = datetime.now(timezone.utc).isoformat()
         self._write_status_file(
             "failed",

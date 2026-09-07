@@ -21,6 +21,7 @@ from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.schemas.task_ssh_grant import TaskSSHGrantInput
 from backend.services.skill_context import is_worker_managed_task_metadata
 from backend.services.ssh_key_store import SSHManagedKeyStore, SSHManagedKeyStoreError
+from backend.services.ssh_profiles import profile_key_is_usable
 
 
 class TaskSSHAccessError(ValueError):
@@ -584,6 +585,8 @@ def _invalid_reason(
         return "profile_task_access_disabled"
     if not _profile_uses_task_managed_key(profile):
         return "profile_key_not_managed"
+    if not profile_key_is_usable(profile):
+        return "profile_key_unusable"
     if not set(grant.capabilities or []).issubset(
         set(profile.task_capabilities or [])
     ):
@@ -889,9 +892,12 @@ async def resolve_task_ssh_profile(
         sharing_reason=sharing_reason,
     )
     if invalid_reason is not None:
+        detail = f"Task SSH grant is no longer valid: {invalid_reason}"
+        if invalid_reason == "profile_key_unusable":
+            detail += " (SSH private key is no longer usable)"
         raise TaskSSHAccessError(
             409,
-            f"Task SSH grant is no longer valid: {invalid_reason}",
+            detail,
         )
     return profile
 

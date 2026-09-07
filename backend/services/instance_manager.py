@@ -1059,11 +1059,19 @@ class _PtyBackgroundState:
     # follow-up has finished pumping its ordered provider events.
     pending_followups: int = 0
     terminal_seen: bool = False
+    # A native child may reach a durable terminal state while Claude only
+    # records its completion in the queue journal (without delivering the
+    # matching task-notification user event).  Keep explicit evidence that
+    # the host reconciled such a child so the epoch can complete without
+    # waiting forever for a turn_duration sentinel that will never arrive.
+    durable_native_completion_reconciled: bool = False
     watcher: asyncio.Task | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
     outcome: str | None = None
     accepting_events: bool = True
     watchdog_stopping: bool = False
+    idle_reap_hold: object | None = None
+    idle_reap_hold_session: Any = None
 
 
 @dataclass(frozen=True)
@@ -5482,6 +5490,16 @@ class InstanceManager:
         ):
             from backend.services.mcp_config import generate_mcp_config
 
+            # A Claude Task PTY is a durable Task session. Its trusted
+            # MCP/AskUser children stay alive across visible turns; every
+            # callback still revalidates the current Task incarnation, grants,
+            # and status at the Manager boundary. The unrestricted profile
+            # keeps its exact administrator permission boundary, while its
+            # scoped CCM credentials are still safe to retain because they
+            # are incarnation-bound and revalidated on every request.
+            persistent_pty_task = bool(
+                self.pty_mode_enabled
+            )
             mcp_config_path = generate_mcp_config(
                 task_id,
                 enabled_skills or {},
@@ -5490,6 +5508,7 @@ class InstanceManager:
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
+                persistent_session=persistent_pty_task,
             )
         if (
             provider == "claude"
@@ -5659,15 +5678,29 @@ class InstanceManager:
                 issue_internal_service_token,
             )
 
+            # Keep the AskUser credential aligned with the MCP config above.
+            # An unrestricted administrator PTY is also resident; the token is
+            # bound to the Task incarnation (not a turn), and the endpoint
+            # checks the current active Task before applying any effect.
+            persistent_pty_task = bool(self.pty_mode_enabled)
+            ask_user_token_kwargs = {
+                "audience": "ccm_ask_user",
+                "task_id": task_id,
+                "task_incarnation_id": task_incarnation_id,
+                "task_retry_count": (
+                    None if persistent_pty_task else task_retry_count
+                ),
+                "task_turn_generation": (
+                    None if persistent_pty_task else task_turn_generation
+                ),
+                "task_status": None if persistent_pty_task else task_status,
+                "owner_kind": (
+                    "task-session" if persistent_pty_task else "task-turn"
+                ),
+                "owner_id": task_id,
+            }
             ask_user_token = issue_internal_service_token(
-                audience="ccm_ask_user",
-                task_id=task_id,
-                task_incarnation_id=task_incarnation_id,
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-                task_status=task_status,
-                owner_kind="task-turn",
-                owner_id=task_id,
+                **ask_user_token_kwargs
             )
             if ask_user_token:
                 git_env = dict(git_env or {})
@@ -6057,6 +6090,7 @@ class InstanceManager:
                             or browser_review_task
                             or delivery_task
                             or codex_task_isolation_required
+                            or codex_sub_agent_mcp_required
                         ),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
@@ -8505,20 +8539,19 @@ class InstanceManager:
                 "agent-unrestricted-v1",
                 tuple(claude_unrestricted_tools),
             )
-        if isolation_fingerprint is not None and resume_session_id:
-            existing_session = (
-                self._pty_backend._pool._sessions.get(
-                    resume_session_id
-                )
+        existing_session = None
+        if resume_session_id:
+            existing_session = self._pty_backend._pool._sessions.get(
+                resume_session_id
             )
+        if isolation_fingerprint is not None and existing_session is not None:
             existing_fingerprint = getattr(
                 getattr(existing_session, "config", None),
                 "_ccm_task_isolation_fingerprint",
                 None,
             )
             if (
-                existing_session is not None
-                and existing_fingerprint != isolation_fingerprint
+                existing_fingerprint != isolation_fingerprint
             ):
                 # A hot process cannot absorb changed CLI settings. Stop
                 # it while idle and cold-resume the same native session.
@@ -8528,6 +8561,24 @@ class InstanceManager:
                         "Changed Claude Task runtime could not stop its exact "
                         "hot PTY Session"
                     )
+                existing_session = None
+
+        if existing_session is not None:
+            logger.info(
+                "Claude PTY reuse hit task_id=%s instance_id=%s "
+                "session_id=%s",
+                task_id,
+                instance_id,
+                resume_session_id,
+            )
+        elif resume_session_id:
+            logger.info(
+                "Claude PTY reuse miss task_id=%s instance_id=%s "
+                "session_id=%s reason=session-not-resident",
+                task_id,
+                instance_id,
+                resume_session_id,
+            )
 
         is_cold_start = (
             resume_session_id
@@ -8788,6 +8839,9 @@ class InstanceManager:
                     from backend.services.skill_context import (
                         wrap_skill_context,
                     )
+                    from backend.services.task_agent_isolation import (
+                        CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS,
+                    )
 
                     wrapped_prompt = wrap_skill_context(prompt, skill_context)
                     if on_launch_admitted is not None:
@@ -8813,6 +8867,9 @@ class InstanceManager:
                         enable_workflows=enable_workflows,
                         enabled_skills=enabled_skills,
                         mcp_config_path=mcp_config_path,
+                        disallowed_tools=list(
+                            CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS
+                        ),
                     )
                 finally:
                     if original_build_config is None:
@@ -9801,6 +9858,7 @@ class InstanceManager:
         state.outcome = None
         state.accepting_events = True
         state.done.clear()
+        self._ensure_pty_background_idle_reap_hold(state)
         watcher = state.watcher
         if (
             watcher is None
@@ -9836,6 +9894,8 @@ class InstanceManager:
         session: Any,
     ) -> bool:
         """Check live native/Bash work and its durable native-agent mirror."""
+
+        await self._reconcile_completed_pty_native_subagents(task_id, session)
 
         # A retained Session can accept one user follow-up while the original
         # root consumer waits for its native descendants.  That follow-up is
@@ -9881,6 +9941,92 @@ class InstanceManager:
                 .limit(1)
             )
             return result.scalar_one_or_none() is not None
+
+    async def _reconcile_completed_pty_native_subagents(
+        self,
+        task_id: int,
+        session: Any,
+    ) -> int:
+        """Reconcile terminal DB children missing a PTY notification.
+
+        The PTY tracker is intentionally fail-closed when a native Agent
+        completion notification is absent.  CCM also has a durable native
+        child mirror, however, and the exact ``tool_use_id`` in that mirror
+        lets us safely retire only tracker entries already proven terminal.
+        This closes the production case where Claude's queue journal contains
+        a completed notification but no normal ``user`` JSONL record.
+        """
+
+        tracker = getattr(session, "_tracker", None)
+        pending = getattr(tracker, "pending", None)
+        if not isinstance(pending, dict) or not pending:
+            return 0
+
+        pending_ids = {
+            tool_use_id
+            for tool_use_id in pending
+            if isinstance(tool_use_id, str) and tool_use_id
+        }
+        if not pending_ids:
+            return 0
+
+        from backend.models.sub_agent import SubAgentSession
+
+        terminal_statuses = ("completed", "failed", "cancelled")
+        async with self.db_factory() as db:
+            result = await db.execute(
+                select(SubAgentSession.meta).where(
+                    SubAgentSession.task_id == task_id,
+                    SubAgentSession.source == "native",
+                    SubAgentSession.status.in_(terminal_statuses),
+                )
+            )
+            terminal_meta = list(result.scalars())
+
+        proven_ids: set[str] = set()
+        for raw_meta in terminal_meta:
+            try:
+                meta = json.loads(raw_meta or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            tool_use_id = meta.get("tool_use_id")
+            if tool_use_id in pending_ids:
+                proven_ids.add(tool_use_id)
+        if not proven_ids:
+            return 0
+
+        reconcile = getattr(tracker, "reconcile_terminal_tool_uses", None)
+        if not callable(reconcile):
+            logger.warning(
+                "PTY tracker cannot reconcile %d terminal native child(ren) "
+                "for task %s; dependency is missing the reconciliation API",
+                len(proven_ids),
+                task_id,
+            )
+            return 0
+        reconciled = reconcile(proven_ids)
+        if not reconciled:
+            return 0
+
+        state = self._pty_background_states.get(
+            (task_id, getattr(session, "session_id", None))
+        )
+        if (
+            state is not None
+            and not getattr(tracker, "has_pending", False)
+            and not getattr(tracker, "has_pending_background_commands", False)
+        ):
+            state.durable_native_completion_reconciled = True
+
+        logger.warning(
+            "Reconciled %d terminal native PTY child(ren) for task %s "
+            "from the durable CCM mirror",
+            len(reconciled),
+            task_id,
+        )
+        return len(reconciled)
 
     async def arm_pty_background_generation(
         self,
@@ -10014,7 +10160,10 @@ class InstanceManager:
                 raise RuntimeError(
                     "PTY background generation turn identity changed"
                 )
-            current.session = session
+            if current.session is not session:
+                self._release_pty_background_idle_reap_hold(current)
+                current.session = session
+            self._ensure_pty_background_idle_reap_hold(current)
             current.last_event_monotonic = time.monotonic()
             return current
         if current is not None:
@@ -10032,10 +10181,55 @@ class InstanceManager:
             last_event_monotonic=now,
         )
         self._pty_background_states[key] = state
+        self._ensure_pty_background_idle_reap_hold(state)
         state.watcher = asyncio.create_task(
             self._watch_pty_background_generation(state)
         )
         return state
+
+    @staticmethod
+    def _release_pty_background_idle_reap_hold(
+        state: _PtyBackgroundState,
+    ) -> None:
+        token = state.idle_reap_hold
+        session = state.idle_reap_hold_session
+        state.idle_reap_hold = None
+        state.idle_reap_hold_session = None
+        release = getattr(session, "release_idle_reap_hold", None)
+        if token is not None and callable(release):
+            try:
+                release(token)
+            except Exception:
+                logger.exception(
+                    "Could not release PTY idle-reap hold for task %s session %s",
+                    state.task_id,
+                    state.session_id,
+                )
+
+    def _ensure_pty_background_idle_reap_hold(
+        self,
+        state: _PtyBackgroundState,
+    ) -> None:
+        session = state.session
+        if (
+            state.idle_reap_hold is not None
+            and state.idle_reap_hold_session is session
+            and bool(getattr(session, "idle_reap_protected", True))
+        ):
+            return
+        self._release_pty_background_idle_reap_hold(state)
+        acquire = getattr(session, "acquire_idle_reap_hold", None)
+        if not callable(acquire):
+            return
+        try:
+            state.idle_reap_hold = acquire()
+            state.idle_reap_hold_session = session
+        except Exception:
+            logger.exception(
+                "Could not retain PTY Session from idle reaping for task %s session %s",
+                state.task_id,
+                state.session_id,
+            )
 
     def _discard_pty_background_state(
         self,
@@ -10046,6 +10240,7 @@ class InstanceManager:
         if state is None or state.generation != generation:
             return
         self._pty_background_states.pop(key, None)
+        self._release_pty_background_idle_reap_hold(state)
         state.accepting_events = False
         state.done.set()
         # A chat post-exit proof is the event-consumer identity for this
@@ -10134,14 +10329,16 @@ class InstanceManager:
         session_id: str,
         task_id: int,
     ) -> bool:
-        """Stop one Session object without ever addressing a reusable key."""
+        """Stop one exact Session object without addressing a reusable key.
+
+        FullMirror keeps the old adapter entry until its background wait is
+        released. The durable Instance slot may already belong to another
+        provider/Task by then, so presence in the adapter dictionary is not
+        live ownership. Stopping this captured object is safe: no lookup by
+        reusable instance key occurs and an ABA replacement remains untouched.
+        """
 
         if getattr(session, "session_id", None) != session_id:
-            return False
-        attached = getattr(self._pty_backend, "_sessions", {})
-        if isinstance(attached, dict) and any(
-            candidate is session for candidate in attached.values()
-        ):
             return False
 
         try:
@@ -10786,6 +10983,7 @@ class InstanceManager:
             # prior sentinel starts a new turn; never let that old sentinel
             # authorize completion of the new turn.
             state.terminal_seen = False
+            state.durable_native_completion_reconciled = False
             event_type = str(event.get("event_type") or "")
             if event_type == "tool_use":
                 state.pending_tools += 1
@@ -10853,13 +11051,16 @@ class InstanceManager:
         if (
             self._pty_background_states.get(key) is not state
             or state.pending_tools
-            or not state.terminal_seen
             or await self.pty_background_activity_pending(
                 state.task_id,
                 state.session,
             )
         ):
             return False
+        if not state.terminal_seen:
+            if not state.durable_native_completion_reconciled:
+                return False
+            state.terminal_seen = True
         # This preflight is deliberately before Harness cleanup.  On a
         # Worker, NodeControl must be the first writer and the exact Task CAS
         # keeps a drain that starts afterwards from overlooking this live
@@ -11637,12 +11838,7 @@ class InstanceManager:
                 key = (state.task_id, state.session_id)
                 if self._pty_background_states.get(key) is not state:
                     return
-                if (
-                    state.terminal_seen
-                    and await self._try_complete_pty_background_generation(
-                        state
-                    )
-                ):
+                if await self._try_complete_pty_background_generation(state):
                     return
                 now = time.monotonic()
                 if (
@@ -12765,14 +12961,25 @@ class InstanceManager:
                 discover_skills,
                 get_skill_disallowed_tools,
             )
+            from backend.services.task_agent_isolation import (
+                CLAUDE_NATIVE_SUB_AGENT_TOOLS,
+            )
             skills = discover_skills(project_dir=cwd)
-            disallowed = []
+            from backend.services.task_agent_isolation import (
+                CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS,
+            )
+
+            disallowed = (
+                list(CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS)
+                if task_id is not None
+                else []
+            )
             if not enable_workflows:
                 disallowed.append("Workflow")
             disallowed.extend(get_skill_disallowed_tools(skills, enabled_skills))
-            # Sub-Agent skill: force-disable native Agent/Task tools
+            # Sub-Agent skill: force-disable every native delegation surface.
             if enabled_skills and enabled_skills.get("sub-agent"):
-                disallowed.extend(["Agent", "Task"])
+                disallowed.extend(CLAUDE_NATIVE_SUB_AGENT_TOOLS)
             if disallowed:
                 cmd.extend(["--disallowedTools", ",".join(sorted(set(disallowed)))])
             if mcp_config_path and Path(mcp_config_path).exists():
@@ -17464,6 +17671,18 @@ class InstanceManager:
                 "content": f"⏰ 后台任务 {label} 回报{status}，会话自主处理中",
                 "autonomous": True,
             }
+
+        # PTY resume/recovery can replay JSONL records from the replaced
+        # generation. They are useful for diagnostics, but must never become
+        # new chat history rows or broadcasts; doing so duplicates completed
+        # assistant messages with a fresh database id.
+        if event.get("orphan") and not event.get("autonomous"):
+            logger.debug(
+                "Dropping orphan replay event for instance %s task %s",
+                instance_id,
+                task_id,
+            )
+            return
 
         # App-server deltas are intentionally live-only: persisting every token
         # would recreate the raw-json/DB amplification that this path is meant

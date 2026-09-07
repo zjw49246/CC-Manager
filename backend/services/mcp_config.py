@@ -252,6 +252,7 @@ def build_mcp_server_specs(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Build the main task's CCM MCP server specs.
 
@@ -259,6 +260,9 @@ def build_mcp_server_specs(
     unified ``ccm_skills`` server is always present and decides tool behaviour
     from task state at call time.
     """
+
+    if persistent_session and task_status not in {"in_progress", "executing"}:
+        raise ValueError("Persistent Task session requires an active Task status")
 
     enabled_tools = CCM_SKILLS_TOOLS
     if (
@@ -290,6 +294,12 @@ def build_mcp_server_specs(
             task_status=task_status,
         )
 
+    scoped_retry_count = None if persistent_session else task_retry_count
+    scoped_turn_generation = None if persistent_session else task_turn_generation
+    scoped_status = None if persistent_session else task_status
+    credential_owner_kind = (
+        "task-session" if persistent_session else "task-turn"
+    )
     specs = [
         _ccm_server_spec(
             name="ccm_skills",
@@ -299,10 +309,10 @@ def build_mcp_server_specs(
             api_base=api_base,
             task_id=task_id,
             task_incarnation_id=task_incarnation_id,
-            task_retry_count=task_retry_count,
-            task_turn_generation=task_turn_generation,
-            task_status=task_status,
-            credential_owner_kind="task-turn",
+            task_retry_count=scoped_retry_count,
+            task_turn_generation=scoped_turn_generation,
+            task_status=scoped_status,
+            credential_owner_kind=credential_owner_kind,
             credential_owner_id=task_id,
             trusted_runtime_asset="ccm_skills_http_server",
             runtime_namespace="task",
@@ -320,6 +330,7 @@ def build_mcp_server_specs(
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
+                persistent_session=persistent_session,
             )
         )
         specs.extend(
@@ -330,6 +341,7 @@ def build_mcp_server_specs(
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
+                persistent_session=persistent_session,
             )
         )
     return tuple(specs)
@@ -344,12 +356,13 @@ def build_task_ssh_mcp_server_specs(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Build the required, Task-scoped SSH capability server."""
 
     if not re.fullmatch(r"[0-9a-f]{32}", task_incarnation_id):
         raise ValueError("Task SSH MCP requires a durable Task incarnation")
-    if any(
+    if not persistent_session and any(
         isinstance(value, bool)
         or not isinstance(value, int)
         or value < 0
@@ -358,6 +371,12 @@ def build_task_ssh_mcp_server_specs(
         raise ValueError("Task SSH MCP requires an exact non-negative generation")
     if task_status not in {"in_progress", "executing"}:
         raise ValueError("Task SSH MCP requires an exact active Task status")
+    scoped_retry_count = None if persistent_session else task_retry_count
+    scoped_turn_generation = None if persistent_session else task_turn_generation
+    scoped_status = None if persistent_session else task_status
+    credential_owner_kind = (
+        "task-session" if persistent_session else "task-turn"
+    )
     enabled_tools = ["list_connections"]
     selected = set(capabilities) & set(CCM_SSH_CAPABILITY_TOOLS)
     for capability in ("exec", "read", "write"):
@@ -379,10 +398,10 @@ def build_task_ssh_mcp_server_specs(
             api_base=api_base,
             task_id=task_id,
             task_incarnation_id=task_incarnation_id,
-            task_retry_count=task_retry_count,
-            task_turn_generation=task_turn_generation,
-            task_status=task_status,
-            credential_owner_kind="task-turn",
+            task_retry_count=scoped_retry_count,
+            task_turn_generation=scoped_turn_generation,
+            task_status=scoped_status,
+            credential_owner_kind=credential_owner_kind,
             credential_owner_id=task_id,
             trusted_runtime_asset="ccm_ssh_server",
             runtime_namespace="task",
@@ -398,11 +417,16 @@ def _validate_review_task_generation(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> None:
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         raise ValueError("review MCP requires a positive Task id")
     if not re.fullmatch(r"[0-9a-f]{32}", task_incarnation_id):
         raise ValueError("review MCP requires a durable Task incarnation")
+    if persistent_session and task_status not in {"in_progress", "executing"}:
+        raise ValueError("review MCP requires an active Task status")
+    if persistent_session:
+        return
     if any(
         isinstance(value, bool)
         or not isinstance(value, int)
@@ -422,6 +446,7 @@ def build_frontend_review_mcp_server_specs(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Expose repeatable browser review tools inside an ordinary Task."""
 
@@ -432,6 +457,13 @@ def build_frontend_review_mcp_server_specs(
         task_retry_count=task_retry_count,
         task_turn_generation=task_turn_generation,
         task_status=task_status,
+        persistent_session=persistent_session,
+    )
+    scoped_retry_count = None if persistent_session else task_retry_count
+    scoped_turn_generation = None if persistent_session else task_turn_generation
+    scoped_status = None if persistent_session else task_status
+    credential_owner_kind = (
+        "task-session" if persistent_session else "task-turn"
     )
     return (
         _ccm_server_spec(
@@ -442,10 +474,10 @@ def build_frontend_review_mcp_server_specs(
             api_base=api_base,
             task_id=task_id,
             task_incarnation_id=task_incarnation_id,
-            task_retry_count=task_retry_count,
-            task_turn_generation=task_turn_generation,
-            task_status=task_status,
-            credential_owner_kind="task-turn",
+            task_retry_count=scoped_retry_count,
+            task_turn_generation=scoped_turn_generation,
+            task_status=scoped_status,
+            credential_owner_kind=credential_owner_kind,
             credential_owner_id=task_id,
             trusted_runtime_asset="ccm_browser_review_server",
             runtime_namespace="task",
@@ -508,6 +540,7 @@ def build_workspace_review_mcp_server_specs(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> tuple[McpServerSpec, ...]:
     """Expose current-branch Preview + isolated Browser Agent orchestration."""
 
@@ -518,6 +551,13 @@ def build_workspace_review_mcp_server_specs(
         task_retry_count=task_retry_count,
         task_turn_generation=task_turn_generation,
         task_status=task_status,
+        persistent_session=persistent_session,
+    )
+    scoped_retry_count = None if persistent_session else task_retry_count
+    scoped_turn_generation = None if persistent_session else task_turn_generation
+    scoped_status = None if persistent_session else task_status
+    credential_owner_kind = (
+        "task-session" if persistent_session else "task-turn"
     )
     return (
         _ccm_server_spec(
@@ -528,10 +568,10 @@ def build_workspace_review_mcp_server_specs(
             api_base=api_base,
             task_id=task_id,
             task_incarnation_id=task_incarnation_id,
-            task_retry_count=task_retry_count,
-            task_turn_generation=task_turn_generation,
-            task_status=task_status,
-            credential_owner_kind="task-turn",
+            task_retry_count=scoped_retry_count,
+            task_turn_generation=scoped_turn_generation,
+            task_status=scoped_status,
+            credential_owner_kind=credential_owner_kind,
             credential_owner_id=task_id,
             trusted_runtime_asset="ccm_workspace_review_server",
             runtime_namespace="task",
@@ -820,6 +860,7 @@ def generate_mcp_config(
     task_retry_count: int,
     task_turn_generation: int,
     task_status: str,
+    persistent_session: bool = False,
 ) -> Path:
     """为指定 task 生成 MCP config JSON 文件。
 
@@ -834,6 +875,7 @@ def generate_mcp_config(
         task_retry_count=task_retry_count,
         task_turn_generation=task_turn_generation,
         task_status=task_status,
+        persistent_session=persistent_session,
     )
     if task_ssh_capabilities:
         specs += build_task_ssh_mcp_server_specs(
@@ -844,6 +886,7 @@ def generate_mcp_config(
             task_retry_count=task_retry_count,
             task_turn_generation=task_turn_generation,
             task_status=task_status,
+            persistent_session=persistent_session,
         )
     return _write_claude_mcp_config(
         specs,
@@ -858,9 +901,11 @@ def cleanup_mcp_config(task_id: int):
     from backend.services.task_runtime_secrets import remove_private_scope
 
     remove_private_scope("task", task_id)
-    # Claude PTY and its MCP children persist across follow-up turns. Keep the
-    # cached, route/task-scoped credentials alive until bounded expiry or an
-    # explicit owner revocation; every endpoint still rechecks live state.
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+    )
+
+    revoke_internal_service_owner("task-session", task_id)
 
 
 def generate_monitor_agent_mcp_config(

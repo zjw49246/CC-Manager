@@ -43,6 +43,16 @@ CLAUDE_TASK_BUILTIN_TOOLS = (
     "Write",
 )
 
+# Claude's native Plan Mode ends in an interactive ``ExitPlanMode`` approval
+# dialog. CCM Tasks are controlled through the web API and have their own
+# durable Plan workflow, so an unattended/background PTY turn cannot answer
+# that terminal-only dialog. Keep both transition tools unavailable for every
+# ordinary CCM Task instead of letting the Session wait forever off-screen.
+CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS = (
+    "EnterPlanMode",
+    "ExitPlanMode",
+)
+
 # An unrestricted administrator turn historically used Claude's complete
 # built-in inventory.  It still needs an explicit permission allowlist because
 # subprocess environment scrubbing can make an interactive PTY report effective
@@ -107,6 +117,23 @@ CLAUDE_UNRESTRICTED_PERMISSION_TOOLS = (
     "WebSearch",
     "Workflow",
     "Write",
+)
+
+# Native Claude delegation and team-management tools must stay unavailable
+# while the CCM Sub-Agent skill is active. Keep legacy ``Task`` alongside the
+# current task/team tool names because Claude versions expose both shapes.
+CLAUDE_NATIVE_SUB_AGENT_TOOLS = (
+    "Agent",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TeamCreate",
+    "TeamDelete",
+    "SendMessage",
 )
 
 CLAUDE_DELIVERY_BUILTIN_TOOLS = (
@@ -1635,14 +1662,16 @@ def generate_claude_unrestricted_task_settings(
     turn_generation: int,
     builtin_tools: Iterable[str] = CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
 ) -> Path:
-    """Write one private permission profile for an unrestricted admin turn.
+    """Write one private permission profile for an unrestricted admin Task.
 
     Claude 2.1.168 can report effective ``default`` mode when subprocess
     credential scrubbing is enabled even though the launcher requested bypass
     mode.  Exact built-in and CCM MCP allow rules prevent that compatibility
     behavior from opening an invisible interactive permission dialog.  This
     profile deliberately contains no filesystem or network sandbox; role and
-    execution-mode admission remain the launcher's responsibility.
+    execution-mode admission remain the launcher's responsibility. PTY mode
+    keeps this file stable for the Task incarnation so the native process can
+    be reused across visible turns.
     """
 
     if (

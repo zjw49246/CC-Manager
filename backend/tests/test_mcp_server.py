@@ -4,15 +4,18 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import backend.mcp.ccm_skills_server as mcp_mod
+import backend.mcp.ccm_skills_http_server as http_mcp_mod
 
 
 @pytest.fixture(autouse=True)
 def _set_mcp_globals():
-    mcp_mod._TASK_ID = 42
-    mcp_mod._API_BASE = "http://localhost:9999"
+    for module in (mcp_mod, http_mcp_mod):
+        module._TASK_ID = 42
+        module._API_BASE = "http://localhost:9999"
     yield
-    mcp_mod._TASK_ID = 0
-    mcp_mod._API_BASE = "http://localhost:8000"
+    for module in (mcp_mod, http_mcp_mod):
+        module._TASK_ID = 0
+        module._API_BASE = "http://localhost:8000"
 
 
 def test_mcp_server_tools_registered():
@@ -88,6 +91,72 @@ async def test_check_monitors_empty():
     assert data["success"] is True
     assert data["monitors"] == []
     assert "没有活跃" in data["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [mcp_mod, http_mcp_mod], ids=["stdio", "http"])
+async def test_check_sub_agents_includes_native_sessions(module):
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = [
+        {
+            "id": 1,
+            "description": "CCM sub-agent",
+            "agent_type": "sub_agent",
+            "source": "ccm",
+            "provider": "claude",
+            "status": "completed",
+            "checks_done": 1,
+            "last_summary": "done",
+        },
+        {
+            "id": 2,
+            "description": "Native agent",
+            "agent_type": "native-agent",
+            "source": "native",
+            "provider": "codex",
+            "status": "running",
+            "checks_done": 2,
+            "last_summary": "inspecting",
+        },
+    ]
+    mock_resp.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(module.httpx, "AsyncClient", return_value=mock_client):
+        result = await module.check_sub_agents()
+
+    data = json.loads(result)
+    assert data["success"] is True
+    assert data["sub_agents"] == [
+        {
+            "sub_agent_id": 1,
+            "name": "CCM sub-agent",
+            "agent_type": "sub_agent",
+            "source": "ccm",
+            "provider": "claude",
+            "status": "completed",
+            "progress_count": 1,
+            "last_progress": "done",
+        },
+        {
+            "sub_agent_id": 2,
+            "name": "Native agent",
+            "agent_type": "native-agent",
+            "source": "native",
+            "provider": "codex",
+            "status": "running",
+            "progress_count": 2,
+            "last_progress": "inspecting",
+        },
+    ]
+    mock_client.get.assert_awaited_once_with(
+        "http://localhost:9999/api/tasks/42/sub-agents/sessions",
+        headers={},
+    )
 
 
 @pytest.mark.asyncio
