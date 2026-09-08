@@ -20608,6 +20608,57 @@ async def test_launch_delegates_to_pty_backend_for_claude():
 
 
 @pytest.mark.asyncio
+async def test_pty_launch_restores_exact_chat_metadata_after_adapter_cache_write():
+    """CCM keeps overflow proof fields after an adapter cache rewrite."""
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    instance_id = 8
+
+    class FakeBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            # Simulate the old adapter replacing the cache entry.
+            im._launch_params[kwargs["instance_id"]] = {
+                "prompt": kwargs["prompt"],
+                "task_id": kwargs["task_id"],
+                "cwd": kwargs["cwd"],
+            }
+            im.processes[kwargs["instance_id"]] = MagicMock(pid=4253)
+            return "sess-overflow-proof"
+
+    im._pty_backend = FakeBackend()
+    im._pty_enabled = True
+    im._persist_actual_turn_transport = AsyncMock()
+    await im.launch(
+        instance_id=instance_id,
+        prompt="continue",
+        task_id=42,
+        task_turn_generation=0,
+        cwd="/w",
+        provider="claude",
+        chat_initiated=True,
+        source_log_id=1234,
+        current_message="continue",
+        queue_timestamp=12.5,
+    )
+
+    params = im._launch_params[instance_id]
+    assert params["source_log_id"] == 1234
+    assert params["task_turn_generation"] == 0
+    assert params["provider"] == "claude"
+    assert params["current_message"] == "continue"
+    assert params["queue_timestamp"] == 12.5
+
+
+@pytest.mark.asyncio
 async def test_pty_launch_commit_persists_actual_instance_provider(db_factory):
     async with db_factory() as db:
         instance = Instance(
