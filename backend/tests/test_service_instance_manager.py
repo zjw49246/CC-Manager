@@ -4722,6 +4722,23 @@ def test_build_command_codex_default_model_not_passed():
     assert "--model" not in cmd
 
 
+@pytest.mark.parametrize("effort", ["max", "ultra"])
+@pytest.mark.parametrize("resume_session_id", [None, "thread-astra"])
+def test_build_command_codex_astra_preserves_model_and_effort(effort, resume_session_id):
+    im = InstanceManager(MagicMock(), MagicMock())
+    cmd = im._build_command(
+        provider="codex",
+        prompt="review changes",
+        model="gpt-6-astra",
+        resume_session_id=resume_session_id,
+        effort_level=effort,
+    )
+
+    assert cmd[cmd.index("--model") + 1] == "gpt-6-astra"
+    assert f'model_reasoning_effort="{effort}"' in cmd
+    assert 'service_tier="default"' in cmd
+
+
 def test_build_command_codex_standard_explicitly_clears_fast_mode():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(
@@ -20588,6 +20605,57 @@ async def test_launch_delegates_to_pty_backend_for_claude():
         "EnterPlanMode",
         "ExitPlanMode",
     ]
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_restores_exact_chat_metadata_after_adapter_cache_write():
+    """CCM keeps overflow proof fields after an adapter cache rewrite."""
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    instance_id = 8
+
+    class FakeBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            # Simulate the old adapter replacing the cache entry.
+            im._launch_params[kwargs["instance_id"]] = {
+                "prompt": kwargs["prompt"],
+                "task_id": kwargs["task_id"],
+                "cwd": kwargs["cwd"],
+            }
+            im.processes[kwargs["instance_id"]] = MagicMock(pid=4253)
+            return "sess-overflow-proof"
+
+    im._pty_backend = FakeBackend()
+    im._pty_enabled = True
+    im._persist_actual_turn_transport = AsyncMock()
+    await im.launch(
+        instance_id=instance_id,
+        prompt="continue",
+        task_id=42,
+        task_turn_generation=0,
+        cwd="/w",
+        provider="claude",
+        chat_initiated=True,
+        source_log_id=1234,
+        current_message="continue",
+        queue_timestamp=12.5,
+    )
+
+    params = im._launch_params[instance_id]
+    assert params["source_log_id"] == 1234
+    assert params["task_turn_generation"] == 0
+    assert params["provider"] == "claude"
+    assert params["current_message"] == "continue"
+    assert params["queue_timestamp"] == 12.5
 
 
 @pytest.mark.asyncio

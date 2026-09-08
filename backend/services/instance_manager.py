@@ -8871,6 +8871,15 @@ class InstanceManager:
                             CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS
                         ),
                     )
+                    # Keep CCM's exact turn proof if an adapter rewrites the
+                    # shared launch-parameter cache after startup.  Context
+                    # overflow recovery requires source_log_id and generation
+                    # to survive the PTY adapter boundary.
+                    if chat_initiated and pty_launch_params is not None:
+                        adapter_params = self._launch_params.get(instance_id)
+                        merged_params = dict(adapter_params or {})
+                        merged_params.update(pty_launch_params)
+                        self._launch_params[instance_id] = merged_params
                 finally:
                     if original_build_config is None:
                         delattr(self._pty_backend, "build_config")
