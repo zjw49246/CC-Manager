@@ -2915,7 +2915,7 @@ async def _send_shared_chat(
     binding_result = await db.execute(select(FeishuUserBinding).limit(1))
     binding = binding_result.scalar_one_or_none()
     sender_name = binding.feishu_name if binding else None
-    prefixed = f"[{sender_name}] {body.message}" if sender_name else body.message
+    prefixed = body.message
 
     log_metadata: dict = {"raw_content": body.message}
     if sender_name:

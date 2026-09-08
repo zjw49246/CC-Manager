@@ -140,6 +140,40 @@ async def test_grandfathered_external_profile_stays_files_only_until_upload(
 
 
 @pytest.mark.asyncio
+async def test_task_eligible_listing_omits_unusable_managed_key(
+    client,
+    tmp_path,
+):
+    key_path = _private_key_file(tmp_path)
+    upload_token = await _upload_private_key(client, key_path)
+    created = await client.post(
+        "/api/ssh-profiles",
+        json={
+            "name": "broken-task-profile",
+            "host": "ssh.broken.internal",
+            "username": "deploy",
+            "key_upload_token": upload_token,
+            "host_key_value": derive_openssh_public_key(key_path),
+            "task_access_enabled": True,
+            "task_capabilities": ["read"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    managed_key = Path(settings.ssh_key_storage_dir) / "managed" / upload_token
+    managed_key.unlink()
+    managed_key.mkdir()
+
+    eligible = await client.get("/api/ssh-profiles?task_eligible_only=true")
+    assert eligible.status_code == 200, eligible.text
+    assert eligible.json() == []
+
+    all_profiles = await client.get("/api/ssh-profiles")
+    assert [profile["id"] for profile in all_profiles.json()] == [
+        created.json()["id"]
+    ]
+
+
+@pytest.mark.asyncio
 async def test_managed_profile_crud_masks_key_and_revisions_identity(
     client, tmp_path, monkeypatch,
 ):

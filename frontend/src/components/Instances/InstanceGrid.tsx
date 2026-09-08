@@ -11,7 +11,7 @@ interface InstanceGridProps {
 
 const statusColors: Record<string, string> = {
   idle: 'bg-gray-500',
-  running: 'bg-green-500 animate-pulse',
+  running: 'bg-green-500',
   error: 'bg-red-500',
   stopped: 'bg-yellow-500',
 };

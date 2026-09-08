@@ -17,6 +17,7 @@ import {
   type TestHarnessRun,
 } from '../../api/client';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import { formatDateTime, parseBackendTimestamp } from '../../config/timezone';
 import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 import { PlanInputForm } from '../PlanReview/PlanInputForm';
@@ -398,14 +399,11 @@ export function DeliveryRunDialog({
     setOpenedPlan(await api.getPlan(openedPlan.id));
   }, [openedPlan]);
 
+  const frontendAgentActive = progress?.phase === 'frontend_review'
+    && harness != null
+    && !HARNESS_TERMINAL.has(harness.status);
   useEffect(() => { void load(true); }, [load]);
-  useEffect(() => {
-    const frontendAgentActive = progress?.phase === 'frontend_review'
-      && harness != null
-      && !HARNESS_TERMINAL.has(harness.status);
-    const timer = window.setInterval(() => void load(), frontendAgentActive ? 1500 : 10000);
-    return () => window.clearInterval(timer);
-  }, [harness?.status, load, progress?.phase]);
+  useVisibilityAwareInterval(() => load(true), frontendAgentActive ? 1500 : 10000, true, false);
   useWebSocket(
     [`delivery:${runId}`],
     () => { void load(); },

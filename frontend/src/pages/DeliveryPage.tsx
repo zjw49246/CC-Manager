@@ -5,6 +5,7 @@ import { DeliveryCreateForm } from '../components/Delivery/DeliveryCreateForm';
 import { DeliveryRunDialog } from '../components/Delivery/DeliveryRunDialog';
 import { CheckCircle2, Circle, GitPullRequest, Loader2, Play, RefreshCw, X } from '../components/icons';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 
 interface Props {
   selectedRunId: number | null;
@@ -33,7 +34,8 @@ export function DeliveryPage({ selectedRunId, onSelectedRunChange, onNavigate, o
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
   }, []);
-  useEffect(() => { void refresh(true); const timer = window.setInterval(() => void refresh(), 15000); return () => window.clearInterval(timer); }, [refresh]);
+  useEffect(() => { void refresh(true); }, [refresh]);
+  useVisibilityAwareInterval(() => refresh(), 15000, true, false);
   useWebSocket(['deliveries'], () => { void refresh(); }, () => { void refresh(); }, () => { void refresh(); });
   const projectMap = useMemo(() => Object.fromEntries(projects.map((project) => [project.id, project])), [projects]);
   const active = runs.filter((run) => run.activity !== 'terminal');

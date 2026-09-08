@@ -37,9 +37,9 @@ export interface TaskListProps {
 const statusColors: Record<string, string> = {
   pending: 'bg-yellow-500',
   in_progress: 'bg-blue-500',
-  executing: 'bg-blue-400 animate-pulse',
-  waiting_capability: 'bg-violet-400 animate-pulse',
-  background: 'bg-teal-400 animate-pulse',
+  executing: 'bg-blue-400',
+  waiting_capability: 'bg-violet-400',
+  background: 'bg-teal-400',
   delivery_waiting: 'bg-indigo-400',
   plan_review: 'bg-purple-500',
   superseded: 'bg-gray-500',

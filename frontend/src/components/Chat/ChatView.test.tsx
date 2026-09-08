@@ -13,6 +13,7 @@ vi.mock('../../api/client', () => ({
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
     getTask: vi.fn(),
+    markTaskRead: vi.fn().mockResolvedValue({}),
     sendTaskChat: vi.fn().mockResolvedValue({}),
     startFrontendReviewGoal: vi.fn().mockResolvedValue({
       status: 'pending',
@@ -3307,6 +3308,59 @@ describe('ChatView', () => {
       expect(screen.getByRole('textbox')).toHaveValue('请结合附件继续');
       expect(screen.getByText('evidence.txt')).toBeInTheDocument();
       expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('moves a stale Claude PTY injection into the ordinary queue when the turn has ended', async () => {
+      const task = makeTask({
+        id: 318,
+        provider: 'claude',
+        status: 'executing',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      const attachment = makeUpload('stale-turn-evidence', 'stale-turn-evidence.txt');
+      vi.mocked(api.getRuntimeSettings).mockResolvedValue({
+        use_pty_mode: true,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        codex_monitor_enabled: true,
+      });
+      vi.mocked(api.uploadImages).mockResolvedValue([attachment]);
+      vi.mocked(api.injectTaskMessage).mockRejectedValueOnce(
+        Object.assign(
+          new Error('注入失败：没有正在运行的 turn。注入仅在任务执行中可用'),
+          {
+            status: 409,
+            detail: '注入失败：没有正在运行的 turn。注入仅在任务执行中可用',
+          },
+        ),
+      );
+      const { container } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} onTaskUpdated={onTaskUpdated} />,
+      );
+
+      await userEvent.click(await screen.findByTitle(/开启注入模式：通过 Claude PTY/));
+      await userEvent.upload(
+        container.querySelector<HTMLInputElement>('input[type="file"]')!,
+        new File(['evidence'], attachment.filename, { type: 'text/plain' }),
+      );
+      await screen.findByText(attachment.filename);
+      await userEvent.type(screen.getByRole('textbox'), '继续处理这个问题');
+      await userEvent.click(screen.getByTitle('注入到运行中的 Session (Ctrl+Enter)'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+        expect(screen.getByText('当前 turn 已结束，消息和附件已转入普通队列，将在下一次普通 turn 发送。')).toBeInTheDocument();
+      });
+      expect(screen.getByRole('textbox')).toHaveValue('');
+      expect(screen.queryByTitle(/注入模式已开启/)).not.toBeInTheDocument();
+      expect(api.injectTaskMessage).toHaveBeenCalledTimes(1);
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
+      expect(screen.getByRole('textbox')).toHaveValue('继续处理这个问题');
+      expect(screen.getByText(attachment.filename)).toBeInTheDocument();
     });
 
     it('does not silently drop a failed upload when injecting text', async () => {

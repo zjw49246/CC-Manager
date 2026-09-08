@@ -1455,6 +1455,44 @@ async def test_start_idempotent(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_start_recovers_dead_dispatch_producer(db_factory):
+    """A stale running flag must not strand pending queue work."""
+    d = _make_dispatcher(db_factory)
+
+    stale = asyncio.create_task(asyncio.sleep(0))
+    await stale
+    d._running = True
+    d._dispatch_task = stale
+
+    async def fake_loop():
+        await asyncio.sleep(999)
+
+    d._dispatch_loop = fake_loop
+    await d.start()
+
+    assert d.is_running is True
+    assert d._dispatch_task is not stale
+    await d.stop()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_dispatch_exit_closes_admission(db_factory):
+    """Producer termination cannot leave the API reporting a live dispatcher."""
+    d = _make_dispatcher(db_factory)
+    d._running = True
+    producer = asyncio.create_task(asyncio.sleep(0))
+    d._dispatch_task = producer
+
+    await producer
+
+    assert d.is_running is False
+    assert d.status()["running"] is False
+
+    producer.add_done_callback(d._dispatch_task_done)
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_stop(db_factory):
     """stop() cancels dispatch task and sets _running=False."""
     d = _make_dispatcher(db_factory)
@@ -16746,8 +16784,15 @@ async def test_start_cleanup_failure_rolls_back_running_and_is_retryable(
         side_effect=[RuntimeError("temporary database failure"), None]
     )
     d._ensure_instances = AsyncMock()
-    d._dispatch_loop = AsyncMock()
-    d._curator_loop = AsyncMock()
+
+    async def held_dispatch_loop():
+        await asyncio.sleep(999)
+
+    async def held_curator_loop():
+        await asyncio.sleep(999)
+
+    d._dispatch_loop = held_dispatch_loop
+    d._curator_loop = held_curator_loop
 
     with pytest.raises(RuntimeError, match="temporary database failure"):
         await d.start()

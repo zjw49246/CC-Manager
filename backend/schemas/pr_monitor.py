@@ -610,6 +610,16 @@ class PRMonitorBindRequest(BaseModel):
     task_id: int = Field(gt=0)
 
 
+class PRMonitorBranchUpdateRequest(BaseModel):
+    expected_head_sha: str = Field(pattern=r"[0-9a-f]{40}")
+
+
+class PRMonitorBranchUpdateResponse(BaseModel):
+    status: Literal["accepted"]
+    expected_head_sha: str = Field(pattern=r"[0-9a-f]{40}")
+    message: str
+
+
 class PRRepairWakeResponse(BaseModel):
     id: int
     review_id: int | None

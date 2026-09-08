@@ -12,6 +12,7 @@ import pytest_asyncio
 from sqlalchemy import select
 
 from backend.models.project import Project
+from backend.models.pr_monitor import MonitoredRepo, PRReview, PRReviewerRun
 from backend.models.task import Task
 from backend.services.project_readiness import (
     ProjectNotDispatchableError,
@@ -134,6 +135,65 @@ async def test_dequeue_holds_task_of_error_project_until_reclone(queue):
     claimed = await queue.dequeue()
     assert claimed is not None
     assert claimed.id == task_id
+
+
+@pytest.mark.asyncio
+async def test_dequeue_claims_pr_reviewer_without_local_project_checkout(queue):
+    """PR reviewer Tasks use an isolated remote checkout, not Project.local_path."""
+
+    project = await _seed_project(
+        queue.db,
+        status="pending",
+        name="readiness-pr-monitor-internal",
+    )
+    project.local_path = None
+    project.git_url = None
+    project.has_remote = False
+    await queue.db.commit()
+
+    repo = MonitoredRepo(
+        repo_full_name="example/readiness-pr-review",
+        webhook_secret="queue-secret",
+    )
+    queue.db.add(repo)
+    await queue.db.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=17,
+        base_ref="main",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        pr_title="Readiness gate",
+        pr_author="alice",
+        pr_url="https://github.com/example/readiness-pr-review/pull/17",
+        status="reviewing",
+    )
+    queue.db.add(review)
+    await queue.db.flush()
+    task = await queue.create(
+        title="PR reviewer",
+        description="isolated review protocol",
+        project_id=project.id,
+        target_repo="",
+        tags=["pr-review"],
+        archived=True,
+    )
+    queue.db.add(PRReviewerRun(
+        pr_review_id=review.id,
+        role="principal_engineer",
+        task_id=task.id,
+        provider="claude",
+        status="pending",
+        prompt_policy_hash="c" * 64,
+        guide_pack_hash="d" * 64,
+    ))
+    await queue.db.commit()
+
+    claimed = await queue.dequeue()
+
+    assert claimed is not None
+    assert claimed.id == task.id
+    assert claimed.status == "in_progress"
 
 
 @pytest.mark.asyncio

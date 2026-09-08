@@ -9,6 +9,7 @@ import type { ComponentType } from 'react';
 import { api } from '../../api/client';
 import { isCapacitor } from '../../config/server';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import { useTheme } from '../../hooks/useTheme';
 import { getThemeOption } from '../../config/theme';
 import { getNavIcon } from '../../config/iconSets';
@@ -98,15 +99,11 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     }
   }, [isAdmin]);
 
-  useEffect(() => {
-    refreshWorkerStatus();
-    if (isAdmin) return;
-    // Members cannot subscribe to the cross-owner global workers channel.
-    // Poll the already ACL-filtered list endpoint so new/revoked assignments
-    // update navigation without requiring a page reload.
-    const timer = window.setInterval(refreshWorkerStatus, 30000);
-    return () => window.clearInterval(timer);
-  }, [isAdmin, refreshWorkerStatus]);
+  // Members cannot subscribe to the cross-owner global workers channel.
+  // Poll the already ACL-filtered list endpoint so new/revoked assignments
+  // update navigation without requiring a page reload.
+  useEffect(() => { refreshWorkerStatus(); }, [refreshWorkerStatus]);
+  useVisibilityAwareInterval(refreshWorkerStatus, 30000, !isAdmin, false);
 
   // Refresh nav when worker assignments change
   useWebSocket(['workers'], () => { refreshWorkerStatus(); });
@@ -117,11 +114,8 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    refreshPlanAttention();
-    const timer = window.setInterval(refreshPlanAttention, 30000);
-    return () => window.clearInterval(timer);
-  }, [refreshPlanAttention]);
+  useEffect(() => { refreshPlanAttention(); }, [refreshPlanAttention]);
+  useVisibilityAwareInterval(refreshPlanAttention, 30000, true, false);
   useWebSocket(['plans'], refreshPlanAttention);
 
   const refreshDeliveryAttention = useCallback(() => {
@@ -130,11 +124,8 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    refreshDeliveryAttention();
-    const timer = window.setInterval(refreshDeliveryAttention, 30000);
-    return () => window.clearInterval(timer);
-  }, [refreshDeliveryAttention]);
+  useEffect(() => { refreshDeliveryAttention(); }, [refreshDeliveryAttention]);
+  useVisibilityAwareInterval(refreshDeliveryAttention, 30000, true, false);
   useWebSocket(['deliveries'], refreshDeliveryAttention);
 
   const allPages: NavItem[] = [

@@ -381,6 +381,18 @@ async def test_config_ships_codex_sol_as_default(client):
 
 
 @pytest.mark.asyncio
+async def test_config_advertises_gpt6_astra_capabilities(client):
+    resp = await client.get("/api/system/config")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "gpt-6-astra" in data["codex_model_options"]
+    assert data["codex_model_efforts"]["gpt-6-astra"] == [
+        "low", "medium", "high", "xhigh", "max", "ultra",
+    ]
+    assert data["codex_model_service_tiers"]["gpt-6-astra"] == ["default", "priority"]
+
+
+@pytest.mark.asyncio
 async def test_config_returns_two_stage_plan_pipeline_defaults(client):
     resp = await client.get("/api/system/config")
     assert resp.status_code == 200
@@ -467,6 +479,9 @@ async def test_config_default_model_options_include_1m_variants(client):
     options = resp.json()["model_options"]
     assert "claude-opus-4-6[1m]" in options
     assert "claude-sonnet-4-6[1m]" in options
+    assert "claude-fable-5-1" in options
+    assert "claude-fable-5-1[1m]" in options
+    assert "claude-fable-5.1" not in options
 
 
 @pytest.mark.asyncio

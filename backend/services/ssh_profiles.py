@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hmac
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +64,28 @@ def validated_profile_material(
         "host_key_value": host_key,
         "host_key_fingerprint": openssh_public_key_fingerprint(host_key),
     }
+
+
+def profile_key_is_usable(profile: SSHProfile) -> bool:
+    """Return whether the persisted Profile still points at its authorized key.
+
+    ``last_test_ok`` is only a historical connection result. The key file can
+    be removed, replaced, or have its type/permissions changed afterwards, so
+    callers that advertise a grant as usable must perform the same local
+    preflight used immediately before opening an SSH connection.
+    """
+
+    try:
+        material = preflight_private_key(profile.key_path)
+        actual = openssh_public_key_fingerprint(material.openssh_public_key)
+    except Exception:
+        return False
+    expected = profile.public_key_fingerprint
+    return (
+        isinstance(expected, str)
+        and expected.startswith("SHA256:")
+        and hmac.compare_digest(actual, expected)
+    )
 
 
 def executor_for_profile(profile: SSHProfile) -> SSHExecutor:

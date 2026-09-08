@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client';
+import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
 import type { PRFinding, PRFindingAction } from '../../api/client';
 
 function actionKey(prefix: string, findingId: number): string {
@@ -42,19 +43,17 @@ export function FindingActions({ finding, currentSnapshot, onChanged }: {
     });
   }, [action]);
 
-  useEffect(() => {
-    if (!action || !['pending', 'running', 'cancelling'].includes(action.status)) return;
-    const timer = window.setInterval(async () => {
+  const actionActive = Boolean(action && ['pending', 'running', 'cancelling'].includes(action.status));
+  useVisibilityAwareInterval(async () => {
       try {
+        if (!action) return;
         const next = await api.getReviewFindingAction(action.id);
         setAction(next);
         if (!['pending', 'running', 'cancelling'].includes(next.status)) await onChanged();
       } catch (reason) {
         setError(String(reason));
       }
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [action, onChanged]);
+  }, 2000, actionActive, false);
 
   const run = async (operation: () => Promise<PRFindingAction>) => {
     setBusy(true);

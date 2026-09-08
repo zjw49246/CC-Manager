@@ -223,9 +223,12 @@ async def _remote_state(
     if snapshot["state"] == "OPEN" and snapshot["merged_at"] is None:
         if (
             snapshot["base_ref"] == base_ref
-            and snapshot["base_sha"] == base_sha
             and snapshot["head_sha"] == head_sha
         ):
+            # The target branch may advance after Review publication.  That
+            # does not change the PR subject by itself: the publisher's
+            # captured-base ancestry check decides whether the frozen head can
+            # still fast-forward the exact target ref safely.
             return "open_exact"
         return "open_changed"
     return "unknown"
@@ -305,7 +308,14 @@ async def _record_failure(
             )
             action.completed_at = datetime.utcnow()
             if not pr_monitor_run_has_terminal_intent(run):
-                if remote_state == "open_exact":
+                base_update_required = (
+                    remote_state == "open_exact"
+                    and "GitHub PR base ancestry is unsafe" in message
+                )
+                if base_update_required:
+                    run.status = "paused"
+                    run.pause_reason = "direct_merge_base_update_required"
+                elif remote_state == "open_exact":
                     run.status = "ready_to_merge"
                     run.pause_reason = action.last_error
                 else:
