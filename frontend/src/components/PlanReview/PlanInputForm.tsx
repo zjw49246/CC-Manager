@@ -125,13 +125,15 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         {request.questions.map((question, index) => {
           const value = answers[question.id];
           const answeredInAdditionalContext = freeFormQuestionIds.has(question.id);
+          const isChoiceQuestion = question.response_type === 'single_choice'
+            || question.response_type === 'multi_choice';
           return (
             <fieldset key={question.id} className="rounded-xl border border-gray-700 bg-gray-900/70 p-3.5">
               <legend className="px-1 text-xs font-semibold text-indigo-300">
                 {index + 1}. {question.header}{question.required ? ' *' : ''}
               </legend>
               <p className="mb-3 text-sm leading-6 text-gray-200">{question.question}</p>
-              {question.response_type === 'text' ? (
+              {!isChoiceQuestion ? (
                 <textarea
                   value={typeof value === 'string' ? value : ''}
                   onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}

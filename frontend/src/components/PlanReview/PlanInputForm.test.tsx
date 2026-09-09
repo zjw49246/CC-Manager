@@ -150,6 +150,43 @@ describe('PlanInputForm', () => {
     expect(onAnswered).toHaveBeenCalledTimes(1);
   });
 
+  it('submits free-form context when no required multi-choice options fit', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'multi_choice',
+      options: [
+        { label: 'Email', value: 'email' },
+        { label: 'SMS', value: 'sms' },
+      ],
+    };
+    const onAnswered = vi.fn();
+    render(<PlanInputForm run={run} request={request} onAnswered={onAnswered} />);
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Send an in-app notification instead.',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
+
+    await waitFor(() => expect(api.answerPlanInput).toHaveBeenCalledWith(
+      71,
+      81,
+      expect.objectContaining({
+        answers: [{
+          question_id: 'question_0',
+          value: null,
+          answered_in_response_text: true,
+        }],
+        response_text: 'Send an in-app notification instead.',
+      }),
+    ));
+    expect(onAnswered).toHaveBeenCalledTimes(1);
+  });
+
   it('still requires non-choice answers when additional context replaces a choice', async () => {
     const request = requestWithQuestions(2);
     request.questions[0] = {
