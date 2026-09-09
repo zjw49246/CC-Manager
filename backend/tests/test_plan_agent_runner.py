@@ -44,6 +44,9 @@ from backend.services.plan_agent_runner import (
     _repository_instruction_manifest,
     _validate_structured,
     _validate_structured_v2,
+    _versioned_planner_prompt,
+    _versioned_reference_files,
+    _versioned_reviewer_prompt,
 )
 from backend.services.plan_runtime_receipt import prepare_runtime_attempt
 from backend.services.task_queue import TaskQueue
@@ -160,7 +163,10 @@ def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
     )
 
     common = {
+        "original_request": "Add a status endpoint.",
+        "run_type": "initial",
         "planning_request": "Add a status endpoint.",
+        "reference_files": "",
         "target_context": "",
         "interaction_history": "",
         "repository_context": '{"changed_since_run_start": false}',
@@ -168,10 +174,15 @@ def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
     planner = _versioned_planner_prompt(
         **common,
         base_plan=None,
+        current_candidate=None,
+        base_review_context="(none)",
         reviewer_feedback=None,
     )
     reviewer = _versioned_reviewer_prompt(
         **common,
+        base_plan=None,
+        base_review_context="(none)",
+        previous_reviewer_feedback=None,
         plan_content="Inspect the existing route conventions.",
     )
 
@@ -357,6 +368,62 @@ def test_interactive_planner_accepts_all_known_questions_without_count_limit():
             "planner",
             json.dumps({"response": {**payload, "reason": ""}}),
         )
+
+
+def test_versioned_revision_prompts_preserve_original_scope_and_review_closure():
+    references = _versioned_reference_files(
+        [{"name": "requirements.pdf", "path": "/tmp/requirements.pdf"}],
+        [
+            {"name": "requirements.pdf", "path": "/tmp/requirements.pdf"},
+            {"name": "revision.md", "path": "/tmp/revision.md"},
+        ],
+    )
+    assert references.count("/tmp/requirements.pdf") == 1
+    assert "[initial Plan] requirements.pdf" in references
+    assert "[current Run] revision.md" in references
+
+    planner_prompt = _versioned_planner_prompt(
+        original_request="Implement authentication, caching, and audit logs.",
+        run_type="user_revision",
+        planning_request="Change only the cache invalidation strategy.",
+        reference_files=references,
+        target_context="user (initial task): keep every accepted requirement",
+        base_plan="# Base\nAuthentication\nCaching\nAudit logs",
+        current_candidate="# Draft\nAuthentication\nCaching\nAudit logs",
+        base_review_context='{"review_verdict":"exhausted"}',
+        reviewer_feedback="Specify cache rollback behavior.",
+        interaction_history="(none)",
+        repository_context='{"changed_since_run_start":false}',
+    )
+    assert "Original Plan request (authoritative scope)" in planner_prompt
+    assert "authentication, caching, and audit logs" in planner_prompt
+    assert "incremental revision" in planner_prompt
+    assert "Change only the cache invalidation strategy" in planner_prompt
+    assert "# Base" in planner_prompt
+    assert "# Draft" in planner_prompt
+    assert "Specify cache rollback behavior" in planner_prompt
+    assert "do not classify unchanged" in planner_prompt
+
+    reviewer_prompt = _versioned_reviewer_prompt(
+        original_request="Implement authentication, caching, and audit logs.",
+        run_type="user_revision",
+        planning_request="Change only the cache invalidation strategy.",
+        reference_files=references,
+        target_context="user (initial task): keep every accepted requirement",
+        base_plan="# Base\nAuthentication\nCaching\nAudit logs",
+        base_review_context='{"review_verdict":"exhausted"}',
+        previous_reviewer_feedback="Specify cache rollback behavior.",
+        plan_content="# Candidate\nAuthentication\nNew caching\nAudit logs",
+        interaction_history="(none)",
+        repository_context='{"changed_since_run_start":false}',
+    )
+    assert "Original Plan request (authoritative scope)" in reviewer_prompt
+    assert "Base Plan Version selected for this Run" in reviewer_prompt
+    assert "# Base" in reviewer_prompt
+    assert "Previous Reviewer feedback to verify" in reviewer_prompt
+    assert "Specify cache rollback behavior" in reviewer_prompt
+    assert "unrequested removals, regressions, or scope expansion" in reviewer_prompt
+    assert "unchanged original requirements" in reviewer_prompt
 
 
 @pytest.mark.parametrize("wire_required", [None, "true", 1])

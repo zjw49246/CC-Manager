@@ -133,6 +133,7 @@ class PlanInputAnswer(BaseModel):
 
     question_id: str = Field(min_length=1, max_length=100)
     value: str | list[str] | None
+    answered_in_response_text: bool = False
 
 
 class PlanInputAnswerRequest(BaseModel):

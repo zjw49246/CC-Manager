@@ -110,6 +110,176 @@ describe('PlanInputForm', () => {
     expect(option).not.toHaveClass('text-indigo-100');
   });
 
+  it('submits free-form context when no required single-choice option fits', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Blue-green', value: 'blue_green' },
+        { label: 'Rolling', value: 'rolling' },
+      ],
+    };
+    const onAnswered = vi.fn();
+    render(<PlanInputForm run={run} request={request} onAnswered={onAnswered} />);
+
+    expect(screen.getByRole('button', { name: 'Submit answers' })).toBeDisabled();
+    await userEvent.click(screen.getByText('Blue-green'));
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    expect(screen.getByLabelText('Blue-green')).not.toBeChecked();
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use a canary rollout with a manual gate instead.',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
+
+    await waitFor(() => expect(api.answerPlanInput).toHaveBeenCalledWith(
+      71,
+      81,
+      expect.objectContaining({
+        answers: [{
+          question_id: 'question_0',
+          value: null,
+          answered_in_response_text: true,
+        }],
+        response_text: 'Use a canary rollout with a manual gate instead.',
+      }),
+    ));
+    expect(onAnswered).toHaveBeenCalledTimes(1);
+  });
+
+  it('submits free-form context when no required multi-choice options fit', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'multi_choice',
+      options: [
+        { label: 'Email', value: 'email' },
+        { label: 'SMS', value: 'sms' },
+      ],
+    };
+    const onAnswered = vi.fn();
+    render(<PlanInputForm run={run} request={request} onAnswered={onAnswered} />);
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Send an in-app notification instead.',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
+
+    await waitFor(() => expect(api.answerPlanInput).toHaveBeenCalledWith(
+      71,
+      81,
+      expect.objectContaining({
+        answers: [{
+          question_id: 'question_0',
+          value: null,
+          answered_in_response_text: true,
+        }],
+        response_text: 'Send an in-app notification instead.',
+      }),
+    ));
+    expect(onAnswered).toHaveBeenCalledTimes(1);
+  });
+
+  it('still requires non-choice answers when additional context replaces a choice', async () => {
+    const request = requestWithQuestions(2);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Blue-green', value: 'blue_green' },
+        { label: 'Rolling', value: 'rolling' },
+      ],
+    };
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use a canary rollout with a manual gate instead.',
+    );
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeDisabled();
+    expect(screen.getByText(/Answer each remaining required question/)).toBeInTheDocument();
+    expect(api.answerPlanInput).not.toHaveBeenCalled();
+
+    await userEvent.type(screen.getAllByRole('textbox')[0], 'us-east-1');
+    expect(submit).toBeEnabled();
+  });
+
+  it('binds additional context to explicitly marked required choices', async () => {
+    const request = requestWithQuestions(2);
+    request.questions = request.questions.map((question) => ({
+      ...question,
+      response_type: 'single_choice',
+      options: [
+        { label: 'Option A', value: 'a' },
+        { label: 'Option B', value: 'b' },
+      ],
+    }));
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    const alternatives = screen.getAllByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    });
+    await userEvent.click(alternatives[0]);
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use an alternative for the first question.',
+    );
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeDisabled();
+
+    await userEvent.click(screen.getAllByLabelText('Option A')[1]);
+    expect(submit).toBeEnabled();
+  });
+
+  it('requires additional context when an optional choice is marked as free-form', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Option A', value: 'a' },
+        { label: 'Option B', value: 'b' },
+      ],
+      required: false,
+    };
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeEnabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    expect(submit).toBeDisabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Answering this question in additional context',
+    }));
+    expect(submit).toBeEnabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use an alternative value.',
+    );
+    expect(submit).toBeEnabled();
+  });
+
   it('clears answers when the InputRequest identity changes', async () => {
     const { rerender } = render(
       <PlanInputForm

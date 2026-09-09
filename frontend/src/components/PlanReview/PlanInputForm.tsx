@@ -18,10 +18,14 @@ type AnswerValue = string | string[];
 
 export function PlanInputForm({ run, request, compact = false, onAnswered }: PlanInputFormProps) {
   const [answers, setAnswers] = useState<Record<string, AnswerValue>>({});
+  const [freeFormQuestionIds, setFreeFormQuestionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [additional, setAdditional] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const additionalRef = useRef<HTMLTextAreaElement>(null);
   const uploads = useFileUpload();
   const clearUploads = uploads.clear;
   const answerIdempotencyKey = useMemo(
@@ -31,6 +35,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
 
   useEffect(() => {
     setAnswers({});
+    setFreeFormQuestionIds(new Set());
     setAdditional('');
     setSubmitting(false);
     setError(null);
@@ -41,13 +46,23 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
     () => request.questions.some((question) => {
       if (!question.required) return false;
       const value = answers[question.id];
-      return value == null || value === '' || (Array.isArray(value) && value.length === 0);
+      const missing = value == null || value === '' || (Array.isArray(value) && value.length === 0);
+      const freeFormReplacesChoice = freeFormQuestionIds.has(question.id)
+        && Boolean(additional.trim());
+      return missing && !freeFormReplacesChoice;
     }),
-    [answers, request.questions],
+    [additional, answers, freeFormQuestionIds, request.questions],
   );
+  const freeFormNeedsContext = freeFormQuestionIds.size > 0 && !additional.trim();
 
   const submit = async () => {
-    if (submitting || missingRequired || uploads.isUploading || uploads.hasFailed) return;
+    if (
+      submitting
+      || missingRequired
+      || freeFormNeedsContext
+      || uploads.isUploading
+      || uploads.hasFailed
+    ) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -58,6 +73,9 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         answers: request.questions.map((question) => ({
           question_id: question.id,
           value: answers[question.id] ?? null,
+          ...(freeFormQuestionIds.has(question.id)
+            ? { answered_in_response_text: true }
+            : {}),
         })),
         ...(additional.trim() ? { response_text: additional.trim() } : {}),
         ...(results.length ? {
@@ -71,6 +89,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         } : {}),
       });
       setAnswers({});
+      setFreeFormQuestionIds(new Set());
       setAdditional('');
       uploads.clear();
       await onAnswered(answered);
@@ -105,13 +124,16 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       <div className="max-h-[min(52vh,560px)] space-y-4 overflow-y-auto pr-1">
         {request.questions.map((question, index) => {
           const value = answers[question.id];
+          const answeredInAdditionalContext = freeFormQuestionIds.has(question.id);
+          const isChoiceQuestion = question.response_type === 'single_choice'
+            || question.response_type === 'multi_choice';
           return (
             <fieldset key={question.id} className="rounded-xl border border-gray-700 bg-gray-900/70 p-3.5">
               <legend className="px-1 text-xs font-semibold text-indigo-300">
                 {index + 1}. {question.header}{question.required ? ' *' : ''}
               </legend>
               <p className="mb-3 text-sm leading-6 text-gray-200">{question.question}</p>
-              {question.response_type === 'text' ? (
+              {!isChoiceQuestion ? (
                 <textarea
                   value={typeof value === 'string' ? value : ''}
                   onChange={(event) => setAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
@@ -132,21 +154,55 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
                           type={multi ? 'checkbox' : 'radio'}
                           name={`plan-question-${request.id}-${question.id}`}
                           checked={selected}
-                          onChange={() => setAnswers((current) => {
-                            if (!multi) return { ...current, [question.id]: option.value };
-                            const existing = Array.isArray(current[question.id]) ? current[question.id] as string[] : [];
-                            return {
-                              ...current,
-                              [question.id]: selected
-                                ? existing.filter((item) => item !== option.value)
-                                : [...existing, option.value],
-                            };
-                          })}
+                          onChange={() => {
+                            setFreeFormQuestionIds((current) => {
+                              if (!current.has(question.id)) return current;
+                              const next = new Set(current);
+                              next.delete(question.id);
+                              return next;
+                            });
+                            setAnswers((current) => {
+                              if (!multi) return { ...current, [question.id]: option.value };
+                              const existing = Array.isArray(current[question.id]) ? current[question.id] as string[] : [];
+                              return {
+                                ...current,
+                                [question.id]: selected
+                                  ? existing.filter((item) => item !== option.value)
+                                  : [...existing, option.value],
+                              };
+                            });
+                          }}
                         />
                         {option.label}
                       </label>
                     );
                   })}
+                  <button
+                    type="button"
+                    aria-pressed={answeredInAdditionalContext}
+                    className={`w-full rounded-lg border border-dashed px-3 py-2 text-left text-xs transition-colors ${answeredInAdditionalContext ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-300' : 'border-gray-700 text-gray-400 hover:border-indigo-500/50 hover:bg-indigo-500/5 hover:text-gray-200'}`}
+                    onClick={() => {
+                      setAnswers((current) => {
+                        const next = { ...current };
+                        delete next[question.id];
+                        return next;
+                      });
+                      setFreeFormQuestionIds((current) => {
+                        const next = new Set(current);
+                        if (answeredInAdditionalContext) {
+                          next.delete(question.id);
+                        } else {
+                          next.add(question.id);
+                        }
+                        return next;
+                      });
+                      if (!answeredInAdditionalContext) additionalRef.current?.focus();
+                    }}
+                  >
+                    {answeredInAdditionalContext
+                      ? 'Answering this question in additional context'
+                      : 'None of these options fit — answer in additional context'}
+                  </button>
                 </div>
               )}
             </fieldset>
@@ -155,9 +211,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       </div>
 
       <textarea
+        ref={additionalRef}
         value={additional}
         onChange={(event) => setAdditional(event.target.value)}
-        placeholder="Additional context (optional)"
+        aria-label="Additional context"
+        placeholder="Additional context (may replace an option when none fit)"
         rows={2}
         maxLength={50000}
         className="w-full resize-y rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
@@ -179,6 +237,15 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
       )}
       {error && <p className="text-xs text-red-400">{error}</p>}
+      {freeFormNeedsContext ? (
+        <p className="text-xs text-gray-500">
+          Add Additional context for each choice marked as answered there.
+        </p>
+      ) : missingRequired && (
+        <p className="text-xs text-gray-500">
+          Answer each remaining required question. Additional context may replace a required choice when none of its options fit.
+        </p>
+      )}
       <div className="flex items-center justify-between gap-3">
         <div>
           <input
@@ -197,7 +264,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
         <button
           type="submit"
-          disabled={submitting || missingRequired || uploads.isUploading || uploads.hasFailed}
+          disabled={submitting || missingRequired || freeFormNeedsContext || uploads.isUploading || uploads.hasFailed}
           className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {submitting && <Loader2 size={12} className="animate-spin" />}
