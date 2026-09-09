@@ -128,7 +128,7 @@ let _codexTaskSkillsCapability:
   | Promise<CodexTaskSkillsCapability>
   | null = null;
 
-export async function loadPlugins(): Promise<{ key: string; label: string }[]> {
+async function loadPlugins(): Promise<{ key: string; label: string }[]> {
   if (_pluginsCache) return _pluginsCache;
   try {
     const skills = await api.listSkills();

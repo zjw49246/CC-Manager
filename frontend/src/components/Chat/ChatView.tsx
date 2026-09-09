@@ -689,7 +689,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   }, [draftUploadsKey, hasControlAccess, legacyDraftUploadsKey]);
   const fileUpload = useFileUpload(initialDraftUploads);
-  const addChatFiles = fileUpload.addFiles;
+  const {
+    addFiles: addChatFiles,
+    addUploadedResults,
+    clear: clearUploadedFiles,
+  } = fileUpload;
   const consumeForkSeedUploads = useCallback(() => {
     if (forkSeedUploads.length === 0) return;
     try {
@@ -720,14 +724,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setInput(nextInput);
     setForkSeedUploads(nextForkSeedUploads);
     setSelectedSecretIds([]);
-    fileUpload.clear();
-    fileUpload.addUploadedResults(nextDraftUploads);
+    clearUploadedFiles();
+    addUploadedResults(nextDraftUploads);
   }, [
     draftKey,
     draftStorageNamespace,
     draftUploadsKey,
-    fileUpload.addUploadedResults,
-    fileUpload.clear,
+    addUploadedResults,
+    clearUploadedFiles,
     forkSeedUploadsConsumedKey,
     forkSeedUploadsKey,
   ]);
@@ -772,7 +776,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(incoming, next);
       return next;
     });
-  }, [resetPtyFollowupTracking, task.id, task.retry_count, task.turn_generation]);
+  }, [resetPtyFollowupTracking, task]);
 
   useVisualViewportBounds(chatRootRef, !inline);
 
@@ -1276,8 +1280,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // false.  A current-turn lifecycle record is the authoritative signal for
   // that retained native work, including after reconnect/history reload.
   const rawBackgroundLifecycle = useMemo(
-    () => latestBackgroundLifecycle(messages, activeTaskTurnRef.current),
-    [messages, task.retry_count, task.turn_generation],
+    () => latestBackgroundLifecycle(messages, {
+      taskId: task.id,
+      retryCount: task.retry_count,
+      turnGeneration: task.turn_generation,
+    }),
+    [messages, task.id, task.retry_count, task.turn_generation],
   );
   const backgroundActive = (
     rawBackgroundLifecycle?.state === 'running'

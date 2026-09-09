@@ -94,8 +94,9 @@ function App() {
   const [planId, setPlanId] = useState<number | null>(initial.planId);
   const [deliveryRunId, setDeliveryRunId] = useState<number | null>(initial.deliveryRunId);
   const [authenticated, setAuthenticated] = useState(false);
-  const [checking, setChecking] = useState(true);
-  const [needsServerConfig, setNeedsServerConfig] = useState(false);
+  const requiresServerConfig = isCapacitor() && !getServerUrl();
+  const [checking, setChecking] = useState(!requiresServerConfig);
+  const [needsServerConfig, setNeedsServerConfig] = useState(requiresServerConfig);
 
   useEffect(() => {
     updateHash(page, chatTaskId, planId, deliveryRunId);
@@ -153,11 +154,7 @@ function App() {
 
   useEffect(() => {
     // In Capacitor, require server URL to be configured first
-    if (isCapacitor() && !getServerUrl()) {
-      setNeedsServerConfig(true);
-      setChecking(false);
-      return;
-    }
+    if (requiresServerConfig) return;
 
     const base = getApiBase();
     // Health is public. Use the identity endpoint as the protected probe so
@@ -194,7 +191,7 @@ function App() {
         // Server down, show login anyway
       })
       .finally(() => setChecking(false));
-  }, []);
+  }, [requiresServerConfig]);
 
   if (needsServerConfig) {
     return (

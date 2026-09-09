@@ -507,18 +507,20 @@ export function DeliveryRunDialog({
   const frontendHarnessEvents = harness && Array.isArray(harness.events) ? harness.events : [];
   const frontendHarnessEvidence = harness && Array.isArray(harness.evidence) ? harness.evidence : [];
   const frontendHarnessLatestEvent = frontendHarnessEvents.at(-1) || null;
+  const taskId = task?.id ?? null;
+  const harnessId = harness?.id ?? null;
   const runIsTerminal = Boolean(run?.activity === 'terminal' || progress?.phase === 'done');
   const runSucceeded = Boolean(runIsTerminal && run?.outcome === 'success');
   const reportOnlySuccess = Boolean(run && isReportOnlySuccess(run));
   useEffect(() => {
-    if (!task || !harness || !latestHarnessScreenshot) {
+    if (!taskId || !harnessId || !latestHarnessScreenshot) {
       if (harnessScreenshotObjectUrl.current) URL.revokeObjectURL(harnessScreenshotObjectUrl.current);
       harnessScreenshotObjectUrl.current = null;
       setHarnessScreenshotUrl(null);
       return;
     }
     let active = true;
-    api.getTestRunEvidence(task.id, harness.id, latestHarnessScreenshot)
+    api.getTestRunEvidence(taskId, harnessId, latestHarnessScreenshot)
       .then((blob) => {
         const objectUrl = URL.createObjectURL(blob);
         if (!active) {
@@ -535,7 +537,7 @@ export function DeliveryRunDialog({
         // Harness refresh retries without hiding the rest of the live trace.
       });
     return () => { active = false; };
-  }, [harness?.id, latestHarnessScreenshot, task?.id]);
+  }, [harnessId, latestHarnessScreenshot, taskId]);
 
   useEffect(() => () => {
     if (harnessScreenshotObjectUrl.current) URL.revokeObjectURL(harnessScreenshotObjectUrl.current);

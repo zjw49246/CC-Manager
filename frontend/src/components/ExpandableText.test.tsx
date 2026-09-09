@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { describe, it, expect, afterEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ExpandableText } from './ExpandableText';
 
@@ -14,17 +14,6 @@ function simulateClamped() {
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
     configurable: true,
     get() { return 40; },
-  });
-}
-
-function simulateNotClamped() {
-  Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
-    configurable: true,
-    get() { return 20; },
-  });
-  Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
-    configurable: true,
-    get() { return 20; },
   });
 }
 

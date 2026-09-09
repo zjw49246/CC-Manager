@@ -27,8 +27,17 @@ export function QuickPhraseDropdown({ onSelect, disabled }: QuickPhraseDropdownP
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    let active = true;
+    (async () => {
+      try {
+        const data = await api.listQuickPhrases();
+        if (active) setPhrases(data);
+      } catch (e) {
+        if (active) console.error('Failed to load quick phrases:', e);
+      }
+    })();
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!open) return;

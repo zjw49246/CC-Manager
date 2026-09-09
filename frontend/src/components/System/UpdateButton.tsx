@@ -249,7 +249,7 @@ export function UpdateButton() {
 
     const recoverActiveUpdate = async () => {
       try {
-        const status = await api.getUpdateStatus() as UpdateStatusData;
+        const status = await api.getUpdateStatus() as unknown as UpdateStatusData;
         if (cancelled) return;
         if (status.old_commit) setOldCommit(status.old_commit);
         if (status.new_commit) setNewCommit(status.new_commit);
@@ -298,7 +298,7 @@ export function UpdateButton() {
       const p = phaseRef.current;
       if (p !== 'running' && p !== 'restarting') return;
       try {
-        const status = await api.getUpdateStatus() as UpdateStatusData;
+        const status = await api.getUpdateStatus() as unknown as UpdateStatusData;
         if (status.old_commit) setOldCommit(status.old_commit);
         if (status.new_commit) setNewCommit(status.new_commit);
         if (status.steps) setSteps(status.steps);
@@ -352,7 +352,7 @@ export function UpdateButton() {
       try {
         await api.health();
         try {
-          const status = await api.getUpdateStatus() as UpdateStatusData;
+          const status = await api.getUpdateStatus() as unknown as UpdateStatusData;
           if (status.old_commit) setOldCommit(status.old_commit);
           if (status.new_commit) setNewCommit(status.new_commit);
           if (status.steps) setSteps(status.steps);
@@ -525,7 +525,7 @@ export function UpdateButton() {
         branch: channel === 'main' ? (branch || undefined) : undefined,
       });
       if (result.update_id) {
-        setOldCommit(result.old_commit || '');
+        setOldCommit(typeof result.old_commit === 'string' ? result.old_commit : '');
       }
     } catch (e: unknown) {
       setUpdateActive(false);
@@ -562,7 +562,7 @@ export function UpdateButton() {
 
   const handleRollback = async () => {
     try {
-      const status = await api.getUpdateStatus() as UpdateStatusData;
+      const status = await api.getUpdateStatus() as unknown as UpdateStatusData;
       // Legacy/interrupted records may not have migration metadata. Match the
       // backend's conservative rule: only an explicit false proves that a
       // database restore is unnecessary.

@@ -107,14 +107,18 @@ export function useTaskReorder(tasks: Task[], onReordered: (optimistic?: Task[])
   const longPress = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 实时引用，供 document 级监听器读取（避免闭包过期）
   const tasksRef = useRef(tasks);
-  tasksRef.current = tasks;
   const dragRef = useRef<number | null>(null);
   const overRef = useRef<number | null>(null);
   const [ghostPos, setGhostPos] = useState<{ x: number; y: number } | null>(null);
   const pointerMode = useRef(false);
 
   const autoSortRef = useRef(autoSort);
-  autoSortRef.current = autoSort;
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
+  useEffect(() => {
+    autoSortRef.current = autoSort;
+  }, [autoSort]);
 
   const commit = useCallback(async (fromId: number, toIdxRaw: number) => {
     const list = tasksRef.current;

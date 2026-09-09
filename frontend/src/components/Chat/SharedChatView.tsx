@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../../api/client';
-import type { SharedTaskReceived } from '../../api/client';
+import type {
+  SharedHistoryMessage,
+  SharedTaskConfig,
+  SharedTaskReceived,
+} from '../../api/client';
 import { ArrowLeft, Send, RefreshCw, Wifi, WifiOff, Loader2 } from '../icons';
 import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 import { useVisibilityAwareInterval } from '../../hooks/useVisibilityAwareInterval';
@@ -10,16 +14,7 @@ interface SharedChatViewProps {
   onBack: () => void;
 }
 
-interface ChatMsg {
-  id: number;
-  role: string;
-  event_type: string;
-  content: string | null;
-  tool_name?: string;
-  tool_input?: string;
-  tool_output?: string;
-  is_error?: boolean;
-  timestamp?: string;
+interface ChatMsg extends SharedHistoryMessage {
   raw_content?: string;
   optimistic?: boolean;
   persisted?: boolean;
@@ -49,7 +44,7 @@ function consumeFingerprint(counts: Map<string, number>, key: string): boolean {
  * events already rendered locally. Reconcile matching occurrences while
  * preserving unconfirmed optimistic bubbles and newer persisted WS rows.
  */
-export function mergeSharedHistory(
+function mergeSharedHistory(
   history: ChatMsg[],
   current: ChatMsg[],
   confirmedOptimisticIds: ReadonlySet<number> = new Set(),
@@ -98,7 +93,7 @@ export function SharedChatView({ shared, onBack }: SharedChatViewProps) {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
-  const [config, setConfig] = useState<any>(null);
+  const [config, setConfig] = useState<SharedTaskConfig | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const nextOptimisticIdRef = useRef(-1);

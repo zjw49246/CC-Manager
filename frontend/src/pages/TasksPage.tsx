@@ -466,7 +466,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       setAllTasks(clearUnread);
       setSearchResults((prev) => prev ? clearUnread(prev) : prev);
     }
-  }, [setChatTaskWrapped]);
+  }, [setChatTaskWrapped, setSearchResults]);
 
   // Filter / Projects / Search controls — shared between the full task list
   // and the split-mode sidebar

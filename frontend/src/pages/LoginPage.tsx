@@ -80,7 +80,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               }));
             }
           }
-        } catch {}
+        } catch { /* user profile enrichment is optional */ }
         onLogin();
       } else {
         setError('Invalid token');
