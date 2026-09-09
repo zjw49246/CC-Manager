@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api/client';
 import type { Project } from '../api/client';
 import { Plus, Trash2, Edit2, X, Search, Check } from './icons';
@@ -222,7 +222,7 @@ export function EnvFilesEditor({ project, onProjectUpdated }: { project: Project
   // Track which file's remove button is pending confirmation
   const [pendingRemovePath, setPendingRemovePath] = useState<string | null>(null);
 
-  const loadFileStatuses = async () => {
+  const loadFileStatuses = useCallback(async () => {
     if (!project.local_path) return;
     try {
       const { files } = await api.listEnvFiles(project.id);
@@ -230,11 +230,11 @@ export function EnvFilesEditor({ project, onProjectUpdated }: { project: Project
     } catch (e) {
       setError(String(e));
     }
-  };
+  }, [project.id, project.local_path]);
 
   useEffect(() => {
     loadFileStatuses();
-  }, [project.id, project.env_files]);
+  }, [loadFileStatuses, project.env_files]);
 
   const saveEnvFiles = async (envFiles: string[]) => {
     try {

@@ -6,7 +6,7 @@
 
 Web 端调度管理多个 Claude Code 实例并行工作。Backend (FastAPI) + Frontend (React/Vite) + SQLite/PostgreSQL/MySQL。
 
-GitHub: https://github.com/zjw49246/Claude-Code-Manager.git
+GitHub: https://github.com/zjw49246/CC-Manager.git
 
 ## 技术栈
 
@@ -202,6 +202,8 @@ claude-manager/
 - 领取任务时若涉及 PTY 接口/行为变化，先对比 uv.lock 中 pin 的 rev 与 Claude-Code-PTY main HEAD，落后则先 bump
 
 ## 关键约定
+
+- **PTY 事件类型兼容**: `claude_pty.events.PTYEvent.to_dict()` 会保留 str-backed `EventType` 枚举；分类事件时可直接与 wire 值比较，或显式读取 `.value`，禁止先调用 `str()`（会得到 `EventType.MESSAGE` 等名称并漏判结构化 API 错误/工具事件）。
 
 - **Claude 无进展恢复**: 同一前台回合仅在连续相似的 `stop_reason=null` 回复持续至少两分钟、且从未出现 `tool_use/tool_result` 时才可中止并用 generation-bound 一次性许可在新 session 自动重放原消息；自动恢复最多一次，恢复回合再次异常或存在任何工具行为必须停止并等待用户重试，禁止盲目重放。
 

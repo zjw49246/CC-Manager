@@ -1459,12 +1459,15 @@ class TaskQueue:
                 "has_live_task_pty_post_exit",
                 None,
             )
-            if callable(has_live_post_exit) and has_live_post_exit(
-                task_id,
-                session_id=getattr(task, "session_id", None),
-                instance_id=observed_instance_id,
-                task_retry_count=observed_retry_count,
-                task_turn_generation=observed_turn_generation,
+            if callable(has_live_post_exit) and (
+                has_live_post_exit(
+                    task_id,
+                    session_id=getattr(task, "session_id", None),
+                    instance_id=observed_instance_id,
+                    task_retry_count=observed_retry_count,
+                    task_turn_generation=observed_turn_generation,
+                )
+                is True
             ):
                 await self.db.rollback()
                 return False

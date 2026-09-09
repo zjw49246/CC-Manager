@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../../api/client';
-import type { CodexServiceTier, Project, TagItem, Task } from '../../api/client';
+import type { CodexServiceTier, Project, TagItem, Task, UserSkill } from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
@@ -53,7 +53,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [mode, setMode] = useState('auto');
   const [provider, setProvider] = useState('codex');
   // 分布式 Worker：执行位置（'' = 本机）
-  const [workerId, setWorkerId] = useState('');
+  // Worker routing is inherited from the selected Project; keep the legacy
+  // payload field empty for backwards-compatible task creation.
+  const workerId = '';
   // workers state removed — Run on moved to Project level
   const [model, setModel] = useState('');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
@@ -85,6 +87,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [hasWorker, setHasWorker] = useState(isAdmin);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const fileUpload = useFileUpload();
+  const { addFiles } = fileUpload;
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
@@ -156,7 +159,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         setCodexMonitorEnabled(runtime.codex_monitor_enabled === true);
       })
       .catch(() => {});
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     if (!projectId) {
@@ -212,7 +215,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const skillsRef = useRef<HTMLDivElement>(null);
   const [skillsDefaultSaved, setSkillsDefaultSaved] = useState(false);
   useEffect(() => {
-    api.listUserSkillsCached().then((list: any[]) => setUserSkills(list.map((s) => ({ id: s.id, name: s.name, description: s.description })))).catch(() => {});
+    api.listUserSkillsCached()
+      .then((list: UserSkill[]) => setUserSkills(
+        list.map((skill) => ({
+          id: skill.id,
+          name: skill.name,
+          description: skill.description,
+        })),
+      ))
+      .catch(() => { /* user skills are optional */ });
   }, []);
   const enabledUserSkillCount = Object.values(enabledUserSkills).filter(Boolean).length;
 
@@ -335,7 +346,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
   useFileDrop({
     targetRef: formRef,
-    onDrop: (files) => fileUpload.addFiles(files, (msg) => setDropError(msg)),
+    onDrop: (files) => addFiles(files, (msg) => setDropError(msg)),
     disabled: false,
   });
 
@@ -352,7 +363,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       }
       if (files.length > 0) {
         e.preventDefault();
-        fileUpload.addFiles(files, (msg) => setDropError(msg));
+        addFiles(files, (msg) => setDropError(msg));
       }
     };
     const form = formRef.current;
@@ -360,7 +371,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       form.addEventListener('paste', handlePaste);
       return () => form.removeEventListener('paste', handlePaste);
     }
-  }, [fileUpload.addFiles]);
+  }, [addFiles]);
 
   useEffect(() => {
     if (dropError) {
@@ -372,7 +383,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
-    fileUpload.addFiles(files, (msg) => setDropError(msg));
+    addFiles(files, (msg) => setDropError(msg));
     e.target.value = '';
   };
 
@@ -704,15 +715,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="goal">Goal</option>
                 </select>
 
-                {false && (
-                  <>
-                    {/* Run on removed — Task inherits from Project */}
-                    <span className="text-gray-400">Run on</span>
-                    <select className="hidden" value={workerId} onChange={(e) => setWorkerId(e.target.value)}>
-                    </select>
-                  </>
-                )}
-
                 <span className="text-gray-400">CLI</span>
                 <select
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
@@ -921,7 +923,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {provider === 'codex' && (
+        {provider === 'codex'
+          && (!codexTaskSkillsEnabled || remoteTaskScope || !codexMonitorEnabled) && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
             title={!codexTaskSkillsEnabled
@@ -936,9 +939,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
               ? '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'
               : remoteTaskScope
                 ? 'Monitor 仅支持本地 Codex'
-                : codexMonitorEnabled
-                  ? '本地 Codex Monitor 已启用'
-                  : 'Codex Monitor capability 未知'}
+                : 'Codex Monitor capability 未知'}
           </span>
         )}
         {/* Plugins dropdown */}

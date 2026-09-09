@@ -8871,11 +8871,32 @@ class InstanceManager:
                             CLAUDE_TASK_INTERACTIVE_DISALLOWED_TOOLS
                         ),
                     )
+                    # Keep CCM's exact turn proof if an adapter rewrites the
+                    # shared launch-parameter cache after startup.  Context
+                    # overflow recovery requires source_log_id and generation
+                    # to survive the PTY adapter boundary.
+                    if chat_initiated and pty_launch_params is not None:
+                        adapter_params = self._launch_params.get(instance_id)
+                        merged_params = dict(adapter_params or {})
+                        merged_params.update(pty_launch_params)
+                        self._launch_params[instance_id] = merged_params
                 finally:
                     if original_build_config is None:
                         delattr(self._pty_backend, "build_config")
                     else:
                         self._pty_backend.build_config = original_build_config
+
+            # ``claude-pty``'s compatibility ``launch_for_ccm`` helper writes
+            # its own (minimal) entry to ``InstanceManager._launch_params``
+            # after the backend consumer has been created.  That entry is
+            # sufficient for the upstream adapter, but it drops CCM's
+            # generation-bound chat metadata (source log, current message and
+            # turn identity).  PTY context-overflow recovery relies on those
+            # fields to prove a preflight rejection before compacting.  Restore
+            # the complete snapshot captured before launch immediately after
+            # the helper returns, before the launch metadata barrier opens.
+            if chat_initiated and pty_launch_params is not None:
+                self._launch_params[instance_id] = dict(pty_launch_params)
 
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)
@@ -10984,7 +11005,10 @@ class InstanceManager:
             # authorize completion of the new turn.
             state.terminal_seen = False
             state.durable_native_completion_reconciled = False
-            event_type = str(event.get("event_type") or "")
+            # claude-pty keeps its str-backed EventType in PTYEvent.to_dict().
+            # It compares directly with the wire value, while str(enum) does
+            # not.
+            event_type = event.get("event_type") or ""
             if event_type == "tool_use":
                 state.pending_tools += 1
             elif event_type == "tool_result" and state.pending_tools:
@@ -17262,7 +17286,19 @@ class InstanceManager:
         ):
             return None
 
-        event_type = str(event.get("event_type") or "")
+        raw_event_type = event.get("event_type")
+        # claude-pty's PTYEvent.to_dict() preserves its ``EventType`` value.
+        # EventType subclasses ``str`` for equality/serialization, but
+        # ``str(EventType.MESSAGE)`` is ``"EventType.MESSAGE"`` rather than
+        # ``"message"``.  Normalise the enum value before classifying a
+        # provider failure; otherwise a persistent PTY process can surface a
+        # structured API rejection and still be finalized as exit code 0.
+        enum_value = getattr(raw_event_type, "value", None)
+        event_type = (
+            enum_value
+            if isinstance(enum_value, str)
+            else str(raw_event_type or "")
+        )
         content = str(event.get("content") or "").strip()
         raw = event.get("raw_json")
         parsed = None

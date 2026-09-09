@@ -6708,8 +6708,12 @@ async def test_cloudrouter_claude_launch_replaces_inherited_auth_env(
 
 @pytest.mark.asyncio
 async def test_cloudrouter_claude_pty_projects_direct_auth_for_model_only(
-    db_factory, tmp_path
+    db_factory, tmp_path, monkeypatch
 ):
+    # PTY must receive the same explicitly configured CLI binary as direct
+    # launches; keep this assertion independent of the developer machine's
+    # ambient ``claude`` executable.
+    monkeypatch.setattr(settings, "claude_binary", "/opt/claude-real")
     async with db_factory() as db:
         inst = Instance(name="cloudrouter-pty-env-inst")
         db.add(inst)
@@ -20587,14 +20591,39 @@ async def test_launch_delegates_to_pty_backend_for_claude():
 
         async def launch_for_ccm(self, **kwargs):
             calls.update(kwargs)
+            # Mirror claude-pty's compatibility helper, which overwrites the
+            # manager's rich chat launch snapshot with only adapter fields.
+            im._launch_params[kwargs["instance_id"]] = {
+                "prompt": kwargs["prompt"],
+                "task_id": kwargs["task_id"],
+                "cwd": kwargs["cwd"],
+                "model": kwargs["model"],
+            }
             im.processes[kwargs["instance_id"]] = MagicMock(pid=4242)
             return "sess-1"
 
     im._pty_backend = FakeBackend()
-    im._pty_enabled = True
-    pid = await im.launch(
-        instance_id=7, prompt="do it", task_id=3, cwd="/w",
-        model="default", provider="claude",
+    pid = await im._launch_pty(
+        instance_id=7,
+        prompt="do it",
+        task_id=3,
+        task_turn_generation=9,
+        cwd="/w",
+        model="default",
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        thinking_budget=None,
+        effort_level=None,
+        chat_initiated=True,
+        config_dir=None,
+        enable_workflows=False,
+        enabled_skills=None,
+        mcp_config_path=None,
+        source_log_id=123,
+        current_message="do it now",
+        task_retry_count=0,
+        on_launch_admitted=AsyncMock(),
     )
     assert pid == 4242
     assert calls["instance_id"] == 7
@@ -20605,6 +20634,60 @@ async def test_launch_delegates_to_pty_backend_for_claude():
         "EnterPlanMode",
         "ExitPlanMode",
     ]
+    assert im._launch_params[7]["source_log_id"] == 123
+    assert im._launch_params[7]["current_message"] == "do it now"
+    assert im._launch_params[7]["task_turn_generation"] == 9
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_restores_exact_chat_metadata_after_adapter_cache_write():
+    """CCM keeps overflow proof fields after an adapter cache rewrite."""
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    instance_id = 8
+
+    class FakeBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            # Simulate the old adapter replacing the cache entry.
+            im._launch_params[kwargs["instance_id"]] = {
+                "prompt": kwargs["prompt"],
+                "task_id": kwargs["task_id"],
+                "cwd": kwargs["cwd"],
+            }
+            im.processes[kwargs["instance_id"]] = MagicMock(pid=4253)
+            return "sess-overflow-proof"
+
+    im._pty_backend = FakeBackend()
+    im._pty_enabled = True
+    im._persist_actual_turn_transport = AsyncMock()
+    await im.launch(
+        instance_id=instance_id,
+        prompt="continue",
+        task_id=42,
+        task_turn_generation=0,
+        cwd="/w",
+        provider="claude",
+        chat_initiated=True,
+        source_log_id=1234,
+        current_message="continue",
+        queue_timestamp=12.5,
+    )
+
+    params = im._launch_params[instance_id]
+    assert params["source_log_id"] == 1234
+    assert params["task_turn_generation"] == 0
+    assert params["provider"] == "claude"
+    assert params["current_message"] == "continue"
+    assert params["queue_timestamp"] == 12.5
 
 
 @pytest.mark.asyncio
@@ -22992,6 +23075,40 @@ def test_claude_login_error_message_is_turn_fatal():
         "raw_json": "{}",
         "is_error": True,
     }) == "Not logged in · Please run /login"
+
+
+@pytest.mark.parametrize(
+    ("content", "error_code"),
+    [
+        ("Prompt is too long", "invalid_request"),
+        (
+            "There's an issue with the selected model.",
+            "model_not_found",
+        ),
+    ],
+)
+def test_claude_pty_api_error_event_is_turn_fatal(
+    content,
+    error_code,
+):
+    """Exercise the enum-valued event shape emitted by claude-pty."""
+
+    from claude_pty.events import EventType, PTYEvent
+
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = PTYEvent(
+        event_type=EventType.MESSAGE,
+        role="assistant",
+        content=content,
+        raw_json=json.dumps({
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": error_code,
+        }),
+        is_error=True,
+    ).to_dict()
+
+    assert im._fatal_provider_error_for_event(event) == content
 
 
 def test_parse_codex_file_change_started_is_tool_use():

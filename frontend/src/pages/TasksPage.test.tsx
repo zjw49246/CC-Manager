@@ -3,7 +3,6 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TasksPage } from './TasksPage';
 import { api } from '../api/client';
-import { useWebSocket } from '../hooks/useWebSocket';
 
 let capturedGlobalWs:
   | ((message: Record<string, unknown>) => void)

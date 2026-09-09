@@ -86,7 +86,21 @@ export function SecretsPage() {
     }
   }, []);
 
-  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const list = await api.listSecrets();
+        if (active) {
+          setSecrets(list);
+          setError(null);
+        }
+      } catch (e) {
+        if (active) setError(String(e));
+      }
+    })();
+    return () => { active = false; };
+  }, []);
 
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this secret?')) return;

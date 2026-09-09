@@ -571,6 +571,7 @@ class TestFullMirrorBackend:
     ):
         """Only exact structured ids may open/close background Bash work."""
 
+        from claude_pty.events import EventType
         from claude_pty.session import Session
         from backend.services.pty_full_mirror import (
             _background_work_tracker,
@@ -589,7 +590,7 @@ class TestFullMirrorBackend:
             tool_use_id = f"toolu-{suffix}"
             tracker.observe(
                 {
-                    "event_type": "tool_use",
+                    "event_type": EventType.TOOL_USE,
                     "raw_json": {
                         "message": {
                             "content": [
@@ -609,7 +610,7 @@ class TestFullMirrorBackend:
             )
             tracker.observe(
                 {
-                    "event_type": "tool_result",
+                    "event_type": EventType.TOOL_RESULT,
                     "raw_json": {
                         "message": {
                             "content": [
@@ -3088,6 +3089,8 @@ class TestFullMirrorBackend:
     async def test_autonomous_turn_clears_marker_only_after_exact_sentinel(
         self, db_factory
     ):
+        from claude_pty.events import EventType
+
         im, broadcaster = _make_im(db_factory)
         terminal_handler = AsyncMock()
         im.pty_background_completion_handler = terminal_handler
@@ -3110,7 +3113,7 @@ class TestFullMirrorBackend:
             session.session_id,
             session,
             {
-                "event_type": "tool_use",
+                "event_type": EventType.TOOL_USE,
                 "role": "assistant",
                 "tool_name": "Bash",
                 "autonomous": True,
@@ -3122,7 +3125,7 @@ class TestFullMirrorBackend:
             session.session_id,
             generation,
             {
-                "event_type": "tool_result",
+                "event_type": EventType.TOOL_RESULT,
                 "role": "tool",
                 "autonomous": True,
             },
@@ -3137,7 +3140,7 @@ class TestFullMirrorBackend:
             session.session_id,
             generation,
             {
-                "event_type": "system_event",
+                "event_type": EventType.SYSTEM_EVENT,
                 "content": "turn_duration",
                 "autonomous": True,
             },
@@ -5846,11 +5849,13 @@ class TestFullMirrorBackend:
     async def test_pty_api_error_overrides_zero_process_exit(
         self, db_factory
     ):
+        from claude_pty.events import EventType, PTYEvent
+
         im, _ = _make_im(db_factory)
         backend = self._bare_backend(im)
         instance_id, task_id = await _make_inst_task(db_factory)
         started_at = datetime.utcnow()
-        error_text = "API Error: invalid_request_error: unsupported beta"
+        error_text = "There's an issue with the selected model."
 
         async with db_factory() as db:
             task = await db.get(Task, task_id)
@@ -5894,19 +5899,20 @@ class TestFullMirrorBackend:
                 task_turn_generation=0,
                 instance_started_at=started_at,
             )
-            await im._process_event(
+            await backend.on_event(
                 instance_id,
-                task_id,
-                {
-                    "event_type": "message",
-                    "role": "assistant",
-                    "content": error_text,
-                    "is_error": True,
-                    "raw_json": (
-                        '{"type":"assistant","isApiErrorMessage":true}'
-                    ),
-                },
-                consumer_record=record,
+                PTYEvent(
+                    event_type=EventType.MESSAGE,
+                    role="assistant",
+                    content=error_text,
+                    is_error=True,
+                    raw_json=json.dumps({
+                        "type": "assistant",
+                        "isApiErrorMessage": True,
+                        "error": "model_not_found",
+                    }),
+                ).to_dict(),
+                task_id=task_id,
             )
             assert record.fatal_provider_error == error_text
             await backend.on_exit(
@@ -5943,6 +5949,8 @@ class TestFullMirrorBackend:
         self, db_factory
     ):
         """A hot PTY session recovers the exact Claude overflow sequence."""
+
+        from claude_pty.events import EventType, PTYEvent
 
         im, _ = _make_im(db_factory)
         backend = self._bare_backend(im)
@@ -6029,12 +6037,12 @@ class TestFullMirrorBackend:
             )
             await backend.on_event(
                 instance_id,
-                {
-                    "event_type": "message",
-                    "role": "assistant",
-                    "content": "Prompt is too long",
-                    "is_error": True,
-                    "raw_json": json.dumps(
+                PTYEvent(
+                    event_type=EventType.MESSAGE,
+                    role="assistant",
+                    content="Prompt is too long",
+                    is_error=True,
+                    raw_json=json.dumps(
                         {
                             "type": "assistant",
                             "isApiErrorMessage": True,
@@ -6053,17 +6061,17 @@ class TestFullMirrorBackend:
                             },
                         }
                     ),
-                },
+                ).to_dict(),
                 task_id=task_id,
             )
             await backend.on_event(
                 instance_id,
-                {
-                    "event_type": "system_event",
-                    "role": None,
-                    "content": "turn_duration",
-                    "is_error": False,
-                    "raw_json": json.dumps(
+                PTYEvent(
+                    event_type=EventType.SYSTEM_EVENT,
+                    role=None,
+                    content="turn_duration",
+                    is_error=False,
+                    raw_json=json.dumps(
                         {
                             "type": "system",
                             "subtype": "turn_duration",
@@ -6071,7 +6079,7 @@ class TestFullMirrorBackend:
                             "messageCount": 1415,
                         }
                     ),
-                },
+                ).to_dict(),
                 task_id=task_id,
             )
             assert record.fatal_provider_error == "Prompt is too long"

@@ -646,7 +646,9 @@ class TestResolveResumeConfigDirCodex:
                 "payload": {
                     "type": "task_complete",
                     "error": {
-                        "message": "try again at Aug 20th, 2026 7:15 AM",
+                        # Keep this terminal evidence active regardless of the
+                        # calendar date on which the test suite is executed.
+                        "message": "try again at Dec 31st, 2099 7:15 AM",
                         "codex_error_info": "usage_limit_exceeded",
                     },
                 },

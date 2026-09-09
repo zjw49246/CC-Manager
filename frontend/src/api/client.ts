@@ -2188,6 +2188,59 @@ export interface TeamUser {
   avatar_url: string;
 }
 
+export interface TeamGroupMember {
+  id: number;
+  name: string;
+  email?: string;
+  avatar_url?: string;
+}
+
+export interface TeamGroup {
+  id: number;
+  name: string;
+  description: string;
+  members: TeamGroupMember[];
+}
+
+export interface TeamShareRecord {
+  target_id: number;
+  target_type: 'user' | 'group';
+}
+
+export interface UserSkill {
+  id: number;
+  name: string;
+  description: string;
+  content: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface SharedHistoryMessage {
+  id: number;
+  role: string;
+  event_type: string;
+  content: string | null;
+  tool_name?: string;
+  tool_input?: string;
+  tool_output?: string;
+  is_error?: boolean;
+  timestamp?: string;
+  raw_content?: string;
+}
+
+export interface SharedTaskConfig {
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexVerifyResult {
+  ok?: boolean;
+  status?: string;
+  detail?: string;
+  [key: string]: unknown;
+}
+
 export type WorkerProvider = 'codex' | 'claude';
 
 export interface WorkerAccountInput {
@@ -2321,7 +2374,7 @@ export interface UpdateReconcileResult {
 // Skills / User-Skills cache (avoid re-fetching on every TaskForm mount)
 // ---------------------------------------------------------------------------
 let _skillsCache: { key: string; label: string; description: string; always: boolean; priority: number; tags: string[] }[] | null = null;
-let _userSkillsCache: any[] | null = null;
+let _userSkillsCache: UserSkill[] | null = null;
 
 export function invalidateSkillsCache() { _skillsCache = null; }
 export function invalidateUserSkillsCache() { _userSkillsCache = null; }
@@ -2335,7 +2388,7 @@ async function listSkillsCached() {
 
 async function listUserSkillsCached() {
   if (_userSkillsCache) return _userSkillsCache;
-  const result = await request<any[]>('/api/user-skills');
+  const result = await request<UserSkill[]>('/api/user-skills');
   _userSkillsCache = result;
   return result;
 }
@@ -2365,19 +2418,19 @@ export const api = {
 
   // Task sharing
   shareTask: (taskId: number, targets: { open_id: string; name?: string; ccm_url: string }[]) =>
-    request<{ shares: any[] }>(`/api/tasks/${taskId}/share`, { method: 'POST', body: JSON.stringify({ targets }) }),
+    request<{ shares: TeamShareRecord[] }>(`/api/tasks/${taskId}/share`, { method: 'POST', body: JSON.stringify({ targets }) }),
   revokeTaskShare: (taskId: number, openId: string) =>
     request<{ ok: boolean }>(`/api/tasks/${taskId}/share/${openId}`, { method: 'DELETE' }),
   getTaskShares: (taskId: number) =>
-    request<{ shares: any[] }>(`/api/tasks/${taskId}/shares`),
+    request<{ shares: TeamShareRecord[] }>(`/api/tasks/${taskId}/shares`),
 
   // Project sharing
   shareProject: (projectId: number, targets: { open_id: string; name?: string; ccm_url: string }[]) =>
-    request<{ shares: any[] }>(`/api/projects/${projectId}/share`, { method: 'POST', body: JSON.stringify({ targets }) }),
+    request<{ shares: TeamShareRecord[] }>(`/api/projects/${projectId}/share`, { method: 'POST', body: JSON.stringify({ targets }) }),
   revokeProjectShare: (projectId: number, openId: string) =>
     request<{ ok: boolean }>(`/api/projects/${projectId}/share/${openId}`, { method: 'DELETE' }),
   getProjectShares: (projectId: number) =>
-    request<{ shares: any[] }>(`/api/projects/${projectId}/shares`),
+    request<{ shares: TeamShareRecord[] }>(`/api/projects/${projectId}/shares`),
 
   // Shared tasks (received from others)
   getSharedTasks: (enrich = false) =>
@@ -2389,12 +2442,12 @@ export const api = {
     if (limit) params.set('limit', String(limit));
     if (beforeId) params.set('before_id', String(beforeId));
     const qs = params.toString();
-    return request<any[]>(`/api/shared/${sharedId}/history${qs ? '?' + qs : ''}`);
+    return request<SharedHistoryMessage[]>(`/api/shared/${sharedId}/history${qs ? '?' + qs : ''}`);
   },
   sendSharedChat: (sharedId: number, message: string) =>
     request<{ ok: boolean }>(`/api/shared/${sharedId}/chat`, { method: 'POST', body: JSON.stringify({ message }) }),
   getSharedConfig: (sharedId: number) =>
-    request<any>(`/api/shared/${sharedId}/config`),
+    request<SharedTaskConfig>(`/api/shared/${sharedId}/config`),
   pingSharer: (sharedId: number) =>
     request<{ online: boolean }>(`/api/shared/${sharedId}/ping`),
 
@@ -3423,11 +3476,11 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ role }),
     }),
-  getTeamGroups: () => request<any[]>('/api/team/groups'),
+  getTeamGroups: () => request<TeamGroup[]>('/api/team/groups'),
   createTeamGroup: (name: string, description?: string) =>
-    request<any>('/api/team/groups', { method: 'POST', body: JSON.stringify({ name, description }) }),
+    request<TeamGroup>('/api/team/groups', { method: 'POST', body: JSON.stringify({ name, description }) }),
   updateTeamGroup: (id: number, name: string, description?: string) =>
-    request<any>(`/api/team/groups/${id}`, { method: 'PUT', body: JSON.stringify({ name, description }) }),
+    request<TeamGroup>(`/api/team/groups/${id}`, { method: 'PUT', body: JSON.stringify({ name, description }) }),
   deleteTeamGroup: (id: number) =>
     request<{ ok: boolean }>(`/api/team/groups/${id}`, { method: 'DELETE' }),
   addTeamGroupMember: (groupId: number, userId: number) =>
@@ -3439,13 +3492,13 @@ export const api = {
   teamUnshareProject: (projectId: number, targetType: string, targetId: number) =>
     request<{ ok: boolean }>(`/api/team/projects/${projectId}/share`, { method: 'DELETE', body: JSON.stringify({ target_type: targetType, target_id: targetId }) }),
   teamGetProjectShares: (projectId: number) =>
-    request<any[]>(`/api/team/projects/${projectId}/shares`),
+    request<TeamShareRecord[]>(`/api/team/projects/${projectId}/shares`),
   shareTaskTeam: (taskId: number, targetType: string, targetId: number, permission?: string) =>
     request<{ ok: boolean }>(`/api/team/tasks/${taskId}/share`, { method: 'POST', body: JSON.stringify({ target_type: targetType, target_id: targetId, permission: permission || 'chat' }) }),
   unshareTaskTeam: (taskId: number, targetType: string, targetId: number) =>
     request<{ ok: boolean }>(`/api/team/tasks/${taskId}/share`, { method: 'DELETE', body: JSON.stringify({ target_type: targetType, target_id: targetId }) }),
   getTaskSharesTeam: (taskId: number) =>
-    request<any[]>(`/api/team/tasks/${taskId}/shares`),
+    request<TeamShareRecord[]>(`/api/team/tasks/${taskId}/shares`),
 
   // Pool add account
   poolAddAccount: (data: { email: string; token: string; login_method?: string }) =>
@@ -3470,7 +3523,7 @@ export const api = {
   codexPoolDeleteAccount: (accountId: string) =>
     request<{ ok: boolean }>(`/api/codex-pool/accounts/${accountId}`, { method: 'DELETE' }),
   codexPoolVerify: (accountId: string) =>
-    request<any>(`/api/codex-pool/accounts/${accountId}/verify`),
+    request<CodexVerifyResult>(`/api/codex-pool/accounts/${accountId}/verify`),
   codexPoolRelogin: (accountId: string) =>
     request<{ ok: boolean; status: CodexLoginStatusName; attempt_id?: string }>(`/api/codex-pool/accounts/${accountId}/relogin`, { method: 'POST' }),
   codexPoolReloginStatus: (accountId: string) =>
@@ -3486,12 +3539,12 @@ export const api = {
     }),
 
   // User Skills
-  listUserSkills: () => request<any[]>('/api/user-skills'),
-  getUserSkill: (id: number) => request<any>(`/api/user-skills/${id}`),
+  listUserSkills: () => request<UserSkill[]>('/api/user-skills'),
+  getUserSkill: (id: number) => request<UserSkill>(`/api/user-skills/${id}`),
   createUserSkill: (data: { name: string; description?: string; content?: string }) =>
-    request<any>('/api/user-skills', { method: 'POST', body: JSON.stringify(data) }),
+    request<UserSkill>('/api/user-skills', { method: 'POST', body: JSON.stringify(data) }),
   updateUserSkill: (id: number, data: { name?: string; description?: string; content?: string }) =>
-    request<any>(`/api/user-skills/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+    request<UserSkill>(`/api/user-skills/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteUserSkill: (id: number) =>
     request<{ ok: boolean }>(`/api/user-skills/${id}`, { method: 'DELETE' }),
 
@@ -3502,9 +3555,9 @@ export const api = {
       method: 'PUT', body: JSON.stringify({ update_channel }),
     }),
   startUpdate: (data: { skip_frontend_build?: boolean; dry_run?: boolean; force?: boolean; branch?: string | null; channel?: 'stable' | 'main' | null } = {}) =>
-    request<any>('/api/system/update', { method: 'POST', body: JSON.stringify(data) }),
+    request<Record<string, unknown>>('/api/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getUpdateStatus: () =>
-    request<any>('/api/system/update/status'),
+    request<Record<string, unknown>>('/api/system/update/status'),
   reconcileUpdateState: () =>
     request<UpdateReconcileResult>('/api/system/update/reconcile', { method: 'POST' }),
   repairUpdate: () =>

@@ -27,7 +27,18 @@ export function TagManager({ onClose, onChanged }: TagManagerProps) {
     }
   };
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const list = await api.listTags();
+        if (active) setTags(list);
+      } catch (e) {
+        if (active) setError(String(e));
+      }
+    })();
+    return () => { active = false; };
+  }, []);
 
   const startEdit = (tag: TagItem) => {
     setEditingId(tag.id);

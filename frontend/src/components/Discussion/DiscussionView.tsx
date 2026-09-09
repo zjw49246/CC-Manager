@@ -183,14 +183,15 @@ export function DiscussionView({ discussionId, onBack, onDeleted }: DiscussionVi
   const [facilitatorEvents, setFacilitatorEvents] = useState<DiscussionEventItem[]>([]);
   const [facilitatorStatus, setFacilitatorStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const discussionTitle = discussion?.title ?? null;
 
   useEffect(() => {
-    if (!discussion) return;
+    if (!discussionTitle) return;
     const prev = document.title;
-    const preview = discussion.title.length > 30 ? discussion.title.slice(0, 30) + '...' : discussion.title;
+    const preview = discussionTitle.length > 30 ? discussionTitle.slice(0, 30) + '...' : discussionTitle;
     document.title = preview || 'Discussion - CCM';
     return () => { document.title = prev; };
-  }, [discussion?.title]);
+  }, [discussionTitle]);
 
   const loadDiscussion = useCallback(async () => {
     try {

@@ -250,7 +250,7 @@ claude-manager/
 ### 安装
 
 ```bash
-git clone https://github.com/zjw49246/Claude-Code-Manager.git && cd Claude-Code-Manager
+git clone https://github.com/zjw49246/CC-Manager.git && cd CC-Manager
 
 # Ubuntu/Debian：本地 Claude Task 的隔离预检依赖
 sudo apt-get install -y bubblewrap socat

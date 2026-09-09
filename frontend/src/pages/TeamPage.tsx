@@ -164,7 +164,22 @@ export default function TeamPage() {
     setLoading(false);
   }, [isAdmin]);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const results = await Promise.allSettled([
+        api.getTeamUsers(),
+        isAdmin ? api.listWorkers() : Promise.resolve([]),
+        api.getTeamGroups(),
+      ]);
+      if (!active) return;
+      if (results[0].status === 'fulfilled') setTeamUsers(results[0].value as TeamUser[]);
+      if (results[1].status === 'fulfilled') setWorkers(results[1].value as Worker[]);
+      if (results[2].status === 'fulfilled') setGroups(results[2].value as UserGroup[]);
+      setLoading(false);
+    })();
+    return () => { active = false; };
+  }, [isAdmin]);
 
   const selectedGroup = groups.find(g => g.id === selectedGroupId) ?? null;
 
@@ -242,7 +257,7 @@ export default function TeamPage() {
                         try {
                           await api.updateTeamUserRole(u.id, newRole);
                           fetchAll();
-                        } catch {}
+                        } catch { /* role update failed; keep current view */ }
                       }}
                       className="p-1 text-gray-500 hover:text-indigo-400"
                       title={u.role === 'admin' ? '降级为普通用户' : '提升为管理员'}

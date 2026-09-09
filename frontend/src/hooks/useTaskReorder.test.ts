@@ -195,7 +195,6 @@ describe('newSortFor', () => {
       makeTask({ id: 2, sort_order: null, created_at: '2025-01-01T00:00:00Z', last_accessed_at: null, starred: false }),
     ];
     const ek1 = effectiveKey(list[0], false);
-    const ek2 = effectiveKey(list[1], false);
     // Moving t2 to top: prev=null, next=t1 → nk + 60
     const result = newSortFor(list, 1, 0, false);
     expect(result).toBe(ek1 + 60);

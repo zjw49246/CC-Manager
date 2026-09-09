@@ -99,7 +99,10 @@ class _CCMBackgroundWorkTracker:
         """Consume one ordered JSONL-derived event without guessing from text."""
 
         raw = self._raw_payload(event)
-        event_type = str(event.get("event_type") or "")
+        # PTYEvent.to_dict() preserves claude-pty's str-backed EventType.
+        # Keep that value intact so it still compares equal to its wire name;
+        # str(EventType.TOOL_USE) would instead become "EventType.TOOL_USE".
+        event_type = event.get("event_type") or ""
         if raw is not None and event_type == "tool_use":
             message = raw.get("message")
             blocks = (

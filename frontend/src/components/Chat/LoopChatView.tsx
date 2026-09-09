@@ -25,22 +25,27 @@ interface IterationMeta {
   progress: string | null;
 }
 
-function messageMatchesTaskTurn(message: ChatMessage, task: Task): boolean {
+function messageMatchesTaskTurn(
+  message: ChatMessage,
+  retryCount: number,
+  turnGeneration: number,
+): boolean {
   return (
-    message.task_retry_count === task.retry_count
-    && message.task_turn_generation === task.turn_generation
+    message.task_retry_count === retryCount
+    && message.task_turn_generation === turnGeneration
   );
 }
 
 function latestBackgroundLifecycle(
   messages: ChatMessage[],
-  task: Task,
+  retryCount: number,
+  turnGeneration: number,
 ): BackgroundLifecycle | null {
   let lifecycleIndex = -1;
   let lifecycleMessage: ChatMessage | null = null;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (!messageMatchesTaskTurn(message, task)) continue;
+    if (!messageMatchesTaskTurn(message, retryCount, turnGeneration)) continue;
     if (message.background_lifecycle) {
       lifecycleIndex = index;
       lifecycleMessage = message;
@@ -70,7 +75,7 @@ function latestBackgroundLifecycle(
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
     if (
-      !messageMatchesTaskTurn(message, task)
+      !messageMatchesTaskTurn(message, retryCount, turnGeneration)
       || !foregroundTypes.has(message.event_type)
     ) continue;
     if (index > lifecycleIndex) return null;
@@ -443,7 +448,7 @@ export function LoopChatView({ task, onBack, inline }: LoopChatViewProps) {
   const lastWsBackgroundAt = useRef(0);
   const effectiveStatus = localStatus || task.status;
   const backgroundLifecycle = useMemo(
-    () => latestBackgroundLifecycle(messages, task),
+    () => latestBackgroundLifecycle(messages, task.retry_count, task.turn_generation),
     [messages, task.retry_count, task.turn_generation],
   );
   const backgroundActive = (

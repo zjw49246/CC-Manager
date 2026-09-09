@@ -1466,7 +1466,13 @@ class TestQuotaAwareSelection:
     async def test_cold_cache_refresh_skips_structured_terminal_account(
         self, pool: CodexPool, tmp_path: Path,
     ):
-        _usage_limit_rollout(tmp_path / "codex-1", "terminal")
+        # Keep the terminal evidence active independently of the calendar date
+        # on which the suite is executed.
+        _usage_limit_rollout(
+            tmp_path / "codex-1",
+            "terminal",
+            reset_text="Dec 31st, 2099 7:15 AM",
+        )
         _quota_rollout(
             tmp_path / "codex-2",
             "healthy",

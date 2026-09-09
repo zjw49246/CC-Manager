@@ -20,18 +20,40 @@ fi
 
 PY=.venv/bin/python3
 UV="${UV:-$HOME/.local/bin/uv}"
-# 必须锚定 claude-pty 那一行——pyproject 里还有其他 git 依赖（如 auto-backup）
-PTY_URL=$(grep -E '"claude-pty @ git\+' pyproject.toml | grep -oE 'git\+https://[^"@]+' | head -1 | sed 's/^git+//')
-[ -n "$PTY_URL" ] || { echo "pyproject.toml 里找不到 claude-pty git 依赖"; exit 1; }
+[ -x "$PY" ] || { echo "claude-pty 刷新失败：Python 环境不存在（$PY）" >&2; exit 1; }
+[ -x "$UV" ] || { echo "claude-pty 刷新失败：uv 不可执行（$UV）" >&2; exit 1; }
 
-# editable 安装：代码就是本地 PTY 仓库，无需刷新
-if ! "$PY" -c "import claude_pty, sys; sys.exit(0 if 'site-packages' in claude_pty.__file__ else 1)" 2>/dev/null; then
-    echo "claude-pty 是 editable/本地安装（$("$PY" -c 'import claude_pty; print(claude_pty.__file__)' 2>/dev/null || echo 未安装)），跳过刷新"
+# 必须锚定 claude-pty 那一行——pyproject 里还有其他 git 依赖（如 auto-backup）。
+# 把解析失败视为失败，而不是让更新流程继续并误报“已完成”。
+if ! PTY_URL="$(grep -E '"claude-pty @ git\+' pyproject.toml \
+    | grep -oE 'git\+https://[^"@]+' \
+    | head -1 | sed 's/^git+//')"; then
+    PTY_URL=""
+fi
+[ -n "$PTY_URL" ] || {
+    echo "pyproject.toml 里找不到 claude-pty git 依赖" >&2
+    exit 1
+}
+
+# editable 安装：代码就是本地 PTY 仓库，无需刷新。导入失败不能当作
+# editable，否则生产缺包时会被错误地当成“PTY 已同步”。
+PTY_LOCATION=$("$PY" -c 'import claude_pty; print(claude_pty.__file__)' 2>/dev/null || true)
+if [ -z "$PTY_LOCATION" ]; then
+    echo "claude-pty 未安装或无法导入，拒绝继续更新" >&2
+    exit 1
+fi
+case "$PTY_LOCATION" in
+*/site-packages/*)
+    ;;
+*)
+    echo "claude-pty 是 editable/本地安装（$PTY_LOCATION），跳过刷新"
     echo "CCM_PTY_REFRESH_CHANGED=0"
     exit 0
-fi
+    ;;
+esac
 
-installed=$("$PY" - <<'EOF'
+installed_commit() {
+    "$PY" - <<'EOF'
 import json, importlib.metadata as m
 try:
     raw = m.distribution("claude-pty").read_text("direct_url.json") or "{}"
@@ -39,14 +61,22 @@ try:
 except Exception:
     print("")
 EOF
-)
-
-latest=$(git ls-remote "$PTY_URL" refs/heads/main | cut -f1)
-[ -n "$latest" ] || {
-    echo "无法获取 PTY 远端 main HEAD（网络/权限？），跳过"
-    echo "CCM_PTY_REFRESH_CHANGED=0"
-    exit 0
 }
+
+installed="$(installed_commit)"
+[ "$installed" != "" ] || {
+    echo "无法读取已安装 claude-pty 的 commit，拒绝继续更新" >&2
+    exit 1
+}
+
+if ! latest="$(git ls-remote "$PTY_URL" refs/heads/main | awk 'NR == 1 {print $1}')"; then
+    echo "无法获取 PTY 远端 main HEAD（网络/权限？），拒绝完成更新" >&2
+    exit 1
+fi
+if ! [[ "$latest" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+    echo "PTY 远端 main HEAD 无效（${latest:-空}），拒绝完成更新" >&2
+    exit 1
+fi
 
 if [ "$installed" = "$latest" ]; then
     echo "claude-pty 已是最新（${latest:0:12}）"
@@ -62,6 +92,11 @@ fi
 
 echo "claude-pty: ${installed:0:12} -> ${latest:0:12}，重新安装…"
 "$UV" pip install --python "$PY" --force-reinstall --no-deps "claude-pty @ git+${PTY_URL}@${latest}"
+installed_after="$(installed_commit)"
+if [ "$installed_after" != "$latest" ]; then
+    echo "claude-pty 安装后 commit 校验失败（期望=${latest} 实际=${installed_after:-空}），拒绝完成更新" >&2
+    exit 1
+fi
 echo "完成。验证："
 "$PY" -c "import claude_pty; print(' import OK:', claude_pty.__file__)"
 echo "CCM_PTY_REFRESH_CHANGED=1"

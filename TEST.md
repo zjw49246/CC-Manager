@@ -1169,7 +1169,8 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/api/instances.py` | `backend/tests/test_api_instances.py` |
 | `backend/services/dispatcher.py` | `backend/tests/test_service_dispatcher.py` |
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
-| `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
+| `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py`（含真实 `claude_pty.events.PTYEvent` / `EventType` 错误事件兼容） |
+| `backend/services/pty_full_mirror.py` | `backend/tests/test_autonomous_mirror.py`（含真实 `EventType` 的后台 tool 追踪与上下文超限恢复） |
 | `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |
