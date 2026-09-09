@@ -1056,6 +1056,12 @@ export interface PlanQuestion {
   required: boolean;
 }
 
+export interface PlanInputAnswer {
+  question_id: string;
+  value: string | string[] | null;
+  answered_in_response_text?: boolean;
+}
+
 export interface PlanInputRequest {
   id: number;
   plan_id: number;
@@ -1065,7 +1071,7 @@ export interface PlanInputRequest {
   reason: string | null;
   questions: PlanQuestion[];
   status: 'prepared' | 'open' | 'answered' | 'cancelled';
-  answers: { question_id: string; value: string | string[] | null }[] | null;
+  answers: PlanInputAnswer[] | null;
   response_text: string | null;
   attachments: FileAttachment[] | null;
   answered_by: number | null;
@@ -2826,7 +2832,7 @@ export const api = {
   answerPlanInput: (runId: number, requestId: number, data: {
     expected_run_generation: number;
     idempotency_key: string;
-    answers: { question_id: string; value: string | string[] | null }[];
+    answers: PlanInputAnswer[];
     response_text?: string;
     file_paths?: string[];
     image_paths?: string[];

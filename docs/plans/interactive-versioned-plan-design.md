@@ -230,9 +230,11 @@ Planner 返回 `request_input` 后：
 7. 新 Planner Step 使用原请求、冻结上下文、全部既有问答、base Version 和当前 candidate
    继续规划。
 
-选择题的模型选项不是强制穷举集合。若所有选项都不适用，用户可以保持未选择并在补充说明中
-给出替代答案；服务端只在补充说明非空时接受 required choice 的空结构化值，恢复后的
-Planner/Reviewer 必须把 `null choice + additional response` 作为一个明确答案处理。
+选择题的模型选项不是强制穷举集合。若所有选项都不适用，用户可以逐题明确选择“在补充说明
+中回答”并给出替代答案；服务端只在补充说明非空且该 choice 带
+`answered_in_response_text=true` 时接受空结构化值，不能用一段全局说明静默跳过其他 required
+问题。恢复后的 Planner/Reviewer 必须把该标记、`null choice` 和 additional response 作为一个
+明确答案处理。
 
 如果提问发生在第一版方案之前，不创建空 Version。
 

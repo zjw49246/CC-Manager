@@ -362,7 +362,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const showStaleness = Boolean(shown && !shown.applied && !plan.read_only);
   const canReviseWithLatestReviewerFeedback = Boolean(
     shown
-    && current
+    && shown.id === plan.current_version_id
     && !plan.active_run_id
     && !plan.archived_at
     && shown.human_decision === 'pending'

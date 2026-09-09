@@ -3037,10 +3037,23 @@ async def test_revision_runner_restores_original_scope_base_and_review_feedback(
         assert "incremental revision" in prompt
         assert "Change only the cache invalidation strategy" in prompt
     assert "# Base" in prompts[0]
-    assert "Retain an explicit rollback procedure" in prompts[0]
+    assert (
+        "## Reviewer feedback to resolve\n"
+        "Retain an explicit rollback procedure"
+    ) in prompts[0]
     assert "# Base" in prompts[1]
-    assert "Specify cache rollback behavior" in prompts[2]
-    assert "Specify cache rollback behavior" in prompts[3]
+    assert (
+        "## Previous Reviewer feedback to verify\n"
+        "Retain an explicit rollback procedure"
+    ) in prompts[1]
+    assert (
+        "## Reviewer feedback to resolve\n"
+        "Specify cache rollback behavior"
+    ) in prompts[2]
+    assert (
+        "## Previous Reviewer feedback to verify\n"
+        "Specify cache rollback behavior"
+    ) in prompts[3]
 
 
 @pytest.mark.asyncio
@@ -3222,7 +3235,11 @@ async def test_required_choice_accepts_free_form_alternative(
         json={
             "expected_run_generation": 3,
             "idempotency_key": "free-form-choice",
-            "answers": [{"question_id": "rollout", "value": None}],
+            "answers": [{
+                "question_id": "rollout",
+                "value": None,
+                "answered_in_response_text": True,
+            }],
             "response_text": (
                 "Neither option fits. Use a canary rollout with a manual gate."
             ),
@@ -3230,7 +3247,11 @@ async def test_required_choice_accepts_free_form_alternative(
     )
     assert answered.status_code == 200, answered.text
     assert answered.json()["answers"] == [
-        {"question_id": "rollout", "value": None}
+        {
+            "question_id": "rollout",
+            "value": None,
+            "answered_in_response_text": True,
+        }
     ]
     assert "canary rollout" in answered.json()["response_text"]
 
@@ -3264,7 +3285,11 @@ def test_free_form_choice_alternative_does_not_bypass_required_text():
         },
     ]
     answers = [
-        {"question_id": "rollout", "value": None},
+        {
+            "question_id": "rollout",
+            "value": None,
+            "answered_in_response_text": True,
+        },
         {"question_id": "region", "value": None},
     ]
 
@@ -3277,6 +3302,41 @@ def test_free_form_choice_alternative_does_not_bypass_required_text():
 
     assert caught.value.status_code == 422
     assert caught.value.detail == "Question 'region' requires an answer"
+
+
+def test_free_form_answer_is_bound_to_each_required_choice():
+    questions = [
+        {
+            "id": question_id,
+            "header": question_id.title(),
+            "question": f"Choose {question_id}",
+            "response_type": "single_choice",
+            "options": [
+                {"value": "a", "label": "A"},
+                {"value": "b", "label": "B"},
+            ],
+            "required": True,
+        }
+        for question_id in ("rollout", "region")
+    ]
+    answers = [
+        {
+            "question_id": "rollout",
+            "value": None,
+            "answered_in_response_text": True,
+        },
+        {"question_id": "region", "value": None},
+    ]
+
+    with pytest.raises(HTTPException) as caught:
+        validate_input_answers(
+            questions,
+            answers,
+            response_text="Use a canary rollout instead.",
+        )
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail.startswith("Question 'region' requires an answer")
 
 
 @pytest.mark.asyncio

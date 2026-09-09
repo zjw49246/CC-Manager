@@ -139,7 +139,11 @@ describe('PlanInputForm', () => {
       71,
       81,
       expect.objectContaining({
-        answers: [{ question_id: 'question_0', value: null }],
+        answers: [{
+          question_id: 'question_0',
+          value: null,
+          answered_in_response_text: true,
+        }],
         response_text: 'Use a canary rollout with a manual gate instead.',
       }),
     ));
@@ -158,6 +162,9 @@ describe('PlanInputForm', () => {
     };
     render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
 
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
     await userEvent.type(
       screen.getByLabelText('Additional context'),
       'Use a canary rollout with a manual gate instead.',
@@ -169,6 +176,34 @@ describe('PlanInputForm', () => {
     expect(api.answerPlanInput).not.toHaveBeenCalled();
 
     await userEvent.type(screen.getAllByRole('textbox')[0], 'us-east-1');
+    expect(submit).toBeEnabled();
+  });
+
+  it('binds additional context to explicitly marked required choices', async () => {
+    const request = requestWithQuestions(2);
+    request.questions = request.questions.map((question) => ({
+      ...question,
+      response_type: 'single_choice',
+      options: [
+        { label: 'Option A', value: 'a' },
+        { label: 'Option B', value: 'b' },
+      ],
+    }));
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    const alternatives = screen.getAllByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    });
+    await userEvent.click(alternatives[0]);
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use an alternative for the first question.',
+    );
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeDisabled();
+
+    await userEvent.click(screen.getAllByLabelText('Option A')[1]);
     expect(submit).toBeEnabled();
   });
 

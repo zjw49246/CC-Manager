@@ -1236,14 +1236,19 @@ async def complete_plan_run_with_version(
     return version
 
 
-def _answer_map(answers: Iterable[PlanInputAnswer | dict]) -> dict[str, object]:
-    result: dict[str, object] = {}
+def _answer_map(
+    answers: Iterable[PlanInputAnswer | dict],
+) -> dict[str, tuple[object, bool]]:
+    result: dict[str, tuple[object, bool]] = {}
     for answer in answers:
         item = answer.model_dump() if isinstance(answer, PlanInputAnswer) else answer
         question_id = item.get("question_id")
         if not isinstance(question_id, str) or question_id in result:
             raise HTTPException(422, "Answers must use unique valid question_id values")
-        result[question_id] = item.get("value")
+        result[question_id] = (
+            item.get("value"),
+            item.get("answered_in_response_text") is True,
+        )
     return result
 
 
@@ -1263,29 +1268,49 @@ def validate_input_answers(
 
     parsed = [PlanQuestion.model_validate(question) for question in questions]
     by_id = {question.id: question for question in parsed}
-    values = _answer_map(answers)
+    answers_by_id = _answer_map(answers)
     has_free_form_answer = bool(response_text and response_text.strip())
-    unknown = set(values) - set(by_id)
+    unknown = set(answers_by_id) - set(by_id)
     if unknown:
         raise HTTPException(422, f"Unknown question ids: {sorted(unknown)}")
     normalized: list[dict] = []
     for question in parsed:
-        value = values.get(question.id)
-        free_form_replaces_choice = (
-            question.response_type in {"single_choice", "multi_choice"}
-            and has_free_form_answer
+        value, answered_in_response_text = answers_by_id.get(
+            question.id,
+            (None, False),
         )
+        if answered_in_response_text:
+            if question.response_type not in {"single_choice", "multi_choice"}:
+                raise HTTPException(
+                    422,
+                    f"Question {question.id!r} is not a choice question",
+                )
+            if value is not None:
+                raise HTTPException(
+                    422,
+                    f"Question {question.id!r} cannot combine a choice with "
+                    "an additional-response answer",
+                )
+            if not has_free_form_answer:
+                raise HTTPException(
+                    422,
+                    f"Question {question.id!r} requires a non-empty "
+                    "additional response",
+                )
         if (
             question.required
             and (value is None or value == "" or value == [])
-            and not free_form_replaces_choice
+            and not answered_in_response_text
         ):
             detail = f"Question {question.id!r} requires an answer"
             if question.response_type in {"single_choice", "multi_choice"}:
                 detail += " or a non-empty additional response"
             raise HTTPException(422, detail)
         if value is None:
-            normalized.append({"question_id": question.id, "value": None})
+            item = {"question_id": question.id, "value": None}
+            if answered_in_response_text:
+                item["answered_in_response_text"] = True
+            normalized.append(item)
             continue
         if question.response_type == "text":
             if not isinstance(value, str) or len(value) > 50_000:

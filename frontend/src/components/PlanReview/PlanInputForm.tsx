@@ -18,6 +18,9 @@ type AnswerValue = string | string[];
 
 export function PlanInputForm({ run, request, compact = false, onAnswered }: PlanInputFormProps) {
   const [answers, setAnswers] = useState<Record<string, AnswerValue>>({});
+  const [freeFormQuestionIds, setFreeFormQuestionIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [additional, setAdditional] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,6 +35,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
 
   useEffect(() => {
     setAnswers({});
+    setFreeFormQuestionIds(new Set());
     setAdditional('');
     setSubmitting(false);
     setError(null);
@@ -43,13 +47,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       if (!question.required) return false;
       const value = answers[question.id];
       const missing = value == null || value === '' || (Array.isArray(value) && value.length === 0);
-      const freeFormReplacesChoice = (
-        question.response_type === 'single_choice'
-        || question.response_type === 'multi_choice'
-      ) && Boolean(additional.trim());
+      const freeFormReplacesChoice = freeFormQuestionIds.has(question.id)
+        && Boolean(additional.trim());
       return missing && !freeFormReplacesChoice;
     }),
-    [additional, answers, request.questions],
+    [additional, answers, freeFormQuestionIds, request.questions],
   );
 
   const submit = async () => {
@@ -64,6 +66,9 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         answers: request.questions.map((question) => ({
           question_id: question.id,
           value: answers[question.id] ?? null,
+          ...(freeFormQuestionIds.has(question.id)
+            ? { answered_in_response_text: true }
+            : {}),
         })),
         ...(additional.trim() ? { response_text: additional.trim() } : {}),
         ...(results.length ? {
@@ -77,6 +82,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         } : {}),
       });
       setAnswers({});
+      setFreeFormQuestionIds(new Set());
       setAdditional('');
       uploads.clear();
       await onAnswered(answered);
@@ -111,6 +117,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       <div className="max-h-[min(52vh,560px)] space-y-4 overflow-y-auto pr-1">
         {request.questions.map((question, index) => {
           const value = answers[question.id];
+          const answeredInAdditionalContext = freeFormQuestionIds.has(question.id);
           return (
             <fieldset key={question.id} className="rounded-xl border border-gray-700 bg-gray-900/70 p-3.5">
               <legend className="px-1 text-xs font-semibold text-indigo-300">
@@ -138,37 +145,47 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
                           type={multi ? 'checkbox' : 'radio'}
                           name={`plan-question-${request.id}-${question.id}`}
                           checked={selected}
-                          onChange={() => setAnswers((current) => {
-                            if (!multi) return { ...current, [question.id]: option.value };
-                            const existing = Array.isArray(current[question.id]) ? current[question.id] as string[] : [];
-                            return {
-                              ...current,
-                              [question.id]: selected
-                                ? existing.filter((item) => item !== option.value)
-                                : [...existing, option.value],
-                            };
-                          })}
+                          onChange={() => {
+                            setFreeFormQuestionIds((current) => {
+                              if (!current.has(question.id)) return current;
+                              const next = new Set(current);
+                              next.delete(question.id);
+                              return next;
+                            });
+                            setAnswers((current) => {
+                              if (!multi) return { ...current, [question.id]: option.value };
+                              const existing = Array.isArray(current[question.id]) ? current[question.id] as string[] : [];
+                              return {
+                                ...current,
+                                [question.id]: selected
+                                  ? existing.filter((item) => item !== option.value)
+                                  : [...existing, option.value],
+                              };
+                            });
+                          }}
                         />
                         {option.label}
                       </label>
                     );
                   })}
-                  {question.response_type === 'single_choice' && (
-                    <button
-                      type="button"
-                      className="w-full rounded-lg border border-dashed border-gray-700 px-3 py-2 text-left text-xs text-gray-400 transition-colors hover:border-indigo-500/50 hover:bg-indigo-500/5 hover:text-gray-200"
-                      onClick={() => {
-                        setAnswers((current) => {
-                          const next = { ...current };
-                          delete next[question.id];
-                          return next;
-                        });
-                        additionalRef.current?.focus();
-                      }}
-                    >
-                      None of these options fit — answer in additional context
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    aria-pressed={answeredInAdditionalContext}
+                    className={`w-full rounded-lg border border-dashed px-3 py-2 text-left text-xs transition-colors ${answeredInAdditionalContext ? 'border-indigo-500/60 bg-indigo-500/10 text-indigo-300' : 'border-gray-700 text-gray-400 hover:border-indigo-500/50 hover:bg-indigo-500/5 hover:text-gray-200'}`}
+                    onClick={() => {
+                      setAnswers((current) => {
+                        const next = { ...current };
+                        delete next[question.id];
+                        return next;
+                      });
+                      setFreeFormQuestionIds((current) => new Set(current).add(question.id));
+                      additionalRef.current?.focus();
+                    }}
+                  >
+                    {answeredInAdditionalContext
+                      ? 'Answering this question in additional context'
+                      : 'None of these options fit — answer in additional context'}
+                  </button>
                 </div>
               )}
             </fieldset>
