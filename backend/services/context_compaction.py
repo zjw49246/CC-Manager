@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 import json
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
-
 
 _CONTEXT_LIMIT_MARKERS = (
     "prompt is too long",
@@ -21,6 +20,214 @@ _CONTEXT_LIMIT_MARKERS = (
     "too many tokens for the model",
     "input is too long for the requested model",
 )
+
+
+def _raw_mapping(value: Any) -> dict[str, Any] | None:
+    """Decode a persisted LogEntry payload without treating text as evidence."""
+
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _canonical_zero_usage(value: Any) -> bool:
+    """Verify that a provider usage envelope represents no model request.
+
+    Claude's API-error envelope contains bookkeeping fields in addition to
+    the token counters (for example ``server_tool_use`` and
+    ``cache_creation``).  The old exact-key check rejected those legitimate
+    envelopes, so a real ``Prompt is too long`` response was not recoverable.
+    Only counter fields are semantically relevant here: every ``*_tokens`` or
+    ``*_requests`` value must be numeric zero, while descriptive metadata may
+    be present and null.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    if any(
+        key not in value or type(value[key]) is not int or value[key] != 0
+        for key in ("input_tokens", "output_tokens")
+    ):
+        return False
+
+    def counters_are_zero(item: Any) -> bool:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if isinstance(key, str) and key.endswith(
+                    ("_tokens", "_requests")
+                ):
+                    if (
+                        isinstance(nested, bool)
+                        or not isinstance(nested, (int, float))
+                        or nested != 0
+                    ):
+                        return False
+                elif isinstance(nested, (Mapping, list)) and not counters_are_zero(
+                    nested
+                ):
+                    return False
+            return True
+        if isinstance(item, list):
+            return all(counters_are_zero(nested) for nested in item)
+        return True
+
+    return counters_are_zero(value)
+
+
+def _harmless_context_failure_trailer(row: Any) -> bool:
+    if row.event_type in {"system_init", "rate_limit_event"}:
+        return row.is_error is False
+    raw = _raw_mapping(row.raw_json)
+    return bool(
+        row.event_type == "system_event"
+        and row.is_error is False
+        and isinstance(raw, dict)
+        and raw.get("type") == "system"
+        and raw.get("subtype") == "turn_duration"
+    )
+
+
+def _is_response_timeout_marker(value: Any) -> bool:
+    text = str(value or "")
+    prefix = "Response timed out after "
+    if not text.startswith(prefix) or not text.endswith("s"):
+        return False
+    seconds = text[len(prefix) : -1]
+    try:
+        return float(seconds) > 0
+    except ValueError:
+        return False
+
+
+async def recoverable_chat_context_failure(db: Any, task: Any) -> str | None:
+    """Return a strict context-failure proof for an exact failed chat turn.
+
+    A failed Task may still have a resumable native session on disk.  Only
+    provider envelopes (or CCM's exact PTY idle-timeout marker) authorize
+    replacing that session.  In particular, a tool result containing the
+    words ``Prompt is too long`` is *not* sufficient: the tool may have run
+    successfully and the next message must not be replayed blindly.
+    """
+
+    if task is None or getattr(task, "status", None) != "failed":
+        return None
+    task_id = getattr(task, "id", None)
+    retry_count = getattr(task, "retry_count", None)
+    turn_generation = getattr(task, "turn_generation", None)
+    if (
+        type(task_id) is not int
+        or type(retry_count) is not int
+        or type(turn_generation) is not int
+    ):
+        return None
+
+    # Import lazily to keep this low-level module free of model import cycles.
+    from sqlalchemy import select
+
+    from backend.models.log_entry import LogEntry
+
+    rows = list(
+        (
+            await db.execute(
+                select(LogEntry)
+                .where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.task_retry_count == retry_count,
+                    LogEntry.task_turn_generation == turn_generation,
+                    LogEntry.turn_scope == "foreground",
+                )
+                .order_by(LogEntry.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    provider = str(getattr(task, "provider", None) or "claude").lower()
+    saw_context_failure_marker = False
+    for index, row in enumerate(rows):
+        raw = _raw_mapping(row.raw_json)
+        content = str(row.content or "").strip()
+        candidate: str | None = None
+        if provider == "claude":
+            # Claude PTY/exec API rejection. Require the structured envelope,
+            # not merely rendered assistant/tool text.
+            message = raw.get("message") if isinstance(raw, dict) else None
+            if (
+                row.event_type == "message"
+                and row.role == "assistant"
+                and row.is_error is True
+                and isinstance(raw, dict)
+                and raw.get("type") == "assistant"
+                and raw.get("isApiErrorMessage") is True
+                and raw.get("error") == "invalid_request"
+                and content.lower() == "prompt is too long"
+                and isinstance(message, dict)
+                and _canonical_zero_usage(message.get("usage"))
+            ):
+                candidate = "prompt_too_long"
+            if (
+                row.event_type == "result"
+                and row.is_error is True
+                and isinstance(raw, dict)
+                and raw.get("type") == "result"
+                and raw.get("is_error") is True
+                and raw.get("terminal_reason") == "blocking_limit"
+                and "prompt is too long"
+                in str(raw.get("result") or content).lower()
+                and raw.get("duration_api_ms") == 0
+                and _canonical_zero_usage(raw.get("usage"))
+            ):
+                candidate = "prompt_too_long"
+            # The PTY idle timeout is an exact CCM-generated terminal marker;
+            # retain the native session as a compaction source but never resume
+            # it after the timeout.
+            if (
+                row.event_type == "system_event"
+                and row.role is None
+                and row.is_error is True
+                and _is_response_timeout_marker(content)
+            ):
+                candidate = "response_timeout"
+        elif provider == "codex":
+            error = raw.get("error") if isinstance(raw, dict) else None
+            if (
+                row.event_type == "system_event"
+                and row.is_error is True
+                and isinstance(raw, dict)
+                and raw.get("type") == "turn.failed"
+                and isinstance(error, dict)
+                and str(error.get("codexErrorInfo") or "").lower()
+                == "contextwindowexceeded"
+            ):
+                candidate = "context_window_exceeded"
+        if candidate is not None:
+            saw_context_failure_marker = True
+            # claude-pty appends a harmless turn_duration envelope after its
+            # API rejection. Any later tool/message/error means the failure
+            # was not the terminal cause for this exact generation.
+            trailing = rows[index + 1 :]
+            if all(
+                _harmless_context_failure_trailer(later)
+                for later in trailing
+            ):
+                return candidate
+    if (
+        provider == "claude"
+        and not saw_context_failure_marker
+        and _is_response_timeout_marker(
+            getattr(task, "error_message", None)
+        )
+    ):
+        # Event mirroring is best-effort, while the terminal Task mutation is
+        # generation-fenced and transactional.  Retain recovery when the PTY
+        # timeout event itself could not be persisted.
+        return "response_timeout"
+    return None
 
 
 def build_compacted_resume_prompt(

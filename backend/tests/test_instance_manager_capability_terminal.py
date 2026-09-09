@@ -583,7 +583,9 @@ async def test_pty_provider_error_overrides_clean_exit_code(
         assert task.status == "failed"
         assert task.error_message == "Response timed out after 900.0s"
         assert task.completed_at is not None
-        assert task.session_id is None
+        # Preserve the native id only as a bounded-summary source. The next
+        # explicit user message proves this timeout and starts a fresh session.
+        assert task.session_id == "terminal-session"
         assert instance.status == "error"
         assert instance.pid is None
         assert instance.current_task_id is None

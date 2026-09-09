@@ -2,12 +2,17 @@
 
 import json
 
+import pytest
+
+from backend.models.log_entry import LogEntry
+from backend.models.task import Task
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
     context_tokens_used,
     is_context_window_exceeded,
     read_codex_rollout_last_usage,
+    recoverable_chat_context_failure,
 )
 
 
@@ -134,3 +139,317 @@ def test_rollout_usage_uses_last_request_instead_of_cumulative_total(tmp_path):
         "total_tokens": 218_000,
         "context_window": 258_400,
     }
+
+
+async def _failed_task(db_factory, *, provider: str = "claude") -> int:
+    async with db_factory() as db:
+        task = Task(
+            title="failed context turn",
+            description="continue",
+            status="failed",
+            provider=provider,
+            session_id="native-session",
+            retry_count=2,
+            turn_generation=7,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        return task.id
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_failure_accepts_exact_claude_api_error(
+    db_factory,
+):
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="tool_use",
+                    role="assistant",
+                    tool_name="Read",
+                    raw_json=json.dumps({"type": "assistant"}),
+                    is_error=False,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="message",
+                    role="assistant",
+                    content="Prompt is too long",
+                    raw_json=json.dumps(
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "error": "invalid_request",
+                            "message": {
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0,
+                                }
+                            },
+                        }
+                    ),
+                    is_error=True,
+                ),
+            ]
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+
+        assert (
+            await recoverable_chat_context_failure(db, task)
+            == "prompt_too_long"
+        )
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_failure_accepts_claude_usage_metadata(
+    db_factory,
+):
+    """Real Claude envelopes include nested zero-valued bookkeeping fields."""
+
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add(
+            LogEntry(
+                task_id=task_id,
+                task_retry_count=2,
+                task_turn_generation=7,
+                turn_scope="foreground",
+                event_type="message",
+                role="assistant",
+                content="Prompt is too long",
+                raw_json=json.dumps(
+                    {
+                        "type": "assistant",
+                        "isApiErrorMessage": True,
+                        "error": "invalid_request",
+                        "message": {
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "output_tokens_details": None,
+                                "server_tool_use": {
+                                    "web_search_requests": 0,
+                                    "web_fetch_requests": 0,
+                                },
+                                "cache_creation": {
+                                    "ephemeral_1h_input_tokens": 0,
+                                    "ephemeral_5m_input_tokens": 0,
+                                },
+                                "service_tier": None,
+                                "inference_geo": None,
+                                "iterations": None,
+                                "speed": None,
+                            },
+                        },
+                    }
+                ),
+                is_error=True,
+            )
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+
+        assert (
+            await recoverable_chat_context_failure(db, task)
+            == "prompt_too_long"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "entry", "expected"),
+    [
+        (
+            "claude",
+            {
+                "event_type": "system_event",
+                "role": None,
+                "content": "Response timed out after 900.0s",
+                "raw_json": None,
+                "is_error": True,
+            },
+            "response_timeout",
+        ),
+        (
+            "codex",
+            {
+                "event_type": "system_event",
+                "role": None,
+                "content": "request failed",
+                "raw_json": json.dumps(
+                    {
+                        "type": "turn.failed",
+                        "error": {
+                            "message": "request failed",
+                            "codexErrorInfo": "contextWindowExceeded",
+                        },
+                    }
+                ),
+                "is_error": True,
+            },
+            "context_window_exceeded",
+        ),
+    ],
+)
+async def test_recoverable_chat_failure_accepts_terminal_protocol_shapes(
+    db_factory,
+    provider,
+    entry,
+    expected,
+):
+    task_id = await _failed_task(db_factory, provider=provider)
+    async with db_factory() as db:
+        db.add(
+            LogEntry(
+                task_id=task_id,
+                task_retry_count=2,
+                task_turn_generation=7,
+                turn_scope="foreground",
+                **entry,
+            )
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+        assert await recoverable_chat_context_failure(db, task) == expected
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_failure_rejects_tool_text_and_stale_generation(
+    db_factory,
+):
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="tool_result",
+                    role="tool",
+                    tool_output="Prompt is too long",
+                    is_error=True,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=1,
+                    task_turn_generation=6,
+                    turn_scope="foreground",
+                    event_type="system_event",
+                    role=None,
+                    content="Response timed out after 900.0s",
+                    is_error=True,
+                ),
+            ]
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+        assert await recoverable_chat_context_failure(db, task) is None
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_timeout_survives_event_persistence_failure(
+    db_factory,
+):
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.error_message = "Response timed out after 900.0s"
+        await db.commit()
+
+        assert (
+            await recoverable_chat_context_failure(db, task)
+            == "response_timeout"
+        )
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_timeout_fallback_allows_prior_activity(
+    db_factory,
+):
+    """The exact terminal Task error survives a dropped timeout event."""
+
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.error_message = "Response timed out after 900.0s"
+        db.add(
+            LogEntry(
+                task_id=task_id,
+                task_retry_count=2,
+                task_turn_generation=7,
+                turn_scope="foreground",
+                event_type="tool_use",
+                role="assistant",
+                tool_name="Bash",
+                is_error=False,
+            )
+        )
+        await db.commit()
+
+        assert (
+            await recoverable_chat_context_failure(db, task)
+            == "response_timeout"
+        )
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_timeout_rejects_inexact_task_error(
+    db_factory,
+):
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.error_message = "Response timed out after unknowns"
+        await db.commit()
+
+        assert await recoverable_chat_context_failure(db, task) is None
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_failure_rejects_context_marker_with_later_activity(
+    db_factory,
+):
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="system_event",
+                    role=None,
+                    content="Response timed out after 900.0s",
+                    is_error=True,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="tool_result",
+                    role="tool",
+                    tool_output="late activity",
+                    is_error=False,
+                ),
+            ]
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+        assert await recoverable_chat_context_failure(db, task) is None

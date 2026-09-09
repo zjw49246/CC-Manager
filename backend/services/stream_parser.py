@@ -149,7 +149,11 @@ class StreamParser:
             usage_data = None
             message_obj = data.get("message", {}) if isinstance(data.get("message"), dict) else {}
             usage = message_obj.get("usage")
-            if isinstance(usage, dict):
+            # Provider API-error envelopes frequently carry a synthetic
+            # all-zero usage object.  It is not a completed request and must
+            # never overwrite the Task's last known context meter.  Keep the
+            # original envelope in raw_json for strict preflight proof.
+            if isinstance(usage, dict) and not data.get("isApiErrorMessage"):
                 input_tokens = usage.get("input_tokens", 0)
                 cache_read = usage.get("cache_read_input_tokens", 0)
                 cache_creation = usage.get("cache_creation_input_tokens", 0)

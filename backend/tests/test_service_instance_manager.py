@@ -21626,6 +21626,71 @@ async def test_release_pty_session_recovers_after_pool_pops_before_stop_error():
 
 
 @pytest.mark.asyncio
+async def test_stop_exact_pty_session_preserves_same_id_replacement():
+    """A late failed-turn callback must not evict an ABA replacement."""
+
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self.is_alive = True
+            self.stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            self.is_alive = False
+
+    old = Session("sid-aba")
+    replacement = Session("sid-aba")
+    pool = types.SimpleNamespace(
+        _sessions={"sid-aba": replacement},
+        _access_order={"sid-aba": 2},
+        _lock=asyncio.Lock(),
+    )
+    im._pty_backend = types.SimpleNamespace(_pool=pool)
+
+    assert await im._stop_exact_unattached_pty_session(old, "sid-aba", 42)
+    assert old.stop_calls == 1
+    assert old.is_alive is False
+    assert pool._sessions["sid-aba"] is replacement
+    assert pool._access_order["sid-aba"] == 2
+    assert replacement.stop_calls == 0
+    assert replacement.is_alive is True
+
+
+@pytest.mark.asyncio
+async def test_stop_exact_pty_session_unpublishes_before_stop_failure():
+    """A poisoned Session cannot be reused when its first stop attempt fails."""
+
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        session_id = "sid-stop-error"
+        is_alive = True
+
+        async def stop(self):
+            raise RuntimeError("stop failed")
+
+    session = Session()
+    pool = types.SimpleNamespace(
+        _sessions={session.session_id: session},
+        _access_order={session.session_id: 1},
+        _lock=asyncio.Lock(),
+    )
+    im._pty_backend = types.SimpleNamespace(_pool=pool)
+
+    assert not await im._stop_exact_unattached_pty_session(
+        session,
+        session.session_id,
+        42,
+    )
+    assert session.session_id not in pool._sessions
+    assert session.session_id not in pool._access_order
+    assert session.is_alive is True
+
+
+@pytest.mark.asyncio
 async def test_release_pty_session_settles_stop_before_delivering_cancellation():
     im = InstanceManager(MagicMock(), MagicMock())
     stop_started = asyncio.Event()

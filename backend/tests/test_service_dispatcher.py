@@ -15993,6 +15993,139 @@ async def test_failed_codex_task_reuses_present_native_thread(db_factory, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["prompt_too_long", "response_timeout"])
+async def test_failed_context_turn_compacts_before_explicit_followup(
+    db_factory,
+    monkeypatch,
+    failure_kind,
+):
+    """A new user message must never clone/resume a poisoned PTY session."""
+
+    import backend.api.tasks as tasks_mod
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    clone = AsyncMock(return_value={"session_id": "unsafe-clone"})
+    monkeypatch.setattr(tasks_mod, "_clone_session", clone)
+    d._compact_session = AsyncMock(return_value="safe bounded history")
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "failed"
+        task.context_window_usage = {
+            "input_tokens": 52_000,
+            "total_input_tokens": 52_000,
+            "context_window": 1_000_000,
+        }
+        if failure_kind == "prompt_too_long":
+            db.add_all(
+                [
+                    LogEntry(
+                        task_id=task_id,
+                        task_retry_count=0,
+                        task_turn_generation=0,
+                        turn_scope="foreground",
+                        event_type="tool_use",
+                        role="assistant",
+                        tool_name="Read",
+                        is_error=False,
+                    ),
+                    LogEntry(
+                        task_id=task_id,
+                        task_retry_count=0,
+                        task_turn_generation=0,
+                        turn_scope="foreground",
+                        event_type="message",
+                        role="assistant",
+                        content="Prompt is too long",
+                        raw_json=json.dumps(
+                            {
+                                "type": "assistant",
+                                "isApiErrorMessage": True,
+                                "error": "invalid_request",
+                                "message": {
+                                    "usage": {
+                                        "input_tokens": 0,
+                                        "output_tokens": 0,
+                                    }
+                                },
+                            }
+                        ),
+                        is_error=True,
+                    ),
+                ]
+            )
+        else:
+            db.add(
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=0,
+                    task_turn_generation=0,
+                    turn_scope="foreground",
+                    event_type="system_event",
+                    role=None,
+                    content="Response timed out after 900.0s",
+                    is_error=True,
+                )
+            )
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    clone.assert_not_awaited()
+    d._compact_session.assert_awaited_once()
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert "safe bounded history" in launch["prompt"]
+    assert launch["prompt"].endswith("[基础当前消息 — 默认最高优先级]\nhi")
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.context_window_usage is None
+
+
+@pytest.mark.asyncio
+async def test_failed_context_turn_keeps_message_when_summary_fails(
+    db_factory,
+    monkeypatch,
+):
+    import backend.api.tasks as tasks_mod
+
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    clone = AsyncMock(return_value={"session_id": "unsafe-clone"})
+    monkeypatch.setattr(tasks_mod, "_clone_session", clone)
+    d._compact_session = AsyncMock(return_value=None)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "failed"
+        db.add(
+            LogEntry(
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=0,
+                turn_scope="foreground",
+                event_type="system_event",
+                role=None,
+                content="Response timed out after 900.0s",
+                is_error=True,
+            )
+        )
+        await db.commit()
+
+    with pytest.raises(QueuedMessagePrelaunchError, match="could not be compacted"):
+        await d._process_queued_message(task_id, msg)
+
+    clone.assert_not_awaited()
+    d.instance_manager.launch.assert_not_awaited()
+    assert msg.prompt == "hi"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert task.session_id == "sess-1"
+
+
+@pytest.mark.asyncio
 async def test_idle_instance_reservation_is_atomic_across_queued_consumers(
     db_factory,
 ):

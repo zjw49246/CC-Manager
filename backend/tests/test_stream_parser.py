@@ -1,5 +1,6 @@
 """Tests for StreamParser — NDJSON line parsing."""
 import json
+
 import pytest
 
 from backend.services.stream_parser import (
@@ -88,6 +89,34 @@ def test_assistant_api_error_message_is_marked_error(parser):
     assert result["event_type"] == "message"
     assert result["content"] == "API Error: upstream unavailable"
     assert result["is_error"] is True
+
+
+def test_assistant_api_error_zero_usage_does_not_replace_context_meter(parser):
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": "invalid_request",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Prompt is too long"},
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+        }
+    )
+
+    result = parser.parse_line(line)[0]
+
+    assert result["is_error"] is True
+    assert "context_usage" not in result
+    assert json.loads(result["raw_json"])["message"]["usage"]["input_tokens"] == 0
 
 
 def test_assistant_stop_reason_preserves_absent_vs_explicit_null(parser):

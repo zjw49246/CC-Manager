@@ -48,6 +48,7 @@ from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
     context_tokens_used,
+    recoverable_chat_context_failure,
 )
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.instance_capacity import (
@@ -23546,31 +23547,40 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     and not session_gone
                     and not codex_lineage_conflict
                 )
+                recoverable_context_failure = await recoverable_chat_context_failure(
+                    db, task
+                )
+                force_context_compaction = recoverable_context_failure is not None
+                if force_context_compaction:
+                    logger.warning(
+                        "Task %d failed with recoverable context error (%s); "
+                        "compacting instead of cloning/resuming native session",
+                        task_id,
+                        recoverable_context_failure,
+                    )
                 cloned = (
-                    None if keep_codex_session else await _clone_session(task_id, db)
+                    None
+                    if keep_codex_session or force_context_compaction
+                    else await _clone_session(task_id, db)
                 )
                 recovered_session_id = recovery_session_id
                 recovered_context_usage = task.context_window_usage
                 recovered_prompt = msg.prompt
-                if cloned:
-                    recovered_session_id = cloned["session_id"]
-                    logger.info(
-                        "Task %d cloned session -> %s",
-                        task_id,
-                        recovered_session_id,
-                    )
-                elif not keep_codex_session:
-                    # JSONL file missing, fall back to compact summary
-                    logger.warning(
-                        "Task %d JSONL not found, falling back to compact summary",
-                        task_id,
-                    )
+                if force_context_compaction or (not cloned and not keep_codex_session):
+                    # Context overflow/timeout and missing JSONL both require a
+                    # bounded historical summary and a fresh native session.
                     summary = await self._compact_session(
                         task_id,
                         recovery_session_id,
                         db,
                         exclude_log_entry_id=msg.source_log_id,
                     )
+                    if force_context_compaction and not summary:
+                        await db.rollback()
+                        raise QueuedMessagePrelaunchError(
+                            "Recoverable context failure could not be compacted; "
+                            "preserving the exact queued message"
+                        )
                     recovered_session_id = None
                     recovered_context_usage = None
                     if summary:
@@ -23579,6 +23589,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             msg.current_message,
                             interrupted=True,
                         )
+                elif cloned:
+                    recovered_session_id = cloned["session_id"]
+                    logger.info(
+                        "Task %d cloned session -> %s",
+                        task_id,
+                        recovered_session_id,
+                    )
                 else:
                     logger.info(
                         "Task %d reusing existing Codex session %s after failed turn",

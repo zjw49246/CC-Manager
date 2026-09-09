@@ -10367,18 +10367,19 @@ class InstanceManager:
             pool_sessions = getattr(pool, "_sessions", None)
             pool_lock = getattr(pool, "_lock", None)
             if isinstance(pool_sessions, dict) and pool_lock is not None:
-                # Keep replacement of this session-id serialized with the
-                # exact stop. Pop only by object identity: an ABA replacement
-                # must remain alive.
+                # Unpublish before the potentially failing stop so this
+                # poisoned Session can never be hot-reused. Keep replacement
+                # serialized with the exact stop and pop only by object
+                # identity: an ABA replacement must remain alive.
                 async with pool_lock:
-                    await session.stop()
                     if pool_sessions.get(session_id) is session:
                         pool_sessions.pop(session_id, None)
                         access_order = getattr(pool, "_access_order", None)
                         if isinstance(access_order, dict):
                             access_order.pop(session_id, None)
+                    await _settle_instance_cleanup(session.stop())
             else:
-                await session.stop()
+                await _settle_instance_cleanup(session.stop())
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -12637,16 +12638,16 @@ class InstanceManager:
                     not preserve_background_failure
                     and not successful_terminal
                     and (
-                        provider_error.startswith("Response timed out")
-                        or provider_error.startswith(
+                        provider_error.startswith(
                             "Claude response made no progress"
                         )
                     )
                 ):
-                    # A silent timeout may leave an unmatched tool_use, while
-                    # a no-progress loop proves the native turn itself is not
-                    # converging. Fence either session off so the next user
-                    # message starts fresh instead of resuming bad state.
+                    # A no-progress loop proves the native turn itself is not
+                    # converging. Fence that session off. PTY idle timeouts
+                    # intentionally retain session_id as a source for the
+                    # next explicit chat recovery; the dispatcher will prove
+                    # the exact timeout and force compaction before launch.
                     task.session_id = None
                     task.context_window_usage = None
                     await db.flush()

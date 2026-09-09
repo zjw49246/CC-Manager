@@ -25,6 +25,7 @@ from sqlalchemy import select
 from backend.services.instance_manager import (
     InstanceManager,
     LaunchSupersededError,
+    PTY_BACKGROUND_MAX_SECONDS,
     effective_task_effort,
 )
 from backend.models.instance import Instance
@@ -3646,7 +3647,12 @@ class TestFullMirrorBackend:
         )
         watcher = asyncio.create_task(im._watch_pty_background_generation(state))
         try:
-            await asyncio.wait_for(watcher, 1)
+            # A full backend run can keep the shared SQLite executor busy
+            # long enough for this durable outbox publication to cross the
+            # old one-second test-only deadline. The production watcher has
+            # no such one-second bound; allow the async DB close/publication
+            # path to settle without turning suite load into a false failure.
+            await asyncio.wait_for(watcher, 5)
             async with db_factory() as db:
                 task = await db.get(Task, task_id)
                 assert task.background_active is False
@@ -6003,7 +6009,19 @@ class TestFullMirrorBackend:
         proxy = Proxy()
         session = MagicMock()
         session.session_id = session_id
+        session.is_alive = True
+
+        async def stop_session():
+            session.is_alive = False
+
+        session.stop = AsyncMock(side_effect=stop_session)
         session._reader._tracker.has_pending = False
+        pool = SimpleNamespace(
+            _sessions={session_id: session},
+            _access_order={session_id: 1},
+            _lock=asyncio.Lock(),
+        )
+        im._pty_backend = SimpleNamespace(_pool=pool)
         backend._sessions[instance_id] = session
         backend._proxies[instance_id] = proxy
         im._try_chat_transient_retry = AsyncMock(return_value=False)
@@ -6109,6 +6127,8 @@ class TestFullMirrorBackend:
             assert task.session_id is None
             assert inst.status == "error"
         assert proxy.returncode == 1
+        session.stop.assert_awaited_once()
+        assert session_id not in pool._sessions
 
     async def test_adaptive_schema_failure_routes_future_turns_to_high(
         self, db_factory
@@ -6209,7 +6229,19 @@ class TestFullMirrorBackend:
         proxy = Proxy()
         session = MagicMock()
         session.session_id = "stalled-native-session"
+        session.is_alive = True
+
+        async def stop_session():
+            session.is_alive = False
+
+        session.stop = AsyncMock(side_effect=stop_session)
         session._reader._tracker.has_pending = False
+        pool = SimpleNamespace(
+            _sessions={"stalled-native-session": session},
+            _access_order={"stalled-native-session": 1},
+            _lock=asyncio.Lock(),
+        )
+        im._pty_backend = SimpleNamespace(_pool=pool)
         backend._sessions[instance_id] = session
         backend._proxies[instance_id] = proxy
         im._try_chat_transient_retry = AsyncMock(return_value=False)
@@ -6259,9 +6291,11 @@ class TestFullMirrorBackend:
             inst = await db.get(Instance, instance_id)
             assert task.status == "failed"
             assert task.error_message == timeout_text
-            assert task.session_id is None
+            assert task.session_id == "stalled-native-session"
             assert inst.status == "error"
         assert proxy.returncode == 1
+        session.stop.assert_awaited_once()
+        assert "stalled-native-session" not in pool._sessions
 
     async def test_soft_quota_warning_keeps_successful_pty_turn_completed(
         self, db_factory
@@ -6973,7 +7007,9 @@ class TestWorkerTerminationReceiptPtyAdmission:
             task_retry_count=0,
             task_turn_generation=0,
         )
-        state.started_monotonic = 0
+        state.started_monotonic = (
+            time.monotonic() - PTY_BACKGROUND_MAX_SECONDS - 1
+        )
         watcher = state.watcher
         try:
             assert not await im._fail_pty_background_generation(state)

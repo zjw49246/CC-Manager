@@ -25,6 +25,8 @@ from typing import Any
 
 from claude_pty.adapters.ccm import CCMBackend
 
+from backend.services.context_compaction import is_context_window_exceeded
+
 logger = logging.getLogger(__name__)
 
 
@@ -850,6 +852,35 @@ class FullMirrorCCMBackend(CCMBackend):
         ):
             await self._maybe_retry_empty_reply(key, task_id)
 
+        # A context overflow or PTY idle timeout leaves the resident native
+        # process in a poisoned state.  Retire only the exact Session object
+        # captured by this callback; a replacement with the same session id
+        # (ABA) must remain untouched.  This also prevents SessionPool's
+        # two-hour idle reaper from hot-reusing the failed process.
+        context_failure = bool(
+            session is not None
+            and session_id
+            and (
+                is_context_window_exceeded("claude", provider_error)
+                or provider_error.startswith("Response timed out")
+            )
+            and background_generation is None
+            and owns_record
+        )
+        if context_failure:
+            retired = await self._im._stop_exact_unattached_pty_session(
+                session,
+                session_id,
+                task_id,
+            )
+            if not retired:
+                logger.warning(
+                    "PTY context-failed session %s for task %s could not be "
+                    "proven stopped; keeping recovery fail-closed",
+                    session_id,
+                    task_id,
+                )
+
         # Completing the proxy below wakes dispatcher/Ralph and releases the
         # normal instance-keyed consumer maps. Retain one immutable generation
         # proof for every successful PTY turn, including chat: a late native
@@ -858,6 +889,7 @@ class FullMirrorCCMBackend(CCMBackend):
         if (
             transition_eligible
             and background_generation is None
+            and not context_failure
             and record is not None
             and session is not None
             and session_id is not None
