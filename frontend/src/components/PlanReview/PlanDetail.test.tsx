@@ -643,7 +643,11 @@ describe('PlanDetail', () => {
 
   it('renders a completed Capability Plan as navigation and audit only', async () => {
     const prior = version({ id: 11, version_number: 1 });
-    const current = version({});
+    const current = version({
+      review_verdict: 'exhausted',
+      review_feedback: 'Unresolved feedback must not enable mutation.',
+      review_exhausted: true,
+    });
     const resource = plan(current, prior);
     resource.target_task_id = 8;
     resource.ownership = 'capability';
@@ -674,6 +678,7 @@ describe('PlanDetail', () => {
       'Attach to next message',
       'Cancel planning',
       'Archive',
+      "Revise with Reviewer's latest feedback",
     ]) {
       expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
     }

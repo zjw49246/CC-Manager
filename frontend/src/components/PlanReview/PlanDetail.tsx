@@ -363,6 +363,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const canReviseWithLatestReviewerFeedback = Boolean(
     shown
     && shown.id === plan.current_version_id
+    && !plan.read_only
     && !plan.active_run_id
     && !plan.archived_at
     && shown.human_decision === 'pending'

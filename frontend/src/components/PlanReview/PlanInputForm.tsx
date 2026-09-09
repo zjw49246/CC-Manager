@@ -53,9 +53,16 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
     }),
     [additional, answers, freeFormQuestionIds, request.questions],
   );
+  const freeFormNeedsContext = freeFormQuestionIds.size > 0 && !additional.trim();
 
   const submit = async () => {
-    if (submitting || missingRequired || uploads.isUploading || uploads.hasFailed) return;
+    if (
+      submitting
+      || missingRequired
+      || freeFormNeedsContext
+      || uploads.isUploading
+      || uploads.hasFailed
+    ) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -178,8 +185,16 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
                         delete next[question.id];
                         return next;
                       });
-                      setFreeFormQuestionIds((current) => new Set(current).add(question.id));
-                      additionalRef.current?.focus();
+                      setFreeFormQuestionIds((current) => {
+                        const next = new Set(current);
+                        if (answeredInAdditionalContext) {
+                          next.delete(question.id);
+                        } else {
+                          next.add(question.id);
+                        }
+                        return next;
+                      });
+                      if (!answeredInAdditionalContext) additionalRef.current?.focus();
                     }}
                   >
                     {answeredInAdditionalContext
@@ -220,7 +235,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
       )}
       {error && <p className="text-xs text-red-400">{error}</p>}
-      {missingRequired && (
+      {freeFormNeedsContext ? (
+        <p className="text-xs text-gray-500">
+          Add Additional context for each choice marked as answered there.
+        </p>
+      ) : missingRequired && (
         <p className="text-xs text-gray-500">
           Answer each remaining required question. Additional context may replace a required choice when none of its options fit.
         </p>
@@ -243,7 +262,7 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
         <button
           type="submit"
-          disabled={submitting || missingRequired || uploads.isUploading || uploads.hasFailed}
+          disabled={submitting || missingRequired || freeFormNeedsContext || uploads.isUploading || uploads.hasFailed}
           className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {submitting && <Loader2 size={12} className="animate-spin" />}

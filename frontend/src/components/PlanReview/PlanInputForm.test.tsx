@@ -207,6 +207,42 @@ describe('PlanInputForm', () => {
     expect(submit).toBeEnabled();
   });
 
+  it('requires additional context when an optional choice is marked as free-form', async () => {
+    const request = requestWithQuestions(1);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Option A', value: 'a' },
+        { label: 'Option B', value: 'b' },
+      ],
+      required: false,
+    };
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeEnabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    expect(submit).toBeDisabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Answering this question in additional context',
+    }));
+    expect(submit).toBeEnabled();
+
+    await userEvent.click(screen.getByRole('button', {
+      name: 'None of these options fit — answer in additional context',
+    }));
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use an alternative value.',
+    );
+    expect(submit).toBeEnabled();
+  });
+
   it('clears answers when the InputRequest identity changes', async () => {
     const { rerender } = render(
       <PlanInputForm
