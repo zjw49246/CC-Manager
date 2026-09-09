@@ -923,7 +923,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {provider === 'codex' && (
+        {provider === 'codex'
+          && (!codexTaskSkillsEnabled || remoteTaskScope || !codexMonitorEnabled) && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
             title={!codexTaskSkillsEnabled
@@ -938,9 +939,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
               ? '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'
               : remoteTaskScope
                 ? 'Monitor 仅支持本地 Codex'
-                : codexMonitorEnabled
-                  ? '本地 Codex Monitor 已启用'
-                  : 'Codex Monitor capability 未知'}
+                : 'Codex Monitor capability 未知'}
           </span>
         )}
         {/* Plugins dropdown */}
