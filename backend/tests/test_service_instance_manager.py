@@ -23077,6 +23077,40 @@ def test_claude_login_error_message_is_turn_fatal():
     }) == "Not logged in · Please run /login"
 
 
+@pytest.mark.parametrize(
+    ("content", "error_code"),
+    [
+        ("Prompt is too long", "invalid_request"),
+        (
+            "There's an issue with the selected model.",
+            "model_not_found",
+        ),
+    ],
+)
+def test_claude_pty_api_error_event_is_turn_fatal(
+    content,
+    error_code,
+):
+    """Exercise the enum-valued event shape emitted by claude-pty."""
+
+    from claude_pty.events import EventType, PTYEvent
+
+    im = InstanceManager(MagicMock(), MagicMock())
+    event = PTYEvent(
+        event_type=EventType.MESSAGE,
+        role="assistant",
+        content=content,
+        raw_json=json.dumps({
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": error_code,
+        }),
+        is_error=True,
+    ).to_dict()
+
+    assert im._fatal_provider_error_for_event(event) == content
+
+
 def test_parse_codex_file_change_started_is_tool_use():
     # 实测（CLI 0.144.6）file_change 也发 item.started——不映射会退化成
     # 一条 "in_progress" 噪音 system_event

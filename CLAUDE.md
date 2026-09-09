@@ -203,6 +203,8 @@ claude-manager/
 
 ## 关键约定
 
+- **PTY 事件类型兼容**: `claude_pty.events.PTYEvent.to_dict()` 会保留 str-backed `EventType` 枚举；分类事件时可直接与 wire 值比较，或显式读取 `.value`，禁止先调用 `str()`（会得到 `EventType.MESSAGE` 等名称并漏判结构化 API 错误/工具事件）。
+
 - **Claude 无进展恢复**: 同一前台回合仅在连续相似的 `stop_reason=null` 回复持续至少两分钟、且从未出现 `tool_use/tool_result` 时才可中止并用 generation-bound 一次性许可在新 session 自动重放原消息；自动恢复最多一次，恢复回合再次异常或存在任何工具行为必须停止并等待用户重试，禁止盲目重放。
 
 - **数据库更新快照**: 数据库回滚快照只在权威 Alembic revision 检查确认有待迁移项时生成，并且只能由停服后的外部 worker 一次性生成、目标完整性检查和 fsync；禁止先做在线全量快照再被停服快照覆盖的双重 I/O。默认只保留当前和上一个恢复点。

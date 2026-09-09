@@ -11005,7 +11005,10 @@ class InstanceManager:
             # authorize completion of the new turn.
             state.terminal_seen = False
             state.durable_native_completion_reconciled = False
-            event_type = str(event.get("event_type") or "")
+            # claude-pty keeps its str-backed EventType in PTYEvent.to_dict().
+            # It compares directly with the wire value, while str(enum) does
+            # not.
+            event_type = event.get("event_type") or ""
             if event_type == "tool_use":
                 state.pending_tools += 1
             elif event_type == "tool_result" and state.pending_tools:
@@ -17283,7 +17286,19 @@ class InstanceManager:
         ):
             return None
 
-        event_type = str(event.get("event_type") or "")
+        raw_event_type = event.get("event_type")
+        # claude-pty's PTYEvent.to_dict() preserves its ``EventType`` value.
+        # EventType subclasses ``str`` for equality/serialization, but
+        # ``str(EventType.MESSAGE)`` is ``"EventType.MESSAGE"`` rather than
+        # ``"message"``.  Normalise the enum value before classifying a
+        # provider failure; otherwise a persistent PTY process can surface a
+        # structured API rejection and still be finalized as exit code 0.
+        enum_value = getattr(raw_event_type, "value", None)
+        event_type = (
+            enum_value
+            if isinstance(enum_value, str)
+            else str(raw_event_type or "")
+        )
         content = str(event.get("content") or "").strip()
         raw = event.get("raw_json")
         parsed = None
