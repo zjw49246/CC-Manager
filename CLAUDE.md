@@ -6,7 +6,7 @@
 
 Web 端调度管理多个 Claude Code 实例并行工作。Backend (FastAPI) + Frontend (React/Vite) + SQLite/PostgreSQL/MySQL。
 
-GitHub: https://github.com/zjw49246/Claude-Code-Manager.git
+GitHub: https://github.com/zjw49246/CC-Manager.git
 
 ## 技术栈
 

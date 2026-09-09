@@ -217,7 +217,7 @@ claude-manager/
 ### Installation
 
 ```bash
-git clone https://github.com/zjw49246/Claude-Code-Manager.git && cd Claude-Code-Manager
+git clone https://github.com/zjw49246/CC-Manager.git && cd CC-Manager
 
 # Backend dependencies (using uv)
 uv sync
