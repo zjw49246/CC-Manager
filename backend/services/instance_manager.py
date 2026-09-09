@@ -8886,6 +8886,18 @@ class InstanceManager:
                     else:
                         self._pty_backend.build_config = original_build_config
 
+            # ``claude-pty``'s compatibility ``launch_for_ccm`` helper writes
+            # its own (minimal) entry to ``InstanceManager._launch_params``
+            # after the backend consumer has been created.  That entry is
+            # sufficient for the upstream adapter, but it drops CCM's
+            # generation-bound chat metadata (source log, current message and
+            # turn identity).  PTY context-overflow recovery relies on those
+            # fields to prove a preflight rejection before compacting.  Restore
+            # the complete snapshot captured before launch immediately after
+            # the helper returns, before the launch metadata barrier opens.
+            if chat_initiated and pty_launch_params is not None:
+                self._launch_params[instance_id] = dict(pty_launch_params)
+
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)
             if process is None:

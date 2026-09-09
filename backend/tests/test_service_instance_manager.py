@@ -6708,8 +6708,12 @@ async def test_cloudrouter_claude_launch_replaces_inherited_auth_env(
 
 @pytest.mark.asyncio
 async def test_cloudrouter_claude_pty_projects_direct_auth_for_model_only(
-    db_factory, tmp_path
+    db_factory, tmp_path, monkeypatch
 ):
+    # PTY must receive the same explicitly configured CLI binary as direct
+    # launches; keep this assertion independent of the developer machine's
+    # ambient ``claude`` executable.
+    monkeypatch.setattr(settings, "claude_binary", "/opt/claude-real")
     async with db_factory() as db:
         inst = Instance(name="cloudrouter-pty-env-inst")
         db.add(inst)
@@ -20587,14 +20591,39 @@ async def test_launch_delegates_to_pty_backend_for_claude():
 
         async def launch_for_ccm(self, **kwargs):
             calls.update(kwargs)
+            # Mirror claude-pty's compatibility helper, which overwrites the
+            # manager's rich chat launch snapshot with only adapter fields.
+            im._launch_params[kwargs["instance_id"]] = {
+                "prompt": kwargs["prompt"],
+                "task_id": kwargs["task_id"],
+                "cwd": kwargs["cwd"],
+                "model": kwargs["model"],
+            }
             im.processes[kwargs["instance_id"]] = MagicMock(pid=4242)
             return "sess-1"
 
     im._pty_backend = FakeBackend()
-    im._pty_enabled = True
-    pid = await im.launch(
-        instance_id=7, prompt="do it", task_id=3, cwd="/w",
-        model="default", provider="claude",
+    pid = await im._launch_pty(
+        instance_id=7,
+        prompt="do it",
+        task_id=3,
+        task_turn_generation=9,
+        cwd="/w",
+        model="default",
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        thinking_budget=None,
+        effort_level=None,
+        chat_initiated=True,
+        config_dir=None,
+        enable_workflows=False,
+        enabled_skills=None,
+        mcp_config_path=None,
+        source_log_id=123,
+        current_message="do it now",
+        task_retry_count=0,
+        on_launch_admitted=AsyncMock(),
     )
     assert pid == 4242
     assert calls["instance_id"] == 7
@@ -20605,6 +20634,9 @@ async def test_launch_delegates_to_pty_backend_for_claude():
         "EnterPlanMode",
         "ExitPlanMode",
     ]
+    assert im._launch_params[7]["source_log_id"] == 123
+    assert im._launch_params[7]["current_message"] == "do it now"
+    assert im._launch_params[7]["task_turn_generation"] == 9
 
 
 @pytest.mark.asyncio

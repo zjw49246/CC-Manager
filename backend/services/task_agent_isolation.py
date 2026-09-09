@@ -1130,31 +1130,42 @@ def require_claude_apply_seccomp(
             f"architecture {machine or 'unknown'}"
         )
 
+    # An explicit npm prefix is the deployment's authoritative installation
+    # root (the updater uses the same prefix when installing the helper).
+    # Prefer it over an unrelated global ``apply-seccomp`` found on PATH;
+    # otherwise a stale system helper can silently mismatch the pinned
+    # sandbox-runtime package.
     candidates: list[Path] = []
-    direct = shutil.which("apply-seccomp")
-    if direct:
-        candidates.append(Path(direct))
+    npm_roots: list[Path] = []
+    npm_prefix = os.environ.get("NPM_CONFIG_PREFIX")
+    if npm_prefix and os.path.isabs(npm_prefix):
+        npm_roots.append(Path(npm_prefix) / "lib" / "node_modules")
 
-    npm_roots: set[Path] = {
+    direct = shutil.which("apply-seccomp")
+    direct_candidate = Path(direct) if direct else None
+
+    npm_roots.extend((
         Path("/usr/lib/node_modules"),
         Path("/usr/local/lib/node_modules"),
         Path.home() / ".npm-global" / "lib" / "node_modules",
-    }
-    npm_prefix = os.environ.get("NPM_CONFIG_PREFIX")
-    if npm_prefix and os.path.isabs(npm_prefix):
-        npm_roots.add(Path(npm_prefix) / "lib" / "node_modules")
+    ))
     resolved_claude = shutil.which(claude_binary)
     if resolved_claude:
         try:
             claude_path = Path(resolved_claude).resolve(strict=True)
         except OSError:
             claude_path = Path(resolved_claude)
-        npm_roots.update(
+        npm_roots.extend(
             parent
             for parent in claude_path.parents
             if parent.name == "node_modules"
         )
-    for root in sorted(npm_roots, key=str):
+
+    seen_roots: set[Path] = set()
+    for root in npm_roots:
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
         candidates.append(
             root.joinpath(
                 *_SANDBOX_RUNTIME_PACKAGE_PARTS,
@@ -1162,6 +1173,10 @@ def require_claude_apply_seccomp(
                 "apply-seccomp",
             )
         )
+    if direct_candidate is not None:
+        # PATH is only a fallback after the package roots above have been
+        # checked, because it may point at a different runtime installation.
+        candidates.append(direct_candidate)
 
     for candidate in candidates:
         try:

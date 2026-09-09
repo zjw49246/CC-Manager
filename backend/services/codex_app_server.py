@@ -4329,6 +4329,19 @@ class CodexAppServer:
     ) -> None:
         if status_type is None:
             return
+        runtime = self._thread_runtime.get(thread_id)
+        if (
+            status_type == "active"
+            and not active_turn_ids
+            and runtime is not None
+            and self._thread_status_is_terminal(runtime.status_type)
+        ):
+            # ``thread/read`` can lag an authoritative idle/notLoaded edge
+            # and report a weak active status with no running turn list. Do
+            # not resurrect a child that has already published its terminal
+            # edge; a real new turn is represented by an explicit
+            # ``thread/status/changed`` or ``turn/started`` notification.
+            return
         if status_type == "active" and not active_turn_ids:
             # ``thread/read`` can lag a just-delivered idle/paused event and
             # report only a weak active status (no active turn list).  Once a

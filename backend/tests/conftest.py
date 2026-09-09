@@ -12,12 +12,34 @@ from pathlib import Path
 # bootstrap, an incompletely mocked test can write Instance/Task lifecycle
 # state into the developer's real ``claude_manager.db``.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+# Keep pytest's generated paths short enough for Unix-domain socket fixtures.
+# The production runner intentionally places its checkout below a long
+# `/var/tmp/...` prefix, which otherwise exceeds AF_UNIX's 108-byte limit.
+_TEST_TMP_ROOT = Path("/tmp/ccm-pytest")
+_TEST_TMP_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+os.environ.update({
+    "TMPDIR": str(_TEST_TMP_ROOT),
+    "TMP": str(_TEST_TMP_ROOT),
+    "TEMP": str(_TEST_TMP_ROOT),
+})
+# Pytest/plugins can import ``tempfile`` before this conftest is loaded, which
+# leaves its process-wide temp-dir cache pointing at the production runner's
+# path.  Invalidate that cache so ``tmp_path`` and application cleanup resolve
+# against the isolated test root above.
+tempfile.tempdir = None
 _GLOBAL_TEST_DB_DIR = Path(
     tempfile.mkdtemp(prefix="ccm-pytest-global-")
 ).resolve()
 atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
 _GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
 _GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)
+_UPDATE_SCRIPT_SOURCE = (
+    Path(__file__).resolve().parents[2] / "scripts" / "update_migrate.sh"
+)
+_UPDATE_SCRIPT_TARGET = _GLOBAL_TEST_PROJECT_DIR / "scripts" / "update_migrate.sh"
+_UPDATE_SCRIPT_TARGET.parent.mkdir(mode=0o700)
+shutil.copyfile(_UPDATE_SCRIPT_SOURCE, _UPDATE_SCRIPT_TARGET)
+_UPDATE_SCRIPT_TARGET.chmod(0o700)
 os.environ.update({
     "DATABASE_URL": (
         f"sqlite+aiosqlite:///{_GLOBAL_TEST_DB_DIR / 'global.db'}"
@@ -26,6 +48,10 @@ os.environ.update({
     # account journals, credentials, cloud workers, backups, or this checkout.
     "CCM_TESTING": "1",
     "CCM_TEST_PROJECT_DIR": str(_GLOBAL_TEST_PROJECT_DIR),
+    # Service-level tests that exercise Harness/Worker control-plane effects
+    # need a configured deployment token.  The `app` fixture still overrides
+    # `settings.auth_token` to empty for tests explicitly covering open mode.
+    "AUTH_TOKEN": "ccm-test-token",
     "CODEX_POOL_CONFIG_PATH": str(
         _GLOBAL_TEST_DB_DIR / "codex-pool" / "accounts.json"
     ),
@@ -64,6 +90,12 @@ os.environ.update({
     # Host shell/.env settings must not make baseline tests nondeterministic.
     "DEFAULT_PROVIDER": "codex",
     "DEFAULT_CODEX_MODEL": "gpt-5.6-sol",
+    # Keep the static model catalog independent of a developer's ambient
+    # CODEX_MODEL_OPTIONS (which may intentionally lag the source catalog).
+    "CODEX_MODEL_OPTIONS": (
+        "default,gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,"
+        "gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex-spark"
+    ),
 })
 
 import pytest
