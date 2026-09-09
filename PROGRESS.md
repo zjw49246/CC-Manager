@@ -4,6 +4,13 @@
 
 ## 已完成功能
 
+### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
+
+- [x] 生产只读取证：Task 538 的首次 Fable 5.1 `[1m]` 请求被 Apex 以 `404 model_not_found` 拒绝；切换到 Opus 4.6 `[1m]` 后，两次约 1K 字符、零 token 请求又被上游以 `400 Prompt is too long` 拒绝。相同 Key 的 Opus 4.6 `[1m]` 最小新会话实测成功，说明 Key 本身有效；Apex 当前模型目录仍列出 Fable，但基础版和 `[1m]` 实际调用均 404，属于上游目录/路由不一致。
+- [x] CCM 根因：`claude-pty` 的 `PTYEvent.to_dict()` 保留 str-backed `EventType`，而 CCM 对其调用 `str()` 后得到 `EventType.MESSAGE`，导致结构化 API 错误未被识别，常驻 PTY 的零退出状态又把失败回合误标 completed，`Prompt is too long` 的压缩恢复也不会启动。
+- [x] 修复：provider fatal-error 分类显式读取枚举 `.value`；后台 autonomous/tool tracker 保留可直接与 wire 值比较的枚举，避免同类工具计数失效。真实 `PTYEvent` 回归覆盖 `model_not_found`、`Prompt is too long`、上下文压缩重试和后台 Bash tracking。实现提交：`e2b991f0`。
+- [x] 验证：InstanceManager + PTY mirror `676 passed`，Dispatcher 全文件 `425 passed`，context compaction `7 passed`；Python compileall、`git diff --check` 和前端 ESLint 通过。生产未修改、未重启。
+
 ### 2026-09-05：修复 PTY pretrust 错库导致的新项目启动卡死（生产 Task 752）
 
 - [x] 生产取证：Task 752（默认账号 `~/.claude`、全新项目 cwd）PTY 启动后 pty-bridge channel server 15 次注入全部 Connection refused，30 秒后盲降级 stdin 粘贴，Claude 0.5 秒内 exit_code=1，dispatcher 以「provider turn failed after crossing its external-effect boundary; exact turn selected transport claude_pty」fail closed。dispatcher 侧 fail-closed 判定符合设计，不改。
