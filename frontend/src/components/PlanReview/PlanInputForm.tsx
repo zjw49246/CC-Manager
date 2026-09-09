@@ -43,7 +43,11 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
       if (!question.required) return false;
       const value = answers[question.id];
       const missing = value == null || value === '' || (Array.isArray(value) && value.length === 0);
-      return missing && !additional.trim();
+      const freeFormReplacesChoice = (
+        question.response_type === 'single_choice'
+        || question.response_type === 'multi_choice'
+      ) && Boolean(additional.trim());
+      return missing && !freeFormReplacesChoice;
     }),
     [additional, answers, request.questions],
   );
@@ -199,9 +203,9 @@ export function PlanInputForm({ run, request, compact = false, onAnswered }: Pla
         </div>
       )}
       {error && <p className="text-xs text-red-400">{error}</p>}
-      {missingRequired && additional.trim() === '' && (
+      {missingRequired && (
         <p className="text-xs text-gray-500">
-          Answer each required question, or explain your alternative in Additional context.
+          Answer each remaining required question. Additional context may replace a required choice when none of its options fit.
         </p>
       )}
       <div className="flex items-center justify-between gap-3">

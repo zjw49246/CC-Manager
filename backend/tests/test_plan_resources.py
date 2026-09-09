@@ -34,6 +34,7 @@ from backend.services.plan_service import (
     decide_version,
     materialize_execution_task,
     stage_plan_with_run,
+    validate_input_answers,
 )
 from backend.tests.group_acl_test_helpers import (
     grant_group_project_access,
@@ -3238,6 +3239,44 @@ async def test_required_choice_accepts_free_form_alternative(
         input_request = await db.get(PlanInputRequest, request_id)
         assert run.status == "queued"
         assert input_request.status == "answered"
+
+
+def test_free_form_choice_alternative_does_not_bypass_required_text():
+    questions = [
+        {
+            "id": "rollout",
+            "header": "Rollout",
+            "question": "Which rollout strategy should be used?",
+            "response_type": "single_choice",
+            "options": [
+                {"value": "blue_green", "label": "Blue-green"},
+                {"value": "rolling", "label": "Rolling"},
+            ],
+            "required": True,
+        },
+        {
+            "id": "region",
+            "header": "Region",
+            "question": "Which deployment region is required?",
+            "response_type": "text",
+            "options": [],
+            "required": True,
+        },
+    ]
+    answers = [
+        {"question_id": "rollout", "value": None},
+        {"question_id": "region", "value": None},
+    ]
+
+    with pytest.raises(HTTPException) as caught:
+        validate_input_answers(
+            questions,
+            answers,
+            response_text="Use a canary rollout instead.",
+        )
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail == "Question 'region' requires an answer"
 
 
 @pytest.mark.asyncio

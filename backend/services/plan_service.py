@@ -1271,16 +1271,19 @@ def validate_input_answers(
     normalized: list[dict] = []
     for question in parsed:
         value = values.get(question.id)
+        free_form_replaces_choice = (
+            question.response_type in {"single_choice", "multi_choice"}
+            and has_free_form_answer
+        )
         if (
             question.required
             and (value is None or value == "" or value == [])
-            and not has_free_form_answer
+            and not free_form_replaces_choice
         ):
-            raise HTTPException(
-                422,
-                f"Question {question.id!r} requires an answer or a non-empty "
-                "additional response",
-            )
+            detail = f"Question {question.id!r} requires an answer"
+            if question.response_type in {"single_choice", "multi_choice"}:
+                detail += " or a non-empty additional response"
+            raise HTTPException(422, detail)
         if value is None:
             normalized.append({"question_id": question.id, "value": None})
             continue

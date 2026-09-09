@@ -146,6 +146,32 @@ describe('PlanInputForm', () => {
     expect(onAnswered).toHaveBeenCalledTimes(1);
   });
 
+  it('still requires non-choice answers when additional context replaces a choice', async () => {
+    const request = requestWithQuestions(2);
+    request.questions[0] = {
+      ...request.questions[0],
+      response_type: 'single_choice',
+      options: [
+        { label: 'Blue-green', value: 'blue_green' },
+        { label: 'Rolling', value: 'rolling' },
+      ],
+    };
+    render(<PlanInputForm run={run} request={request} onAnswered={vi.fn()} />);
+
+    await userEvent.type(
+      screen.getByLabelText('Additional context'),
+      'Use a canary rollout with a manual gate instead.',
+    );
+
+    const submit = screen.getByRole('button', { name: 'Submit answers' });
+    expect(submit).toBeDisabled();
+    expect(screen.getByText(/Answer each remaining required question/)).toBeInTheDocument();
+    expect(api.answerPlanInput).not.toHaveBeenCalled();
+
+    await userEvent.type(screen.getAllByRole('textbox')[0], 'us-east-1');
+    expect(submit).toBeEnabled();
+  });
+
   it('clears answers when the InputRequest identity changes', async () => {
     const { rerender } = render(
       <PlanInputForm
