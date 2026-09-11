@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     # genuinely silent turn is failed instead of holding a Task executing for
     # two hours. Known long-running tools can opt into a larger value through
     # CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS.
-    claude_pty_response_idle_timeout_seconds: float = 900.0
+    claude_pty_response_idle_timeout_seconds: float = 3600.0
     # 会话上下文利用率达到该比例即自动摘要+换新 session。超大 context 的请求
     # 在服务端易挂起（2026-07-08 task 22/27 连环 stall 均发生在 ~90% 区间），
     # 故不要设回 0.9 让 session 在重灾区长时间工作。
