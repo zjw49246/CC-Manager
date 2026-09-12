@@ -1325,6 +1325,48 @@ async def test_chat_history_full_returns_tool_fields(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_chat_history_hides_internal_context_snapshots(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/tasks",
+        json={"title": "Snapshot", "description": "d", "target_repo": "/tmp"},
+    )
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    event_type="context_snapshot",
+                    role="system",
+                    content="internal snapshot metadata",
+                    raw_json=json.dumps(
+                        {"state": {"tool_activity": ["private recovery state"]}}
+                    ),
+                    is_error=False,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    event_type="message",
+                    role="assistant",
+                    content="visible answer",
+                    is_error=False,
+                ),
+            ]
+        )
+        await db.commit()
+
+    response = await client.get(f"/api/tasks/{task_id}/chat/history?compact=false")
+
+    assert response.status_code == 200
+    messages = response.json()
+    assert [message["content"] for message in messages] == ["visible answer"]
+    assert all(message["event_type"] != "context_snapshot" for message in messages)
+
+
+@pytest.mark.asyncio
 async def test_message_detail_endpoint(client, session_factory):
     """Detail endpoint returns full tool_input/tool_output for a single message."""
     task_id = await _create_task_with_tools(client, session_factory)

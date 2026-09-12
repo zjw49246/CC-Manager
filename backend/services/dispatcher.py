@@ -47,9 +47,11 @@ from backend.services.cancellation import (
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
+    context_compact_threshold_with_headroom,
     context_tokens_used,
     recoverable_chat_context_failure,
 )
+from backend.services.context_snapshot import capture_context_recovery_snapshot
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.instance_capacity import (
     active_capacity_predicate,
@@ -12135,6 +12137,12 @@ class GlobalDispatcher:
                                 permit.task_id,
                                 permit.session_id,
                                 db,
+                                reason=(
+                                    "context_window_exceeded"
+                                    if (task.provider or "claude").lower()
+                                    == "codex"
+                                    else "prompt_too_long"
+                                ),
                             )
                             if summary:
                                 compacted = await db.execute(
@@ -12176,10 +12184,10 @@ class GlobalDispatcher:
                                     )
                                 return
 
-                            # A failed/empty summary must not hand the stale
-                            # lifecycle-only generation to the generic retry
-                            # path after source/session ownership changed while
-                            # history was being collected.
+                            # A failed/empty snapshot must not hand the stale
+                            # native session to the generic retry path after
+                            # source/session ownership changed while history
+                            # was being collected.
                             still_exact = (
                                 await db.execute(
                                     select(Task.id).where(
@@ -12197,11 +12205,27 @@ class GlobalDispatcher:
                                     task.id,
                                 )
                                 return
+                            await self._fail_owned_task(
+                                lifecycle_generation,
+                                (
+                                    "Context-window recovery snapshot failed; "
+                                    "the old native session was retained"
+                                ),
+                            )
+                            return
                     except Exception:
                         logger.exception(
                             "Context-window compaction failed for task %d",
                             task.id,
                         )
+                        await self._fail_owned_task(
+                            lifecycle_generation,
+                            (
+                                "Context-window recovery snapshot failed; "
+                                "the old native session was retained"
+                            ),
+                        )
+                        return
 
                 await self._retry_or_fail_mode_task(
                     lifecycle_generation,
@@ -23573,13 +23597,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task_id,
                         recovery_session_id,
                         db,
+                        reason=(
+                            recoverable_context_failure
+                            or "session_unavailable"
+                        ),
                         exclude_log_entry_id=msg.source_log_id,
                     )
-                    if force_context_compaction and not summary:
+                    if not summary:
                         await db.rollback()
                         raise QueuedMessagePrelaunchError(
-                            "Recoverable context failure could not be compacted; "
-                            "preserving the exact queued message"
+                            "Session recovery context could not be compacted and "
+                            "snapshotted; "
+                            "preserving the exact queued message and old session "
+                            "identity"
                         )
                     recovered_session_id = None
                     recovered_context_usage = None
@@ -23862,64 +23892,91 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 utilization = used_tokens / window if window else 0
                 # 阈值：GlobalSettings 覆盖 > env 默认（前端运行时设置可改）
                 gs = await db.get(GlobalSettings, 1)
-                compact_threshold = (
+                configured_compact_threshold = (
                     gs.context_compact_threshold
                     if gs and gs.context_compact_threshold is not None
                     else settings.context_compact_threshold
                 )
+                compact_threshold, minimum_headroom = (
+                    context_compact_threshold_with_headroom(
+                        configured_compact_threshold,
+                        window,
+                    )
+                )
                 if utilization >= compact_threshold:
                     logger.info(
-                        "Task %d context at %.0f%% (%d/%d), compacting session...",
+                        "Task %d context at %.0f%% (%d/%d), compacting session "
+                        "at effective %.0f%% threshold (configured %.0f%%, "
+                        "minimum headroom %d)...",
                         task_id,
                         utilization * 100,
                         used_tokens,
                         window,
+                        compact_threshold * 100,
+                        configured_compact_threshold * 100,
+                        minimum_headroom,
                     )
                     # 收集最近对话摘要
                     summary = await self._compact_session(
                         task_id,
                         task.session_id,
                         db,
+                        reason="threshold",
                         exclude_log_entry_id=msg.source_log_id,
                     )
-                    if summary:
-                        # 清空 session_id → 下次 launch 开新 session，prompt 带摘要
-                        task.session_id = None
-                        task.context_window_usage = None
-                        # 在聊天里给用户留一条可见的压缩提示（落库 + 实时广播）
-                        notice = (
-                            f"⚡ 上下文已达 {utilization * 100:.0f}%"
-                            f"（{used_tokens:,}/{window:,} tokens，阈值 {compact_threshold * 100:.0f}%），"
-                            f"已自动压缩摘要并开启新会话延续上下文"
+                    if not summary:
+                        await db.rollback()
+                        raise QueuedMessagePrelaunchError(
+                            "Threshold context snapshot failed; preserving the "
+                            "exact queued message and old session identity"
                         )
-                        db.add(
-                            LogEntry(
-                                instance_id=inst.id,
-                                task_id=task_id,
-                                event_type="system_event",
-                                role="system",
-                                content=notice,
-                                is_error=False,
-                            )
+                    # 清空 session_id → 下次 launch 开新 session，prompt 带摘要
+                    task.session_id = None
+                    task.context_window_usage = None
+                    # 在聊天里给用户留一条可见的压缩提示（落库 + 实时广播）
+                    if compact_threshold + 1e-9 < configured_compact_threshold:
+                        threshold_label = (
+                            f"配置阈值 {configured_compact_threshold * 100:.0f}%，"
+                            f"安全阈值 {compact_threshold * 100:.0f}%，"
+                            f"预留至少 {minimum_headroom:,} tokens"
                         )
-                        await db.commit()
-                        await self.broadcaster.broadcast(
-                            f"task:{task_id}",
-                            {
-                                "event_type": "system_event",
-                                "role": "system",
-                                "content": notice,
-                            },
+                    else:
+                        threshold_label = (
+                            f"阈值 {compact_threshold * 100:.0f}%"
                         )
-                        msg.prompt = build_compacted_resume_prompt(
-                            summary,
-                            msg.current_message,
+                    notice = (
+                        f"⚡ 上一轮上下文已达 {utilization * 100:.0f}%"
+                        f"（{used_tokens:,}/{window:,} tokens，{threshold_label}），"
+                        "已保存结构化工作状态快照并压缩对话，开启新会话延续上下文"
+                    )
+                    db.add(
+                        LogEntry(
+                            instance_id=inst.id,
+                            task_id=task_id,
+                            event_type="system_event",
+                            role="system",
+                            content=notice,
+                            is_error=False,
                         )
-                        msg.allow_new_session = True
-                        logger.info(
-                            "Task %d compacted, new session will start with summary",
-                            task_id,
-                        )
+                    )
+                    await db.commit()
+                    await self.broadcaster.broadcast(
+                        f"task:{task_id}",
+                        {
+                            "event_type": "system_event",
+                            "role": "system",
+                            "content": notice,
+                        },
+                    )
+                    msg.prompt = build_compacted_resume_prompt(
+                        summary,
+                        msg.current_message,
+                    )
+                    msg.allow_new_session = True
+                    logger.info(
+                        "Task %d compacted, new session will start with summary",
+                        task_id,
+                    )
 
             # Capture launch params before closing DB session
             launch_kwargs = dict(
@@ -25509,25 +25566,29 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         session_id: str,
         db,
         *,
+        reason: str = "context_compaction",
         exclude_log_entry_id: int | None = None,
         post_source_injects_are_current: bool = False,
     ) -> str | None:
-        """Collect recent logged history for a replacement native session.
+        """Persist work state and collect history for a replacement session.
 
         Log rows do not currently carry a native session id, so ``session_id``
         identifies the caller's generation rather than filtering the query.
         The current user row is bounded by its exact id, so the same request
         cannot appear in both the historical summary and the new-message
         section. Later ordinary queued requests are excluded, while live
-        injections made into the still-active turn are retained.
+        injections made into the still-active turn are retained. The hidden
+        structured snapshot is flushed here and committed only with the
+        caller's exact Task/session reset transaction.
         """
 
-        del session_id
         try:
             from backend.models.log_entry import LogEntry
             from backend.models.task import Task
 
             task = await db.get(Task, task_id)
+            if task is None:
+                raise RuntimeError(f"Task {task_id} disappeared during compaction")
 
             user_conditions = [
                 LogEntry.task_id == task_id,
@@ -25690,6 +25751,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     + "\n\n".join(recent_blocks)
                 )
 
+            work_state = await capture_context_recovery_snapshot(
+                db,
+                task,
+                session_id=session_id,
+                reason=reason,
+                before_log_entry_id=exclude_log_entry_id,
+                include_post_source_injections=post_source_injects_are_current,
+            )
+            if work_state.strip():
+                parts.append(work_state)
+
             # Put the original description last and label it explicitly.  It
             # is provenance, not an instruction that should outrank months of
             # follow-up conversation.
@@ -25704,7 +25776,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 tail_length = limit - len(omission) - head_length
                 return text[:head_length] + omission + text[-tail_length:]
 
-            original_background = task.description if task else None
+            original_background = task.description
             if original_background and original_background.lstrip().startswith(
                 "[Context compacted]"
             ):
@@ -25744,4 +25816,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             return summary if summary.strip() else None
         except Exception as e:
             logger.exception("compact session failed for task %d: %s", task_id, e)
+            try:
+                await db.rollback()
+            except Exception:
+                logger.exception(
+                    "compact session rollback failed for task %d",
+                    task_id,
+                )
             return None

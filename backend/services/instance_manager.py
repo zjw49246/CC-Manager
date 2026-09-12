@@ -14184,6 +14184,11 @@ class InstanceManager:
                                 task_id,
                                 permit.session_id,
                                 db,
+                                reason=(
+                                    "context_window_exceeded"
+                                    if provider == "codex"
+                                    else "prompt_too_long"
+                                ),
                                 **compact_kwargs,
                             )
                         if summary:
@@ -15482,6 +15487,12 @@ class InstanceManager:
                     task_id,
                     permit.session_id,
                     db,
+                    reason=(
+                        "context_window_exceeded"
+                        if str(params.get("provider") or "claude").lower()
+                        == "codex"
+                        else "prompt_too_long"
+                    ),
                     **compact_kwargs,
                 )
                 if not summary:

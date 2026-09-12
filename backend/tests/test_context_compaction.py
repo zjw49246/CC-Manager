@@ -9,6 +9,7 @@ from backend.models.task import Task
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
+    context_compact_threshold_with_headroom,
     context_tokens_used,
     is_context_window_exceeded,
     read_codex_rollout_last_usage,
@@ -100,6 +101,22 @@ def test_claude_context_tokens_keep_existing_input_only_semantics():
             "output_tokens": 15_000,
         },
     ) == 195_000
+
+
+def test_context_compaction_keeps_fixed_and_relative_headroom():
+    threshold, headroom = context_compact_threshold_with_headroom(0.85, 258_400)
+    assert threshold == pytest.approx(1 - (64_000 / 258_400))
+    assert headroom == 64_000
+
+    threshold, headroom = context_compact_threshold_with_headroom(0.9, 1_000_000)
+    assert threshold == pytest.approx(0.85)
+    assert headroom == 150_000
+
+
+def test_context_compaction_preserves_lower_operator_threshold():
+    threshold, headroom = context_compact_threshold_with_headroom(0.7, 258_400)
+    assert threshold == pytest.approx(0.7)
+    assert headroom == 64_000
 
 
 def test_rollout_usage_uses_last_request_instead_of_cumulative_total(tmp_path):

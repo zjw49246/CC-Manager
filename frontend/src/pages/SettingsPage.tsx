@@ -443,7 +443,8 @@ export function SettingsPage() {
               <label className="block rounded-lg border border-gray-800 bg-gray-950/50 px-4 py-3">
                 <span className="mb-1.5 block text-sm font-medium text-gray-200">压缩阈值</span>
                 <span className="mb-3 block text-xs leading-5 text-gray-500">
-                  会话上下文利用率达到该比例时自动压缩摘要并换新 session。
+                  上一轮会话上下文利用率达到该比例时自动压缩并换新 session；
+                  系统仍会至少预留 64K tokens 或 15% 窗口，避免长工具结果在本轮中途超限。
                 </span>
                 <select
                   aria-label="压缩阈值"

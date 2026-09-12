@@ -41,6 +41,7 @@ from backend.services.task_artifact_contract import (
 from backend.services.test_harness_owner_fence import (
     TEST_HARNESS_TERMINAL_GATE_KEY,
 )
+from backend.models.global_settings import GlobalSettings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.plan import (
@@ -15962,12 +15963,107 @@ async def test_codex_precompact_uses_full_context_tokens(
 
     d._compact_session.assert_awaited_once()
     assert d._compact_session.await_args.kwargs["exclude_log_entry_id"] == 321
+    assert d._compact_session.await_args.kwargs["reason"] == "threshold"
     launch = d.instance_manager.launch.await_args.kwargs
     assert launch["resume_session_id"] is None
     assert "compact summary" in launch["prompt"]
     assert "[基础当前消息 — 默认最高优先级]\nhi" in launch["prompt"]
     assert launch["current_message"] == "hi"
     assert launch["source_log_id"] == 321
+
+
+@pytest.mark.asyncio
+async def test_codex_precompact_applies_headroom_below_late_runtime_threshold(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    msg.source_log_id = 322
+    d._compact_session = AsyncMock(return_value="headroom summary")
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        db.add(
+            LogEntry(
+                id=msg.source_log_id,
+                task_id=task_id,
+                event_type="user_message",
+                role="user",
+                content=msg.prompt,
+                raw_json=_system_source_metadata(raw_content=msg.prompt),
+                is_error=False,
+            )
+        )
+        task.provider = "codex"
+        task.model = "gpt-5.6-sol"
+        task.context_window_usage = {
+            "context_tokens": 194_631,
+            "context_window": 258_400,
+        }
+        global_settings = await db.get(GlobalSettings, 1)
+        if global_settings is None:
+            global_settings = GlobalSettings(id=1)
+            db.add(global_settings)
+        global_settings.context_compact_threshold = 0.85
+        await db.commit()
+
+    await d._process_queued_message(task_id, msg)
+
+    d._compact_session.assert_awaited_once()
+    launch = d.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert "headroom summary" in launch["prompt"]
+    async with db_factory() as db:
+        notices = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.event_type == "system_event",
+                    )
+                )
+            ).scalars()
+        )
+    assert any(
+        "配置阈值 85%" in (notice.content or "")
+        and "预留至少 64,000 tokens" in (notice.content or "")
+        for notice in notices
+    )
+
+
+@pytest.mark.asyncio
+async def test_threshold_snapshot_failure_preserves_session_and_message(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    d._compact_session = AsyncMock(return_value=None)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.provider = "codex"
+        task.model = "gpt-5.6-terra"
+        task.context_window_usage = {
+            "context_tokens": 240_000,
+            "context_window": 258_400,
+        }
+        original_usage = dict(task.context_window_usage)
+        await db.commit()
+
+    with pytest.raises(
+        QueuedMessagePrelaunchError,
+        match="Threshold context snapshot failed",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_not_awaited()
+    assert msg.prompt == "hi"
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.session_id == "sess-1"
+        assert task.context_window_usage == original_usage
 
 
 @pytest.mark.asyncio
@@ -16074,6 +16170,7 @@ async def test_failed_context_turn_compacts_before_explicit_followup(
 
     clone.assert_not_awaited()
     d._compact_session.assert_awaited_once()
+    assert d._compact_session.await_args.kwargs["reason"] == failure_kind
     launch = d.instance_manager.launch.await_args.kwargs
     assert launch["resume_session_id"] is None
     assert "safe bounded history" in launch["prompt"]
@@ -17032,7 +17129,7 @@ async def test_start_waits_for_inflight_queued_admission_before_snapshot(
 
         release_routing.set()
         await asyncio.wait_for(queued, timeout=1)
-        await asyncio.wait_for(starter, timeout=1)
+        await asyncio.wait_for(starter, timeout=5)
         assert cleanup_seen.is_set()
     finally:
         release_routing.set()

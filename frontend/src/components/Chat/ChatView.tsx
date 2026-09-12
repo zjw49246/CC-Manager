@@ -472,6 +472,7 @@ interface ContextUsage {
   cache_creation_input_tokens: number;
   output_tokens: number;
   total_input_tokens: number;
+  context_tokens?: number;
   context_window?: number;
 }
 
@@ -483,7 +484,8 @@ function formatTokenCount(n: number): string {
 
 function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
   const contextWindow = usage.context_window;
-  const totalUsed = usage.total_input_tokens + usage.output_tokens;
+  const totalUsed = usage.context_tokens
+    ?? (usage.total_input_tokens + usage.output_tokens);
   const percentage = contextWindow ? Math.min((totalUsed / contextWindow) * 100, 100) : null;
 
   // Color based on usage level
@@ -499,6 +501,7 @@ function ContextUsageIndicator({ usage }: { usage: ContextUsage }) {
 
   return (
     <div className="flex items-center gap-2 text-xs shrink-0" title={`Input: ${formatTokenCount(usage.input_tokens)} | Cache read: ${formatTokenCount(usage.cache_read_input_tokens)} | Cache create: ${formatTokenCount(usage.cache_creation_input_tokens)} | Output: ${formatTokenCount(usage.output_tokens)}${contextWindow ? ` | Context window: ${formatTokenCount(contextWindow)}` : ' | Context window: unknown'}`}>
+      <span className="text-gray-600">上一轮</span>
       <div className="flex items-center gap-1.5">
         <span className={`${textColor} font-medium`}>{formatTokenCount(totalUsed)}</span>
         <span className="text-gray-600">/</span>
@@ -2288,6 +2291,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         cache_creation_input_tokens: (msg.data!.cache_creation_input_tokens as number) || 0,
         output_tokens: (msg.data!.output_tokens as number) || 0,
         total_input_tokens: (msg.data!.total_input_tokens as number) || 0,
+        context_tokens: (msg.data!.context_tokens as number) || undefined,
         context_window: (msg.data!.context_window as number) || prev?.context_window,
       }));
       return;

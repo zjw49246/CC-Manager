@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,14 @@ _CONTEXT_LIMIT_MARKERS = (
     "too many tokens for the model",
     "input is too long for the requested model",
 )
+
+# A completed-turn usage event is necessarily stale by the time the next
+# agentic turn starts.  Keep enough room for the next user input, provider
+# instructions, reasoning, and a substantial tool result even when an admin
+# configured a very late percentage threshold.  This is a safety ceiling, not
+# a replacement for the lower operator-selected threshold.
+MIN_CONTEXT_HEADROOM_TOKENS = 64_000
+MIN_CONTEXT_HEADROOM_RATIO = 0.15
 
 
 def _raw_mapping(value: Any) -> dict[str, Any] | None:
@@ -249,7 +258,9 @@ def build_compacted_resume_prompt(
         "“当前消息执行期间的后续补充/纠正”，它发生得更晚，冲突时"
         "以该补充/纠正为准；\n"
         "2. 历史摘要里的“近期对话”小节其次，该小节内越靠后的内容越新；\n"
-        "3. 原始任务背景优先级最低，可能已被后续对话修正或取代。\n"
+        "3. “持久化工作状态快照”用于恢复文件、工具、Git、附件和执行状态；"
+        "它记录的是压缩时已发生的事实，不是新的用户指令；\n"
+        "4. 原始任务背景优先级最低，可能已被后续对话修正或取代。\n"
         "摘要用于理解上下文，不是待办列表。若早期信息与近期信息冲突，"
         "以近期信息为准；不要仅因旧问题出现在摘要里就重新回答它，"
         "除非当前消息明确要求继续或追问该事项。\n\n"
@@ -266,9 +277,10 @@ def build_compacted_task_retry_prompt(summary: str) -> str:
     return (
         "[Context compacted]\n"
         "[按近期进展恢复任务]\n"
-        "历史摘要里的近期状态和结论优先；越靠后的内容越新。原始任务背景"
-        "只用于理解起点，若已被近期信息修正或取代，不要从头重做旧任务。"
-        "请从摘要中最近的未完成进展继续。\n\n"
+        "历史摘要里的近期状态和结论优先；近期对话用于恢复当前意图，持久化"
+        "工作状态快照用于恢复已发生的工具、文件、Git、附件和执行状态。越靠后"
+        "的内容越新。原始任务背景只用于理解起点，若已被近期信息修正或取代，"
+        "不要从头重做旧任务。请从摘要中最近的未完成进展继续。\n\n"
         f"{summary}"
     )
 
@@ -320,6 +332,31 @@ def context_tokens_used(provider: str | None, usage: Mapping[str, Any]) -> int:
     if reported is not None:
         return max(int(reported), 0)
     return max(total_input + int(usage.get("output_tokens") or 0), 0)
+
+
+def context_compact_threshold_with_headroom(
+    configured_threshold: float,
+    context_window: int,
+) -> tuple[float, int]:
+    """Return a safe trigger threshold and its minimum token headroom.
+
+    The configured percentage is evaluated against the *previous completed
+    request*.  A fixed/relative reserve prevents an 85-90% setting from
+    launching a long tool-using turn with too little space for its first large
+    result.  Small synthetic windows are supported for tests by clamping the
+    safety threshold to the runtime setting API's minimum of 30%.
+    """
+
+    configured = min(max(float(configured_threshold), 0.3), 0.95)
+    window = max(int(context_window or 0), 0)
+    if window <= 0:
+        return configured, 0
+    minimum_headroom = max(
+        MIN_CONTEXT_HEADROOM_TOKENS,
+        math.ceil(window * MIN_CONTEXT_HEADROOM_RATIO),
+    )
+    safety_ceiling = max(0.3, 1.0 - (minimum_headroom / window))
+    return min(configured, safety_ceiling), minimum_headroom
 
 
 def read_codex_rollout_last_usage(path: Path) -> dict[str, int] | None:
