@@ -5756,6 +5756,153 @@ class TestFullMirrorBackend:
                 "exit_code": 9,
             }
 
+    async def test_pty_timeout_fails_without_waiting_for_native_monitors(
+        self, db_factory
+    ):
+        """A killed PTY Session cannot enter an unfinishable background wait."""
+
+        im, broadcaster = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+        session_id = "timed-out-native-monitor-session"
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 4
+            task.turn_generation = 9
+            task.instance_id = instance_id
+            task.session_id = session_id
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 57_700
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            native_monitor = SubAgentSession(
+                task_id=task_id,
+                source="native",
+                provider="claude",
+                agent_type="native-monitor",
+                description="monitor killed with PTY session",
+                status="running",
+            )
+            ccm_monitor = SubAgentSession(
+                task_id=task_id,
+                source="ccm",
+                provider="claude",
+                agent_type="monitor",
+                description="independent CCM monitor",
+                status="running",
+            )
+            db.add_all([native_monitor, ccm_monitor])
+            await db.commit()
+            native_monitor_id = native_monitor.id
+            ccm_monitor_id = ccm_monitor.id
+
+        class Proxy:
+            pid = 57_700
+            returncode = -9
+            termination_kind = "timeout"
+            termination_error = "Chat run timed out after 7200s"
+
+            def __init__(self):
+                self.completions = []
+
+            def complete(self, code=0):
+                self.completions.append(code)
+
+        proxy = Proxy()
+        session = MagicMock()
+        session.session_id = session_id
+        session._reader._tracker.has_pending = False
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+        real_pending_probe = im.pty_background_activity_pending
+        im.pty_background_activity_pending = AsyncMock(
+            side_effect=real_pending_probe
+        )
+        im._try_chat_transient_retry = AsyncMock(return_value=False)
+        im._try_chat_pool_rotation = AsyncMock(return_value=False)
+
+        async def exit_timed_out_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=4,
+                task_turn_generation=9,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                None,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        exit_task = asyncio.create_task(exit_timed_out_turn())
+        await asyncio.wait_for(exit_task, timeout=5)
+        await asyncio.sleep(0)
+
+        im.pty_background_activity_pending.assert_not_awaited()
+        assert proxy.completions == [-9]
+        assert instance_id not in backend._consumers
+        assert instance_id not in backend._sessions
+        assert instance_id not in backend._proxies
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        assert not im._pty_background_states
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            native_monitor = await db.get(
+                SubAgentSession, native_monitor_id
+            )
+            ccm_monitor = await db.get(SubAgentSession, ccm_monitor_id)
+            assert task.status == "failed"
+            assert task.completed_at is not None
+            assert task.error_message == "Chat run timed out after 7200s"
+            assert task.pty_background_generation is None
+            assert inst.status == "error"
+            assert inst.pid is None
+            assert inst.current_task_id is None
+            assert native_monitor.status == "failed"
+            assert native_monitor.completed_at is not None
+            assert ccm_monitor.status == "running"
+            assert ccm_monitor.completed_at is None
+
+        child_statuses = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+            and call.args[1].get("event_type")
+            == "sub_agent_session_status"
+        ]
+        assert [payload["sub_agent_session_id"] for payload in child_statuses] == [
+            native_monitor_id
+        ]
+        broadcaster.broadcast.assert_any_await(
+            "tasks",
+            {
+                "event": "sub_agent_count",
+                "event_type": "sub_agent_count",
+                "task_id": task_id,
+                "active_sub_agents": 1,
+                "task_retry_count": 4,
+                "task_turn_generation": 9,
+            },
+        )
+
     async def test_handoff_during_terminal_commit_rearms_before_publish(
         self, db_factory
     ):

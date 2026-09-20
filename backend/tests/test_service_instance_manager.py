@@ -18975,7 +18975,7 @@ def test_internal_codex_abort_is_not_a_successful_chat_terminal():
     assert InstanceManager._chat_terminal_succeeded(process, 130)
     process.termination_kind = "timeout"
     assert not InstanceManager._chat_terminal_succeeded(process, 130)
-    assert InstanceManager._chat_terminal_succeeded(process, 0)
+    assert not InstanceManager._chat_terminal_succeeded(process, 0)
 
 
 async def _run_crashed_chat_consumer(

@@ -12373,11 +12373,28 @@ class InstanceManager:
 
         ec = exit_code if exit_code is not None else 0
         provider_error = (record.fatal_provider_error or "").strip()
-        interrupted = ec in (-2, 130)
-        successful_terminal = (ec == 0 or interrupted) and not provider_error
+        termination_kind = getattr(process, "termination_kind", None)
+        termination_error = str(
+            getattr(process, "termination_error", "") or ""
+        ).strip()
+        successful_terminal = (
+            self._chat_terminal_succeeded(process, ec)
+            and not provider_error
+        )
         final_status = "completed" if successful_terminal else "failed"
         completed_at = datetime.utcnow()
+        failure_text = (
+            provider_error[:2000]
+            if provider_error
+            else (
+                termination_error[:2000]
+                if termination_error
+                else f"Process exited with code {ec}"
+            )
+        )
         failure_notice_data = None
+        terminated_native_children: list[dict[str, Any]] = []
+        active_sub_agent_count: int | None = None
 
         def background_handoff_pending() -> bool:
             return bool(
@@ -12765,15 +12782,13 @@ class InstanceManager:
                         task,
                         instance_id=instance_id,
                         successful_terminal=successful_terminal,
-                        admit_agent_action=(ec == 0),
+                        admit_agent_action=(
+                            successful_terminal and ec == 0
+                        ),
                         failure_sets_completed_at=(
                             not context_preflight_requeued
                         ),
-                        failure_message=(
-                            provider_error[:2000]
-                            if provider_error
-                            else f"Process exited with code {ec}"
-                        ),
+                        failure_message=failure_text,
                     )
                     if (
                         admission is not None
@@ -12792,11 +12807,7 @@ class InstanceManager:
                     task.error_message = (
                         None
                         if successful_terminal
-                        else (
-                            provider_error[:2000]
-                            if provider_error
-                            else f"Process exited with code {ec}"
-                        )
+                        else failure_text
                     )
                     await db.flush()
                 if (
@@ -12847,6 +12858,66 @@ class InstanceManager:
                 if not instance_result.rowcount or not owns_generation():
                     await db.rollback()
                     return None
+                if (
+                    termination_kind == "timeout"
+                    and not preserve_background_failure
+                ):
+                    # Dispatcher timeout kills the resident PTY Session, so
+                    # every native child still marked running has lost its
+                    # only execution owner. Settle them in the same exact Task
+                    # -> Instance transaction instead of leaving phantom
+                    # monitors that can keep the UI and later cleanup active.
+                    from backend.models.sub_agent import SubAgentSession
+
+                    native_children = list((
+                        await db.execute(
+                            select(SubAgentSession)
+                            .where(
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.source == "native",
+                                SubAgentSession.status == "running",
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars())
+                    native_completed_at = datetime.utcnow()
+                    for native_child in native_children:
+                        native_child.status = "failed"
+                        native_child.completed_at = native_completed_at
+                        terminated_native_children.append({
+                            "event_type": "sub_agent_session_status",
+                            "sub_agent_session_id": native_child.id,
+                            "agent_type": native_child.agent_type,
+                            "source": "native",
+                            "native_mirror_version": 1,
+                            "provider": native_child.provider,
+                            "description": native_child.description,
+                            "model": native_child.model,
+                            "reasoning_effort": (
+                                native_child.codex_effort_level
+                            ),
+                            "status": "failed",
+                            "checks_done": native_child.checks_done,
+                            "last_summary": native_child.last_summary,
+                            "codex_thread_id": (
+                                native_child.codex_thread_id
+                            ),
+                            "native_sequence": None,
+                            "task_retry_count": expected_retry_count,
+                            "task_turn_generation": (
+                                expected_turn_generation
+                            ),
+                        })
+                    if native_children:
+                        await db.flush()
+                        active_sub_agent_count = int((
+                            await db.execute(
+                                select(func.count(SubAgentSession.id)).where(
+                                    SubAgentSession.task_id == task_id,
+                                    SubAgentSession.status == "running",
+                                )
+                            )
+                        ).scalar_one())
                 # API-error events have already been persisted verbatim by
                 # _process_event. A process that dies before producing any
                 # event still needs a visible chat entry; process_exit alone
@@ -12865,8 +12936,12 @@ class InstanceManager:
                         reason="process_exit_before_response",
                         exit_code=ec,
                         content=(
-                            "Claude 进程在返回回复前异常退出"
-                            f"（exit code {ec}）。"
+                            "Claude 回合执行超时，进程已终止。"
+                            if termination_kind == "timeout"
+                            else (
+                                "Claude 进程在返回回复前异常退出"
+                                f"（exit code {ec}）。"
+                            )
                         ),
                     )
                     db.add(failure_notice)
@@ -12967,6 +13042,19 @@ class InstanceManager:
                             f"task:{task_id}",
                             failure_notice_data,
                         )
+                    for child_payload in terminated_native_children:
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}", child_payload
+                        )
+                    if active_sub_agent_count is not None:
+                        await self.broadcaster.broadcast("tasks", {
+                            "event": "sub_agent_count",
+                            "event_type": "sub_agent_count",
+                            "task_id": task_id,
+                            "active_sub_agents": active_sub_agent_count,
+                            "task_retry_count": expected_retry_count,
+                            "task_turn_generation": expected_turn_generation,
+                        })
                     if (
                         final_status == "completed"
                         and background_generation is not None
@@ -22754,16 +22842,18 @@ class InstanceManager:
 
     @staticmethod
     def _chat_terminal_succeeded(process, exit_code: int) -> bool:
-        """Separate an acknowledged user interrupt from internal abort cleanup."""
+        """Reject forced aborts even when their transport exit looks clean."""
 
+        if (
+            getattr(process, "termination_kind", None)
+            in {"internal_abort", "timeout"}
+        ):
+            return False
         if exit_code == 0:
             return True
         if exit_code not in (-2, 130):
             return False
-        return (
-            getattr(process, "termination_kind", None)
-            not in {"internal_abort", "timeout"}
-        )
+        return True
 
     def get_config_dir(self, instance_id: int) -> str | None:
         return self._config_dirs.get(instance_id)

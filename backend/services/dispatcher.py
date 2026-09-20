@@ -5214,6 +5214,9 @@ class GlobalDispatcher:
                 # cannot publish a timed-out, partial reply as completed.
                 try:
                     process.termination_kind = "timeout"
+                    process.termination_error = (
+                        f"{label} timed out after {timeout:.0f}s"
+                    )
                 except (AttributeError, TypeError):
                     pass
                 killed = await self.instance_manager.kill_process_generation(

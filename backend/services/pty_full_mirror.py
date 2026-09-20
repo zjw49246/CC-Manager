@@ -518,6 +518,22 @@ class FullMirrorCCMBackend(CCMBackend):
         chat_initiated = bool(context.get("chat_initiated", False))
         ec = exit_code if exit_code is not None else 0
 
+        process = getattr(record, "process", None)
+        termination_kind = getattr(process, "termination_kind", None)
+        if termination_kind == "timeout" and ec in (0, -2, 130):
+            # The PTY adapter reads the native Session's exit code, which can
+            # remain None after Dispatcher has killed the exact proxy/process
+            # generation.  Preserve a real non-zero proxy code when available;
+            # otherwise use a generic failure so timeout can never arm a
+            # background epoch or publish a successful terminal.
+            proxy_exit_code = getattr(process, "returncode", None)
+            ec = (
+                proxy_exit_code
+                if isinstance(proxy_exit_code, int)
+                and proxy_exit_code not in (0, -2, 130)
+                else 1
+            )
+
         # The upstream CCM adapter finalizes with only instance_id/task_id.
         # That is unsafe for PTY hot reuse: many turns share one Session/PID,
         # and a late old callback can clear a newer same-slot owner.  Keep pool
@@ -627,6 +643,7 @@ class FullMirrorCCMBackend(CCMBackend):
             and owns_record
             and not stop_owns_terminal
             and ec == 0
+            and self._im._chat_terminal_succeeded(process, ec)
             and session_id
         )
 
