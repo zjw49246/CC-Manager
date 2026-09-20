@@ -432,6 +432,126 @@ async def test_recoverable_chat_failure_accepts_claude_usage_metadata(
 
 
 @pytest.mark.asyncio
+async def test_recoverable_chat_failure_accepts_terminal_claude_autonomous_overflow(
+    db_factory,
+):
+    """A PTY autonomous tail can poison the exact resumable Claude session."""
+
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="autonomous",
+                    event_type="tool_result",
+                    role="tool",
+                    tool_output="work already completed before overflow",
+                    is_error=False,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="autonomous",
+                    event_type="message",
+                    role="assistant",
+                    content="Prompt is too long",
+                    raw_json=json.dumps(
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "error": "invalid_request",
+                            "message": {
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0,
+                                }
+                            },
+                        }
+                    ),
+                    is_error=True,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="autonomous",
+                    event_type="system_event",
+                    role=None,
+                    content="turn_duration",
+                    raw_json=json.dumps(
+                        {"type": "system", "subtype": "turn_duration"}
+                    ),
+                    is_error=False,
+                ),
+            ]
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+
+        assert (
+            await recoverable_chat_context_failure(db, task)
+            == "prompt_too_long"
+        )
+
+
+@pytest.mark.asyncio
+async def test_recoverable_chat_failure_rejects_autonomous_overflow_with_later_activity(
+    db_factory,
+):
+    """An old autonomous marker cannot override later exact-generation work."""
+
+    task_id = await _failed_task(db_factory)
+    async with db_factory() as db:
+        db.add_all(
+            [
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="autonomous",
+                    event_type="message",
+                    role="assistant",
+                    content="Prompt is too long",
+                    raw_json=json.dumps(
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "error": "invalid_request",
+                            "message": {
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                }
+                            },
+                        }
+                    ),
+                    is_error=True,
+                ),
+                LogEntry(
+                    task_id=task_id,
+                    task_retry_count=2,
+                    task_turn_generation=7,
+                    turn_scope="foreground",
+                    event_type="tool_use",
+                    role="assistant",
+                    tool_name="Bash",
+                    is_error=False,
+                ),
+            ]
+        )
+        await db.commit()
+        task = await db.get(Task, task_id)
+
+        assert await recoverable_chat_context_failure(db, task) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider", "entry", "expected"),
     [

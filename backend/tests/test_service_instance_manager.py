@@ -59,6 +59,7 @@ from backend.services.mcp_config import (
     render_codex_exec_config_args,
 )
 from backend.services.task_agent_isolation import (
+    CLAUDE_DISABLE_CRON,
     CLAUDE_SUBPROCESS_ENV_SCRUB,
     CLAUDE_NATIVE_SUB_AGENT_TOOLS,
     CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
@@ -2063,19 +2064,39 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             99,
             session,
         ) is True
-        # The native Session exposes the follow-up process while its pump is
-        # still draining.  It must not be mistaken for a separate foreground
-        # turn and steered a second time.
+        followup = next(iter(manager._pty_followup_tasks[7]))
+        for _ in range(20):
+            if (
+                getattr(followup, "_ccm_followup_native_process", None)
+                is followup_process
+            ):
+                break
+            await asyncio.sleep(0)
+        assert (
+            getattr(followup, "_ccm_followup_native_process", None)
+            is followup_process
+        )
+
+        # Once the pump has proven ownership of the active process, a later
+        # injection is a same-turn steer. It does not create a second prompt
+        # pump or claim a second retained boundary operation.
         assert await manager.inject_pty_message(
             session.session_id,
-            "must wait for the first follow-up",
+            "steer the active follow-up",
             task_id=99,
             task_retry_count=2,
             task_turn_generation=3,
             expected_instance_id=7,
             followup_operation_id="followup-99-second",
-        ) is False
-        session.steer_active_turn.assert_not_awaited()
+        ) is True
+        session.steer_active_turn.assert_awaited_once_with(
+            "steer the active follow-up",
+            expected_process=followup_process,
+        )
+        assert manager.consume_pty_followup_operation_route(
+            "followup-99-second"
+        ) == (True, None)
+        assert len(manager._pty_followup_tasks[7]) == 1
 
         release_followup.set()
         await asyncio.wait_for(
@@ -7127,6 +7148,147 @@ async def test_launch_without_thinking_budget_omits_env(db_factory):
     env = mock_exec.call_args[1]["env"]
     assert "MAX_THINKING_TOKENS" not in env
     await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_managed_claude_launch_disables_native_cron(db_factory):
+    """Managed Claude Tasks cannot revive provider-local cron schedules."""
+    async with db_factory() as db:
+        inst = Instance(name="managed-cron-inst")
+        task = Task(title="managed-cron-task", status="executing")
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst.current_task_id = task.id
+        task.instance_id = inst.id
+        await db.commit()
+        inst_id, task_id = inst.id, task.id
+
+    mock_proc = _make_mock_process()
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    im = InstanceManager(db_factory, broadcaster)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as mock_exec:
+        await im.launch(
+            instance_id=inst_id,
+            task_id=task_id,
+            prompt="hi",
+            cwd="/tmp",
+        )
+
+    assert mock_exec.call_args.kwargs["env"][CLAUDE_DISABLE_CRON] == "1"
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_managed_claude_pty_resume_disables_native_cron_in_patched_config(
+    db_factory,
+):
+    """The PTY resume/config path carries the same cron kill switch."""
+    async with db_factory() as db:
+        inst = Instance(name="managed-cron-pty-resume")
+        task = Task(
+            title="managed-cron-pty-resume-task",
+            status="executing",
+            provider="claude",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        inst.current_task_id = task.id
+        task.instance_id = inst.id
+        await db.commit()
+        instance_id, task_id = inst.id, task.id
+
+    observed: dict[str, dict] = {}
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class Config:
+        claude_binary = "claude"
+        env_overrides = {}
+
+    class FakePTYBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return Config()
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["env"] = dict(config.env_overrides)
+            manager.processes[kwargs["instance_id"]] = _make_mock_process(
+                pid=52_004,
+                returncode=None,
+            )
+            return kwargs["resume_session_id"]
+
+    manager._pty_backend = FakePTYBackend()
+    manager._pty_enabled = True
+    await manager.launch(
+        instance_id=instance_id,
+        task_id=task_id,
+        prompt="continue",
+        cwd="/tmp",
+        provider="claude",
+        resume_session_id="persisted-cron-session",
+        chat_initiated=True,
+    )
+
+    assert observed["env"][CLAUDE_DISABLE_CRON] == "1"
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_claude_pty_config_does_not_inject_native_cron_switch(
+    db_factory,
+):
+    """The provider switch is scoped to CCM-managed task launches."""
+    async with db_factory() as db:
+        inst = Instance(name="unmanaged-cron-pty")
+        db.add(inst)
+        await db.commit()
+        instance_id = inst.id
+
+    observed: dict[str, dict] = {}
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class Config:
+        claude_binary = "claude"
+        env_overrides = {}
+
+    class FakePTYBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return Config()
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["env"] = dict(config.env_overrides)
+            manager.processes[kwargs["instance_id"]] = _make_mock_process(
+                pid=52_005,
+                returncode=None,
+            )
+            return kwargs["resume_session_id"]
+
+    manager._pty_backend = FakePTYBackend()
+    manager._pty_enabled = True
+    await manager.launch(
+        instance_id=instance_id,
+        prompt="continue",
+        cwd="/tmp",
+        provider="claude",
+        resume_session_id="unmanaged-session",
+        chat_initiated=True,
+    )
+
+    assert CLAUDE_DISABLE_CRON not in observed["env"]
 
 
 @pytest.mark.asyncio
@@ -20401,8 +20563,12 @@ def test_build_command_claude_task_disables_interactive_plan_mode():
 
     idx = cmd.index("--disallowedTools")
     assert set(cmd[idx + 1].split(",")) == {
+        "CronCreate",
+        "CronDelete",
+        "CronList",
         "EnterPlanMode",
         "ExitPlanMode",
+        "ScheduleWakeup",
     }
 
 
@@ -20876,6 +21042,10 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["disallowed_tools"] == [
         "EnterPlanMode",
         "ExitPlanMode",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "ScheduleWakeup",
     ]
     assert im._launch_params[7]["source_log_id"] == 123
     assert im._launch_params[7]["current_message"] == "do it now"
@@ -21054,6 +21224,121 @@ async def test_delete_cleanup_stops_runtime_owned_session_after_proof_generation
     assert stop_calls == 1
     assert session_id not in backend._pool._sessions
     assert session not in manager._task_runtime_scope_pty_owners
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphaned_pty_guard_requires_no_live_owner():
+    task_id = 902
+    session_id = "orphaned-timeout-session"
+    manager = InstanceManager(MagicMock(), types.SimpleNamespace())
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=types.SimpleNamespace(_sessions={}),
+    )
+    token = object()
+    manager._pty_autonomous_activity_handoffs[(task_id, session_id)] = token
+
+    owner = asyncio.create_task(asyncio.Event().wait())
+    manager._pty_autonomous_activity_handoff_owners[
+        (owner, (task_id, session_id))
+    ] = token
+    try:
+        assert not await manager.reconcile_orphaned_pty_runtime_guard(
+            task_id,
+            session_id,
+        )
+        assert manager.has_pty_autonomous_activity_handoff(task_id, session_id)
+    finally:
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        manager._pty_autonomous_activity_handoff_owners.pop(
+            (owner, (task_id, session_id)),
+            None,
+        )
+
+    assert await manager.reconcile_orphaned_pty_runtime_guard(
+        task_id,
+        session_id,
+    )
+    assert not manager.has_pty_autonomous_activity_handoff(task_id, session_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphaned_pty_guard_discards_dead_background_state():
+    task_id = 903
+    session_id = "dead-timeout-session"
+    manager = InstanceManager(MagicMock(), types.SimpleNamespace())
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=types.SimpleNamespace(_sessions={}),
+    )
+    session = types.SimpleNamespace(session_id=session_id, is_alive=False)
+    state = manager.register_pty_background_generation(
+        task_id,
+        session_id,
+        "dead-background-generation",
+        session,
+        task_retry_count=0,
+        task_turn_generation=7,
+    )
+    manager._pty_autonomous_activity_handoffs[(task_id, session_id)] = object()
+
+    assert await manager.reconcile_orphaned_pty_runtime_guard(
+        task_id,
+        session_id,
+    )
+    assert state.outcome == "superseded"
+    assert manager.pty_background_generation_for(task_id, session_id) is None
+    assert not manager.has_pty_autonomous_activity_handoff(task_id, session_id)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphaned_pty_guard_keeps_live_post_exit_proof_without_indexes():
+    task_id = 904
+    session_id = "retained-proof-session"
+    manager = InstanceManager(MagicMock(), types.SimpleNamespace())
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=types.SimpleNamespace(_sessions={}),
+    )
+    proof = types.SimpleNamespace(
+        session=types.SimpleNamespace(session_id=session_id, is_alive=True),
+        invalidated=False,
+        watcher=None,
+    )
+    key = (task_id, session_id)
+    manager._pty_post_exit_generations[key] = proof
+
+    assert not await manager.reconcile_orphaned_pty_runtime_guard(
+        task_id,
+        session_id,
+    )
+    assert manager._pty_post_exit_generations[key] is proof
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphaned_pty_guard_keeps_live_runtime_session_without_indexes():
+    task_id = 905
+    session_id = "runtime-owner-session"
+    manager = InstanceManager(MagicMock(), types.SimpleNamespace())
+    class LiveSession:
+        __hash__ = object.__hash__
+
+        def __init__(self):
+            self.session_id = session_id
+            self.is_alive = True
+
+    session = LiveSession()
+    manager._pty_backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=types.SimpleNamespace(_sessions={}),
+    )
+    manager._task_runtime_scope_pty_owners[session] = task_id
+
+    assert not await manager.reconcile_orphaned_pty_runtime_guard(
+        task_id,
+        session_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -23831,6 +24116,27 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
         current = await db.get(Task, task_id)
         assert current.session_id is None
         assert current.context_window_usage is None
+        notices = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.content.contains("正在用新会话自动重试"),
+                )
+            )
+        ).scalars().all()
+        assert len(notices) == 1
+        assert notices[0].task_turn_generation == 2
+        assert json.loads(notices[0].raw_json) == {
+            "type": "ccm.context_compaction",
+            "reason": "prompt_too_long",
+            "recovery": "fresh_session_retry",
+        }
+    assert any(
+        call.args[0] == f"task:{task_id}"
+        and "正在用新会话自动重试" in call.args[1].get("content", "")
+        for call in manager.broadcaster.broadcast.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -23991,6 +24297,23 @@ async def test_claude_pty_context_error_turn_duration_compacts_and_requeues(
         current = await db.get(Task, task_id)
         assert current.session_id is None
         assert current.context_window_usage is None
+        notices = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.content.contains("正在用新会话自动重试"),
+                )
+            )
+        ).scalars().all()
+        assert len(notices) == 1
+        assert notices[0].task_turn_generation == 10
+        assert json.loads(notices[0].raw_json)["reason"] == "prompt_too_long"
+    assert any(
+        call.args[0] == f"task:{task_id}"
+        and "正在用新会话自动重试" in call.args[1].get("content", "")
+        for call in manager.broadcaster.broadcast.await_args_list
+    )
 
 
 @pytest.mark.asyncio

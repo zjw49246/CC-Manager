@@ -15434,6 +15434,180 @@ async def test_queued_busy_ignores_lifecycle_that_reused_historical_instance(
 
 
 @pytest.mark.asyncio
+async def test_queued_busy_reconciles_terminal_ownerless_stale_lifecycle(
+    db_factory,
+):
+    """A dead cleanup coroutine must not permanently block later chat."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="failed terminal turn",
+            description="d",
+            status="failed",
+            session_id="resumable-session",
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="released-error-slot",
+            status="error",
+            pid=None,
+            current_task_id=None,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+        lifecycle_generation = d._task_lifecycle_generation(task)
+
+    lifecycle = asyncio.create_task(asyncio.Event().wait())
+    setattr(lifecycle, "_ccm_task_id", task_id)
+    setattr(lifecycle, "_ccm_task_generation", lifecycle_generation)
+    d._running_tasks[instance_id] = lifecycle
+
+    async with db_factory() as db:
+        assert not await d._queued_task_has_live_generation(db, task_id)
+
+    assert d._running_tasks.get(instance_id) is None
+    assert lifecycle.cancelling()
+    await asyncio.gather(lifecycle, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_keeps_stale_lifecycle_until_cancellation_finishes(
+    db_factory,
+    monkeypatch,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="terminal lifecycle cancellation",
+            description="d",
+            status="failed",
+            session_id="cancel-wait-session",
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="cancel-wait-slot",
+            status="error",
+            pid=None,
+            current_task_id=None,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+        lifecycle_generation = d._task_lifecycle_generation(task)
+
+    cancellation_started = asyncio.Event()
+    release_cancellation = asyncio.Event()
+
+    async def lifecycle_body():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_started.set()
+            await release_cancellation.wait()
+            raise
+
+    lifecycle = asyncio.create_task(lifecycle_body())
+    setattr(lifecycle, "_ccm_task_id", task_id)
+    setattr(lifecycle, "_ccm_task_generation", lifecycle_generation)
+    d._running_tasks[instance_id] = lifecycle
+    monkeypatch.setattr(
+        "backend.services.dispatcher.AUX_LIFECYCLE_CANCEL_TIMEOUT",
+        0.02,
+    )
+
+    async def release_after_observed():
+        await cancellation_started.wait()
+        release_cancellation.set()
+
+    releaser = asyncio.create_task(release_after_observed())
+    try:
+        async with db_factory() as db:
+            check = asyncio.create_task(
+                d._queued_task_has_live_generation(db, task_id)
+            )
+            await asyncio.wait_for(cancellation_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not check.done()
+            assert d._running_tasks.get(instance_id) is lifecycle
+            release_cancellation.set()
+            assert not await asyncio.wait_for(check, timeout=1)
+        await asyncio.wait_for(releaser, timeout=1)
+        assert lifecycle.done()
+        assert d._running_tasks.get(instance_id) is None
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+        if not lifecycle.done():
+            release_cancellation.set()
+            lifecycle.cancel()
+            await asyncio.gather(lifecycle, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instance_kwargs", "manager_running"),
+    [
+        ({"status": "running", "current_task_id": "task"}, False),
+        ({"status": "error", "pid": 99125}, False),
+        ({"status": "error"}, True),
+    ],
+)
+async def test_queued_busy_keeps_terminal_lifecycle_with_runtime_evidence(
+    db_factory,
+    instance_kwargs,
+    manager_running,
+):
+    """Any durable owner, PID, or manager runtime keeps replay fail-closed."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="terminal turn with runtime evidence",
+            description="d",
+            status="failed",
+            session_id="resumable-session",
+        )
+        db.add(task)
+        await db.flush()
+        instance_values = dict(instance_kwargs)
+        current_task_id = instance_values.pop("current_task_id", None)
+        instance = Instance(
+            name="runtime-evidence-slot",
+            current_task_id=(
+                task.id if current_task_id == "task" else current_task_id
+            ),
+            **instance_values,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+    d.instance_manager.is_running = MagicMock(return_value=manager_running)
+    lifecycle = asyncio.create_task(asyncio.Event().wait())
+    setattr(lifecycle, "_ccm_task_id", task_id)
+    d._running_tasks[instance_id] = lifecycle
+    try:
+        async with db_factory() as db:
+            assert await d._queued_task_has_live_generation(db, task_id)
+        assert d._running_tasks.get(instance_id) is lifecycle
+        assert not lifecycle.cancelling()
+    finally:
+        lifecycle.cancel()
+        await asyncio.gather(lifecycle, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_queued_busy_ignores_stale_consumer_after_instance_reassignment(
     db_factory,
 ):
@@ -15509,6 +15683,160 @@ async def test_queued_busy_detects_detached_pty_background_epoch(
         task.pty_background_generation = None
         await db.commit()
         assert not await d._queued_task_has_live_generation(db, task_id)
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_reconciles_orphaned_terminal_pty_handoff(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="timed out PTY turn",
+            description="d",
+            status="failed",
+            session_id="stopped-session",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    d.instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+        side_effect=[True, False]
+    )
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard = (
+        AsyncMock(return_value=True)
+    )
+
+    async with db_factory() as db:
+        assert not await d._queued_task_has_live_generation(db, task_id)
+
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard.assert_awaited_once_with(
+        task_id,
+        "stopped-session",
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_reconciles_orphaned_terminal_pty_background_state(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="timed out PTY background state",
+            description="d",
+            status="failed",
+            session_id="stopped-background-session",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    d.instance_manager.pty_background_generation_for = MagicMock(
+        side_effect=["dead-background-generation", None]
+    )
+    d.instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+        return_value=False
+    )
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard = (
+        AsyncMock(return_value=True)
+    )
+
+    async with db_factory() as db:
+        assert not await d._queued_task_has_live_generation(db, task_id)
+
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard.assert_awaited_once_with(
+        task_id,
+        "stopped-background-session",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", ["failed", "superseded"])
+async def test_queued_busy_reconciles_guard_with_retained_dead_instance(
+    db_factory,
+    task_status,
+):
+    """A terminal Task may retain its last now-ownerless Instance id."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(
+            name="dead PTY slot",
+            status="error",
+            pid=None,
+            current_task_id=None,
+            current_plan_run_id=None,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="timed out PTY retained slot",
+            description="d",
+            status=task_status,
+            session_id="stopped-retained-session",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    d.instance_manager.is_running = MagicMock(return_value=False)
+    d.instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+        side_effect=[True, False]
+    )
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard = (
+        AsyncMock(return_value=True)
+    )
+
+    async with db_factory() as db:
+        assert not await d._queued_task_has_live_generation(db, task_id)
+
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard.assert_awaited_once_with(
+        task_id,
+        "stopped-retained-session",
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_busy_keeps_guard_with_retained_live_instance(
+    db_factory,
+):
+    """A retained slot is not ownerless while its manager generation is live."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(
+            name="live PTY slot",
+            status="error",
+            pid=None,
+            current_task_id=None,
+            current_plan_run_id=None,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="PTY retained live generation",
+            description="d",
+            status="failed",
+            session_id="live-retained-session",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    d.instance_manager.is_running = MagicMock(return_value=True)
+    d.instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+        return_value=True
+    )
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard = AsyncMock()
+
+    async with db_factory() as db:
+        assert await d._queued_task_has_live_generation(db, task_id)
+
+    d.instance_manager.reconcile_orphaned_pty_runtime_guard.assert_not_awaited()
 
 
 @pytest.mark.asyncio

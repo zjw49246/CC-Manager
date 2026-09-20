@@ -2175,6 +2175,29 @@ async def test_cleanup_called_on_start(db_factory):
     await d.stop()
 
 
+@pytest.mark.asyncio
+async def test_dispatch_loop_reconciles_stale_state_without_restart(db_factory):
+    """A dead PTY/monitor graph is reconciled while dispatch remains live."""
+
+    d = _make_dispatcher(db_factory)
+    d._running = True
+    d._last_stale_state_reconcile = 0.0
+    d._cleanup_stale_state = AsyncMock()
+    d._recover_due_versioned_plan_runs = AsyncMock()
+    d._ensure_min_idle_instances = AsyncMock()
+    d._dispatch_worker_plan_runs = AsyncMock()
+
+    async def stop_after_reconcile():
+        d._running = False
+        d.wake()
+
+    d._dispatch_worker_tasks = AsyncMock(side_effect=stop_after_reconcile)
+
+    await asyncio.wait_for(d._dispatch_loop(), timeout=1)
+
+    d._cleanup_stale_state.assert_awaited_once_with()
+
+
 # === _reset_instance_if_stale (safety net) tests ===
 
 
@@ -3231,6 +3254,75 @@ async def test_startup_fails_closed_orphaned_pty_background_marker(
         and call.args[1].get("new_status") == "failed"
         for call in d.broadcaster.broadcast.await_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_clears_live_registry_marker_when_exact_runtime_is_dead(
+    db_factory,
+):
+    """A stale in-memory PTY marker cannot survive generic fail-close."""
+
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(
+            title="dead PTY owner with retained marker",
+            description="foreground process timed out",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+            session_id="dead-pty-session",
+            pty_background_generation="stale-live-registry-epoch",
+        )
+        db.add(task)
+        await db.flush()
+        owner = Instance(
+            name="dead-pty-owner",
+            status="running",
+            pid=999998,
+            current_task_id=task.id,
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        source = LogEntry(
+            instance_id=owner.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            actual_transport="claude_pty",
+            event_type="user_message",
+            role="user",
+            content="continue",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+        owner_id = owner.id
+
+    # The registry can outlive the exact PTY process after a timeout. It must
+    # not exempt the Task marker once runtime ownership is proven dead.
+    d.instance_manager.active_pty_background_task_ids.return_value = {task_id}
+    with patch(
+        "backend.services.process_identity.os.kill",
+        side_effect=ProcessLookupError,
+    ):
+        await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert current.status == "failed"
+        assert current.instance_id is None
+        assert current.pty_background_generation is None
+        assert "transport claude_pty" in (current.error_message or "")
+        assert owner.status == "error"
+        assert owner.pid is None
+        assert owner.current_task_id is None
 
 
 # === Mixed scenario: startup with multiple stale entities ===

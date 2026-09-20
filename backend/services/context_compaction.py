@@ -208,6 +208,18 @@ async def recoverable_chat_context_failure(db: Any, task: Any) -> str | None:
 
     from backend.models.log_entry import LogEntry
 
+    provider = str(getattr(task, "provider", None) or "claude").lower()
+    # A Claude PTY process can finish its foreground callback while the same
+    # exact Task generation keeps handling native child/background events.
+    # Those events are generation-bound and persisted as ``autonomous``.  A
+    # terminal structured overflow there poisons the same resumable session,
+    # so the next explicit user message must snapshot it and start fresh.  Do
+    # not extend this to orphan replay, or to Codex child-thread events.
+    recoverable_scopes = (
+        ("foreground", "autonomous")
+        if provider == "claude"
+        else ("foreground",)
+    )
     rows = list(
         (
             await db.execute(
@@ -216,7 +228,7 @@ async def recoverable_chat_context_failure(db: Any, task: Any) -> str | None:
                     LogEntry.task_id == task_id,
                     LogEntry.task_retry_count == retry_count,
                     LogEntry.task_turn_generation == turn_generation,
-                    LogEntry.turn_scope == "foreground",
+                    LogEntry.turn_scope.in_(recoverable_scopes),
                 )
                 .order_by(LogEntry.id.asc())
             )
@@ -224,7 +236,6 @@ async def recoverable_chat_context_failure(db: Any, task: Any) -> str | None:
         .scalars()
         .all()
     )
-    provider = str(getattr(task, "provider", None) or "claude").lower()
     saw_context_failure_marker = False
     for index, row in enumerate(rows):
         raw = _raw_mapping(row.raw_json)

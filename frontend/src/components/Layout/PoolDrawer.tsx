@@ -1011,6 +1011,8 @@ function CodexAccountCard({ account, preferred, lastSelected, apiAccount, onClea
               ? '暂无额度数据（使用后自动更新）'
               : account.quota_error === 'live_unavailable'
                 ? '实时额度查询失败，无法确认当前额度'
+                : account.quota_error === 'upstream_rejected'
+                  ? '上游额度接口拒绝请求（不等于已限流）'
                 : (account.quota_error || '未知')}</span>
             <button
               onClick={onRetryUsage}

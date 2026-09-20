@@ -384,6 +384,30 @@ describe('PoolDrawer', () => {
 
       expect(await screen.findByText('实时额度查询失败，无法确认当前额度')).toBeInTheDocument();
     });
+
+    it('does not present an upstream quota rejection as rate limiting', async () => {
+      enableCodexPool({
+        total: 1,
+        available: 1,
+        preferred: null,
+        accounts: [{
+          id: 'codex-1',
+          email: 'codex@example.com',
+          codex_home: '/tmp/codex-1',
+          available: true,
+          enabled: true,
+          quota: null,
+          quota_error: 'upstream_rejected',
+        }],
+      });
+      const user = userEvent.setup();
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+
+      expect(await screen.findByText('上游额度接口拒绝请求（不等于已限流）')).toBeInTheDocument();
+      expect(screen.queryByText('已触发限速')).not.toBeInTheDocument();
+    });
   });
 
   describe('CloudRouter API accounts', () => {

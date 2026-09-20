@@ -518,6 +518,7 @@ SHUTDOWN_CONSUMER_CANCEL_TIMEOUT = 5
 TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
+STALE_STATE_RECONCILE_INTERVAL_SECONDS = 30.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
 PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL = 5.0
 PLAN_RUNTIME_RECOVERY_BACKOFF_MAX = 60.0
@@ -1180,6 +1181,7 @@ class GlobalDispatcher:
         # an idle slot; start() must either observe that spawned generation or
         # finish its stale-state snapshot before the turn can spawn.
         self._chat_launch_admission_lock = asyncio.Lock()
+        self._last_stale_state_reconcile = 0.0
         self._running = False
         self._shutting_down = False
         self._monitor_tasks: dict[
@@ -4128,6 +4130,13 @@ class GlobalDispatcher:
                         t.id,
                         t.status,
                     )
+                if new_status in {"pending", "failed"}:
+                    # Once the exact runtime has been released or failed
+                    # closed, no retained PTY tail can still accept input.
+                    # Clear the durable routing marker in the same CAS so the
+                    # API cannot keep projecting background_active=True for a
+                    # dead Session that the frontend would try to inject into.
+                    values["pty_background_generation"] = None
                 release_predicates = [
                     Task.id == t.id,
                     Task.status == t.status,
@@ -5684,6 +5693,21 @@ class GlobalDispatcher:
                     except asyncio.TimeoutError:
                         pass
                     continue
+                # A provider/PTY consumer can disappear without taking the
+                # normal terminal callback with it.  Startup reconciliation
+                # handles this after a restart, but leaving the same durable
+                # Task/monitor graph stranded until the next restart makes a
+                # dead turn look indefinitely executing.  Reuse the exact
+                # startup CAS reconciler while holding the launch barrier so
+                # this cannot cross a fresh admission.
+                now = time.monotonic()
+                if (
+                    now - self._last_stale_state_reconcile
+                    >= STALE_STATE_RECONCILE_INTERVAL_SECONDS
+                ):
+                    async with self._chat_launch_admission_lock:
+                        await self._cleanup_stale_state()
+                    self._last_stale_state_reconcile = now
                 # Keep orphan Plan cleanup and local Plan claim/lifecycle
                 # registration in this one producer. Do not move this into a
                 # detached timer task: the claim commit is intentionally
@@ -5830,6 +5854,11 @@ class GlobalDispatcher:
                         # Bind this lifecycle to its exact Task so a later Plan
                         # on the same slot cannot block the old Task's chat.
                         setattr(lifecycle, "_ccm_task_id", task.id)
+                        setattr(
+                            lifecycle,
+                            "_ccm_task_generation",
+                            self._task_lifecycle_generation(task),
+                        )
                         self._running_tasks[reserved_instance_id] = lifecycle
                         self._prefer_plan_runs = True
                         lifecycle_registered = True
@@ -22920,8 +22949,44 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # would create two writers for the same native session. Keep the
             # queued message pending until its exact durable fence is cleared.
             return True
+        instance_id = task.instance_id
+        instance = (
+            await db.get(Instance, instance_id, populate_existing=True)
+            if instance_id is not None
+            else None
+        )
+        manager_running = bool(
+            instance_id is not None
+            and self.instance_manager.is_running(instance_id)
+        )
         session_id = task.session_id
         if session_id:
+            reconcile_runtime_guard = getattr(
+                self.instance_manager,
+                "reconcile_orphaned_pty_runtime_guard",
+                None,
+            )
+            terminal_ownerless = bool(
+                task.status
+                in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "conflict",
+                    "superseded",
+                }
+                and (
+                    instance_id is None
+                    or (
+                        instance is not None
+                        and instance.status in {"idle", "error"}
+                        and instance.current_task_id is None
+                        and instance.current_plan_run_id is None
+                        and instance.pid is None
+                        and not manager_running
+                    )
+                )
+            )
             generation_lookup = getattr(
                 self.instance_manager,
                 "pty_background_generation_for",
@@ -22930,7 +22995,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if callable(generation_lookup):
                 generation = generation_lookup(task_id, session_id)
                 if isinstance(generation, str) and generation:
-                    return True
+                    if not (
+                        terminal_ownerless
+                        and callable(reconcile_runtime_guard)
+                        and await reconcile_runtime_guard(task_id, session_id)
+                    ):
+                        return True
+                    generation = generation_lookup(task_id, session_id)
+                    if isinstance(generation, str) and generation:
+                        return True
             handoff_lookup = getattr(
                 self.instance_manager,
                 "has_pty_autonomous_activity_handoff",
@@ -22941,12 +23014,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ):
                 # The idle callback records this synchronously before its DB
                 # marker can be delayed on the transition lock.
-                return True
-        if task.instance_id is None:
+                if not (
+                    terminal_ownerless
+                    and callable(reconcile_runtime_guard)
+                    and await reconcile_runtime_guard(task_id, session_id)
+                ):
+                    return True
+                # The exact transition lock invalidated the orphaned callback
+                # token. A new callback may still have published a replacement
+                # immediately afterwards, so sample once more before launch.
+                if handoff_lookup(task_id, session_id) is True:
+                    return True
+        if instance_id is None:
             return False
-        instance_id = task.instance_id
-
-        instance = await db.get(Instance, instance_id, populate_existing=True)
         if (
             instance is not None
             and instance.current_task_id is not None
@@ -22964,6 +23044,89 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         if lifecycle is not None and not lifecycle.done():
             lifecycle_task_id = getattr(lifecycle, "_ccm_task_id", None)
             if lifecycle_task_id == task_id:
+                if (
+                    task.status
+                    in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "conflict",
+                        "superseded",
+                    }
+                    and instance is not None
+                    and instance.status in {"idle", "error"}
+                    and instance.current_task_id is None
+                    and instance.current_plan_run_id is None
+                    and instance.pid is None
+                    and not manager_running
+                ):
+                    lifecycle_generation = getattr(
+                        lifecycle,
+                        "_ccm_task_generation",
+                        None,
+                    )
+                    if lifecycle_generation is None or (
+                        lifecycle_generation.task_id != task.id
+                        or any(
+                            getattr(lifecycle_generation, field)
+                            != getattr(task, field)
+                            for field in (
+                                "worker_id",
+                                "shared_from_id",
+                                "retry_count",
+                                "turn_generation",
+                                "instance_id",
+                                "started_at",
+                                "completed_at",
+                            )
+                        )
+                    ):
+                        # A lifecycle without an exact immutable generation is
+                        # not provably stale. Keep the task busy until its
+                        # owner can be reconciled by the normal cleanup path.
+                        return True
+
+                    lifecycle.cancel()
+                    operation, cancellation = await _settle_despite_cancellation(
+                        asyncio.wait_for(
+                            asyncio.shield(
+                                asyncio.gather(
+                                    lifecycle,
+                                    return_exceptions=True,
+                                )
+                            ),
+                            timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
+                        )
+                    )
+                    try:
+                        operation.result()
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Stale terminal lifecycle for task %s on instance %s "
+                            "did not stop within %.1fs",
+                            task_id,
+                            instance_id,
+                            AUX_LIFECYCLE_CANCEL_TIMEOUT,
+                        )
+                        return True
+                    if cancellation is not None:
+                        raise cancellation
+                    # A lifecycle can remain suspended in terminal cleanup
+                    # after its exact process/consumer and reverse owner have
+                    # already been released.  It has no remaining execution
+                    # authority, so retaining it here would block every later
+                    # chat turn forever.  Remove it only after cancellation
+                    # and all lifecycle cleanup have actually completed; the
+                    # old generation's cleanup writers remain CAS-fenced from
+                    # a replacement turn.
+                    self._remove_running_task_if_same(instance_id, lifecycle)
+                    logger.warning(
+                        "Reconciled stale terminal lifecycle for task %s on "
+                        "instance %s",
+                        task_id,
+                        instance_id,
+                    )
+                    return False
                 # Fresh lifecycle preparation precedes
                 # Instance.current_task_id/PID persistence, so the explicit
                 # in-memory binding is authoritative in that launch window.
@@ -22988,7 +23151,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             launch_params.get(instance_id) if isinstance(launch_params, dict) else None
         )
         params_task_id = params.get("task_id") if isinstance(params, dict) else None
-        manager_running = bool(self.instance_manager.is_running(instance_id))
         if manager_running and (record_task_id == task_id or params_task_id == task_id):
             # Instance.current_task_id can be cleared near the end of output
             # persistence while the exact Codex consumer still owns rollout

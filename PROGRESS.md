@@ -4,6 +4,14 @@
 
 ## 已完成功能
 
+### 2026-09-19：整合 PR #149 的 PTY 生命周期与恢复修复
+
+- [x] 修复 orphaned PTY guard 在索引暂时消失时提前放行的问题；保留 live post-exit proof/runtime Session 的阻塞证据。
+- [x] 为 Dispatcher 生命周期绑定精确 Task generation，补齐 `superseded` 终态，并等待 stale lifecycle 的取消清理完成后才解除占用。
+- [x] 将 Claude PTY 依赖固定到不可变 fork SHA，同时保留上游的空提醒关闭配置；补充 managed/unmanaged Cron、cron resume、生命周期竞态和运行时 guard 回归测试。
+- [x] 整合 `origin/main` 的空请求循环、会话收口、PR monitor 与 context snapshot 修复；后端相关套件 `1408 passed`，前端生产构建通过。
+- **实现提交**：`32ad88e5`；**合并提交**：`0f2cddcd`。
+
 ### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
 
 - [x] 生产只读取证：Task 538 的首次 Fable 5.1 `[1m]` 请求被 Apex 以 `404 model_not_found` 拒绝；切换到 Opus 4.6 `[1m]` 后，两次约 1K 字符、零 token 请求又被上游以 `400 Prompt is too long` 拒绝。相同 Key 的 Opus 4.6 `[1m]` 最小新会话实测成功，说明 Key 本身有效；Apex 当前模型目录仍列出 Fable，但基础版和 `[1m]` 实际调用均 404，属于上游目录/路由不一致。

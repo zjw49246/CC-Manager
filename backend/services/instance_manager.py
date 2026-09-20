@@ -2085,6 +2085,27 @@ class InstanceManager:
             """Route pre-prompt child output back through its lifecycle owner."""
 
             event_dict = event.to_dict()
+            if current is not None:
+                # ``send_prompt`` exposes its exact process only after the
+                # follow-up prompt has crossed the JSONL start boundary. Keep
+                # that identity on the pump so a later live injection can
+                # distinguish steering this follow-up from steering an
+                # unrelated autonomous child on the same retained Session.
+                active_process = getattr(session, "active_turn_process", None)
+                if (
+                    active_process is not None
+                    and getattr(
+                        current,
+                        "_ccm_followup_native_process",
+                        None,
+                    )
+                    is None
+                ):
+                    setattr(
+                        current,
+                        "_ccm_followup_native_process",
+                        active_process,
+                    )
             if event_dict.get("orphan"):
                 callback = getattr(session, "on_autonomous_event", None)
                 callback_matches = bool(
@@ -2695,23 +2716,57 @@ class InstanceManager:
             native_process = getattr(session, "active_turn_process", None)
             steer = getattr(session, "steer_active_turn", None)
             if native_process is not None:
-                if retained_proof is not None and not exact_turn:
+                followups = tuple(
+                    followup
+                    for followup in self._pty_followup_tasks.get(key, ())
+                    if not followup.done()
+                )
+                owning_followups = tuple(
+                    followup
+                    for followup in followups
+                    if getattr(
+                        followup,
+                        "_ccm_followup_native_process",
+                        None,
+                    )
+                    is native_process
+                )
+                if followups and len(owning_followups) == 0:
+                    started_followups = tuple(
+                        followup
+                        for followup in followups
+                        if getattr(
+                            followup,
+                            "_ccm_followup_started",
+                            False,
+                        )
+                    )
+                    if len(started_followups) == 1:
+                        # The follow-up pump owns Session.send_lock for its
+                        # whole stream. If the PTY library has published the
+                        # process before our first event callback, bind that
+                        # process to the one started pump now.
+                        setattr(
+                            started_followups[0],
+                            "_ccm_followup_native_process",
+                            native_process,
+                        )
+                        owning_followups = started_followups
+                if followups and len(owning_followups) != 1:
                     logger.info(
-                        "PTY steer rejected for session %s: retained proof "
-                        "has no idle follow-up boundary",
+                        "PTY steer rejected for session %s: active process "
+                        "ownership is not proven by one retained follow-up",
                         session_id,
                     )
                     return False
-                # A retained follow-up pump owns the Session's current native
-                # process after ``send_prompt`` starts.  Do not mistake that
-                # process for an independent foreground turn: steering it
-                # would bypass the serialized follow-up slot and leave the
-                # second API operation waiting for a boundary it cannot own.
-                followups = self._pty_followup_tasks.get(key, ())
-                if any(not followup.done() for followup in followups):
+                if (
+                    retained_proof is not None
+                    and not exact_turn
+                    and len(owning_followups) != 1
+                ):
                     logger.info(
-                        "PTY steer rejected for session %s: a retained "
-                        "follow-up prompt is already being consumed",
+                        "PTY steer rejected for session %s: retained proof "
+                        "does not own the active process",
                         session_id,
                     )
                     return False
@@ -6624,6 +6679,15 @@ class InstanceManager:
             # user request. This is a supported baseline/off CLI environment
             # setting; CCM owns progress tracking, so disable the reminder.
             env[_CLAUDE_TODO_REMINDER_MODE_ENV] = "off"
+            # Managed Tasks must not revive provider-local cron schedules from
+            # a resumable Claude session. CCM scheduling is handled by
+            # Dispatcher and durable Monitor/Delivery records instead.
+            if task_id is not None:
+                from backend.services.task_agent_isolation import (
+                    CLAUDE_DISABLE_CRON,
+                )
+
+                env[CLAUDE_DISABLE_CRON] = "1"
 
         # Forward Extended Thinking budget (Claude-specific env var)
         if thinking_budget and thinking_budget > 0 and provider == "claude":
@@ -8871,6 +8935,12 @@ class InstanceManager:
                     # so this security switch must be an explicit override.
                     overrides[CLAUDE_SUBPROCESS_ENV_SCRUB] = "1"
                     overrides[_CLAUDE_TODO_REMINDER_MODE_ENV] = "off"
+                    if task_id is not None:
+                        from backend.services.task_agent_isolation import (
+                            CLAUDE_DISABLE_CRON,
+                        )
+
+                        overrides[CLAUDE_DISABLE_CRON] = "1"
                     overrides["AUTH_TOKEN"] = ""
                     overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
                     final_binary = wrapper or cfg.claude_binary
@@ -10008,6 +10078,74 @@ class InstanceManager:
         proof = self._pty_post_exit_generations.get(key)
         if proof is not None:
             self._discard_pty_post_exit_generation(key, proof)
+
+    async def reconcile_orphaned_pty_runtime_guard(
+        self,
+        task_id: int,
+        session_id: str,
+    ) -> bool:
+        """Retire terminal PTY guards after every exact owner is gone.
+
+        A forced PTY timeout can stop the native Session and fail-close the
+        durable Task while a background state and/or autonomous handoff token
+        remains indexed.  Those guards no longer have a durable owner, so a
+        later chat turn would otherwise wait forever.  Serialize with the
+        callback admission lock and keep any live Session, callback owner, or
+        post-exit proof fail-closed.
+
+        Return ``True`` when no runtime guard remains for the Task/session.
+        """
+
+        key = (task_id, session_id)
+        async with self.pty_background_transition(task_id, session_id):
+            state = self._pty_background_states.get(key)
+            has_handoff = key in self._pty_autonomous_activity_handoffs
+            if any(
+                owner_key == key and not owner.done()
+                for owner, owner_key in (
+                    self._pty_autonomous_activity_handoff_owners
+                )
+            ):
+                return False
+            if (
+                state is not None
+                and getattr(state.session, "is_alive", True) is not False
+            ):
+                return False
+
+            proof = self._pty_post_exit_generations.get(key)
+            if (
+                proof is not None
+                and getattr(proof.session, "is_alive", True) is not False
+            ):
+                return False
+            runtime_sessions = self._task_pty_runtime_session_candidates(
+                task_id,
+                session_id,
+            )
+            if any(
+                getattr(session, "is_alive", True) is not False
+                for _instance_id, session in runtime_sessions
+            ):
+                return False
+
+            # The durable/background indexes can disappear while this method
+            # waits for the transition lock.  Only report success after every
+            # independent post-exit proof and runtime-session owner has been
+            # checked; otherwise a live retained Session could race a resume.
+            if state is None and not has_handoff:
+                return True
+
+            if state is not None:
+                state.outcome = "superseded"
+                self._discard_pty_background_state(key, state.generation)
+            self.reset_pty_autonomous_activity_handoff(task_id, session_id)
+            logger.warning(
+                "Reconciled orphaned PTY runtime guard for task %s session %s",
+                task_id,
+                session_id,
+            )
+            return True
 
     def _restore_pty_background_after_failed_stop(
         self,
@@ -14461,7 +14599,13 @@ class InstanceManager:
                                     task_id,
                                 )
                             else:
+                                notice = await self._stage_context_retry_notice(
+                                    db,
+                                    permit,
+                                    provider=provider,
+                                )
                                 await db.commit()
+                                await self._publish_context_retry_notice(notice)
                                 current_message = (
                                     params.get("current_message")
                                     or params.get("prompt")
@@ -15336,6 +15480,80 @@ class InstanceManager:
             ),
         ]
 
+    async def _stage_context_retry_notice(
+        self,
+        db: AsyncSession,
+        permit: _ContextPreflightPermit,
+        *,
+        provider: str,
+    ) -> LogEntry:
+        """Persist the user-visible handoff from overflow to fresh retry."""
+
+        reason = (
+            "context_window_exceeded"
+            if provider == "codex"
+            else "prompt_too_long"
+        )
+        provider_label = (
+            "Codex context window"
+            if provider == "codex"
+            else "Claude Prompt is too long"
+        )
+        content = (
+            f"检测到 {provider_label}；CCM 已保存结构化工作状态快照并压缩对话，"
+            "正在用新会话自动重试本轮消息。无需再次发送或停止会话。"
+        )
+        notice = LogEntry(
+            instance_id=permit.instance_id,
+            task_id=permit.task_id,
+            task_retry_count=permit.retry_count,
+            task_turn_generation=permit.turn_generation,
+            turn_scope="foreground",
+            event_type="system_event",
+            role="system",
+            content=content,
+            raw_json=json.dumps(
+                {
+                    "type": "ccm.context_compaction",
+                    "reason": reason,
+                    "recovery": "fresh_session_retry",
+                },
+                separators=(",", ":"),
+            ),
+            is_error=False,
+        )
+        db.add(notice)
+        await db.flush()
+        return notice
+
+    async def _publish_context_retry_notice(self, notice: LogEntry) -> None:
+        payload = {
+            "id": notice.id,
+            "instance_id": notice.instance_id,
+            "task_id": notice.task_id,
+            "task_retry_count": notice.task_retry_count,
+            "task_turn_generation": notice.task_turn_generation,
+            "turn_scope": notice.turn_scope,
+            "event_type": notice.event_type,
+            "role": notice.role,
+            "content": notice.content,
+            "is_error": notice.is_error,
+            "timestamp": (
+                notice.timestamp or datetime.utcnow()
+            ).isoformat(),
+        }
+        try:
+            await self.broadcaster.broadcast(
+                f"task:{notice.task_id}",
+                payload,
+            )
+        except Exception:
+            logger.warning(
+                "Context retry notice broadcast failed for task %s",
+                notice.task_id,
+                exc_info=True,
+            )
+
     async def _chat_structured_context_preflight_rejection(
         self,
         task_id: int,
@@ -15809,7 +16027,13 @@ class InstanceManager:
                         task_id,
                     )
                     return False
+                notice = await self._stage_context_retry_notice(
+                    db,
+                    permit,
+                    provider=str(params.get("provider") or "claude").lower(),
+                )
                 await db.commit()
+                await self._publish_context_retry_notice(notice)
 
             current_message = (
                 params.get("current_message")
@@ -16773,8 +16997,10 @@ class InstanceManager:
                     return False
                 if not new_home:
                     logger.info(
-                        "Codex quota switch: current account below 90%% or no "
-                        "usable alternative for task %d",
+                        "Codex quota switch skipped for task %d: no eligible "
+                        "alternative account (current quota was not proven "
+                        "above the threshold, or every alternative was "
+                        "unavailable)",
                         task_id,
                     )
                     return False
