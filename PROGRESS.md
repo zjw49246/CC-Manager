@@ -4,6 +4,13 @@
 
 ## 已完成功能
 
+### 2026-09-23：Apex 网关迁移到 api.apexin.net + 自定义第三方 API 网关渠道
+
+- [x] Apex 渠道基址从 `api.apexin.ai` 改为 `api.apexin.net`（`7d19889b`）。旧 `.ai` 代账号在加载时校验后原子改写到 `.net`，不再要求重新录入 Key；sslip.io 代 Codex-only 快照的迁移路径保持不变。
+- [x] 新增 `api_provider=custom`：号池「添加 API 账号」可选「自定义」，填写网关 URL + Key（可选额度 URL），不再限于 CloudRouter/Apex/APIBest 预置渠道（`129966bd` 起共 11 笔）。服务端只接受 http/https + 域名/IP，拒绝 userinfo/query/fragment/`..`（含 `%2e%2e`）与元数据地址，回环和私网明确放行；`base_url`/`usage_override` 持久化在 `account.json`，派生的 Claude/Codex 配置被改写即 fail closed。
+- [x] **问题**：`.ai` 代账号迁移到 `.net` 时把 `.claude.json` 当 CCM 受管文件逐字比对 onboarding 载荷，但那代账号真的跑过 Claude，CLI 已往里写了启动计数/项目历史/`customApiKeyResponses`，且 CLI 重写后权限是 0644，整个账号被 fail closed。**解决**：迁移只在缺失时写入 onboarding 载荷；已存在的只走 `_converge_cli_mutable_private_file`（owned regular/non-symlink 校验 + 收敛 0600），与 `_load_account` 常规路径一致。**避免**：CLI 可变文件（`.claude.json`）不能进入受管文件的内容/权限严格校验集合；新增 `test_legacy_apexin_ai_account_keeps_accumulated_cli_state` 与 symlink fail-closed 回归锚点。实现提交：本提交。
+- [x] 验证：`backend/tests/` 全量 pytest 通过，`npx tsc --noEmit` 通过，PoolDrawer / client.cloudrouter 前端测试 57 passed。注意：shell 里若 `CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS` 为空字符串，pydantic Settings 会在 conftest 导入时直接报错，需 `env -u` 掉再跑。
+
 ### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
 
 - [x] 生产只读取证：Task 538 的首次 Fable 5.1 `[1m]` 请求被 Apex 以 `404 model_not_found` 拒绝；切换到 Opus 4.6 `[1m]` 后，两次约 1K 字符、零 token 请求又被上游以 `400 Prompt is too long` 拒绝。相同 Key 的 Opus 4.6 `[1m]` 最小新会话实测成功，说明 Key 本身有效；Apex 当前模型目录仍列出 Fable，但基础版和 `[1m]` 实际调用均 404，属于上游目录/路由不一致。

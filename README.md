@@ -48,6 +48,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter、ApexRouter、APIBest API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Claude API Key 只投影给模型主进程，Bash、hooks 与 MCP 子进程仍会清除凭据。API 网关只有在自己的模型目录显式广告 Fast 时才参与选择；CCM 验证实际发出的 Responses 请求携带 `service_tier=priority`，但不会把响应中的信息性 `auto/default` 误判成失败。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
 - **API 账号安全删除** — CloudRouter/ApexRouter/APIBest 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
 - **APIBest 渠道** — 可在 API 账号中直接添加 APIBest Key，同时发现 Claude/Codex 模型。CCM 先经 `/v1/models` 验证 Key，空目录时再读公开 `/api/pricing`，兼容可选 `service_tiers`；Codex 使用 Responses API，该渠道当前不展示额度
+- **自定义 API 网关** — 添加 API 账号时选择「自定义」，填写任意第三方网关的 URL + Key（可选额度 URL），即可像预置渠道一样接入 Claude/Codex 号池。网关 URL 只接受 http/https，支持内网/本机地址，拒绝路径穿越与云元数据地址；`/v1/models` 兼容 OpenAI `data[].id` 与原生 `models[].slug` 两种目录形状。ApexRouter 渠道已迁移到 `api.apexin.net`，旧账号自动升级
 - **Claude API PTY 认证** — 受管网关 Key 以无交互 Bearer token 投影给 Claude 主进程，不受 CLI `.claude.json` 中 API-key 批准/拒绝状态影响；凭据仍不会进入 Bash、hooks 或 MCP 子进程
 - **Codex 日志库自维护** — app-server 启动前自动隔离超过 1 GiB 的本地诊断日志库，只有新运行时初始化成功后才回收旧库；账号配置、认证和 session/rollout 始终保留
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级

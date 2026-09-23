@@ -2399,32 +2399,43 @@ class CloudRouterAccountStore:
                 CLAUDE_SKIP_DANGEROUS_PROMPT: True,
             },
         )
-        has_onboarding = {"hasCompletedOnboarding": True}
-        for path, expected in (
-            (account.root / "claude" / "settings.json", settings_payloads),
-            (account.root / "claude" / ".claude.json", (has_onboarding,)),
-        ):
-            if path.exists() or path.is_symlink():
-                _require_owned_regular(path, 0o600)
-                try:
-                    current = json.loads(_open_regular_nofollow(
-                        path,
-                        maximum=MAX_METADATA_BYTES,
-                    ).decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise CloudRouterUnsafePathError(
-                        f"Invalid legacy Apex Claude config: {account.id}",
-                    ) from exc
-                if current not in expected:
-                    raise CloudRouterUnsafePathError(
-                        f"Modified legacy Apex Claude config: {account.id}",
-                    )
-                continue
-            if write_missing:
-                _atomic_private_json(
-                    path,
-                    expected[0] if isinstance(expected, tuple) else expected,
+        settings_path = account.root / "claude" / "settings.json"
+        if settings_path.exists() or settings_path.is_symlink():
+            _require_owned_regular(settings_path, 0o600)
+            try:
+                current = json.loads(_open_regular_nofollow(
+                    settings_path,
+                    maximum=MAX_METADATA_BYTES,
+                ).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid legacy Apex Claude config: {account.id}",
+                ) from exc
+            if current not in settings_payloads:
+                raise CloudRouterUnsafePathError(
+                    f"Modified legacy Apex Claude config: {account.id}",
                 )
+        elif write_missing:
+            _atomic_private_json(settings_path, settings_payloads[0])
+
+        # ``.claude.json`` is CLI-mutable state, not a CCM-owned file.  The
+        # sslip.io generation had no Claude runtime at all, so this migration
+        # only ever created it fresh and could assume the one-key onboarding
+        # payload.  The api.apexin.ai generation *did* run Claude, so its copy
+        # has legitimately accumulated CLI state (startup counts, project
+        # history, feature flags) and the CLI rewrites it with its own umask,
+        # so content- or mode-checking it fails the account closed.  Only
+        # the owned regular/non-symlink invariant is CCM's to enforce here;
+        # the mode is safely converged back to 0600, exactly as
+        # ``_load_account`` does on every ordinary load.  Materialize it
+        # only when absent.
+        onboarding_path = account.root / "claude" / ".claude.json"
+        if onboarding_path.exists() or onboarding_path.is_symlink():
+            _converge_cli_mutable_private_file(onboarding_path)
+        elif write_missing:
+            _atomic_private_json(
+                onboarding_path, {"hasCompletedOnboarding": True},
+            )
 
     @staticmethod
     def _converge_claude_runtime_settings(

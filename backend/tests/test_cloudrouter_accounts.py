@@ -400,6 +400,105 @@ async def test_legacy_apex_endpoint_is_migrated_to_apexin(
     } == {APEX_CODEX_BASE_URL}
 
 
+def _write_legacy_apexin_ai_apex_account(account) -> tuple[Path, Path, Path, Path]:
+    """Rewrite a fresh Apex account as the api.apexin.ai generation."""
+
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"] = dict(
+        cloudrouter_module.LEGACY_APEX_APEXIN_AI_ENDPOINTS,
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    settings_path = account.root / "claude" / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["env"]["ANTHROPIC_BASE_URL"] = (
+        cloudrouter_module.LEGACY_APEX_APEXIN_AI_BASE_URL
+    )
+    settings_path.write_text(json.dumps(settings))
+    config_path = account.root / "codex" / "config.toml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            APEX_CODEX_BASE_URL,
+            cloudrouter_module.LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL,
+        ),
+    )
+    onboarding_path = account.root / "claude" / ".claude.json"
+    return metadata_path, settings_path, config_path, onboarding_path
+
+
+@pytest.mark.asyncio
+async def test_legacy_apexin_ai_account_keeps_accumulated_cli_state(
+    tmp_path, monkeypatch,
+):
+    """The api.apexin.ai generation ran Claude, so ``.claude.json`` has grown
+    CLI state.  Migration must not content-check it against the one-key
+    onboarding payload and must leave the accumulated state untouched."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    metadata_path, settings_path, config_path, onboarding_path = (
+        _write_legacy_apexin_ai_apex_account(account)
+    )
+    accumulated_state = {
+        "hasCompletedOnboarding": True,
+        "numStartups": 17,
+        "projects": {"/srv/repo": {"allowedTools": [], "hasTrustDialogAccepted": True}},
+        "customApiKeyResponses": {"approved": ["cret"], "rejected": []},
+    }
+    onboarding_path.write_text(json.dumps(accumulated_state))
+    onboarding_path.chmod(0o644)
+
+    migrated = store.reload()[0]
+
+    assert migrated.id == account.id
+    assert json.loads(onboarding_path.read_text()) == accumulated_state
+    assert stat.S_IMODE(onboarding_path.stat().st_mode) == 0o600
+    assert json.loads(settings_path.read_text())["env"] == {
+        "ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL,
+    }
+    assert json.loads(metadata_path.read_text())["endpoints"] == (
+        cloudrouter_module.API_PROVIDER_SPECS["apex"].endpoints
+    )
+    assert {
+        provider["base_url"]
+        for provider in tomllib.loads(config_path.read_text())[
+            "model_providers"
+        ].values()
+    } == {APEX_CODEX_BASE_URL}
+
+
+@pytest.mark.asyncio
+async def test_legacy_apexin_ai_account_rejects_onboarding_symlink(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    metadata_path, _settings_path, _config_path, onboarding_path = (
+        _write_legacy_apexin_ai_apex_account(account)
+    )
+    metadata_before = metadata_path.read_bytes()
+    target = tmp_path / "outside.json"
+    target.write_text(json.dumps({"hasCompletedOnboarding": True}))
+    onboarding_path.unlink()
+    onboarding_path.symlink_to(target)
+
+    # ``O_NOFOLLOW`` refuses the symlink before any content is read; the
+    # helper reports that as a missing managed file, which is still closed.
+    with pytest.raises(
+        CloudRouterUnsafePathError, match="(Unsafe|Missing) managed file",
+    ):
+        store.reload()
+
+    assert onboarding_path.is_symlink()
+    assert metadata_path.read_bytes() == metadata_before
+
+
 @pytest.mark.asyncio
 async def test_legacy_apex_gateway_config_migrates_with_resume_alias(
     tmp_path, monkeypatch,
