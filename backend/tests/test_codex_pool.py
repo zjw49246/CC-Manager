@@ -1588,7 +1588,7 @@ class TestQuotaAwareSelection:
 
 
 class _FakeCloudRouterCodexAccount:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, base_url: str | None = None):
         self.id = "cloudrouter-1"
         self.name = "CloudRouter Codex"
         self.auth_kind = "cloudrouter_api"
@@ -1600,6 +1600,8 @@ class _FakeCloudRouterCodexAccount:
             "codex": ["gpt-5.5"],
         }
         self.service_tiers = {}
+        # Preset providers leave this unset; only a custom account sets it.
+        self.base_url = base_url
         self.root = root
         self.claude_config_dir = str(root / "claude")
         self.codex_home = str(root / "codex")
@@ -1836,6 +1838,40 @@ class TestCloudRouterCodexProjection:
         assert rows[0]["quota"] is None
         assert rows[0]["api_quota"] == snapshot
         assert rows[0]["error"] is None
+
+    @pytest.mark.asyncio
+    async def test_custom_gateway_quota_reaches_the_codex_usage_projection(
+        self, tmp_path
+    ):
+        """A custom account's quota must surface on the Codex tab too."""
+
+        account = _FakeCloudRouterCodexAccount(
+            tmp_path / "custom-1",
+            base_url="https://gateway.example.com",
+        )
+        account.id = "custom-1"
+        account.name = "Vendor X"
+        account.auth_kind = "custom_api"
+        account.api_provider = "custom"
+        snapshot = {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+            "windows": [{"used": 3, "limit": 100}],
+        }
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        rows = await pool.fetch_quota(force=True, live=True)
+
+        assert rows[0]["api_provider"] == "custom"
+        assert rows[0]["base_url"] == "https://gateway.example.com"
+        assert rows[0]["api_quota"] == snapshot
+        assert pool.list_accounts()[0]["base_url"] == "https://gateway.example.com"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("reason", ["invalid_api_key", "forbidden"])

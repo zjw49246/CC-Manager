@@ -1547,6 +1547,7 @@ class CodexPool:
                 "display_name": acc.display_name,
                 "api_account_id": acc.api_account_id,
                 "supported_models": acc.supported_models,
+                "base_url": acc.base_url,
                 "error": (
                     quota_error
                     if quota_error

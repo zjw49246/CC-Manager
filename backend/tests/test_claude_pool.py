@@ -1758,6 +1758,74 @@ class TestCloudRouterClaudeProjection:
         assert pool.select(model="claude-sonnet-5") is None
 
     @pytest.mark.asyncio
+    async def test_custom_gateway_quota_reaches_the_usage_projection(
+        self, tmp_path
+    ):
+        """A custom account's quota must surface through /usage like any other."""
+
+        account = _FakeCloudRouterAccount(
+            tmp_path / "custom-1",
+            base_url="https://gateway.example.com",
+        )
+        account.id = "custom-1"
+        account.name = "Vendor X"
+        account.auth_kind = "custom_api"
+        account.api_provider = "custom"
+        snapshot = {
+            "available": True,
+            "known": True,
+            "reason": "active",
+            "state": "active",
+            "quota": {"limit": 100, "used": 3, "remaining": 97, "currency": "USD"},
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        rows = await pool.fetch_usage(force=True)
+
+        assert rows[0]["api_provider"] == "custom"
+        assert rows[0]["base_url"] == "https://gateway.example.com"
+        assert rows[0]["api_quota"] == snapshot
+        assert rows[0]["error"] is None
+        # The cached snapshot is what the account list renders.
+        assert pool.list_accounts()[0]["api_quota"] == snapshot
+
+    @pytest.mark.asyncio
+    async def test_custom_gateway_unknown_quota_does_not_read_as_available(
+        self, tmp_path
+    ):
+        """An unparseable quota document must stay unknown, never a zero balance."""
+
+        account = _FakeCloudRouterAccount(
+            tmp_path / "custom-1",
+            base_url="https://gateway.example.com",
+        )
+        account.id = "custom-1"
+        account.auth_kind = "custom_api"
+        account.api_provider = "custom"
+        snapshot = {
+            "known": False,
+            "reason": "unsupported_usage_response",
+            "state": "unknown",
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        rows = await pool.fetch_usage(force=True)
+
+        assert rows[0]["api_quota"] == snapshot
+        # Unknown is not exhausted: the account stays selectable rather than
+        # being taken out of rotation by an unreadable quota endpoint.
+        assert rows[0]["error"] is None
+        assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
+
+    @pytest.mark.asyncio
     async def test_projection_survives_provider_model_removal_for_session_discovery(
         self, tmp_path
     ):
