@@ -3372,15 +3372,20 @@ def test_custom_provider_spec_derives_every_endpoint():
     assert spec.codex_provider == "custom"
 
 
-def test_custom_provider_spec_honours_a_usage_path_override():
+def test_custom_provider_spec_honours_a_usage_override():
+    """Both accepted forms must be retained verbatim, not just the relative one."""
+
     relative = custom_provider_spec(CUSTOM_BASE_URL, usage_url="/api/quota")
     assert relative.usage_url == f"{CUSTOM_BASE_URL}/api/quota"
-    assert relative.usage_path == "/api/quota"
+    assert relative.usage_override == "/api/quota"
     absolute = custom_provider_spec(
         CUSTOM_BASE_URL, usage_url="https://quota.example.com/v1/usage",
     )
     assert absolute.usage_url == "https://quota.example.com/v1/usage"
-    assert absolute.usage_path is None
+    assert absolute.usage_override == "https://quota.example.com/v1/usage"
+    # Two accounts on one gateway with different quota endpoints must not
+    # collapse onto a single cached spec.
+    assert relative.usage_url != absolute.usage_url
 
 
 def test_custom_base_url_is_not_a_registered_preset_provider():
@@ -3425,7 +3430,7 @@ async def test_add_custom_builds_a_gateway_scoped_dual_provider_home(
     metadata = json.loads((root / "account.json").read_text())
     assert metadata["api_provider"] == "custom"
     assert metadata["base_url"] == CUSTOM_BASE_URL
-    assert metadata["usage_path"] is None
+    assert metadata["usage_override"] is None
     assert metadata["endpoints"] == {
         "claude_base_url": CUSTOM_BASE_URL,
         "codex_base_url": f"{CUSTOM_BASE_URL}/v1",
@@ -3467,9 +3472,40 @@ async def test_custom_account_survives_reload_from_its_own_metadata(
     assert [item.id for item in reloaded] == ["custom-1"]
     restored = reloaded[0]
     assert restored.base_url == CUSTOM_BASE_URL
-    assert restored.usage_path == "/api/quota"
+    assert restored.usage_override == "/api/quota"
     assert restored.spec.usage_url == f"{CUSTOM_BASE_URL}/api/quota"
     assert restored.spec.codex_base_url == account.spec.codex_base_url
+
+
+@pytest.mark.asyncio
+async def test_custom_account_survives_reload_with_an_absolute_usage_url(
+    tmp_path, monkeypatch,
+):
+    """An absolute quota endpoint must round-trip, not be silently dropped.
+
+    Persisting only the relative form lost an absolute override, and the
+    endpoints rebuilt on the next load then disagreed with the ones stored
+    beside them -- which failed the account closed at creation time.
+    """
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+        usage_url="https://console.example.com/api/quota",
+    )
+
+    assert account.spec.usage_url == "https://console.example.com/api/quota"
+    reloaded = CloudRouterAccountStore(tmp_path / "accounts").reload()[0]
+    assert reloaded.spec.usage_url == "https://console.example.com/api/quota"
+    assert reloaded.usage_override == "https://console.example.com/api/quota"
 
 
 @pytest.mark.asyncio
@@ -3855,7 +3891,7 @@ async def test_preset_account_metadata_predating_custom_urls_still_loads(
     metadata = json.loads(metadata_path.read_text())
     # Reproduce the exact on-disk shape an older CCM build wrote.
     metadata.pop("base_url")
-    metadata.pop("usage_path")
+    metadata.pop("usage_override")
     metadata_path.write_text(json.dumps(metadata))
 
     reloaded = CloudRouterAccountStore(tmp_path / "accounts").reload()
@@ -3910,7 +3946,7 @@ async def test_custom_account_refresh_preserves_its_gateway(tmp_path, monkeypatc
 
     assert refreshed.models["codex"] == ["gpt-5.4", "gpt-5.5"]
     assert refreshed.base_url == CUSTOM_BASE_URL
-    assert refreshed.usage_path == "/api/quota"
+    assert refreshed.usage_override == "/api/quota"
     metadata = json.loads((refreshed.root / "account.json").read_text())
     assert metadata["base_url"] == CUSTOM_BASE_URL
-    assert metadata["usage_path"] == "/api/quota"
+    assert metadata["usage_override"] == "/api/quota"

@@ -111,10 +111,10 @@ class ApiProviderSpec:
     # rather than pinned in this module.  ``base_url`` is persisted in
     # account.json and re-validated on every load.
     base_url: str | None = None
-    # A custom account may point its quota lookup at a path relative to its own
-    # base URL; this retains that relative form so refresh can re-derive it
-    # without reparsing the absolute URL.
-    usage_path: str | None = None
+    # A custom account may override its quota endpoint, either as a path
+    # relative to its own base URL or as an absolute URL.  Retained verbatim
+    # so the same endpoints are rebuilt on every load.
+    usage_override: str | None = None
 
     @property
     def endpoints(self) -> dict[str, str | None]:
@@ -395,19 +395,16 @@ def custom_provider_spec(
 
     normalised = _normalise_custom_base_url(base_url)
     resolved_usage = _normalise_custom_usage_url(usage_url)
-    if resolved_usage is not None and not resolved_usage.startswith("/"):
-        absolute_usage = resolved_usage
-    elif resolved_usage is not None:
+    if resolved_usage is None:
+        absolute_usage = f"{normalised}/v1/usage"
+    elif resolved_usage.startswith("/"):
         absolute_usage = f"{normalised}{resolved_usage}"
     else:
-        absolute_usage = f"{normalised}/v1/usage"
+        absolute_usage = resolved_usage
     codex_base_url = f"{normalised}/v1"
-    cached = _CUSTOM_SPEC_CACHE.get(codex_base_url)
-    if (
-        cached is not None
-        and cached.claude_base_url == normalised
-        and cached.usage_url == absolute_usage
-    ):
+    cache_key = (codex_base_url, absolute_usage)
+    cached = _CUSTOM_SPEC_CACHE.get(cache_key)
+    if cached is not None:
         return cached
     spec = ApiProviderSpec(
         id=API_PROVIDER_CUSTOM,
@@ -419,12 +416,13 @@ def custom_provider_spec(
         models_url=f"{codex_base_url}/models",
         usage_url=absolute_usage,
         base_url=normalised,
-        usage_path=(
-            resolved_usage if resolved_usage and resolved_usage.startswith("/")
-            else None
-        ),
+        # Persisted verbatim in either accepted form.  Keeping only the
+        # relative form would silently drop an absolute override, and the
+        # endpoints rebuilt on the next load would no longer match the ones
+        # stored beside it -- which fails the whole account closed.
+        usage_override=resolved_usage,
     )
-    _CUSTOM_SPEC_CACHE[codex_base_url] = spec
+    _CUSTOM_SPEC_CACHE[cache_key] = spec
     return spec
 
 
@@ -1886,7 +1884,7 @@ class CloudRouterAccount:
     # Custom accounts only: the administrator-supplied gateway.  ``None`` for
     # every preset provider, whose endpoints stay pinned in this module.
     base_url: str | None = None
-    usage_path: str | None = None
+    usage_override: str | None = None
 
     @property
     def claude_config_dir(self) -> str:
@@ -1917,7 +1915,7 @@ class CloudRouterAccount:
             return API_PROVIDER_SPECS[self.api_provider]
         return custom_provider_spec(
             self.base_url,
-            usage_url=self.usage_path,
+            usage_url=self.usage_override,
         )
 
     @property
@@ -1992,7 +1990,7 @@ class CloudRouterAccount:
             "supported_models": supported_models,
             "endpoints": dict(self.spec.endpoints),
             "base_url": self.base_url,
-            "usage_path": self.usage_path,
+            "usage_override": self.usage_override,
         }
 
 
@@ -2180,18 +2178,23 @@ class CloudRouterAccountStore:
         # value: the URL is validated once, and the Claude/Codex runtime files
         # must then match what it derives.
         base_url: str | None = None
-        usage_path: str | None = None
+        usage_override: str | None = None
         if api_provider == API_PROVIDER_CUSTOM:
             try:
                 base_url = _normalise_custom_base_url(data.get("base_url"))
-                usage_path = _normalise_custom_usage_url(data.get("usage_path"))
+                usage_override = _normalise_custom_usage_url(
+                    data.get("usage_override"),
+                )
             except ValueError as exc:
                 raise CloudRouterUnsafePathError(
                     f"Invalid custom API base URL: {account_id}"
                 ) from exc
-            spec = custom_provider_spec(base_url, usage_url=usage_path)
+            spec = custom_provider_spec(base_url, usage_url=usage_override)
         else:
-            if data.get("base_url") is not None or data.get("usage_path") is not None:
+            if (
+                data.get("base_url") is not None
+                or data.get("usage_override") is not None
+            ):
                 raise CloudRouterUnsafePathError(
                     f"Unexpected custom endpoint metadata: {account_id}"
                 )
@@ -2292,7 +2295,7 @@ class CloudRouterAccountStore:
             key_hint=str(data.get("key_hint") or ""),
             root=path,
             base_url=base_url,
-            usage_path=usage_path,
+            usage_override=usage_override,
         )
         for directory in (path / "claude", path / "codex"):
             _ensure_private_directory(directory, create=False)
@@ -3070,7 +3073,7 @@ class CloudRouterAccountStore:
             # providers already have these pinned in the module, so writing
             # them would only add redundant state that could silently diverge.
             "base_url": resolved_spec.base_url,
-            "usage_path": resolved_spec.usage_path,
+            "usage_override": resolved_spec.usage_override,
             "created_at": created_at or current,
             "updated_at": current,
         }

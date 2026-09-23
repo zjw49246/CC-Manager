@@ -2055,8 +2055,8 @@ export interface CloudRouterAccount extends ApiAccountCleanupDiagnostics {
   endpoints: Record<string, string | null>;
   /** Custom accounts only: the administrator-supplied gateway. */
   base_url?: string | null;
-  /** Custom accounts only: a quota path relative to `base_url`, when set. */
-  usage_path?: string | null;
+  /** Custom accounts only: a quota path or absolute URL, when overridden. */
+  usage_override?: string | null;
   api_quota?: CloudRouterApiQuota | null;
 }
 
