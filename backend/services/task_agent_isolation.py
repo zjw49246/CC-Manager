@@ -1196,6 +1196,72 @@ def require_claude_apply_seccomp(
     )
 
 
+TASK_CLAUDE_WRAPPER_NAME = "task_claude_wrapper.sh"
+
+
+def resolve_task_claude_wrapper() -> Path:
+    """Return the CCM-owned Task Claude wrapper with a private mode.
+
+    The wrapper is the executable every isolated Claude Task process is
+    launched through, so it must be a regular, non-symlink file owned by the
+    CCM user and writable by nobody else.  Git only tracks the executable
+    bit: a checkout made with ``core.sharedRepository`` or a permissive
+    umask legitimately materialises it group-writable.  That is CCM's own
+    file, so the mode is converged to owner-only write (through an
+    ``O_NOFOLLOW`` descriptor, never a path) rather than failing the launch
+    closed; anything CCM does not own stays a hard failure.
+    """
+
+    wrapper = Path(__file__).with_name(TASK_CLAUDE_WRAPPER_NAME)
+    unsafe_bits = stat.S_IWGRP | stat.S_IWOTH
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(wrapper, flags)
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            "Task Claude wrapper is unavailable"
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or not info.st_mode & stat.S_IXUSR
+        ):
+            raise TaskAgentIsolationError(
+                "Task Claude wrapper is not a private executable"
+            )
+        if info.st_mode & unsafe_bits:
+            try:
+                os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & ~unsafe_bits)
+            except OSError as exc:
+                raise TaskAgentIsolationError(
+                    "Task Claude wrapper mode could not be converged"
+                ) from exc
+            converged = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(converged.st_mode)
+                or converged.st_uid != os.getuid()
+                or converged.st_mode & unsafe_bits
+            ):
+                raise TaskAgentIsolationError(
+                    "Task Claude wrapper is not a private executable"
+                )
+    finally:
+        os.close(descriptor)
+    current = wrapper.lstat()
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid != os.getuid()
+        or current.st_mode & unsafe_bits
+        or not os.access(wrapper, os.X_OK)
+    ):
+        raise TaskAgentIsolationError(
+            "Task Claude wrapper is not a private executable"
+        )
+    return wrapper
+
+
 def scrub_task_model_environment(
     source: Mapping[str, str],
     *,

@@ -275,7 +275,17 @@ class Settings(BaseSettings):
     service_name: str = "ccm.service"  # systemd service to restart (e.g. ccm-dev.service)
     service_scope: str = "auto"        # auto | user | system
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    # ``env_ignore_empty``: a settings key exported as an empty string (for
+    # example the blanked provider/runtime keys a CCM-launched Task session
+    # inherits) must fall back to the field default instead of overriding it
+    # with ``""`` — an empty string is not a valid binary name, effort list
+    # or float, and would otherwise make ``Settings()`` unusable in-process.
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+        "env_ignore_empty": True,
+    }
 
     @model_validator(mode="after")
     def require_worker_control_credential(self):

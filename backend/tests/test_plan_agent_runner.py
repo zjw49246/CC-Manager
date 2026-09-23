@@ -820,6 +820,12 @@ async def test_sqlite_wal_provider_admission_serializes_terminal_task_delete(
 ):
     from backend.database import Base
 
+    # ``TaskQueue.delete`` lazily imports ``backend.main`` to consult the live
+    # PTY post-exit registry.  That cold import takes >1s, longer than the
+    # fenced ``wait_for`` windows below, so the test only passed when an
+    # earlier test had already imported the app.  Warm it explicitly.
+    import backend.main  # noqa: F401
+
     task_fenced = asyncio.Event()
     release_admission = asyncio.Event()
     delete_task_update_attempted = asyncio.Event()
@@ -1216,6 +1222,7 @@ async def test_claude_missing_binary_before_spawn_is_route_unavailable(
 async def test_claude_plan_projects_api_account_auth_into_process(
     db_factory,
     monkeypatch,
+    tmp_path,
 ):
     runtime_temp_dir = _plan_runtime_tmp(712)
     instance_manager = MagicMock()
@@ -1251,6 +1258,20 @@ async def test_claude_plan_projects_api_account_auth_into_process(
         return True
 
     runner._runtime_admission = runtime_admission
+    # This test pins the auth projection contract only.  The isolation
+    # settings canary spawns the real Claude CLI under bubblewrap and is
+    # covered by test_task_agent_isolation; stub it so the outcome does not
+    # depend on the host's sandbox toolchain.
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "generate_claude_read_only_isolation_settings",
+        lambda *_args, **_kwargs: tmp_path / "plan-security.json",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "backend.services.claude_auth_projection."
         "inject_cloudrouter_claude_direct_auth",

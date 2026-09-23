@@ -8891,7 +8891,9 @@ class InstanceManager:
                     if claude_isolation_settings_path is not None:
                         from backend.services.task_agent_isolation import (
                             CLAUDE_TASK_BUILTIN_TOOLS,
+                            TaskAgentIsolationError,
                             claude_permission_allow_rules,
+                            resolve_task_claude_wrapper,
                         )
 
                         selected_claude_tools = tuple(
@@ -8905,16 +8907,12 @@ class InstanceManager:
                             )
                         )
 
-                        task_wrapper = Path(__file__).with_name(
-                            "task_claude_wrapper.sh"
-                        )
-                        if not (
-                            task_wrapper.is_file()
-                            and os.access(task_wrapper, os.X_OK)
-                        ):
+                        try:
+                            task_wrapper = resolve_task_claude_wrapper()
+                        except TaskAgentIsolationError as exc:
                             raise RuntimeError(
                                 "Task Claude isolation wrapper is unavailable"
-                            )
+                            ) from exc
                         overrides.update({
                             "CCM_TASK_CLAUDE_SETTINGS": str(
                                 claude_isolation_settings_path
@@ -8936,7 +8934,9 @@ class InstanceManager:
                         )
                     elif claude_unrestricted_tools is not None:
                         from backend.services.task_agent_isolation import (
+                            TaskAgentIsolationError,
                             claude_permission_allow_rules,
+                            resolve_task_claude_wrapper,
                         )
 
                         selected_claude_tools = tuple(
@@ -8952,16 +8952,12 @@ class InstanceManager:
                                 ),
                             )
                         )
-                        task_wrapper = Path(__file__).with_name(
-                            "task_claude_wrapper.sh"
-                        )
-                        if not (
-                            task_wrapper.is_file()
-                            and os.access(task_wrapper, os.X_OK)
-                        ):
+                        try:
+                            task_wrapper = resolve_task_claude_wrapper()
+                        except TaskAgentIsolationError as exc:
                             raise RuntimeError(
                                 "Task Claude permission wrapper is unavailable"
-                            )
+                            ) from exc
                         overrides.update({
                             "CCM_TASK_CLAUDE_PROFILE": "unrestricted",
                             "CCM_TASK_CLAUDE_BINARY": str(final_binary),

@@ -601,6 +601,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_cloudrouter_accounts.py::test_legacy_apex_endpoint_is_migrated_to_apexin` / `test_legacy_apexin_ai_account_keeps_accumulated_cli_state` | Apex 网关 sslip.io / `api.apexin.ai` 两代旧账号都原子迁移到 `api.apexin.net`；`.ai` 代 `.claude.json` 已累积 CLI 状态时只收敛权限、不比对内容、不覆盖 |
 | `test_cloudrouter_accounts.py::test_legacy_apexin_ai_account_rejects_onboarding_symlink` / `test_legacy_apex_migration_preflights_codex_before_writing` | 迁移前置校验：`.claude.json` 为 symlink 或 Codex routing 被改写时 fail closed，`account.json` 保持原字节 |
 | `test_cloudrouter_accounts.py::test_custom_*` / `test_add_custom_*` / `test_probe_custom_models_*` | `api_provider=custom` 自带网关：`base_url` 规范化与拒绝规则（userinfo/query/`..`/`%2e%2e`/元数据地址）、私网与回环放行、`usage_override` 相对/绝对原样持久化、派生 Claude/Codex 配置被改写即 fail closed、双形状 `/v1/models` 与额度解析 |
+| `test_service_instance_manager.py::test_settings_ignore_blank_environment_overrides` | `Settings` 对空字符串环境变量回落默认值（CCM 启动的 Task 会话会继承 `CLAUDE_BINARY=` 等空键），非空值仍覆盖 |
+| `test_task_agent_isolation.py::test_task_claude_wrapper_*` | `resolve_task_claude_wrapper()`：0775 checkout 收敛为 0755；symlink / 不可执行 fail closed 且不改动文件 |
 | `test_service_dispatcher.py::test_lifecycle_codex_context_error_compacts_before_retry` | fresh/mode Codex 超限后摘要并回到 pending，不消耗普通失败重试语义 |
 | `test_service_dispatcher.py::test_codex_precompact_uses_full_context_tokens` | Codex 预压缩按 current context（含会进入下一请求的 output）和有效窗口触发 |
 | `test_api_pr_monitor.py::test_create_repo_with_codex_provider` 等 | PR Monitor API 层 provider 创建/默认/更新（含显式 null 清空模型防跨家族残留） |

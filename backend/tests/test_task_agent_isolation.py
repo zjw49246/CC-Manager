@@ -31,6 +31,7 @@ from backend.services.task_agent_isolation import (
     prepare_task_working_directory,
     require_claude_apply_seccomp,
     require_task_security_boundary_configured,
+    resolve_task_claude_wrapper,
     scrub_task_model_environment,
     task_model_tool_environment,
     validate_claude_delivery_isolation_settings,
@@ -1376,6 +1377,57 @@ def test_apply_seccomp_resolution_uses_matching_global_architecture(
     assert require_claude_apply_seccomp("claude") == helper.resolve()
 
 
+def test_task_claude_wrapper_converges_group_writable_checkout_mode(
+    tmp_path,
+    monkeypatch,
+):
+    """A shared-repository checkout materialises the wrapper as 0775."""
+
+    wrapper = tmp_path / "task_claude_wrapper.sh"
+    wrapper.write_text("#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o775)
+    monkeypatch.setattr(
+        task_agent_isolation_module,
+        "__file__",
+        str(tmp_path / "task_agent_isolation.py"),
+    )
+
+    assert resolve_task_claude_wrapper() == wrapper
+    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o755
+
+
+def test_task_claude_wrapper_symlink_fails_closed(tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere.sh"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    (tmp_path / "task_claude_wrapper.sh").symlink_to(target)
+    monkeypatch.setattr(
+        task_agent_isolation_module,
+        "__file__",
+        str(tmp_path / "task_agent_isolation.py"),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="wrapper is unavailable"):
+        resolve_task_claude_wrapper()
+
+
+def test_task_claude_wrapper_non_executable_fails_closed(tmp_path, monkeypatch):
+    wrapper = tmp_path / "task_claude_wrapper.sh"
+    wrapper.write_text("#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o644)
+    monkeypatch.setattr(
+        task_agent_isolation_module,
+        "__file__",
+        str(tmp_path / "task_agent_isolation.py"),
+    )
+
+    with pytest.raises(
+        TaskAgentIsolationError, match="not a private executable",
+    ):
+        resolve_task_claude_wrapper()
+    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o644
+
+
 def test_claude_isolation_preflight_accepts_real_cli_empty_zero_turn_shape(
     tmp_path,
     monkeypatch,
@@ -1480,7 +1532,10 @@ def test_claude_isolation_preflight_rejects_model_execution(
 
 
 def test_task_claude_wrapper_is_private_and_uses_exact_cli_boundary():
-    wrapper = Path(__file__).resolve().parents[1] / "services" / "task_claude_wrapper.sh"
+    wrapper = resolve_task_claude_wrapper()
+    assert wrapper == (
+        Path(__file__).resolve().parents[1] / "services" / "task_claude_wrapper.sh"
+    )
 
     text = wrapper.read_text(encoding="utf-8")
 

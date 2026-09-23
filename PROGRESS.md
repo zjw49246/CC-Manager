@@ -9,7 +9,14 @@
 - [x] Apex 渠道基址从 `api.apexin.ai` 改为 `api.apexin.net`（`7d19889b`）。旧 `.ai` 代账号在加载时校验后原子改写到 `.net`，不再要求重新录入 Key；sslip.io 代 Codex-only 快照的迁移路径保持不变。
 - [x] 新增 `api_provider=custom`：号池「添加 API 账号」可选「自定义」，填写网关 URL + Key（可选额度 URL），不再限于 CloudRouter/Apex/APIBest 预置渠道（`129966bd` 起共 11 笔）。服务端只接受 http/https + 域名/IP，拒绝 userinfo/query/fragment/`..`（含 `%2e%2e`）与元数据地址，回环和私网明确放行；`base_url`/`usage_override` 持久化在 `account.json`，派生的 Claude/Codex 配置被改写即 fail closed。
 - [x] **问题**：`.ai` 代账号迁移到 `.net` 时把 `.claude.json` 当 CCM 受管文件逐字比对 onboarding 载荷，但那代账号真的跑过 Claude，CLI 已往里写了启动计数/项目历史/`customApiKeyResponses`，且 CLI 重写后权限是 0644，整个账号被 fail closed。**解决**：迁移只在缺失时写入 onboarding 载荷；已存在的只走 `_converge_cli_mutable_private_file`（owned regular/non-symlink 校验 + 收敛 0600），与 `_load_account` 常规路径一致。**避免**：CLI 可变文件（`.claude.json`）不能进入受管文件的内容/权限严格校验集合；新增 `test_legacy_apexin_ai_account_keeps_accumulated_cli_state` 与 symlink fail-closed 回归锚点。实现提交：本提交。
-- [x] 验证：`backend/tests/` 全量 pytest 通过，`npx tsc --noEmit` 通过，PoolDrawer / client.cloudrouter 前端测试 57 passed。注意：shell 里若 `CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS` 为空字符串，pydantic Settings 会在 conftest 导入时直接报错，需 `env -u` 掉再跑。
+- [x] 验证：`backend/tests/` 全量 pytest 通过（8543 passed，另 8 个既有环境相关失败见下条），`npx tsc --noEmit` 通过，PoolDrawer / client.cloudrouter 前端测试 57 passed。实现提交：`4f1ccba0`。
+
+### 2026-09-23：修复 8 个依赖宿主环境的基线测试失败
+
+- [x] **问题 1（6 个）**：CCM 启动的 Task 会话会把 `CLAUDE_BINARY=`、`CODEX_EFFORT_OPTIONS=`、`CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS=` 等 settings 键以空字符串导出给子进程；pydantic-settings 把空串当作显式覆盖，于是 `claude_binary == ""`、effort 列表为空、float 直接校验失败，`test_codex_models` / `test_build_command_*` 全挂，严重时 conftest 导入 `Settings()` 就崩。**解决**：`Settings.model_config` 打开 `env_ignore_empty=True`，空串回落到字段默认值，非空值照常覆盖；新增 `test_settings_ignore_blank_environment_overrides`。**避免**：Settings 新增字段不要假设环境变量“存在即有值”。
+- [x] **问题 2（1 个）**：`task_claude_wrapper.sh` 在 `core.sharedRepository=true` / umask 002 的 checkout 里被 git 物化成 0775，`test_task_claude_wrapper_is_private_*` 断言无 group/other 写位失败；生产路径 `instance_manager` 只检查 `is_file + X_OK`，并没有真正执行这条私有性契约。**解决**：新增 `task_agent_isolation.resolve_task_claude_wrapper()`，通过 `O_NOFOLLOW` 描述符校验 owned regular 文件并把 group/other 写位安全收敛掉（symlink、非本人所有、不可执行仍 fail closed），两处 launch 站点改为调用它；测试改为先走同一解析器。**避免**：CCM 自有文件的权限漂移应收敛而非只在测试里断言；git 不跟踪 group 位。
+- [x] **问题 3（1 个）**：`test_claude_plan_projects_api_account_auth_into_process` 真实执行 Claude CLI 的 sandbox 探针，结果随宿主机 bwrap/seccomp 环境变化。**解决**：与同文件邻居测试一致，stub 掉 `generate_claude_read_only_isolation_settings` / `validate_claude_task_isolation_settings`，只锁定认证投影契约；探针本身由 `test_task_agent_isolation` 覆盖。
+- [x] **问题 4（顺序依赖，单独跑必挂）**：`test_sqlite_wal_provider_admission_serializes_terminal_task_delete` 用 1 秒 `wait_for` 等 `TaskQueue.delete` 走到 Task UPDATE，但 delete 路径会懒 `import backend.main` 查 PTY post-exit registry，冷导入约 1.4 秒；只有前面某个用了 `app` fixture 的测试先导入过才能通过。**解决**：测试开头显式预热 `import backend.main`。**避免**：带短超时的并发时序测试必须先把懒导入/首次初始化排除在计时窗口外。实现提交：本提交。
 
 ### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
 

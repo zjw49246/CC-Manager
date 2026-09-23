@@ -1664,6 +1664,21 @@ def test_codex_main_mcp_capability_allows_explicit_env_opt_out(monkeypatch):
     assert Settings(_env_file=None).codex_main_mcp_enabled is False
 
 
+def test_settings_ignore_blank_environment_overrides(monkeypatch):
+    """A CCM-launched session inherits blanked settings keys; they must fall
+    back to the field default instead of overriding it with ``""``."""
+
+    monkeypatch.setenv("CLAUDE_BINARY", "")
+    monkeypatch.setenv("CODEX_EFFORT_OPTIONS", "")
+    monkeypatch.setenv("CLAUDE_PTY_RESPONSE_IDLE_TIMEOUT_SECONDS", "")
+    loaded = Settings(_env_file=None)
+    assert loaded.claude_binary == "claude"
+    assert loaded.codex_effort_options == "low,medium,high,xhigh"
+    assert loaded.claude_pty_response_idle_timeout_seconds == 3600.0
+    monkeypatch.setenv("CLAUDE_BINARY", "/opt/claude")
+    assert Settings(_env_file=None).claude_binary == "/opt/claude"
+
+
 def test_parse_codex_agent_message():
     im = InstanceManager(MagicMock(), MagicMock())
     event = im._parse_codex_line(json.dumps({
