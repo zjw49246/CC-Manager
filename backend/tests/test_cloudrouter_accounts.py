@@ -3816,3 +3816,77 @@ async def test_api_accepts_a_custom_account_and_requires_its_base_url(
             ),
         )
     assert excinfo.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_preset_account_metadata_predating_custom_urls_still_loads(
+    tmp_path, monkeypatch,
+):
+    """Accounts written before custom gateways existed have no URL fields."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    account = await store.add_account("Primary API", "cr-secret-value")
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    # Reproduce the exact on-disk shape an older CCM build wrote.
+    metadata.pop("base_url")
+    metadata.pop("usage_path")
+    metadata_path.write_text(json.dumps(metadata))
+
+    reloaded = CloudRouterAccountStore(tmp_path / "accounts").reload()
+
+    assert [item.id for item in reloaded] == [account.id]
+    assert reloaded[0].base_url is None
+    assert reloaded[0].spec.claude_base_url == CLAUDE_BASE_URL
+
+
+@pytest.mark.asyncio
+async def test_preset_account_cannot_smuggle_a_base_url_through_metadata(
+    tmp_path, monkeypatch,
+):
+    """Only a custom account may carry its own gateway."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    account = await store.add_account("Primary API", "cr-secret-value")
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["base_url"] = "https://attacker.example.com"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(CloudRouterUnsafePathError):
+        CloudRouterAccountStore(tmp_path / "accounts").reload()
+
+
+@pytest.mark.asyncio
+async def test_custom_account_refresh_preserves_its_gateway(tmp_path, monkeypatch):
+    """A model refresh must not drop the URL fields from account.json."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+        usage_url="/api/quota",
+    )
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4", "gpt-5.5"]}),
+    )
+
+    refreshed = await store.refresh_account(account.id)
+
+    assert refreshed.models["codex"] == ["gpt-5.4", "gpt-5.5"]
+    assert refreshed.base_url == CUSTOM_BASE_URL
+    assert refreshed.usage_path == "/api/quota"
+    metadata = json.loads((refreshed.root / "account.json").read_text())
+    assert metadata["base_url"] == CUSTOM_BASE_URL
+    assert metadata["usage_path"] == "/api/quota"
