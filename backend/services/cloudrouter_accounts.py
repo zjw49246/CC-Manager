@@ -252,13 +252,12 @@ def _sanitise_cleanup_reason(value: object) -> str:
 
 MAX_CUSTOM_BASE_URL_BYTES = 2048
 MAX_CUSTOM_LABEL_BYTES = 60
-# Hosts a custom account must never be pointed at.  The gateway URL becomes
-# ``ANTHROPIC_BASE_URL`` and an outbound Codex ``base_url``, so a loopback or
-# link-local target would turn account validation into a request against the
-# CCM host or its metadata service.
+# Hosts a custom account must never be pointed at.  Loopback is deliberately
+# absent: a gateway on the same box as CCM is one of the common self-hosted
+# deployments.  What stays refused is the cloud metadata service, whose
+# instance-role credentials are an escalation beyond anything a CCM
+# administrator already holds.
 _BLOCKED_CUSTOM_HOSTS = frozenset({
-    "localhost",
-    "localhost.localdomain",
     "metadata.google.internal",
 })
 
@@ -268,12 +267,11 @@ def _normalise_custom_base_url(value: str | None) -> str:
 
     Both ``https://`` and plain ``http://`` are accepted because self-hosted
     gateways are a supported target, and a bare IP literal is allowed for the
-    same reason -- including RFC1918 ranges, which is how a LAN gateway is
-    reached.  What is refused is anything that could smuggle a second request
-    or a credential into the derived endpoint URLs (query, fragment, embedded
-    userinfo, duplicate or relative path segments), and anything pointing back
-    at the CCM host or a cloud metadata service, which would turn account
-    validation into a request against CCM itself.
+    same reason -- including loopback and RFC1918 ranges, which is how a
+    gateway on the CCM host or elsewhere on the LAN is reached.  What is
+    refused is anything that could smuggle a second request or a credential
+    into the derived endpoint URLs (query, fragment, embedded userinfo,
+    duplicate or relative path segments), plus the cloud metadata addresses.
     """
 
     raw = str(value or "").strip()
@@ -319,12 +317,9 @@ def _normalise_custom_base_url(value: str | None) -> str:
     if any(character.isspace() for character in host):
         raise ValueError("API base URL host is invalid")
     if host.lower() in _BLOCKED_CUSTOM_HOSTS:
-        raise ValueError("API base URL must not target the local host")
+        raise ValueError("API base URL must not target a metadata service")
     if _is_blocked_custom_address(host):
-        raise ValueError(
-            "API base URL must not target a loopback, link-local, or "
-            "metadata address"
-        )
+        raise ValueError("API base URL must not target a link-local address")
     if path in {"", "/"}:
         path = ""
     else:
@@ -344,12 +339,14 @@ def _normalise_custom_base_url(value: str | None) -> str:
 
 
 def _is_blocked_custom_address(host: str) -> bool:
-    """Reject addresses that resolve to the CCM host or a metadata service.
+    """Reject only the link-local ranges that front cloud metadata services.
 
-    Loopback and link-local are refused outright.  Private ranges are
-    deliberately *allowed*: a self-hosted gateway on a LAN is a supported
-    target, and the administrator supplying the URL is the same principal who
-    may read the API key.
+    Loopback and private ranges are deliberately allowed: a gateway on the
+    CCM host or elsewhere on the LAN is a supported deployment, and the
+    administrator supplying the URL is the same principal who may read the
+    API key.  ``169.254.0.0/16`` and ``fe80::/10`` are different -- they reach
+    instance-role credentials that a CCM administrator does not otherwise
+    hold -- so they stay refused.
     """
 
     import ipaddress
@@ -359,12 +356,8 @@ def _is_blocked_custom_address(host: str) -> bool:
         address = ipaddress.ip_address(candidate)
     except ValueError:
         return False
-    if address.is_loopback or address.is_link_local:
-        return True
-    # ``::`` and its IPv6 siblings carry no routable meaning here.
-    if address.is_unspecified:
-        return True
-    return isinstance(address, ipaddress.IPv6Address) and address.is_site_local
+    # An unspecified address carries no routable meaning as a gateway target.
+    return address.is_link_local or address.is_unspecified
 
 
 def _normalise_custom_usage_url(value: str | None) -> str | None:

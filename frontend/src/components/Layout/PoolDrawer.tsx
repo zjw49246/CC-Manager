@@ -1205,7 +1205,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               <>
                 <p>系统通过 {'{API 地址}'}/v1/models 自动识别该 Key 可用于 Claude、Codex 或两者；识别出的模型决定生成 Anthropic 还是 Responses 配置，两者都有则都配置。</p>
                 <p>额度从 {'{额度查询地址}'} 读取，未填写时使用 {'{API 地址}'}/v1/usage。返回格式无法识别时会显示“无法确认”，不会当作 $0。</p>
-                <p>地址支持 http/https、域名或 IP（含内网地址）；不允许回环地址与云元数据地址。</p>
+                <p>地址支持 http/https、域名或 IP，可填 localhost 与内网地址（网关与 CCM 同机也可以）；仅不允许云元数据地址。</p>
               </>
             ) : apiProvider === 'cloudrouter' ? (
               <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>

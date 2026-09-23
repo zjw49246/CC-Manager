@@ -3301,10 +3301,14 @@ CUSTOM_BASE_URL = "https://gateway.example.com"
         "http://10.0.0.5:8080",
         "http://192.168.1.20:3000/gateway",
         "https://api.example.com/v1/anthropic",
+        # A gateway on the CCM host is one of the common self-hosted setups.
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://[::1]:8443",
     ],
 )
 def test_custom_base_url_accepts_self_hosted_and_lan_gateways(value):
-    """A self-hosted gateway is a supported target, LAN addresses included."""
+    """A self-hosted gateway is a supported target, loopback and LAN included."""
 
     assert _normalise_custom_base_url(value).startswith(("http://", "https://"))
 
@@ -3324,10 +3328,10 @@ def test_custom_base_url_normalises_equivalents_to_one_snapshot():
         ("https://user:pw@api.example.com", "credentials"),
         ("https://api.example.com?token=1", "query or fragment"),
         ("https://api.example.com#frag", "query or fragment"),
-        ("https://localhost", "local host"),
-        ("https://127.0.0.1", "loopback"),
-        ("https://[::1]:8080", "loopback"),
-        ("https://169.254.169.254", "metadata"),
+        ("https://169.254.169.254", "link-local"),
+        ("https://[fe80::1]", "link-local"),
+        ("https://0.0.0.0", "link-local"),
+        ("https://metadata.google.internal", "metadata service"),
         ("https://api.example.com/a/../b", "path"),
         ("https://api.example.com//a", "path"),
         ("https://api.example.com/a\\b", "backslash"),
