@@ -3333,6 +3333,10 @@ def test_custom_base_url_normalises_equivalents_to_one_snapshot():
         ("https://0.0.0.0", "link-local"),
         ("https://metadata.google.internal", "metadata service"),
         ("https://api.example.com/a/../b", "path"),
+        # httpx decodes these before the literal check can see them, so the
+        # decoded path has to be re-checked or one endpoint gets two snapshots.
+        ("https://api.example.com/%2e%2e/b", "path"),
+        ("https://api.example.com/a/..%2fb", "path"),
         ("https://api.example.com//a", "path"),
         ("https://api.example.com/a\\b", "backslash"),
         ("https://api.example.com/a\x01b", "control"),
@@ -3355,8 +3359,9 @@ def test_custom_usage_url_accepts_absolute_or_relative_forms():
     )
     with pytest.raises(ValueError, match="absolute URL or start with"):
         _normalise_custom_usage_url("api/quota")
-    with pytest.raises(ValueError, match="path is invalid"):
-        _normalise_custom_usage_url("/api/../quota")
+    for traversal in ("/api/../quota", "/api/%2e%2e/quota", "/api//quota"):
+        with pytest.raises(ValueError, match="path is invalid"):
+            _normalise_custom_usage_url(traversal)
 
 
 def test_custom_provider_spec_derives_every_endpoint():

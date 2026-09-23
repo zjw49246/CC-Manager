@@ -25,6 +25,7 @@ import tomllib
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from urllib.parse import unquote
 from pathlib import Path
 from typing import Any
 
@@ -324,7 +325,15 @@ def _normalise_custom_base_url(value: str | None) -> str:
         path = ""
     else:
         path = path.rstrip("/")
-        if "//" in path:
+        # Re-check the decoded path.  The raw check above catches a literal
+        # ``..`` that httpx would normalise away before this point; this one
+        # catches its percent-encoded spelling, which httpx decodes instead.
+        # Either would otherwise persist a non-canonical snapshot, and two
+        # spellings of one endpoint comparing unequal is exactly what the
+        # fail-closed endpoint check must not have to reason about.
+        if "//" in path or any(
+            part in {".", ".."} for part in path.split("/")
+        ):
             raise ValueError("API base URL path is invalid")
     # A default port is not part of the gateway's identity: ``https://x:443``
     # and ``https://x`` address the same host, so collapsing them keeps one
@@ -377,12 +386,19 @@ def _normalise_custom_usage_url(value: str | None) -> str | None:
         raise ValueError("Usage URL must be an absolute URL or start with /")
     if len(raw.encode("utf-8")) > MAX_CUSTOM_BASE_URL_BYTES:
         raise ValueError("Usage URL is too long")
-    if any(ord(character) < 32 for character in raw) or any(
-        character in raw for character in "?#\\"
-    ):
+    if any(
+        ord(character) < 32 or ord(character) == 127 for character in raw
+    ) or any(character in raw for character in "?#\\"):
         raise ValueError("Usage URL path is invalid")
-    if "//" in raw or any(part in {".", ".."} for part in raw.split("/")):
-        raise ValueError("Usage URL path is invalid")
+    # Check both the literal and the percent-decoded spelling: the value is
+    # concatenated onto the base URL verbatim, and httpx decodes and collapses
+    # dot segments at request time, so only rejecting the literal form would
+    # let two spellings of one endpoint be stored as different snapshots.
+    for candidate in (raw, unquote(raw)):
+        if "//" in candidate or any(
+            part in {".", ".."} for part in candidate.split("/")
+        ):
+            raise ValueError("Usage URL path is invalid")
     return raw.rstrip("/")
 
 
