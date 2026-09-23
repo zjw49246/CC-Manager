@@ -58,7 +58,11 @@ function apiProviderBadge(
   if (provider === 'apibest') return 'APIBEST API';
   if (provider === 'custom') {
     const host = (baseUrl ?? '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-    return host ? `${host.toUpperCase()} API` : '自定义 API';
+    if (!host) return '自定义 API';
+    // The badge is a fixed-height pill next to the account name, so a long
+    // hostname is elided rather than allowed to push the row wider.
+    const shown = host.length > 24 ? `${host.slice(0, 23)}…` : host;
+    return `${shown.toUpperCase()} API`;
   }
   return 'API';
 }
