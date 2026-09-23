@@ -1171,7 +1171,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
                   className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
                   value={usageUrl}
                   onChange={(event) => setUsageUrl(event.target.value)}
-                  placeholder="默认 {API 地址}/v1/usage"
+                  placeholder="留空即 {API 地址}/v1/usage"
                   autoComplete="off"
                   spellCheck={false}
                 />
@@ -1208,7 +1208,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
             {isCustom ? (
               <>
                 <p>填写网关根地址，<b className="text-gray-400">不要带 /v1</b>；系统会自动拼接 /v1/models 识别该 Key 可用于 Claude、Codex 或两者，识别出的模型决定生成 Anthropic 还是 Responses 配置，两者都有则都配置。</p>
-                <p>额度从 {'{额度查询地址}'} 读取，未填写时使用 {'{API 地址}'}/v1/usage。返回格式无法识别时会显示“无法确认”，不会当作 $0。</p>
+                <p>额度查询地址可填 <code>/相对路径</code> 或完整 URL，留空则用 {'{API 地址}'}/v1/usage；返回格式无法识别时会显示“无法确认”，不会当作 $0。</p>
                 <p>地址支持 http/https、域名或 IP，可填 localhost 与内网地址（网关与 CCM 同机也可以）；仅不允许云元数据地址。</p>
               </>
             ) : apiProvider === 'cloudrouter' ? (
