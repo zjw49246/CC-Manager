@@ -4,6 +4,14 @@
 
 ## 已完成功能
 
+### 2026-09-23：修正 Claude 非 `[1m]` 模型的上下文窗口兜底
+
+- [x] 根因：CLI 对 `claude-opus-5` 的原始 `modelUsage.contextWindow` 曾上报 200K，但 CCM 的 `CLAUDE_CONTEXT_WINDOWS`、Fable 名称匹配和前端 `fable` 特判将非后缀模型强制抬到 1M。
+- [x] 修复：仅显式 `[1m]` 后缀使用 1M；其他 Claude 模型默认 200K，同时保留运行时 CLI 上报更大窗口的修正路径；配置 API 的静态窗口映射保持为空以兼容既有客户端。
+- [x] 验证：Claude 模型/API 后端专项 34 passed，ChatView 前端 168 passed，前端 production build 通过；InstanceManager 扩展套件 625 passed，3 个 Unix socket 路径过长的既有环境失败与本次修改无关。
+- [x] commit ID：`9c0942cc`。
+
+
 ### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
 
 - [x] 生产只读取证：Task 538 的首次 Fable 5.1 `[1m]` 请求被 Apex 以 `404 model_not_found` 拒绝；切换到 Opus 4.6 `[1m]` 后，两次约 1K 字符、零 token 请求又被上游以 `400 Prompt is too long` 拒绝。相同 Key 的 Opus 4.6 `[1m]` 最小新会话实测成功，说明 Key 本身有效；Apex 当前模型目录仍列出 Fable，但基础版和 `[1m]` 实际调用均 404，属于上游目录/路由不一致。

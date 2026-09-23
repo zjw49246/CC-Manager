@@ -1226,3 +1226,9 @@ manager(8003) 注册 worker → 建 git_url 项目 → 创建 task 选 worker �
 转发同 ID、状态回流、43 条日志镜像、README 真实修改 + merge push、
 chat 代理 + session_id 同步、回复经 relay 回流。测试仓库
 github.com/youchengsong/ccm-worker-e2e-test（可删）。
+
+### Claude 上下文窗口兜底回归
+
+- 非 `[1m]` 的 Opus 5/Fable/Sonnet 默认 200K；显式 `[1m]` 保留 1M，default 先解析配置模型。
+- 配置 API 不再返回模型名 1M 覆盖，Opus 5 effort 能力保持不变。
+- Chat 模型菜单在 250K 输入下对非 `[1m]` 模型提示 200K 超限，对 `[1m]` 不提示；CLI 上报更大窗口的运行时修正保持不变。

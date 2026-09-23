@@ -4748,7 +4748,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   {modelOptions.map((m) => {
                     // Known fixed windows come from the backend capability table.
                     const win = modelContextWindows[m]
-                      ?? ((m.includes('[1m]') || m.includes('fable')) ? 1_000_000 : 200_000);
+                      ?? (m.includes('[1m]') ? 1_000_000 : 200_000);
                     const over = !!contextUsage && contextUsage.total_input_tokens > win;
                     const fastUnsupported = task.provider === 'codex'
                       && task.codex_service_tier === 'priority'

@@ -10,10 +10,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.instance import Instance
 from backend.models.task import Task
-from backend.services.claude_models import (
-    CLAUDE_CONTEXT_WINDOWS,
-    CLAUDE_MODEL_EFFORTS,
-)
+from backend.services.claude_models import CLAUDE_MODEL_EFFORTS
 from backend.services.codex_models import (
     CODEX_MODEL_EFFORTS,
     CODEX_MODEL_SERVICE_TIERS,
@@ -247,7 +244,9 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "default_effort": settings.default_effort,
         "effort_options": [e.strip() for e in settings.effort_options.split(",") if e.strip()],
         "claude_model_efforts": CLAUDE_MODEL_EFFORTS,
-        "claude_model_context_windows": CLAUDE_CONTEXT_WINDOWS,
+        # Context windows are selected by the explicit [1m] model alias or
+        # runtime provider usage; there are no model-name 1M overrides.
+        "claude_model_context_windows": {},
         "codex_effort_options": [e.strip() for e in settings.codex_effort_options.split(",") if e.strip()],
         # GPT-5.6 系列按模型区分档位（sol/terra 到 ultra，luna 到 max）；未列出的模型用 codex_effort_options
         "codex_model_efforts": CODEX_MODEL_EFFORTS,

@@ -24,7 +24,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **Goal 模式** — `mode="goal"` 使用自然语言完成条件（`goal_condition`），每 turn 后由轻量评估器（默认 Haiku）自动判断是否达成目标
 - **交互式版本化 Plan** — Plan 是独立于 Task 的一等制品；Planner/Reviewer 可暂停同一个 Run 请求任意数量的必要输入，回答后继续并保留不可变 Version 历史。审批不自动执行，关联 Version 由用户显式附到下一条真实消息，standalone Version 可一键创建执行 Task
 - **Effort Level** — 支持 `low` / `medium` / `high` / `xhigh` / `max` 五档，优先级链：Task → Instance → 全局默认
-- **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；Opus 5 固定为 1M context 并支持 `low/medium/high/xhigh/max` effort，其他兼容模型可用 `[1m]` 后缀开启 1M context
+- **Model 配置** — 支持全称模型 ID（包括 `claude-opus-5`）；仅带 `[1m]` 后缀的 Claude 模型按 1M context 处理，其他模型（包括不带后缀的 Opus 5/Fable）默认按 200K 处理，并支持运行时采用 Claude CLI 上报的更大窗口；Opus 5 支持 `low/medium/high/xhigh/max` effort
 - **Codex Fast** — Codex Task 可选择 Standard 或 Fast；Fast 使用同一模型的 `priority` service tier，不会换模型或降低 effort。当前支持 GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4；账号或模型无法确认 `priority` 时会在执行前明确失败，不会挂着 Fast 徽标偷偷按 Standard 运行
 - **Thinking Budget** — Instance 级别设置 `thinking_budget`，通过 `MAX_THINKING_TOKENS` 传递给 CLI
 - **Workflows 开关** — Task 级别控制是否启用 Workflow 工具，关闭时节省 token

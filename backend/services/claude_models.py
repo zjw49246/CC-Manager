@@ -7,11 +7,6 @@ CLAUDE_MODEL_EFFORTS: dict[str, list[str]] = {
     "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
 }
 
-CLAUDE_CONTEXT_WINDOWS: dict[str, int] = {
-    # Opus 5 has a fixed 1M window; there is no separate [1m] variant.
-    "claude-opus-5": 1_000_000,
-}
-
 DEFAULT_CLAUDE_CONTEXT_WINDOW = 200_000
 
 
@@ -25,9 +20,9 @@ def _configured_model(model: str | None) -> str:
 def claude_context_window(model: str | None) -> int:
     """Return the effective context window for a Claude CLI model choice."""
     value = _configured_model(model)
-    if value.endswith("[1m]") or "fable" in value:
+    if value.endswith("[1m]"):
         return 1_000_000
-    return CLAUDE_CONTEXT_WINDOWS.get(value, DEFAULT_CLAUDE_CONTEXT_WINDOW)
+    return DEFAULT_CLAUDE_CONTEXT_WINDOW
 
 
 def supported_claude_efforts(model: str | None) -> list[str]:

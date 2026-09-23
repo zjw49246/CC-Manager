@@ -491,7 +491,7 @@ async def test_config_includes_opus5_capabilities(client):
 
     assert "claude-opus-5" in data["model_options"]
     assert "claude-opus-5[1m]" not in data["model_options"]
-    assert data["claude_model_context_windows"]["claude-opus-5"] == 1_000_000
+    assert data["claude_model_context_windows"] == {}
     assert data["claude_model_efforts"]["claude-opus-5"] == [
         "low",
         "medium",
