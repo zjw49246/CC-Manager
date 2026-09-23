@@ -586,8 +586,14 @@ describe('PoolDrawer', () => {
       // for it and say how the optional quota override is resolved.
       expect(screen.getByLabelText('API 地址')).toBeInTheDocument();
       expect(screen.getByLabelText('额度查询地址（可选）')).toBeInTheDocument();
-      expect(screen.getByText(/自动识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
+      expect(screen.getByText(/识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
       expect(screen.getByText(/无法识别时会显示“无法确认”，不会当作 \$0/)).toBeInTheDocument();
+      // Third-party docs usually quote the /v1 endpoint, which would make the
+      // probe hit /v1/v1/models; the form has to say so before that happens.
+      expect(screen.getByText('不要带 /v1')).toBeInTheDocument();
+      expect(screen.getByLabelText('API 地址')).toHaveAttribute(
+        'placeholder', expect.stringContaining('不含 /v1'),
+      );
 
       await user.type(screen.getByLabelText('账号名称'), 'Vendor X');
       await user.type(
