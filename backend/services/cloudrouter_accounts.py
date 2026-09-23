@@ -1131,30 +1131,42 @@ def _probe_custom_models(payload: Any) -> dict[str, Any]:
     )
     merged: dict[str, Any] = {"claude": [], "codex": []}
     service_tiers: dict[str, list[str]] = {}
-    matched = False
-    empty = True
+    applicable_shapes = 0
+    understood = 0
+    declared_tiers = False
+    empty_catalog: CloudRouterUpstreamError | None = None
     for applicable, normaliser in shapes:
         if not applicable:
             continue
+        applicable_shapes += 1
         try:
             result = normaliser(payload)
-        except CloudRouterUpstreamError:
+        except CloudRouterUpstreamError as exc:
+            # The shape was recognised but held nothing usable.  Remember it so
+            # an all-empty catalog reports that, rather than being downgraded
+            # to "we could not read the response".
+            if exc.code == "no_supported_models":
+                empty_catalog = exc
             continue
-        matched = True
+        understood += 1
         for provider in ("claude", "codex"):
-            values = result.get(provider)
-            if values:
-                empty = False
-                merged[provider] = sorted(set(merged[provider]) | set(values))
-        for model, tiers in (result.get("service_tiers") or {}).items():
-            merged_tiers = set(service_tiers.get(model, ())) | set(tiers)
-            service_tiers[model] = sorted(merged_tiers)
-    if not matched:
+            merged[provider] = sorted(
+                set(merged[provider]) | set(result.get(provider) or ())
+            )
+        # Only a normaliser that actually emitted the key has evidence about
+        # tier capability; the OpenAI shape omits it when nothing declared
+        # tiers, and that must stay distinguishable from "no tiers exist".
+        if "service_tiers" in result:
+            declared_tiers = True
+            for model, tiers in (result["service_tiers"] or {}).items():
+                service_tiers[model] = sorted(
+                    set(service_tiers.get(model, ())) | set(tiers)
+                )
+    if understood == 0:
+        if empty_catalog is not None:
+            raise empty_catalog
         raise CloudRouterUpstreamError("invalid_models_response")
-    if not empty:
-        # Only advertise upstream tier provenance when the gateway actually
-        # declared tiers; an empty map must keep the ``none`` source so the UI
-        # never implies graduated Fast capability.
+    if declared_tiers:
         merged["service_tiers"] = service_tiers
     return merged
 

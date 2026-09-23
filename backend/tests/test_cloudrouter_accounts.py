@@ -3568,6 +3568,30 @@ def test_probe_custom_models_refuses_an_unrecognised_catalog():
         cloudrouter_module._probe_custom_models({"result": "ok"})
 
 
+@pytest.mark.parametrize("payload", [{"data": []}, {"models": []}])
+def test_probe_custom_models_reports_an_empty_catalog_precisely(payload):
+    """A readable but empty catalog is a key problem, not a protocol problem."""
+
+    with pytest.raises(CloudRouterUpstreamError) as excinfo:
+        cloudrouter_module._probe_custom_models(payload)
+    assert excinfo.value.code == "no_supported_models"
+
+
+def test_probe_custom_models_keeps_tier_provenance_honest():
+    """Claiming upstream tier support requires the catalog to have declared it."""
+
+    # The OpenAI shape omits the key entirely when nothing declared tiers, so
+    # a custom account on that protocol must record "none", exactly as the
+    # CloudRouter preset does.
+    assert "service_tiers" not in cloudrouter_module._probe_custom_models(
+        {"data": [{"id": "gpt-5.4"}]},
+    )
+    # The native shape always reports the key, so its absence is meaningful.
+    assert "service_tiers" in cloudrouter_module._probe_custom_models(
+        {"models": [{"slug": "gpt-5.4"}]},
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [{}, {"result": "ok"}, [], None, {"total": 0}],
