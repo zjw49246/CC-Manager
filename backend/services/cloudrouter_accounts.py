@@ -38,8 +38,11 @@ CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
 MODELS_URL = f"{CODEX_BASE_URL}/models"
 USAGE_URL = f"{CODEX_BASE_URL}/usage"
-APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
-APEX_CLAUDE_BASE_URL = "https://api.apexin.ai"
+# Apex migrated from ``api.apexin.ai`` to ``api.apexin.net``.  The old host
+# stays recognised below as a recoverable legacy snapshot so accounts written
+# before the move are migrated instead of failing closed.
+APEX_CODEX_BASE_URL = "https://api.apexin.net/v1"
+APEX_CLAUDE_BASE_URL = "https://api.apexin.net"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
 APIBEST_CLAUDE_BASE_URL = "https://apibest.ai"
@@ -47,17 +50,31 @@ APIBEST_CODEX_BASE_URL = f"{APIBEST_CLAUDE_BASE_URL}/v1"
 APIBEST_MODELS_URL = f"{APIBEST_CODEX_BASE_URL}/models"
 APIBEST_PRICING_URL = f"{APIBEST_CLAUDE_BASE_URL}/api/pricing"
 LEGACY_APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+LEGACY_APEX_APEXIN_AI_BASE_URL = "https://api.apexin.ai"
+LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 LEGACY_APEX_ENDPOINTS = {
     "claude_base_url": None,
     "codex_base_url": LEGACY_APEX_CODEX_BASE_URL,
     "models_url": f"{LEGACY_APEX_CODEX_BASE_URL}/models",
     "usage_url": f"{LEGACY_APEX_CODEX_BASE_URL}/usage",
 }
+# Apex snapshot written while ``api.apexin.ai`` was the current host, before
+# Claude support existed on the gateway (``claude_base_url`` was null).
+# Pinned literally: this must stay the *old* host now that
+# ``APEX_*_BASE_URL`` points at ``api.apexin.net``.
 LEGACY_APEX_CODEX_ONLY_ENDPOINTS = {
     "claude_base_url": None,
-    "codex_base_url": APEX_CODEX_BASE_URL,
-    "models_url": APEX_MODELS_URL,
-    "usage_url": APEX_USAGE_URL,
+    "codex_base_url": LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL,
+    "models_url": f"{LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL}/models",
+    "usage_url": f"{LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL}/usage",
+}
+# Current-until-migration Apex snapshot: the gateway serves both Claude and
+# Codex, so the Claude base URL is populated.
+LEGACY_APEX_APEXIN_AI_ENDPOINTS = {
+    "claude_base_url": LEGACY_APEX_APEXIN_AI_BASE_URL,
+    "codex_base_url": LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL,
+    "models_url": f"{LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL}/models",
+    "usage_url": f"{LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL}/usage",
 }
 # Keep this aligned with the Codex CLI version pinned by scripts/setup.sh and
 # WorkerProvisioner.  Apex exposes the native Codex model catalog endpoint,
@@ -1807,15 +1824,22 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Mismatched API provider metadata: {account_id}"
             )
+        # Recognised pre-migration Apex snapshots.  The sslip.io generation
+        # only ever had Codex; the api.apexin.ai generation existed both
+        # before and after Claude support was added to the gateway, so both
+        # its shapes are admitted and both need the Claude runtime
+        # materialized when it is missing.
         migrate_legacy_apex_endpoints = (
             api_provider == API_PROVIDER_APEX
-            and data.get("endpoints") == LEGACY_APEX_ENDPOINTS
+            and data.get("endpoints")
+            in (LEGACY_APEX_ENDPOINTS, LEGACY_APEX_APEXIN_AI_ENDPOINTS)
         )
         migrate_apex_claude_runtime = (
             api_provider == API_PROVIDER_APEX
             and data.get("endpoints") in (
                 LEGACY_APEX_ENDPOINTS,
                 LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+                LEGACY_APEX_APEXIN_AI_ENDPOINTS,
             )
         )
         if (
@@ -1963,17 +1987,26 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Invalid Apex Claude migration: {account.id}",
             )
-        expected_files = {
-            account.root / "claude" / "settings.json": {
+        # An account written before the api.apexin.ai -> api.apexin.net move
+        # still points at the old host; it is rewritten below, so both the
+        # current and the pre-migration payload are admissible.
+        settings_payloads = (
+            {
                 "env": {"ANTHROPIC_BASE_URL": APEX_CLAUDE_BASE_URL},
                 "apiKeyHelper": _claude_helper_command(account.root),
                 CLAUDE_SKIP_DANGEROUS_PROMPT: True,
             },
-            account.root / "claude" / ".claude.json": {
-                "hasCompletedOnboarding": True,
+            {
+                "env": {"ANTHROPIC_BASE_URL": LEGACY_APEX_APEXIN_AI_BASE_URL},
+                "apiKeyHelper": _claude_helper_command(account.root),
+                CLAUDE_SKIP_DANGEROUS_PROMPT: True,
             },
-        }
-        for path, expected in expected_files.items():
+        )
+        has_onboarding = {"hasCompletedOnboarding": True}
+        for path, expected in (
+            (account.root / "claude" / "settings.json", settings_payloads),
+            (account.root / "claude" / ".claude.json", (has_onboarding,)),
+        ):
             if path.exists() or path.is_symlink():
                 _require_owned_regular(path, 0o600)
                 try:
@@ -1985,13 +2018,16 @@ class CloudRouterAccountStore:
                     raise CloudRouterUnsafePathError(
                         f"Invalid legacy Apex Claude config: {account.id}",
                     ) from exc
-                if current != expected:
+                if current not in expected:
                     raise CloudRouterUnsafePathError(
                         f"Modified legacy Apex Claude config: {account.id}",
                     )
                 continue
             if write_missing:
-                _atomic_private_json(path, expected)
+                _atomic_private_json(
+                    path,
+                    expected[0] if isinstance(expected, tuple) else expected,
+                )
 
     @staticmethod
     def _converge_claude_runtime_settings(
@@ -2017,17 +2053,29 @@ class CloudRouterAccountStore:
                 f"Invalid Claude settings: {account.id}",
             ) from exc
         expected_base_url = API_PROVIDER_SPECS[account.api_provider].claude_base_url
+        # A pre-migration Apex account still routes to the old host.  Admit
+        # that exact value so the rewrite below can move it onto the current
+        # one instead of failing closed; anything else is still rejected.
+        admissible_base_urls = {expected_base_url}
+        if account.api_provider == API_PROVIDER_APEX:
+            admissible_base_urls.add(LEGACY_APEX_APEXIN_AI_BASE_URL)
+        env = settings.get("env") if isinstance(settings, dict) else None
         if (
             not isinstance(settings, dict)
-            or settings.get("env")
-            != {"ANTHROPIC_BASE_URL": expected_base_url}
+            or not isinstance(env, dict)
+            or set(env) != {"ANTHROPIC_BASE_URL"}
+            or env.get("ANTHROPIC_BASE_URL") not in admissible_base_urls
             or settings.get("apiKeyHelper")
             != _claude_helper_command(account.root)
         ):
             raise CloudRouterUnsafePathError(
                 f"Modified Claude API routing: {account.id}",
             )
-        if settings.get(CLAUDE_SKIP_DANGEROUS_PROMPT) is not True:
+        if (
+            settings.get(CLAUDE_SKIP_DANGEROUS_PROMPT) is not True
+            or env.get("ANTHROPIC_BASE_URL") != expected_base_url
+        ):
+            settings["env"] = {"ANTHROPIC_BASE_URL": expected_base_url}
             settings[CLAUDE_SKIP_DANGEROUS_PROMPT] = True
             _atomic_private_json(settings_path, settings)
 
@@ -2128,6 +2176,7 @@ class CloudRouterAccountStore:
         legacy_apex_codex = None
         legacy_apex_endpoint_codex = None
         legacy_apex_endpoint_legacy_codex = None
+        legacy_apex_apexin_ai_codex = None
         if account.api_provider == API_PROVIDER_APEX:
             legacy_apex_codex = {
                 "model_provider": LEGACY_APEX_CODEX_PROVIDER,
@@ -2157,6 +2206,23 @@ class CloudRouterAccountStore:
                     LEGACY_APEX_CODEX_PROVIDER: {
                         **legacy_endpoint_provider,
                         "name": LEGACY_APEX_LABEL,
+                    },
+                },
+            }
+            # The api.apexin.ai generation already used the ``apexrouter``
+            # provider id, but still pointed at the old host.  Admit the
+            # legacy host for both provider ids so the config is rewritten
+            # onto api.apexin.net instead of failing closed.
+            legacy_apexin_ai_provider = {
+                **expected_provider,
+                "base_url": LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL,
+            }
+            legacy_apex_apexin_ai_codex = {
+                "model_provider": spec.codex_provider,
+                "model_providers": {
+                    spec.codex_provider: legacy_apexin_ai_provider,
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **legacy_apexin_ai_provider,
                     },
                 },
             }
@@ -2195,6 +2261,10 @@ class CloudRouterAccountStore:
             or (
                 legacy_apex_endpoint_legacy_codex is not None
                 and codex == legacy_apex_endpoint_legacy_codex
+            )
+            or (
+                legacy_apex_apexin_ai_codex is not None
+                and codex == legacy_apex_apexin_ai_codex
             )
         )
         if (

@@ -45,10 +45,33 @@ MODELS = {
 
 
 def test_apex_gateway_uses_apexin_endpoint():
-    assert APEX_CLAUDE_BASE_URL == "https://api.apexin.ai"
-    assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
-    assert APEX_MODELS_URL == "https://api.apexin.ai/v1/models"
-    assert APEX_USAGE_URL == "https://api.apexin.ai/v1/usage"
+    assert APEX_CLAUDE_BASE_URL == "https://api.apexin.net"
+    assert APEX_CODEX_BASE_URL == "https://api.apexin.net/v1"
+    assert APEX_MODELS_URL == "https://api.apexin.net/v1/models"
+    assert APEX_USAGE_URL == "https://api.apexin.net/v1/usage"
+
+
+def test_legacy_apexin_ai_snapshots_stay_pinned_to_the_old_host():
+    """The pre-migration snapshots must not follow the canonical constants."""
+
+    assert cloudrouter_module.LEGACY_APEX_APEXIN_AI_BASE_URL == "https://api.apexin.ai"
+    assert (
+        cloudrouter_module.LEGACY_APEX_APEXIN_AI_CODEX_BASE_URL
+        == "https://api.apexin.ai/v1"
+    )
+    assert cloudrouter_module.LEGACY_APEX_APEXIN_AI_ENDPOINTS == {
+        "claude_base_url": "https://api.apexin.ai",
+        "codex_base_url": "https://api.apexin.ai/v1",
+        "models_url": "https://api.apexin.ai/v1/models",
+        "usage_url": "https://api.apexin.ai/v1/usage",
+    }
+    assert cloudrouter_module.LEGACY_APEX_CODEX_ONLY_ENDPOINTS == {
+        "claude_base_url": None,
+        "codex_base_url": "https://api.apexin.ai/v1",
+        "models_url": "https://api.apexin.ai/v1/models",
+        "usage_url": "https://api.apexin.ai/v1/usage",
+    }
+    assert cloudrouter_module.LEGACY_APEX_APEXIN_AI_ENDPOINTS != APEX_CLAUDE_BASE_URL
 
 
 def test_api_auth_kind_is_limited_to_registered_gateways():
@@ -212,7 +235,9 @@ async def test_legacy_codex_only_apex_account_adds_safe_claude_runtime(
     onboarding_path.unlink()
     metadata_path = account.root / "account.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata["endpoints"]["claude_base_url"] = None
+    metadata["endpoints"] = dict(
+        cloudrouter_module.LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+    )
     metadata_path.write_text(json.dumps(metadata))
 
     migrated = store.reload()[0]
@@ -293,7 +318,9 @@ async def test_legacy_codex_only_apex_rejects_existing_claude_redirect(
     settings_path.write_text(json.dumps(settings))
     metadata_path = account.root / "account.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata["endpoints"]["claude_base_url"] = None
+    metadata["endpoints"] = dict(
+        cloudrouter_module.LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+    )
     metadata_path.write_text(json.dumps(metadata))
 
     with pytest.raises(
