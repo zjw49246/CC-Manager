@@ -1568,7 +1568,7 @@ class TestChatTransientRetryCodex:
 
 
 class _FakeCloudRouterAccount:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, base_url: str | None = None):
         self.id = "cloudrouter-1"
         self.name = "CloudRouter test"
         self.auth_kind = "cloudrouter_api"
@@ -1580,6 +1580,8 @@ class _FakeCloudRouterAccount:
             "codex": [],
         }
         self.root = root
+        # Preset providers leave this unset; only a custom account sets it.
+        self.base_url = base_url
         self.claude_config_dir = str(root / "claude")
         self.codex_home = str(root / "codex")
 
@@ -1707,6 +1709,30 @@ class TestCloudRouterClaudeProjection:
         assert public["api_provider"] == "cloudrouter"
         assert public["api_account_id"] == "cloudrouter-1"
         assert public["supported_models"] == ["claude-sonnet-5"]
+        assert public["base_url"] is None
+
+    def test_pool_projection_carries_a_custom_accounts_own_gateway(
+        self, tmp_path
+    ):
+        """``/usage`` must be able to name which gateway a key belongs to."""
+
+        account = _FakeCloudRouterAccount(
+            tmp_path / "custom-1",
+            base_url="https://gateway.example.com",
+        )
+        account.id = "custom-1"
+        account.name = "Vendor X"
+        account.auth_kind = "custom_api"
+        account.api_provider = "custom"
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account),
+            bootstrap_default=False,
+        )
+
+        public = pool.list_accounts()[0]
+        assert public["api_provider"] == "custom"
+        assert public["base_url"] == "https://gateway.example.com"
 
     @pytest.mark.asyncio
     async def test_api_usage_uses_store_and_known_exhaustion_blocks_selection(

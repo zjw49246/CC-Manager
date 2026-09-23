@@ -62,6 +62,30 @@ describe('API account compatibility routing', () => {
     );
   });
 
+  it('creates a custom account with its own gateway and quota endpoint', async () => {
+    await api.createCloudRouterAccount({
+      name: 'Vendor X',
+      api_key: 'sk_test_only_not_real',
+      api_provider: 'custom',
+      base_url: 'https://gateway.example.com',
+      usage_url: '/api/quota',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/cloudrouter/accounts',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          name: 'Vendor X',
+          api_key: 'sk_test_only_not_real',
+          api_provider: 'custom',
+          base_url: 'https://gateway.example.com',
+          usage_url: '/api/quota',
+        }),
+      }),
+    );
+  });
+
   it('encodes account ids for refresh and safe retirement', async () => {
     await api.refreshCloudRouterAccount('api/account 1');
     await api.deleteCloudRouterAccount('api/account 1');

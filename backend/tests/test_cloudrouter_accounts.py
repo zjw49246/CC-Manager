@@ -35,6 +35,11 @@ from backend.services.cloudrouter_accounts import (
     CloudRouterAccountStore,
     CloudRouterUnsafePathError,
     CloudRouterUpstreamError,
+    custom_provider_spec,
+)
+from backend.services.cloudrouter_accounts import (
+    _normalise_custom_base_url,
+    _normalise_custom_usage_url,
 )
 
 
@@ -3279,3 +3284,531 @@ async def test_retire_rejects_symlink_credential_without_following_it(
     assert pending.retired is True
     assert pending.cleanup_pending is True
     assert external.read_text() == "outside"
+
+
+# --- Custom (administrator-supplied) gateways -------------------------------
+
+
+CUSTOM_BASE_URL = "https://gateway.example.com"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://api.example.com",
+        "https://api.example.com/",
+        "HTTPS://API.EXAMPLE.COM",
+        "http://10.0.0.5:8080",
+        "http://192.168.1.20:3000/gateway",
+        "https://api.example.com/v1/anthropic",
+    ],
+)
+def test_custom_base_url_accepts_self_hosted_and_lan_gateways(value):
+    """A self-hosted gateway is a supported target, LAN addresses included."""
+
+    assert _normalise_custom_base_url(value).startswith(("http://", "https://"))
+
+
+def test_custom_base_url_normalises_equivalents_to_one_snapshot():
+    assert (
+        _normalise_custom_base_url("HTTPS://API.Example.com:443/")
+        == _normalise_custom_base_url("https://api.example.com")
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("", "required"),
+        ("ftp://api.example.com", "http or https"),
+        ("https://user:pw@api.example.com", "credentials"),
+        ("https://api.example.com?token=1", "query or fragment"),
+        ("https://api.example.com#frag", "query or fragment"),
+        ("https://localhost", "local host"),
+        ("https://127.0.0.1", "loopback"),
+        ("https://[::1]:8080", "loopback"),
+        ("https://169.254.169.254", "metadata"),
+        ("https://api.example.com/a/../b", "path"),
+        ("https://api.example.com//a", "path"),
+        ("https://api.example.com/a\\b", "backslash"),
+        ("https://api.example.com/a\x01b", "control"),
+    ],
+)
+def test_custom_base_url_rejects_unsafe_shapes(value, reason):
+    """Traversal, embedded credentials, and metadata targets stay refused."""
+
+    with pytest.raises(ValueError, match=reason):
+        _normalise_custom_base_url(value)
+
+
+def test_custom_usage_url_accepts_absolute_or_relative_forms():
+    assert _normalise_custom_usage_url(None) is None
+    assert _normalise_custom_usage_url("  ") is None
+    assert _normalise_custom_usage_url("/api/quota") == "/api/quota"
+    assert (
+        _normalise_custom_usage_url("https://quota.example.com/v1/usage")
+        == "https://quota.example.com/v1/usage"
+    )
+    with pytest.raises(ValueError, match="absolute URL or start with"):
+        _normalise_custom_usage_url("api/quota")
+    with pytest.raises(ValueError, match="path is invalid"):
+        _normalise_custom_usage_url("/api/../quota")
+
+
+def test_custom_provider_spec_derives_every_endpoint():
+    spec = custom_provider_spec(CUSTOM_BASE_URL)
+    assert spec.claude_base_url == CUSTOM_BASE_URL
+    assert spec.codex_base_url == f"{CUSTOM_BASE_URL}/v1"
+    assert spec.models_url == f"{CUSTOM_BASE_URL}/v1/models"
+    assert spec.usage_url == f"{CUSTOM_BASE_URL}/v1/usage"
+    assert spec.base_url == CUSTOM_BASE_URL
+    assert spec.label == "gateway.example.com"
+    # The gateway host names the account, so the build never derives the
+    # Codex provider id from it.
+    assert spec.codex_provider == "custom"
+
+
+def test_custom_provider_spec_honours_a_usage_path_override():
+    relative = custom_provider_spec(CUSTOM_BASE_URL, usage_url="/api/quota")
+    assert relative.usage_url == f"{CUSTOM_BASE_URL}/api/quota"
+    assert relative.usage_path == "/api/quota"
+    absolute = custom_provider_spec(
+        CUSTOM_BASE_URL, usage_url="https://quota.example.com/v1/usage",
+    )
+    assert absolute.usage_url == "https://quota.example.com/v1/usage"
+    assert absolute.usage_path is None
+
+
+def test_custom_base_url_is_not_a_registered_preset_provider():
+    """``custom`` has no pinned spec; its endpoints always come from the store."""
+
+    assert "custom" not in cloudrouter_module.API_PROVIDER_SPECS
+    assert "custom" in cloudrouter_module.API_PROVIDER_IDS
+    assert cloudrouter_module.is_api_auth_kind("custom_api")
+
+
+@pytest.mark.asyncio
+async def test_add_custom_builds_a_gateway_scoped_dual_provider_home(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={
+            "claude": ["claude-opus-4-8"],
+            "codex": ["gpt-5.4"],
+        }),
+    )
+
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    root = account.root
+
+    assert account.id == "custom-1"
+    assert account.api_provider == "custom"
+    assert account.auth_kind == "custom_api"
+    assert account.providers == ["claude", "codex"]
+    assert account.base_url == CUSTOM_BASE_URL
+    settings = json.loads((root / "claude" / "settings.json").read_text())
+    assert settings["env"] == {"ANTHROPIC_BASE_URL": CUSTOM_BASE_URL}
+    assert settings["apiKeyHelper"] == cloudrouter_module._claude_helper_command(root)
+
+    metadata = json.loads((root / "account.json").read_text())
+    assert metadata["api_provider"] == "custom"
+    assert metadata["base_url"] == CUSTOM_BASE_URL
+    assert metadata["usage_path"] is None
+    assert metadata["endpoints"] == {
+        "claude_base_url": CUSTOM_BASE_URL,
+        "codex_base_url": f"{CUSTOM_BASE_URL}/v1",
+        "models_url": f"{CUSTOM_BASE_URL}/v1/models",
+        "usage_url": f"{CUSTOM_BASE_URL}/v1/usage",
+    }
+    assert "sk-custom-secret" not in json.dumps(metadata)
+
+    codex_config = (root / "codex" / "config.toml").read_text()
+    assert 'model_provider = "custom"' in codex_config
+    assert f'base_url = "{CUSTOM_BASE_URL}/v1"' in codex_config
+    assert 'name = "gateway.example.com"' in codex_config
+    assert "sk-custom-secret" not in codex_config
+    assert os.popen(str(root / "key-helper")).read() == "sk-custom-secret"
+
+
+@pytest.mark.asyncio
+async def test_custom_account_survives_reload_from_its_own_metadata(
+    tmp_path, monkeypatch,
+):
+    """The base URL is the account's only endpoint source, so reload must work."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+        usage_url="/api/quota",
+    )
+
+    reloaded = CloudRouterAccountStore(tmp_path / "accounts").reload()
+
+    assert [item.id for item in reloaded] == ["custom-1"]
+    restored = reloaded[0]
+    assert restored.base_url == CUSTOM_BASE_URL
+    assert restored.usage_path == "/api/quota"
+    assert restored.spec.usage_url == f"{CUSTOM_BASE_URL}/api/quota"
+    assert restored.spec.codex_base_url == account.spec.codex_base_url
+
+
+@pytest.mark.asyncio
+async def test_preset_provider_rejects_a_custom_url(tmp_path, monkeypatch):
+    """Preset accounts pin their endpoints, so an extra URL is a caller bug."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    with pytest.raises(ValueError, match="custom API account"):
+        await store.add_account(
+            "Primary API",
+            "cr-secret-value",
+            api_provider="cloudrouter",
+            base_url=CUSTOM_BASE_URL,
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_account_without_a_base_url_is_rejected(tmp_path, monkeypatch):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+    with pytest.raises(ValueError, match="required"):
+        await store.add_account("Vendor X", "sk-custom-secret", api_provider="custom")
+
+
+@pytest.mark.asyncio
+async def test_custom_account_redirected_gateway_fails_closed(tmp_path, monkeypatch):
+    """Redirecting a custom account's gateway must not silently take effect."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["base_url"] = "https://attacker.example.com"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(CloudRouterUnsafePathError):
+        CloudRouterAccountStore(tmp_path / "accounts").reload()
+
+
+@pytest.mark.asyncio
+async def test_custom_account_settings_redirect_fails_closed(tmp_path, monkeypatch):
+    """The Claude runtime must route to the account's own gateway exactly."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": ["claude-opus-4-8"], "codex": []}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    settings_path = account.root / "claude" / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    settings["env"] = {"ANTHROPIC_BASE_URL": "https://attacker.example.com"}
+    settings_path.write_text(json.dumps(settings))
+
+    with pytest.raises(CloudRouterUnsafePathError):
+        CloudRouterAccountStore(tmp_path / "accounts").reload()
+
+
+def test_probe_custom_models_merges_both_catalog_shapes():
+    merged = cloudrouter_module._probe_custom_models({
+        "data": [{"id": "claude-sonnet-5"}],
+        "models": [{"slug": "gpt-5.4"}],
+    })
+    assert merged["claude"] == ["claude-sonnet-5"]
+    assert merged["codex"] == ["gpt-5.4"]
+
+
+def test_probe_custom_models_projects_either_shape_alone():
+    assert cloudrouter_module._probe_custom_models(
+        {"data": [{"id": "claude-sonnet-5"}]},
+    )["claude"] == ["claude-sonnet-5"]
+    assert cloudrouter_module._probe_custom_models(
+        {"models": [{"slug": "gpt-5.4"}]},
+    )["codex"] == ["gpt-5.4"]
+
+
+def test_probe_custom_models_refuses_an_unrecognised_catalog():
+    with pytest.raises(CloudRouterUpstreamError, match="invalid_models_response"):
+        cloudrouter_module._probe_custom_models({"result": "ok"})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"result": "ok"}, [], None, {"total": 0}],
+)
+def test_custom_usage_shape_refuses_to_guess(payload):
+    """An unknown quota document must never read as verified-clear quota."""
+
+    assert cloudrouter_module._custom_usage_shape(payload) == "unsupported"
+    with pytest.raises(
+        CloudRouterUpstreamError, match="unsupported_usage_response",
+    ):
+        cloudrouter_module._normalise_custom_usage("custom-1", payload)
+
+
+def test_custom_usage_shape_detects_the_shared_group_protocol():
+    payload = {"used": {}, "remaining": {}, "limits": {}}
+    assert cloudrouter_module._custom_usage_shape(payload) == "shared_group"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "unrestricted"},
+        {"quota": {"used": 1, "limit": 10}},
+        {"status": "active", "isValid": True},
+        {"subscription": {"daily_usage_usd": 1}},
+    ],
+)
+def test_custom_usage_shape_detects_the_router_protocol(payload):
+    assert cloudrouter_module._custom_usage_shape(payload) == "router"
+
+
+@pytest.mark.asyncio
+async def test_custom_usage_unknown_payload_is_reported_unknown_not_zero(
+    tmp_path, monkeypatch,
+):
+    """A gateway whose quota document is unrecognised must not read as $0."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    monkeypatch.setattr(
+        store, "_request_json", AsyncMock(return_value={"result": "ok"}),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["known"] is False
+    assert snapshot["reason"] == "unsupported_usage_response"
+    assert snapshot.get("quota") in (None, {})
+    assert snapshot.get("balance") is None
+
+
+@pytest.mark.asyncio
+async def test_custom_usage_parses_a_router_protocol_payload(tmp_path, monkeypatch):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "mode": "quota_limited",
+            "status": "active",
+            "quota": {"used": 2, "limit": 10, "remaining": 8},
+        }),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    assert snapshot["known"] is True
+    assert snapshot["quota"]["limit"] == 10
+    assert snapshot["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_custom_usage_parses_a_shared_group_payload(tmp_path, monkeypatch):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "key_name": "vendor-key",
+            "group_name": "vendor-group",
+            "used": {
+                "requests_5h": 3,
+                "requests_day": 7,
+                "tokens_day": 1_000,
+                "tokens_month": 2_000,
+            },
+            "remaining": {
+                "requests_5h": 24_000,
+                "requests_day": 49_000,
+                "tokens_day": 9_000_000,
+                "tokens_month": 90_000_000,
+            },
+            "limits": {
+                "requests_5h": 25_000,
+                "requests_day": 50_000,
+                "tokens_day": 10_000_000,
+                "tokens_month": 100_000_000,
+                "concurrency": 20,
+            },
+        }),
+    )
+
+    snapshot = await store.fetch_usage(account.id, force=True)
+
+    # The shared-group protocol keeps this Key's own usage separate from the
+    # group limits, exactly as it does for Apex.
+    assert snapshot["known"] is True
+    assert snapshot["key_usage"]["requests_5h"] == 3
+    assert all(window["scope"] == "group" for window in snapshot["windows"])
+
+
+@pytest.mark.asyncio
+async def test_custom_usage_honours_an_explicit_usage_url(tmp_path, monkeypatch):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Vendor X",
+        "sk-custom-secret",
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+        usage_url="/api/user/quota",
+    )
+    request = AsyncMock(return_value={"mode": "unrestricted"})
+    monkeypatch.setattr(store, "_request_json", request)
+
+    await store.fetch_usage(account.id, force=True)
+
+    assert request.await_args.args[0] == f"{CUSTOM_BASE_URL}/api/user/quota"
+
+
+@pytest.mark.asyncio
+async def test_custom_models_probe_uses_its_own_gateway(tmp_path, monkeypatch):
+    """The catalog probe must never reach a preset provider's host."""
+
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    request = AsyncMock(return_value={"data": [{"id": "gpt-5.4"}]})
+    monkeypatch.setattr(store, "_request_json", request)
+
+    models = await store.probe_models(
+        "sk-custom-secret",
+        api_provider="custom",
+        spec=custom_provider_spec(CUSTOM_BASE_URL),
+    )
+
+    assert models["codex"] == ["gpt-5.4"]
+    assert request.await_args.args[0] == f"{CUSTOM_BASE_URL}/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_custom_account_numbers_share_one_namespace(tmp_path, monkeypatch):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    first = await store.add_account(
+        "Vendor X", "sk-one", api_provider="custom", base_url=CUSTOM_BASE_URL,
+    )
+    second = await store.add_account(
+        "Vendor Y",
+        "sk-two",
+        api_provider="custom",
+        base_url="https://other.example.com",
+    )
+
+    assert (first.id, second.id) == ("custom-1", "custom-2")
+
+
+@pytest.mark.asyncio
+async def test_api_accepts_a_custom_account_and_requires_its_base_url(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={"mode": "unrestricted"}),
+    )
+    monkeypatch.setattr(cloudrouter_api, "_get_store", lambda: store)
+    monkeypatch.setattr(cloudrouter_api, "_reload_runtime_pools", lambda: None)
+
+    body = cloudrouter_api.CloudRouterAccountCreate(
+        name="Vendor X",
+        api_key=SecretStr("sk-custom-secret"),
+        api_provider="custom",
+        base_url=CUSTOM_BASE_URL,
+        usage_url="/api/quota",
+    )
+    created = await cloudrouter_api.create_account(_admin_request(), body)
+
+    assert created["api_provider"] == "custom"
+    assert created["base_url"] == CUSTOM_BASE_URL
+    assert created["endpoints"]["usage_url"] == f"{CUSTOM_BASE_URL}/api/quota"
+
+    # A custom account without a gateway is refused as an invalid request.
+    with pytest.raises(HTTPException) as excinfo:
+        await cloudrouter_api.create_account(
+            _admin_request(),
+            cloudrouter_api.CloudRouterAccountCreate(
+                name="Vendor Y",
+                api_key=SecretStr("sk-custom-secret"),
+                api_provider="custom",
+            ),
+        )
+    assert excinfo.value.status_code == 422

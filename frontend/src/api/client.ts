@@ -2016,7 +2016,7 @@ export interface CloudRouterModelMap {
   codex: string[];
 }
 
-export type ApiAccountProvider = 'cloudrouter' | 'apex' | 'apibest';
+export type ApiAccountProvider = 'cloudrouter' | 'apex' | 'apibest' | 'custom';
 
 export interface ApiAccountCleanupDiagnostics {
   cleanup_pending?: boolean;
@@ -2040,7 +2040,7 @@ export interface CloudRouterAccount extends ApiAccountCleanupDiagnostics {
   id: string;
   name: string;
   api_provider: ApiAccountProvider;
-  auth_kind: 'cloudrouter_api' | 'apex_api' | 'apibest_api';
+  auth_kind: 'cloudrouter_api' | 'apex_api' | 'apibest_api' | 'custom_api';
   enabled: boolean;
   retired: boolean;
   key_hint: string;
@@ -2053,6 +2053,10 @@ export interface CloudRouterAccount extends ApiAccountCleanupDiagnostics {
   codex_home: string;
   supported_models: string[];
   endpoints: Record<string, string | null>;
+  /** Custom accounts only: the administrator-supplied gateway. */
+  base_url?: string | null;
+  /** Custom accounts only: a quota path relative to `base_url`, when set. */
+  usage_path?: string | null;
   api_quota?: CloudRouterApiQuota | null;
 }
 
@@ -2069,6 +2073,8 @@ export interface CloudRouterAccountProjection extends ApiAccountCleanupDiagnosti
   retired?: boolean;
   supported_models?: string[];
   service_tiers?: Record<string, string[]>;
+  /** Custom accounts only: the administrator-supplied gateway. */
+  base_url?: string | null;
   api_quota?: CloudRouterApiQuota | null;
 }
 
@@ -2531,6 +2537,10 @@ export const api = {
     name: string;
     api_key: string;
     api_provider?: ApiAccountProvider;
+    /** Required when `api_provider` is `custom`. */
+    base_url?: string;
+    /** Optional quota endpoint override for a custom gateway. */
+    usage_url?: string;
   }) =>
     request<CloudRouterAccount>('/api/cloudrouter/accounts', {
       method: 'POST',

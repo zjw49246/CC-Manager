@@ -1,7 +1,10 @@
 """Administrative API for managed API-gateway Claude/Codex accounts.
 
 The historical route is retained so existing CloudRouter clients continue to
-work; ``api_provider`` selects CloudRouter, ApexRouter, or APIBest.
+work; ``api_provider`` selects CloudRouter, ApexRouter, APIBest, or ``custom``.
+A custom account names its own gateway through ``base_url`` and is validated
+the same way a preset provider is: one exact URL snapshot per account, with
+the Claude/Codex runtime files required to match it.
 """
 
 from __future__ import annotations
@@ -31,7 +34,13 @@ router = APIRouter(
 class CloudRouterAccountCreate(BaseModel):
     name: str
     api_key: SecretStr
-    api_provider: Literal["cloudrouter", "apex", "apibest"] = "cloudrouter"
+    api_provider: Literal["cloudrouter", "apex", "apibest", "custom"] = "cloudrouter"
+    # Required for ``custom``: the gateway the administrator is adding.  A
+    # preset provider pins these in the service module and may omit them.
+    base_url: str | None = None
+    # Optional quota endpoint for ``custom``; either an absolute URL or a path
+    # relative to ``base_url``.  Defaults to ``<base_url>/v1/usage``.
+    usage_url: str | None = None
 
 
 def _get_store() -> CloudRouterAccountStore:
@@ -157,6 +166,8 @@ async def create_account(request: Request, body: CloudRouterAccountCreate):
             body.name,
             body.api_key.get_secret_value(),
             api_provider=body.api_provider,
+            base_url=body.base_url,
+            usage_url=body.usage_url,
         )
         quota = await store.fetch_usage(account.id, force=True)
         _reload_runtime_pools()
@@ -264,9 +275,10 @@ async def _runtime_retirement_fence(account, store):
                     )
                 # Shared-project containers are a Claude-only execution path.
                 # ApexRouter has never exposed a Claude route, so no CCM
-                # container can mount its account root. CloudRouter must scan
-                # even if a later model refresh removed all Claude models,
-                # because an older idle container may retain the mount.
+                # container can mount its account root. Every other provider
+                # -- including a custom gateway, which may serve Claude -- must
+                # scan even if a later model refresh removed all Claude
+                # models, because an older idle container may retain the mount.
                 if account.api_provider != "apex":
                     await (
                         runtime.instance_manager

@@ -363,6 +363,7 @@ class PoolAccount:
         "display_name",
         "api_account_id",
         "supported_models",
+        "base_url",
         "_api_account",
     )
 
@@ -386,6 +387,9 @@ class PoolAccount:
         )
         self.api_account_id: str | None = data.get("api_account_id")
         self.supported_models: list[str] | None = data.get("supported_models")
+        # Custom API accounts name their own gateway, so the pool projection
+        # has to carry it for the account list to stay distinguishable.
+        self.base_url: str | None = data.get("base_url")
         self._api_account = data.get("_api_account")
 
     @classmethod
@@ -418,6 +422,7 @@ class PoolAccount:
             "display_name": account.name,
             "api_account_id": account.id,
             "supported_models": list((account.models or {}).get("claude", [])),
+            "base_url": getattr(account, "base_url", None),
             "_api_account": account,
         })
 
@@ -639,6 +644,7 @@ class ClaudePool:
                 "display_name": a.display_name,
                 "api_account_id": a.api_account_id,
                 "supported_models": a.supported_models,
+                "base_url": a.base_url,
                 "api_quota": self._api_quota_cache.get(a.id),
             })
         return result
@@ -1229,6 +1235,7 @@ class ClaudePool:
                     "display_name": account.display_name,
                     "api_account_id": account.api_account_id,
                     "supported_models": account.supported_models,
+                    "base_url": account.base_url,
                     "api_quota": None}
             # Disabled (retired) accounts make zero outbound requests: don't read
             # their credentials, don't refresh their OAuth token, don't hit the

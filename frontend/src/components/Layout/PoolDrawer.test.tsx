@@ -560,6 +560,107 @@ describe('PoolDrawer', () => {
       });
     });
 
+    it('adds a custom third-party gateway from a URL and key', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'custom-1',
+        name: 'Vendor X',
+        api_provider: 'custom',
+        auth_kind: 'custom_api',
+        base_url: 'https://gateway.example.com',
+        models: {
+          claude: ['claude-opus-4-8'],
+          codex: ['gpt-5.4'],
+        },
+        providers: ['claude', 'codex'],
+        supported_models: ['claude-opus-4-8', 'gpt-5.4'],
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'custom');
+
+      // The gateway URL is what makes a custom account, so the form must ask
+      // for it and say how the optional quota override is resolved.
+      expect(screen.getByLabelText('API 地址')).toBeInTheDocument();
+      expect(screen.getByLabelText('额度查询地址（可选）')).toBeInTheDocument();
+      expect(screen.getByText(/自动识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
+      expect(screen.getByText(/无法识别时会显示“无法确认”，不会当作 \$0/)).toBeInTheDocument();
+
+      await user.type(screen.getByLabelText('账号名称'), 'Vendor X');
+      await user.type(
+        screen.getByLabelText('API 地址'), 'https://gateway.example.com',
+      );
+      await user.type(
+        screen.getByLabelText('额度查询地址（可选）'), '/api/quota',
+      );
+      await user.type(screen.getByLabelText('自定义 API Key'), 'sk_test_only_not_real');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'Vendor X',
+          api_key: 'sk_test_only_not_real',
+          api_provider: 'custom',
+          base_url: 'https://gateway.example.com',
+          usage_url: '/api/quota',
+        });
+      });
+    });
+
+    it('omits the optional quota path when a custom gateway leaves it blank', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'custom-1',
+        name: 'Vendor X',
+        api_provider: 'custom',
+        auth_kind: 'custom_api',
+        base_url: 'https://gateway.example.com',
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'custom');
+
+      await user.type(screen.getByLabelText('账号名称'), 'Vendor X');
+      await user.type(
+        screen.getByLabelText('API 地址'), 'https://gateway.example.com',
+      );
+      await user.type(screen.getByLabelText('自定义 API Key'), 'sk_test_only_not_real');
+
+      const submit = screen.getByRole('button', { name: '验证并添加' });
+      expect(submit).toBeEnabled();
+      await user.click(submit);
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'Vendor X',
+          api_key: 'sk_test_only_not_real',
+          api_provider: 'custom',
+          base_url: 'https://gateway.example.com',
+        });
+      });
+    });
+
+    it('blocks a custom submission until a gateway URL is supplied', async () => {
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'custom');
+
+      await user.type(screen.getByLabelText('账号名称'), 'Vendor X');
+      await user.type(screen.getByLabelText('自定义 API Key'), 'sk_test_only_not_real');
+
+      expect(screen.getByRole('button', { name: '验证并添加' })).toBeDisabled();
+      expect(api.createCloudRouterAccount).not.toHaveBeenCalled();
+    });
+
     it('adds an APIBest key as a dual-provider API account', async () => {
       vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
         ...apiAccount,

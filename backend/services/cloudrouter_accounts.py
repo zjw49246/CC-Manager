@@ -83,6 +83,7 @@ APEX_CODEX_CLIENT_VERSION = "0.147.0"
 API_PROVIDER_CLOUDROUTER = "cloudrouter"
 API_PROVIDER_APEX = "apex"
 API_PROVIDER_APIBEST = "apibest"
+API_PROVIDER_CUSTOM = "custom"
 APEX_CODEX_PROVIDER = "apexrouter"
 # Existing installs may already have the pre-rename provider in their managed
 # config. Accept only its exact CCM-owned shape and atomically rewrite it.
@@ -106,6 +107,14 @@ class ApiProviderSpec:
     models_url: str
     usage_url: str | None
     claude_base_url: str | None = None
+    # Set only for custom accounts, whose endpoints are administrator-supplied
+    # rather than pinned in this module.  ``base_url`` is persisted in
+    # account.json and re-validated on every load.
+    base_url: str | None = None
+    # A custom account may point its quota lookup at a path relative to its own
+    # base URL; this retains that relative form so refresh can re-derive it
+    # without reparsing the absolute URL.
+    usage_path: str | None = None
 
     @property
     def endpoints(self) -> dict[str, str | None]:
@@ -115,6 +124,10 @@ class ApiProviderSpec:
             "models_url": self.models_url,
             "usage_url": self.usage_url,
         }
+
+    @property
+    def is_custom(self) -> bool:
+        return self.id == API_PROVIDER_CUSTOM
 
 
 API_PROVIDER_SPECS = {
@@ -149,8 +162,11 @@ API_PROVIDER_SPECS = {
         usage_url=None,
     ),
 }
+# Custom accounts carry their own gateway. Cache the spec object so repeated
+# lookups stay identity-stable for the pinned ``custom-N`` directory order.
+_CUSTOM_SPEC_CACHE: dict[str, ApiProviderSpec] = {}
 ACCOUNT_ID_RE = re.compile(
-    r"^(?P<provider>cloudrouter|apex|apibest)-(?P<number>[1-9][0-9]*)$"
+    r"^(?P<provider>cloudrouter|apex|apibest|custom)-(?P<number>[1-9][0-9]*)$"
 )
 MAX_METADATA_BYTES = 256 * 1024
 MAX_API_RESPONSE_BYTES = 1024 * 1024
@@ -234,9 +250,206 @@ def _sanitise_cleanup_reason(value: object) -> str:
     return reason or "API account cleanup is blocked"
 
 
+MAX_CUSTOM_BASE_URL_BYTES = 2048
+MAX_CUSTOM_LABEL_BYTES = 60
+# Hosts a custom account must never be pointed at.  The gateway URL becomes
+# ``ANTHROPIC_BASE_URL`` and an outbound Codex ``base_url``, so a loopback or
+# link-local target would turn account validation into a request against the
+# CCM host or its metadata service.
+_BLOCKED_CUSTOM_HOSTS = frozenset({
+    "localhost",
+    "localhost.localdomain",
+    "metadata.google.internal",
+})
+
+
+def _normalise_custom_base_url(value: str | None) -> str:
+    """Validate an administrator-supplied gateway base URL.
+
+    Both ``https://`` and plain ``http://`` are accepted because self-hosted
+    gateways are a supported target, and a bare IP literal is allowed for the
+    same reason -- including RFC1918 ranges, which is how a LAN gateway is
+    reached.  What is refused is anything that could smuggle a second request
+    or a credential into the derived endpoint URLs (query, fragment, embedded
+    userinfo, duplicate or relative path segments), and anything pointing back
+    at the CCM host or a cloud metadata service, which would turn account
+    validation into a request against CCM itself.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("API base URL is required")
+    if len(raw.encode("utf-8")) > MAX_CUSTOM_BASE_URL_BYTES:
+        raise ValueError("API base URL is too long")
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        # A control character would let a stored URL render misleadingly in
+        # the admin UI while still reaching the gateway.
+        raise ValueError("API base URL contains control characters")
+    if "\\" in raw:
+        raise ValueError("API base URL must not contain a backslash")
+    # Inspect the raw text first: httpx normalises ``/a/../b`` to ``/b`` while
+    # parsing, which would hide a traversal attempt from the path check below.
+    raw_path = raw.split("://", 1)[-1].split("/", 1)
+    raw_path = f"/{raw_path[1]}" if len(raw_path) == 2 else ""
+    if raw_path.endswith("/?"):
+        raw_path = raw_path[:-1]
+    if any(part in {".", ".."} for part in raw_path.split("/")):
+        raise ValueError("API base URL path is invalid")
+    try:
+        parsed = httpx.URL(raw)
+        scheme = parsed.scheme.lower()
+        host = parsed.host
+        port = parsed.port
+        userinfo = parsed.userinfo
+        path = parsed.path or ""
+        query = parsed.query
+        fragment = parsed.fragment
+    except (httpx.InvalidURL, ValueError) as exc:
+        raise ValueError("API base URL is not a valid URL") from exc
+    if scheme not in {"https", "http"}:
+        raise ValueError("API base URL must use http or https")
+    if userinfo:
+        # Credentials embedded in the URL would bypass the key-helper and be
+        # persisted in clear text inside account.json.
+        raise ValueError("API base URL must not contain credentials")
+    if query or fragment:
+        raise ValueError("API base URL must not contain a query or fragment")
+    if not host:
+        raise ValueError("API base URL must include a host")
+    if any(character.isspace() for character in host):
+        raise ValueError("API base URL host is invalid")
+    if host.lower() in _BLOCKED_CUSTOM_HOSTS:
+        raise ValueError("API base URL must not target the local host")
+    if _is_blocked_custom_address(host):
+        raise ValueError(
+            "API base URL must not target a loopback, link-local, or "
+            "metadata address"
+        )
+    if path in {"", "/"}:
+        path = ""
+    else:
+        path = path.rstrip("/")
+        if "//" in path:
+            raise ValueError("API base URL path is invalid")
+    # A default port is not part of the gateway's identity: ``https://x:443``
+    # and ``https://x`` address the same host, so collapsing them keeps one
+    # account from looking like two distinct endpoints.
+    if port == (443 if scheme == "https" else 80):
+        port = None
+    # A parsed IPv6 host drops its brackets, so re-add them before the URL is
+    # rebuilt or the result would be unparseable.
+    rendered_host = f"[{host}]" if ":" in host else host
+    rendered_port = f":{port}" if port is not None else ""
+    return f"{scheme}://{rendered_host}{rendered_port}{path}"
+
+
+def _is_blocked_custom_address(host: str) -> bool:
+    """Reject addresses that resolve to the CCM host or a metadata service.
+
+    Loopback and link-local are refused outright.  Private ranges are
+    deliberately *allowed*: a self-hosted gateway on a LAN is a supported
+    target, and the administrator supplying the URL is the same principal who
+    may read the API key.
+    """
+
+    import ipaddress
+
+    candidate = host.strip("[]")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    if address.is_loopback or address.is_link_local:
+        return True
+    # ``::`` and its IPv6 siblings carry no routable meaning here.
+    if address.is_unspecified:
+        return True
+    return isinstance(address, ipaddress.IPv6Address) and address.is_site_local
+
+
+def _normalise_custom_usage_url(value: str | None) -> str | None:
+    """Validate the optional quota endpoint for a custom gateway.
+
+    The value is either an absolute URL equivalent to a base URL, or a path
+    resolved against the account's own base URL.  ``None`` keeps the default
+    ``<base>/v1/usage``.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://")):
+        return _normalise_custom_base_url(raw)
+    if not raw.startswith("/"):
+        raise ValueError("Usage URL must be an absolute URL or start with /")
+    if len(raw.encode("utf-8")) > MAX_CUSTOM_BASE_URL_BYTES:
+        raise ValueError("Usage URL is too long")
+    if any(ord(character) < 32 for character in raw) or any(
+        character in raw for character in "?#\\"
+    ):
+        raise ValueError("Usage URL path is invalid")
+    if "//" in raw or any(part in {".", ".."} for part in raw.split("/")):
+        raise ValueError("Usage URL path is invalid")
+    return raw.rstrip("/")
+
+
+def custom_provider_spec(
+    base_url: str,
+    *,
+    usage_url: str | None = None,
+) -> ApiProviderSpec:
+    """Build the per-account spec for an administrator-supplied gateway."""
+
+    normalised = _normalise_custom_base_url(base_url)
+    resolved_usage = _normalise_custom_usage_url(usage_url)
+    if resolved_usage is not None and not resolved_usage.startswith("/"):
+        absolute_usage = resolved_usage
+    elif resolved_usage is not None:
+        absolute_usage = f"{normalised}{resolved_usage}"
+    else:
+        absolute_usage = f"{normalised}/v1/usage"
+    codex_base_url = f"{normalised}/v1"
+    cached = _CUSTOM_SPEC_CACHE.get(codex_base_url)
+    if (
+        cached is not None
+        and cached.claude_base_url == normalised
+        and cached.usage_url == absolute_usage
+    ):
+        return cached
+    spec = ApiProviderSpec(
+        id=API_PROVIDER_CUSTOM,
+        label=_custom_spec_label(normalised),
+        account_prefix="custom",
+        codex_provider="custom",
+        claude_base_url=normalised,
+        codex_base_url=codex_base_url,
+        models_url=f"{codex_base_url}/models",
+        usage_url=absolute_usage,
+        base_url=normalised,
+        usage_path=(
+            resolved_usage if resolved_usage and resolved_usage.startswith("/")
+            else None
+        ),
+    )
+    _CUSTOM_SPEC_CACHE[codex_base_url] = spec
+    return spec
+
+
+def _custom_spec_label(base_url: str) -> str:
+    """Derive a bounded, secret-free display label from a gateway URL."""
+
+    label = base_url.split("://", 1)[-1].rstrip("/") or "custom"
+    return _bounded_utf8(label, MAX_CUSTOM_LABEL_BYTES)
+
+
+# Every provider id a caller may send.  ``custom`` has no static spec because
+# its endpoints come from the account's own base URL.
+API_PROVIDER_IDS = frozenset({*API_PROVIDER_SPECS, API_PROVIDER_CUSTOM})
+
+
 def normalize_api_provider(value: str | None) -> str:
     provider = str(value or API_PROVIDER_CLOUDROUTER).strip().lower()
-    if provider not in API_PROVIDER_SPECS:
+    if provider not in API_PROVIDER_IDS:
         raise ValueError("Unknown API provider")
     return provider
 
@@ -245,9 +458,24 @@ def api_auth_kind(api_provider: str | None) -> str:
     return f"{normalize_api_provider(api_provider)}_api"
 
 
+# Stable display order for the account list.  Custom accounts sort last so a
+# pool with many administrator-supplied gateways never displaces the pinned
+# providers at the top of the panel.
+API_PROVIDER_ORDER = {
+    **{provider: index for index, provider in enumerate(API_PROVIDER_SPECS)},
+    API_PROVIDER_CUSTOM: len(API_PROVIDER_SPECS),
+}
+
+
+def api_provider_sort_index(api_provider: str | None) -> int:
+    """Rank a provider for display; unknown values sort after every known one."""
+
+    return API_PROVIDER_ORDER.get(api_provider or "", len(API_PROVIDER_ORDER))
+
+
 def is_api_auth_kind(value: str | None) -> bool:
     return str(value or "").lower() in {
-        api_auth_kind(provider) for provider in API_PROVIDER_SPECS
+        api_auth_kind(provider) for provider in API_PROVIDER_IDS
     }
 
 
@@ -888,6 +1116,56 @@ def _normalise_apex_models(payload: Any) -> dict[str, Any]:
     return result
 
 
+def _probe_custom_models(payload: Any) -> dict[str, Any]:
+    """Project a custom gateway's catalog onto CCM's Claude/Codex split.
+
+    No single response shape is guaranteed: an OpenAI-compatible gateway
+    answers ``data[].id``, a native Anthropic/Codex one answers ``models[]``
+    with ``slug``, and a gateway fronting both protocols may merge them.  Each
+    shape is tried on its own so a partially understood response degrades to
+    the recognizable half instead of failing the whole account.
+    """
+
+    shapes = (
+        (
+            isinstance(payload, dict) and isinstance(payload.get("data"), list),
+            _normalise_models,
+        ),
+        (
+            isinstance(payload, dict) and isinstance(payload.get("models"), list),
+            _normalise_apex_models,
+        ),
+    )
+    merged: dict[str, Any] = {"claude": [], "codex": []}
+    service_tiers: dict[str, list[str]] = {}
+    matched = False
+    empty = True
+    for applicable, normaliser in shapes:
+        if not applicable:
+            continue
+        try:
+            result = normaliser(payload)
+        except CloudRouterUpstreamError:
+            continue
+        matched = True
+        for provider in ("claude", "codex"):
+            values = result.get(provider)
+            if values:
+                empty = False
+                merged[provider] = sorted(set(merged[provider]) | set(values))
+        for model, tiers in (result.get("service_tiers") or {}).items():
+            merged_tiers = set(service_tiers.get(model, ())) | set(tiers)
+            service_tiers[model] = sorted(merged_tiers)
+    if not matched:
+        raise CloudRouterUpstreamError("invalid_models_response")
+    if not empty:
+        # Only advertise upstream tier provenance when the gateway actually
+        # declared tiers; an empty map must keep the ``none`` source so the UI
+        # never implies graduated Fast capability.
+        merged["service_tiers"] = service_tiers
+    return merged
+
+
 def _normalise_service_tiers(
     value: Any,
     codex_models: list[str],
@@ -1422,6 +1700,59 @@ def _normalise_apex_usage(
     return snapshot
 
 
+def _custom_usage_shape(payload: Any) -> str:
+    """Classify a third-party quota payload before parsing it.
+
+    Shape detection is deliberately explicit rather than "try each parser":
+    ``_normalise_usage`` treats an unrecognised object as an active Key with
+    no windows, so a gateway answering ``{}`` or an unrelated JSON document
+    would otherwise be reported as verified-clear quota.  An unrecognised
+    payload must resolve to ``unknown`` instead.
+    """
+
+    if not isinstance(payload, dict) or not payload:
+        return "unsupported"
+    apex_markers = ("used", "remaining", "limits")
+    if all(isinstance(payload.get(marker), dict) for marker in apex_markers):
+        return "shared_group"
+    router_markers = (
+        "mode",
+        "quota",
+        "rate_limits",
+        "subscription",
+        "balance",
+        "usage",
+        "status",
+        "isValid",
+        "planName",
+        "plan_name",
+        "expires_at",
+        "expiry",
+    )
+    if any(marker in payload for marker in router_markers):
+        return "router"
+    return "unsupported"
+
+
+def _normalise_custom_usage(account_id: str, payload: Any) -> dict[str, Any]:
+    """Parse a custom gateway's quota, refusing to guess at unknown shapes.
+
+    A custom account may front either supported protocol, and their quota
+    documents are not interchangeable: ``shared_group`` separates this Key's
+    own usage from limits shared across its group, while ``router`` reports
+    the Key's own plan.  Mixing them would double-count or under-count quota,
+    so the shape is identified first and an unrecognised document raises --
+    the caller turns that into an explicit unknown snapshot.
+    """
+
+    shape = _custom_usage_shape(payload)
+    if shape == "shared_group":
+        return _normalise_apex_usage(account_id, payload)
+    if shape == "router":
+        return _normalise_usage(account_id, payload)
+    raise CloudRouterUpstreamError("unsupported_usage_response")
+
+
 def _unknown_snapshot(
     account_id: str,
     reason: str,
@@ -1547,6 +1878,10 @@ class CloudRouterAccount:
     service_tiers_explicit: bool
     key_hint: str
     root: Path
+    # Custom accounts only: the administrator-supplied gateway.  ``None`` for
+    # every preset provider, whose endpoints stay pinned in this module.
+    base_url: str | None = None
+    usage_path: str | None = None
 
     @property
     def claude_config_dir(self) -> str:
@@ -1565,8 +1900,24 @@ class CloudRouterAccount:
         return api_auth_kind(self.api_provider)
 
     @property
+    def spec(self) -> ApiProviderSpec:
+        """This account's own endpoints.
+
+        Preset providers resolve to the pinned module spec; a custom account
+        rebuilds its spec from the base URL persisted in ``account.json``,
+        which is re-validated on every load.
+        """
+
+        if self.base_url is None:
+            return API_PROVIDER_SPECS[self.api_provider]
+        return custom_provider_spec(
+            self.base_url,
+            usage_url=self.usage_path,
+        )
+
+    @property
     def provider_label(self) -> str:
-        return API_PROVIDER_SPECS[self.api_provider].label
+        return self.spec.label
 
     def supports_model(self, provider: str, model: str | None) -> bool:
         provider = str(provider or "").lower()
@@ -1634,9 +1985,9 @@ class CloudRouterAccount:
             "claude_config_dir": self.claude_config_dir,
             "codex_home": self.codex_home,
             "supported_models": supported_models,
-            "endpoints": dict(
-                API_PROVIDER_SPECS[self.api_provider].endpoints
-            ),
+            "endpoints": dict(self.spec.endpoints),
+            "base_url": self.base_url,
+            "usage_path": self.usage_path,
         }
 
 
@@ -1819,7 +2170,27 @@ class CloudRouterAccountStore:
                 f"Invalid API provider metadata: {account_id}"
             ) from exc
         match = ACCOUNT_ID_RE.fullmatch(account_id)
-        spec = API_PROVIDER_SPECS[api_provider]
+        # A custom account stores its own gateway.  Rebuilding the spec here is
+        # what lets every downstream endpoint check stay pinned to one exact
+        # value: the URL is validated once, and the Claude/Codex runtime files
+        # must then match what it derives.
+        base_url: str | None = None
+        usage_path: str | None = None
+        if api_provider == API_PROVIDER_CUSTOM:
+            try:
+                base_url = _normalise_custom_base_url(data.get("base_url"))
+                usage_path = _normalise_custom_usage_url(data.get("usage_path"))
+            except ValueError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid custom API base URL: {account_id}"
+                ) from exc
+            spec = custom_provider_spec(base_url, usage_url=usage_path)
+        else:
+            if data.get("base_url") is not None or data.get("usage_path") is not None:
+                raise CloudRouterUnsafePathError(
+                    f"Unexpected custom endpoint metadata: {account_id}"
+                )
+            spec = API_PROVIDER_SPECS[api_provider]
         if match is None or match.group("provider") != spec.account_prefix:
             raise CloudRouterUnsafePathError(
                 f"Mismatched API provider metadata: {account_id}"
@@ -1915,6 +2286,8 @@ class CloudRouterAccountStore:
             service_tiers_explicit=service_tiers_explicit,
             key_hint=str(data.get("key_hint") or ""),
             root=path,
+            base_url=base_url,
+            usage_path=usage_path,
         )
         for directory in (path / "claude", path / "codex"):
             _ensure_private_directory(directory, create=False)
@@ -2052,7 +2425,7 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Invalid Claude settings: {account.id}",
             ) from exc
-        expected_base_url = API_PROVIDER_SPECS[account.api_provider].claude_base_url
+        expected_base_url = account.spec.claude_base_url
         # A pre-migration Apex account still routes to the old host.  Admit
         # that exact value so the rewrite below can move it onto the current
         # one instead of failing closed; anything else is still rejected.
@@ -2102,7 +2475,7 @@ class CloudRouterAccountStore:
                 f"Modified API credential helper: {account.id}",
             )
 
-        spec = API_PROVIDER_SPECS[account.api_provider]
+        spec = account.spec
         if spec.claude_base_url is not None and validate_claude:
             try:
                 settings = json.loads(_open_regular_nofollow(
@@ -2318,7 +2691,7 @@ class CloudRouterAccountStore:
         accounts = sorted(
             self._accounts.values(),
             key=lambda account: (
-                list(API_PROVIDER_SPECS).index(account.api_provider),
+                api_provider_sort_index(account.api_provider),
                 int(
                     ACCOUNT_ID_RE.fullmatch(account.id).group("number")  # type: ignore[union-attr]
                 ),
@@ -2528,17 +2901,25 @@ class CloudRouterAccountStore:
         return account
 
     def _next_account_id(self, api_provider: str) -> str:
-        spec = API_PROVIDER_SPECS[normalize_api_provider(api_provider)]
+        provider = normalize_api_provider(api_provider)
+        # The directory prefix equals the provider id for every preset and for
+        # ``custom``; deriving it from the id keeps custom accounts allocatable
+        # without a static spec entry.
+        prefix = (
+            API_PROVIDER_SPECS[provider].account_prefix
+            if provider in API_PROVIDER_SPECS
+            else provider
+        )
         used = {
             int(match.group("number"))
             for child in self.root.iterdir()
             if (match := ACCOUNT_ID_RE.fullmatch(child.name))
-            and match.group("provider") == spec.account_prefix
+            and match.group("provider") == prefix
         }
         number = 1
         while number in used:
             number += 1
-        return f"{spec.account_prefix}-{number}"
+        return f"{prefix}-{number}"
 
     async def _request_json(self, url: str, api_key: str) -> Any:
         headers = {
@@ -2590,19 +2971,20 @@ class CloudRouterAccountStore:
         api_key: str,
         *,
         api_provider: str = API_PROVIDER_CLOUDROUTER,
+        spec: ApiProviderSpec | None = None,
     ) -> dict[str, Any]:
         provider = normalize_api_provider(api_provider)
-        spec = API_PROVIDER_SPECS[provider]
+        resolved_spec = spec or API_PROVIDER_SPECS[provider]
         if provider == API_PROVIDER_APEX:
             models_url = str(
-                httpx.URL(spec.models_url).copy_set_param(
+                httpx.URL(resolved_spec.models_url).copy_set_param(
                     "client_version", APEX_CODEX_CLIENT_VERSION,
                 )
             )
             return _normalise_apex_models(
                 await self._request_json(models_url, api_key)
             )
-        payload = await self._request_json(spec.models_url, api_key)
+        payload = await self._request_json(resolved_spec.models_url, api_key)
         if provider == API_PROVIDER_APIBEST:
             authenticated = (
                 _normalise_models(payload)
@@ -2614,6 +2996,13 @@ class CloudRouterAccountStore:
             return _normalise_apibest_pricing(
                 await self._request_json(APIBEST_PRICING_URL, api_key)
             )
+        if provider == API_PROVIDER_CUSTOM:
+            # A third-party gateway may speak the OpenAI-compatible catalog
+            # (``data[].id``), the native Anthropic/Codex catalog
+            # (``models[].slug``), or both.  Try the OpenAI shape first and
+            # fall back to the native one; a gateway that answers with only
+            # the latter still has to project both protocols.
+            return _probe_custom_models(payload)
         return _normalise_models(payload)
 
     def _read_api_key(self, account: CloudRouterAccount) -> str:
@@ -2644,9 +3033,11 @@ class CloudRouterAccountStore:
         enabled: bool = True,
         retired: bool = False,
         created_at: float | None = None,
+        spec: ApiProviderSpec | None = None,
     ) -> dict[str, Any]:
         current = _now()
         provider = normalize_api_provider(api_provider)
+        resolved_spec = spec or API_PROVIDER_SPECS[provider]
         service_tiers_source = (
             SERVICE_TIER_SOURCE_UPSTREAM
             if "service_tiers" in models
@@ -2669,7 +3060,12 @@ class CloudRouterAccountStore:
             "service_tiers": service_tiers,
             "service_tiers_source": service_tiers_source,
             "key_hint": key_hint,
-            "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
+            "endpoints": dict(resolved_spec.endpoints),
+            # A custom account is fully described by its own gateway.  Preset
+            # providers already have these pinned in the module, so writing
+            # them would only add redundant state that could silently diverge.
+            "base_url": resolved_spec.base_url,
+            "usage_path": resolved_spec.usage_path,
             "created_at": created_at or current,
             "updated_at": current,
         }
@@ -2684,9 +3080,10 @@ class CloudRouterAccountStore:
         api_key: str,
         models: dict[str, Any],
         api_provider: str = API_PROVIDER_CLOUDROUTER,
+        spec: ApiProviderSpec | None = None,
     ) -> None:
         provider = normalize_api_provider(api_provider)
-        spec = API_PROVIDER_SPECS[provider]
+        spec = spec or API_PROVIDER_SPECS[provider]
         _ensure_private_directory(root)
         claude_dir = root / "claude"
         codex_dir = root / "codex"
@@ -2722,6 +3119,7 @@ class CloudRouterAccountStore:
                 models,
                 _key_hint(api_key),
                 api_provider=provider,
+                spec=spec,
             ),
             maximum=MAX_METADATA_BYTES,
         )
@@ -2732,8 +3130,20 @@ class CloudRouterAccountStore:
         api_key: str,
         *,
         api_provider: str = API_PROVIDER_CLOUDROUTER,
+        base_url: str | None = None,
+        usage_url: str | None = None,
     ) -> CloudRouterAccount:
         provider = normalize_api_provider(api_provider)
+        if provider == API_PROVIDER_CUSTOM:
+            # Validated before the upstream probe so a malformed URL fails as
+            # a request error instead of a gateway validation failure.
+            spec = custom_provider_spec(str(base_url or ""), usage_url=usage_url)
+        else:
+            if base_url or usage_url:
+                raise ValueError(
+                    "Only a custom API account may specify its own URL"
+                )
+            spec = API_PROVIDER_SPECS[provider]
         clean_name = str(name or "").strip()
         if not clean_name or len(clean_name) > 100 or any(
             ord(character) < 32 for character in clean_name
@@ -2752,6 +3162,7 @@ class CloudRouterAccountStore:
         models = await self.probe_models(
             api_key,
             api_provider=provider,
+            spec=spec,
         )
         async with self._mutation_lock:
             self.reload()
@@ -2770,6 +3181,7 @@ class CloudRouterAccountStore:
                     api_key=api_key,
                     models=models,
                     api_provider=provider,
+                    spec=spec,
                 )
                 if target.exists() or target.is_symlink():
                     raise CloudRouterUnsafePathError("Account destination already exists")
@@ -2789,6 +3201,7 @@ class CloudRouterAccountStore:
             models = await self.probe_models(
                 api_key,
                 api_provider=account.api_provider,
+                spec=account.spec,
             )
             metadata_path = account.root / "account.json"
             data = json.loads(
@@ -2832,7 +3245,7 @@ class CloudRouterAccountStore:
         ):
             return dict(cached)
         async with self.credential_admission(account_id) as account:
-            spec = API_PROVIDER_SPECS[account.api_provider]
+            spec = account.spec
             if spec.usage_url is None:
                 snapshot = _unknown_snapshot(
                     account_id,
@@ -2844,11 +3257,12 @@ class CloudRouterAccountStore:
                     payload = await self._request_json(
                         spec.usage_url, self._read_api_key(account),
                     )
-                    snapshot = (
-                        _normalise_apex_usage(account_id, payload)
-                        if account.api_provider == API_PROVIDER_APEX
-                        else _normalise_usage(account_id, payload)
-                    )
+                    if account.api_provider == API_PROVIDER_APEX:
+                        snapshot = _normalise_apex_usage(account_id, payload)
+                    elif account.api_provider == API_PROVIDER_CUSTOM:
+                        snapshot = _normalise_custom_usage(account_id, payload)
+                    else:
+                        snapshot = _normalise_usage(account_id, payload)
                 except CloudRouterUpstreamError as exc:
                     if exc.status_code in {401, 403}:
                         snapshot = _unavailable_snapshot(account_id, exc.code)

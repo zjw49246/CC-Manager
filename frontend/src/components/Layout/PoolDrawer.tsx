@@ -24,7 +24,9 @@ const ACTIVE_CODEX_LOGIN_STATUSES = new Set([
   'running', 'awaiting_otp', 'verifying_otp', 'finalizing',
 ]);
 
-const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api', 'apibest_api']);
+const API_AUTH_KINDS = new Set([
+  'cloudrouter_api', 'apex_api', 'apibest_api', 'custom_api',
+]);
 
 function isApiAuthKind(authKind: string | null | undefined): boolean {
   return authKind != null && API_AUTH_KINDS.has(authKind);
@@ -37,7 +39,28 @@ function resolveApiProvider(
   if (provider) return provider;
   if (authKind === 'apex_api') return 'apex';
   if (authKind === 'apibest_api') return 'apibest';
+  if (authKind === 'custom_api') return 'custom';
   return 'cloudrouter';
+}
+
+/**
+ * Channel badge for an API account.
+ *
+ * A custom account is named by its own gateway host, so two custom keys
+ * pointed at different gateways stay distinguishable in the pool list
+ * instead of collapsing into a generic "API" badge.
+ */
+function apiProviderBadge(
+  provider: ApiAccountProvider,
+  baseUrl?: string | null,
+): string {
+  if (provider === 'apex') return 'APEXROUTER API';
+  if (provider === 'apibest') return 'APIBEST API';
+  if (provider === 'custom') {
+    const host = (baseUrl ?? '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    return host ? `${host.toUpperCase()} API` : '自定义 API';
+  }
+  return 'API';
 }
 
 function isApiCleanupPending(
@@ -648,7 +671,7 @@ function AccountCard({ account, preferred, lastSelected, apiAccount, onClearCool
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
+            {apiProviderBadge(apiProvider, account.base_url)}
           </span>
         )}
         {cleanupPending && (
@@ -869,7 +892,7 @@ function CodexAccountCard({ account, preferred, lastSelected, apiAccount, onClea
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
+            {apiProviderBadge(apiProvider, account.base_url)}
           </span>
         )}
         {cleanupPending && (
@@ -1053,17 +1076,22 @@ function AddApiAccountModal({ onClose, onAdded }: {
   const [apiProvider, setApiProvider] = useState<ApiAccountProvider>('cloudrouter');
   const [name, setName] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [usageUrl, setUsageUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isCustom = apiProvider === 'custom';
   const providerName = apiProvider === 'apex'
     ? 'ApexRouter'
-    : apiProvider === 'apibest' ? 'APIBest' : 'CloudRouter';
+    : apiProvider === 'apibest' ? 'APIBest' : isCustom ? '自定义' : 'CloudRouter';
+  const trimmedBaseUrl = baseUrl.trim();
+  const customIncomplete = isCustom && !trimmedBaseUrl;
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     const trimmedName = name.trim();
     const secret = apiKey.trim();
-    if (!trimmedName || !secret) return;
+    if (!trimmedName || !secret || customIncomplete) return;
 
     setSubmitting(true);
     setError(null);
@@ -1075,6 +1103,12 @@ function AddApiAccountModal({ onClose, onAdded }: {
         name: trimmedName,
         api_key: secret,
         api_provider: apiProvider,
+        ...(isCustom
+          ? {
+            base_url: trimmedBaseUrl,
+            ...(usageUrl.trim() ? { usage_url: usageUrl.trim() } : {}),
+          }
+          : {}),
       });
       await onAdded();
       onClose();
@@ -1105,8 +1139,41 @@ function AddApiAccountModal({ onClose, onAdded }: {
               <option value="cloudrouter">CloudRouter</option>
               <option value="apex">ApexRouter</option>
               <option value="apibest">APIBest</option>
+              <option value="custom">自定义（自行填写 API 地址）</option>
             </select>
           </div>
+          {isCustom && (
+            <>
+              <div>
+                <label htmlFor="api-account-base-url" className="block text-xs text-gray-400 mb-1">API 地址</label>
+                <input
+                  id="api-account-base-url"
+                  type="url"
+                  className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
+                  value={baseUrl}
+                  onChange={(event) => setBaseUrl(event.target.value)}
+                  placeholder="https://api.example.com"
+                  autoComplete="off"
+                  spellCheck={false}
+                  required
+                />
+              </div>
+              <div>
+                <label htmlFor="api-account-usage-url" className="block text-xs text-gray-400 mb-1">
+                  额度查询地址（可选）
+                </label>
+                <input
+                  id="api-account-usage-url"
+                  className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
+                  value={usageUrl}
+                  onChange={(event) => setUsageUrl(event.target.value)}
+                  placeholder="默认 {API 地址}/v1/usage"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+            </>
+          )}
           <div>
             <label htmlFor="api-account-name" className="block text-xs text-gray-400 mb-1">账号名称</label>
             <input
@@ -1114,7 +1181,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder={apiProvider === 'apex' ? '例如：ApexRouter' : apiProvider === 'apibest' ? '例如：APIBest' : '例如：CloudRouter Claude'}
+              placeholder={apiProvider === 'apex' ? '例如：ApexRouter' : apiProvider === 'apibest' ? '例如：APIBest' : isCustom ? '例如：自建网关' : '例如：CloudRouter Claude'}
               autoComplete="off"
               required
             />
@@ -1127,14 +1194,20 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder={apiProvider === 'apex' ? 'lck_...' : apiProvider === 'apibest' ? 'sk-...' : 'cr-...'}
+              placeholder={apiProvider === 'apex' ? 'lck_...' : apiProvider === 'apibest' ? 'sk-...' : isCustom ? '该网关签发的 Key' : 'cr-...'}
               autoComplete="new-password"
               required
             />
           </div>
           <div className="space-y-1 text-[11px] leading-relaxed text-gray-500">
             <p>每把 Key 建立一个独立 API 账号目录，Key 会以 0600 权限持久保存，不会显示在账号列表或日志中。</p>
-            {apiProvider === 'cloudrouter' ? (
+            {isCustom ? (
+              <>
+                <p>系统通过 {'{API 地址}'}/v1/models 自动识别该 Key 可用于 Claude、Codex 或两者；识别出的模型决定生成 Anthropic 还是 Responses 配置，两者都有则都配置。</p>
+                <p>额度从 {'{额度查询地址}'} 读取，未填写时使用 {'{API 地址}'}/v1/usage。返回格式无法识别时会显示“无法确认”，不会当作 $0。</p>
+                <p>地址支持 http/https、域名或 IP（含内网地址）；不允许回环地址与云元数据地址。</p>
+              </>
+            ) : apiProvider === 'cloudrouter' ? (
               <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
             ) : apiProvider === 'apex' ? (
               <>
@@ -1152,7 +1225,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
             <button type="button" onClick={onClose} className="px-3 py-1.5 text-xs text-gray-300 hover:text-foreground">取消</button>
             <button
               type="submit"
-              disabled={submitting || !name.trim() || !apiKey.trim()}
+              disabled={submitting || !name.trim() || !apiKey.trim() || customIncomplete}
               className="px-3 py-1.5 text-xs bg-sky-600 text-white rounded hover:bg-sky-500 disabled:opacity-50"
             >
               {submitting ? '验证并添加…' : '验证并添加'}
@@ -2087,7 +2160,7 @@ export function PoolDrawer() {
               {!hasActivePool && (
                 <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-gray-400">
                   还没有可用账号。点击右上角 <span className="font-semibold text-sky-300">API</span>，
-                  选择 CloudRouter 或 ApexRouter，并添加相应的 API Key。
+                  选择 CloudRouter、ApexRouter、APIBest，或“自定义”自行填写任意第三方 API 地址与 Key。
                 </div>
               )}
 
