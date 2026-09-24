@@ -9,7 +9,7 @@
 - [x] 根因：CLI 对 `claude-opus-5` 的原始 `modelUsage.contextWindow` 曾上报 200K，但 CCM 的 `CLAUDE_CONTEXT_WINDOWS`、Fable 名称匹配和前端 `fable` 特判将非后缀模型强制抬到 1M。
 - [x] 修复：仅显式 `[1m]` 后缀使用 1M；其他 Claude 模型默认 200K，同时保留运行时 CLI 上报更大窗口的修正路径；配置 API 的静态窗口映射保持为空以兼容既有客户端。
 - [x] 验证：Claude 模型/API 后端专项 34 passed，ChatView 前端 168 passed，前端 production build 通过；InstanceManager 扩展套件 625 passed，3 个 Unix socket 路径过长的既有环境失败与本次修改无关。
-- [x] commit ID：`9c0942cc`。
+- [x] commit ID：`68c9c34b`。
 
 
 ### 2026-09-09：修复 PTY 枚举事件导致的 API 错误漏判（生产 Task 538）
